@@ -278,13 +278,8 @@ void ToolManifest::SerializeForRemote( IOStream & ms ) const
 //------------------------------------------------------------------------------
 bool ToolManifest::DeserializeFromRemote( IOStream & ms )
 {
-    // NOTE: In clients prior to v1.07 a bug could cause ToolManifests to be
-    //       corrupt so we try to read this stream in a way that allows us to
-    //       detect this corruption.
-    // If we ever break protocol compatibility we can simplify this code.
-    // Any replacement packet integrity validation should be not specific to
-    // these packets and belongs at a higher level.
-    static_assert( Protocol::kVersionMajor == 22, "Remove backwards compat shims" );
+    // Validate stream integrity during deserialization.
+    // Corruption detection remains useful even without backwards compat concerns.
 
     // Should not be called more than once
     ASSERT( m_Files.IsEmpty() );
@@ -599,7 +594,9 @@ bool ToolManifest::ReceiveFileData( uint32_t fileId,
         return true;
     }
 
-    ASSERT( f.GetSyncState() == ToolManifestFile::SYNCHRONIZING );
+    // In push mode, files may arrive unsolicited (NOT_SYNCHRONIZED → SYNCHRONIZED)
+    ASSERT( f.GetSyncState() == ToolManifestFile::SYNCHRONIZING ||
+            f.GetSyncState() == ToolManifestFile::NOT_SYNCHRONIZED );
 
     // do decompression
     outCorruptData = false;
@@ -607,12 +604,7 @@ bool ToolManifest::ReceiveFileData( uint32_t fileId,
     if ( ( Compressor::IsValidData( data, dataSize ) == false ) ||
          ( c.Decompress( data ) == false ) )
     {
-        // NOTE: In clients prior to v1.07 a bug could cause ToolFiles to be
-        //       corrupt so we try to gracefully handle corrupt data.
-        // If we ever break protocol compatibility we can simplify this code.
-        // Any replacement packet integrity validation should be not specific to
-        // these packets and belongs at a higher level.
-        static_assert( Protocol::kVersionMajor == 22, "Remove backwards compat shims" );
+        // Gracefully handle corrupt file data.
 
         // When running tests we should be using latest protocols which don't
         // have the bug anymore so this should never happen

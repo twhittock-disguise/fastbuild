@@ -124,12 +124,14 @@ Protocol::MsgConnection::MsgConnection( uint32_t numJobsAvailable )
 
 // MsgConnectionAck
 //------------------------------------------------------------------------------
-Protocol::MsgConnectionAck::MsgConnectionAck()
+Protocol::MsgConnectionAck::MsgConnectionAck( uint8_t capacity )
     : Protocol::IMessage( Protocol::MSG_CONNECTION_ACK, sizeof( MsgConnectionAck ), false )
     , m_WorkerVersion( static_cast<uint16_t>( FBUILD_VERSION ) )
     , m_ProtocolVersionMajor( kVersionMajor )
     , m_ProtocolVersionMinor( kVersionMinor )
+    , m_WorkerCapacity( capacity )
 {
+    memset( m_Padding2, 0, sizeof( m_Padding2 ) );
 }
 
 // MsgStatus
@@ -167,15 +169,17 @@ Protocol::MsgJob::MsgJob( uint64_t toolId, int16_t resultCompressionLevel )
 
 // MsgJobResult
 //------------------------------------------------------------------------------
-Protocol::MsgJobResult::MsgJobResult()
+Protocol::MsgJobResult::MsgJobResult( uint8_t remainingCapacity )
     : Protocol::IMessage( Protocol::MSG_JOB_RESULT, sizeof( MsgJobResult ), true )
+    , m_RemainingCapacity( remainingCapacity )
 {
 }
 
 // MsgJobResultCompressed
 //------------------------------------------------------------------------------
-Protocol::MsgJobResultCompressed::MsgJobResultCompressed()
+Protocol::MsgJobResultCompressed::MsgJobResultCompressed( uint8_t remainingCapacity )
     : Protocol::IMessage( Protocol::MSG_JOB_RESULT_COMPRESSED, sizeof( MsgJobResultCompressed ), true )
+    , m_RemainingCapacity( remainingCapacity )
 {
 }
 

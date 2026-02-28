@@ -15,6 +15,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/BuildProfiler.h"
 #include "Tools/FBuild/FBuildCore/Helpers/MultiBuffer.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
+#include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueue.h"
 
@@ -26,6 +27,7 @@
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
 #include "Core/Profile/Profile.h"
+#include "Core/Time/Timer.h"
 
 // Defines
 //------------------------------------------------------------------------------
@@ -103,6 +105,8 @@ public:
 
     Atomic<uint32_t> m_NumJobsAvailableSentToClient{ 0 }; // num jobs we've told this server we have available
 
+    void PushJobsToWorker();
+
     template <class T>
     void EnqueueSend( const T & msg );
     template <class T>
@@ -148,6 +152,11 @@ private:
     // Info returned by worker
     Atomic<uint16_t> m_WorkerVersion;
     Atomic<uint8_t> m_ProtocolVersionMinor;
+
+    // Push-based job tracking
+    Atomic<uint32_t> m_WorkerCapacity{ 0 };
+    Atomic<uint32_t> m_JobsInFlight{ 0 };
+    Array<uint64_t> m_SentToolchains; // Protected by m_Mutex
 
     // Queue of messages to send
     Mutex m_SendQueueMutex;
@@ -420,52 +429,10 @@ void Client::CommunicateJobAvailability()
 {
     PROFILE_FUNCTION;
 
-    // We send updates periodically as a baseline, but other events can result
-    // us sending extra update messages
-    const bool timerExpired = ( m_StatusUpdateTimer.GetElapsed() >= CLIENT_STATUS_UPDATE_FREQUENCY_SECONDS );
-
-    // has status changed since we last sent it?
-    const uint32_t numJobsAvailable = (uint32_t)JobQueue::Get().GetNumDistributableJobsAvailable();
-
-    // Early out if we are guaranteed to not need to send to anyone
-    if ( ( timerExpired == false ) &&
-         ( numJobsAvailable == 0 ) )
-    {
-        return;
-    }
-
-    // Update each server so it knows how many jobs we have available now
+    // Push jobs directly to workers that have capacity
     for ( UniquePtr<ClientToWorkerConnection> & ss : m_ActiveConnections )
     {
-        // Update the worker periodically (but only if the state has changed)
-        const uint32_t numJobsAvailableSentToClient = ss->m_NumJobsAvailableSentToClient.Load();
-        bool sendAvailabilityToWorker = timerExpired &&
-                                        ( numJobsAvailableSentToClient != numJobsAvailable );
-
-        // Update worker when jobs become available if there were no jobs available,
-        // even if the periodic update timer has not expired. This creates more traffic,
-        // but significantly reduces job scheduling latency when:
-        //  - a) A build starts, if workers connect before he first jobs become available.
-        // OR
-        //  - b) During builds, after any period of worker starvation (having zero jobs available
-        //       and jobs then becoming available)
-        //
-        // In both cases, we avoid upto CLIENT_STATUS_UPDATE_FREQUENCY_SECONDS of latency
-        if ( numJobsAvailable && ( numJobsAvailableSentToClient == 0 ) )
-        {
-            sendAvailabilityToWorker = true;
-        }
-
-        if ( sendAvailabilityToWorker )
-        {
-            ss->EnqueueSendJobAvailability( numJobsAvailable );
-        }
-    }
-
-    // Restart periodic update timer if needed
-    if ( timerExpired )
-    {
-        m_StatusUpdateTimer.Restart();
+        ss->PushJobsToWorker();
     }
 }
 
@@ -672,12 +639,111 @@ void ClientToWorkerConnection::Process( const Protocol::MsgConnectionAck * msg )
     // Take note of additional server info
     m_WorkerVersion.Store( msg->GetWorkerVersion() );
     m_ProtocolVersionMinor.Store( msg->GetProtocolVersionMinor() );
-    DIST_INFO( " - Worker %s is v%u.%u (protocol v%u.%u)\n",
+    m_WorkerCapacity.Store( msg->GetWorkerCapacity() );
+    DIST_INFO( " - Worker %s is v%u.%u (protocol v%u.%u) capacity=%u\n",
                m_Worker->m_Address.Get(),
                ( m_WorkerVersion.Load() / 100U ),
                ( m_WorkerVersion.Load() % 100U ),
                Protocol::kVersionMajor,
-               m_ProtocolVersionMinor.Load() );
+               m_ProtocolVersionMinor.Load(),
+               msg->GetWorkerCapacity() );
+
+    // Push initial batch of jobs to fill worker capacity
+    PushJobsToWorker();
+}
+
+// PushJobsToWorker
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::PushJobsToWorker()
+{
+    PROFILE_SECTION( "PushJobsToWorker" );
+
+    const uint32_t capacity = m_WorkerCapacity.Load();
+    const uint32_t inFlight = m_JobsInFlight.Load();
+    if ( ( inFlight >= capacity ) || m_Worker->m_DenyListed || ( capacity == 0 ) )
+    {
+        return;
+    }
+
+    const uint8_t workerMinorProtocolVersion = m_ProtocolVersionMinor.Load();
+    uint32_t toSend = capacity - inFlight;
+
+    while ( toSend > 0 )
+    {
+        Job * job = JobQueue::Get().GetDistributableJobToProcess( true, workerMinorProtocolVersion );
+        if ( job == nullptr )
+        {
+            break;
+        }
+
+        const Node * n = job->GetNode()->CastTo<ObjectNode>()->GetCompiler();
+        ASSERT( n );
+        const ToolManifest & manifest = n->CastTo<CompilerNode>()->GetManifest();
+        const uint64_t toolId = manifest.GetToolId();
+
+        // Push toolchain if not yet sent to this worker
+        {
+            MutexHolder mh( m_Mutex );
+            if ( m_SentToolchains.Find( toolId ) == nullptr )
+            {
+                MemoryStream ms;
+                manifest.SerializeForRemote( ms );
+                EnqueueSend( Protocol::MsgManifest( toolId ),
+                             Move( ConstMemoryStream( Move( ms ) ) ) );
+
+                const Array<ToolManifestFile> & files = manifest.GetFiles();
+                for ( uint32_t i = 0; i < files.GetSize(); ++i )
+                {
+                    size_t dataSize = 0;
+                    const void * data = manifest.GetFileData( i, dataSize );
+                    if ( data )
+                    {
+                        EnqueueSend( Protocol::MsgFile( toolId, i ),
+                                     Move( ConstMemoryStream( data, dataSize ) ) );
+                    }
+                }
+                m_SentToolchains.Append( toolId );
+            }
+        }
+
+        // Track and send job
+        {
+            MutexHolder mh( m_Mutex );
+            m_Jobs.Append( job );
+        }
+        m_JobsInFlight.Increment();
+
+        if ( FBuild::Get().GetOptions().m_ShowCommandSummary )
+        {
+            FLOG_OUTPUT( "-> Obj: %s <REMOTE: %s>\n",
+                         job->GetNode()->GetName().Get(), m_Worker->m_Address.Get() );
+        }
+        FLOG_MONITOR( "START_JOB %s \"%s\" \n", m_Worker->m_Address.Get(), job->GetNode()->GetName().Get() );
+
+        MemoryStream stream;
+        job->Serialize( stream );
+
+        // Determine compression level for results
+        int16_t resultCompressionLevel = -1;
+        if ( FBuild::IsValid() )
+        {
+            const int16_t cacheCompressionLevel = FBuild::Get().GetOptions().m_CacheCompressionLevel;
+            if ( ( cacheCompressionLevel != 0 ) &&
+                 ( FBuild::Get().GetOptions().m_UseCacheWrite ) &&
+                 ( job->GetNode()->CastTo<ObjectNode>()->ShouldUseCache() ) )
+            {
+                resultCompressionLevel = Math::Max( resultCompressionLevel, cacheCompressionLevel );
+            }
+        }
+
+        const bool allowZstdUse = true;
+        job->SetResultCompressionLevel( resultCompressionLevel, allowZstdUse );
+
+        EnqueueSend( Protocol::MsgJob( toolId, resultCompressionLevel ),
+                     Move( ConstMemoryStream( Move( stream ) ) ) );
+
+        toSend--;
+    }
 }
 
 // ProcessJobResultCommon
@@ -690,6 +756,9 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
     // Doing it as soon as possible makes it more accurate, as work below can take a non-trivial
     // amount of time. (For example OnReturnRemoteJob when cancelling the local job in a race)
     const int64_t receivedResultEndTime = Timer::GetNow();
+
+    // Decrement in-flight count immediately
+    m_JobsInFlight.Decrement();
 
     ConstMemoryStream ms( payload, payloadSize );
 
@@ -1032,6 +1101,9 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
     JobQueue::Get().FinishedProcessingJob( job,
                                            result ? Node::BuildResult::eOk : Node::BuildResult::eFailed,
                                            true ); // remote job
+
+    // Push more jobs to fill freed capacity
+    PushJobsToWorker();
 }
 
 // Process( MsgRequestManifest )
@@ -1243,17 +1315,8 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
     // Send messages
     while ( true )
     {
-        // Sleep until there is some work to do
-        m_SendThreadWakeSemaphore.Wait();
-
-        // When client has been signaled to exit, we should exit as well
-        if ( m_SendThreadQuit.Load() == true )
-        {
-            break;
-        }
-
         // Take queue of messages to process, or take the MsgStatus and
-        // send that first if needed.
+        // send that first if needed. Drain fully before blocking on semaphore.
         Array<ClientSendQueueItem> sendQueue;
         {
             MutexHolder lock( m_SendQueueMutex );
@@ -1265,6 +1328,19 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
             {
                 m_SendQueue.Swap( sendQueue );
             }
+        }
+
+        // If nothing to send, block until signaled
+        if ( sendQueue.IsEmpty() )
+        {
+            m_SendThreadWakeSemaphore.Wait();
+
+            // When client has been signaled to exit, we should exit as well
+            if ( m_SendThreadQuit.Load() == true )
+            {
+                break;
+            }
+            continue; // Re-check queue after waking
         }
 
         for ( const ClientSendQueueItem & item : sendQueue )

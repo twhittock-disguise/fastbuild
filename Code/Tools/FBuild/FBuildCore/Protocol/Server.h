@@ -53,12 +53,13 @@ private:
     static uint32_t ThreadFuncStatic( void * param );
     void ThreadFunc();
 
-    void FindNeedyClients();
     void FinalizeCompletedJobs();
     void TouchToolchains();
     void CheckWaitingJobs( const ToolManifest * manifest );
 
     void RequestMissingFiles( const ConnectionInfo * connection, ToolManifest * manifest ) const;
+    void RecalculateCapacity();        // Takes m_ClientListMutex
+    void RecalculateCapacityLocked();  // Caller must hold m_ClientListMutex
 
     struct ClientState
     {
@@ -68,15 +69,13 @@ private:
             m_WaitingJobs.SetCapacity( 16 );
         }
 
-        bool operator<( const ClientState & other ) const { return ( m_NumJobsAvailable.Load() > other.m_NumJobsAvailable.Load() ); }
-
         Mutex m_Mutex;
 
         const Protocol::IMessage * m_CurrentMessage = nullptr;
         const ConnectionInfo * m_Connection = nullptr;
         Atomic<uint32_t> m_NumJobsAvailable;
-        Atomic<uint32_t> m_NumJobsRequested;
         Atomic<uint32_t> m_NumJobsActive;
+        uint32_t m_AllocatedCapacity = 0;
 
         uint8_t m_ProtocolVersionMinor = 0;
         AString m_HostName;

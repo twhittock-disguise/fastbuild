@@ -31,7 +31,7 @@ namespace Protocol
     inline static const uint16_t kPort = 31264; // Arbitrarily chosen port
 
     // Protocol Version
-    inline static const uint32_t kVersionMajor = 22; // Changes here make workers incompatible
+    inline static const uint32_t kVersionMajor = 23; // Changes here make workers incompatible
     inline static const uint8_t kVersionMinor = 5; // Changes must be forwards and backwards compatible
 
     inline static const uint16_t kTestPort = kPort + 1; // Different port for use by tests
@@ -128,17 +128,21 @@ namespace Protocol
     class MsgConnectionAck : public IMessage
     {
     public:
-        MsgConnectionAck();
+        explicit MsgConnectionAck( uint8_t capacity );
 
         uint16_t GetWorkerVersion() const { return m_WorkerVersion; }
         uint8_t GetProtocolVersionMajor() const { return m_ProtocolVersionMajor; }
         uint8_t GetProtocolVersionMinor() const { return m_ProtocolVersionMinor; }
+        uint8_t GetWorkerCapacity() const { return m_WorkerCapacity; }
 
     private:
         uint16_t m_WorkerVersion;
         uint8_t m_ProtocolVersionMajor;
         uint8_t m_ProtocolVersionMinor;
+        uint8_t m_WorkerCapacity;
+        char m_Padding2[ 3 ];
     };
+    static_assert( sizeof( MsgConnectionAck ) == sizeof( IMessage ) + 8, "MsgConnectionAck message has incorrect size" );
 
     // MsgStatus
     //------------------------------------------------------------------------------
@@ -194,18 +198,28 @@ namespace Protocol
     class MsgJobResult : public IMessage
     {
     public:
-        MsgJobResult();
+        explicit MsgJobResult( uint8_t remainingCapacity );
+
+        uint8_t GetRemainingCapacity() const { return m_RemainingCapacity; }
+
+    private:
+        uint8_t m_RemainingCapacity;
     };
-    static_assert( sizeof( MsgJobResult ) == sizeof( IMessage ), "MsgJobResult message has incorrect size" );
+    static_assert( sizeof( MsgJobResult ) == sizeof( IMessage ) + 1, "MsgJobResult message has incorrect size" );
 
     // MsgJobResultCompressed
     //------------------------------------------------------------------------------
     class MsgJobResultCompressed : public IMessage
     {
     public:
-        MsgJobResultCompressed();
+        explicit MsgJobResultCompressed( uint8_t remainingCapacity );
+
+        uint8_t GetRemainingCapacity() const { return m_RemainingCapacity; }
+
+    private:
+        uint8_t m_RemainingCapacity;
     };
-    static_assert( sizeof( MsgJobResultCompressed ) == sizeof( IMessage ), "MsgJobResultCompressed message has incorrect size" );
+    static_assert( sizeof( MsgJobResultCompressed ) == sizeof( IMessage ) + 1, "MsgJobResultCompressed message has incorrect size" );
 
     // MsgRequestManifest
     //------------------------------------------------------------------------------
