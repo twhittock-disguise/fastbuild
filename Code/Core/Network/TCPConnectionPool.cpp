@@ -625,7 +625,23 @@ bool TCPConnectionPool::SendInternal( const ConnectionInfo * connection, const T
                     break;
                 }
 
-                Thread::Sleep( 1 );
+                // Wait for socket to become writable instead of sleeping.
+                // Thread::Sleep(1) on Windows sleeps 1-15ms due to timer
+                // resolution; select() returns as soon as buffer space is available.
+                fd_set writeFds;
+                FD_ZERO( &writeFds );
+                #if defined( __WINDOWS__ )
+                    __pragma( warning( push ) )
+                    __pragma( warning( disable : 4548 ) ) // FD_SET macro triggers C4548
+                #endif
+                FD_SET( connection->m_Socket, &writeFds );
+                #if defined( __WINDOWS__ )
+                    __pragma( warning( pop ) )
+                #endif
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 100000; // 100ms max wait
+                select( (int)( connection->m_Socket + 1 ), nullptr, &writeFds, nullptr, &tv );
                 continue;
             }
             // error
@@ -697,7 +713,24 @@ bool TCPConnectionPool::HandleRead( ConnectionInfo * ci )
                     return false;
                 }
 
-                Thread::Sleep( 1 );
+                // Wait for socket to become readable instead of sleeping.
+                // Thread::Sleep(1) on Windows sleeps 1-15ms due to timer
+                // resolution, which throttles the receive path and causes
+                // TCP window back-pressure on the sender.
+                fd_set readFds;
+                FD_ZERO( &readFds );
+                #if defined( __WINDOWS__ )
+                    __pragma( warning( push ) )
+                    __pragma( warning( disable : 4548 ) ) // FD_SET macro triggers C4548
+                #endif
+                FD_SET( ci->m_Socket, &readFds );
+                #if defined( __WINDOWS__ )
+                    __pragma( warning( pop ) )
+                #endif
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 100000; // 100ms max wait
+                select( (int)( ci->m_Socket + 1 ), &readFds, nullptr, nullptr, &tv );
                 continue;
             }
             TCPDEBUG( "recv() failed (A). Error: %s (Read: %i, Socket: %x)\n", LAST_NETWORK_ERROR_STR, numBytes, (uint32_t)( ci->m_Socket ) );
@@ -732,7 +765,21 @@ bool TCPConnectionPool::HandleRead( ConnectionInfo * ci )
                     return false;
                 }
 
-                Thread::Sleep( 1 );
+                // Wait for socket to become readable instead of sleeping.
+                fd_set readFds;
+                FD_ZERO( &readFds );
+                #if defined( __WINDOWS__ )
+                    __pragma( warning( push ) )
+                    __pragma( warning( disable : 4548 ) ) // FD_SET macro triggers C4548
+                #endif
+                FD_SET( ci->m_Socket, &readFds );
+                #if defined( __WINDOWS__ )
+                    __pragma( warning( pop ) )
+                #endif
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 100000; // 100ms max wait
+                select( (int)( ci->m_Socket + 1 ), &readFds, nullptr, nullptr, &tv );
                 continue;
             }
             TCPDEBUG( "recv() failed (B). Error: %s (Read: %i, Socket: %x)\n", LAST_NETWORK_ERROR_STR, numBytes, (uint32_t)( ci->m_Socket ) );
@@ -1165,9 +1212,11 @@ void TCPConnectionPool::AllowSocketReuse( TCPSocket socket ) const
 //------------------------------------------------------------------------------
 void TCPConnectionPool::DisableNagle( TCPSocket socket ) const
 {
-    // disable TCP nagle
-    static const int disableNagle = 1;
-    const int ret = setsockopt( socket, IPPROTO_TCP, TCP_NODELAY, (const char *)&disableNagle, sizeof( disableNagle ) );
+    // Disable Nagle's algorithm to prevent coalescing small protocol messages.
+    // This reduces latency for the many small (7-15 byte) messages in the
+    // FASTBuild protocol, which otherwise get delayed up to 200ms.
+    const int flag = 1;
+    const int ret = setsockopt( socket, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof( flag ) );
     if ( ret != 0 )
     {
         TCPDEBUG( "setsockopt(TCP_NODELAY) failed. Error: %s\n", LAST_NETWORK_ERROR_STR );
