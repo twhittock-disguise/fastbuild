@@ -584,6 +584,13 @@ bool ToolManifest::ReceiveFileData( uint32_t fileId,
 {
     MutexHolder mh( m_Mutex );
 
+    // Validate fileId is within bounds
+    if ( fileId >= m_Files.GetSize() )
+    {
+        outCorruptData = true;
+        return false;
+    }
+
     ToolManifestFile & f = m_Files[ fileId ];
 
     // gracefully handle multiple receipts of the same data
