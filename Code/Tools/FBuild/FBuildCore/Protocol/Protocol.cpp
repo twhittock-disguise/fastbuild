@@ -175,7 +175,7 @@ Protocol::MsgJobResult::MsgJobResult()
 // MsgJobResultCompressed
 //------------------------------------------------------------------------------
 Protocol::MsgJobResultCompressed::MsgJobResultCompressed()
-    : Protocol::IMessage( Protocol::MSG_JOB_RESULT_COMPRESSED, sizeof( MsgJobResult ), true )
+    : Protocol::IMessage( Protocol::MSG_JOB_RESULT_COMPRESSED, sizeof( MsgJobResultCompressed ), true )
 {
 }
 
