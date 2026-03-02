@@ -156,6 +156,7 @@ private:
     void AllowSocketReuse( TCPSocket socket ) const;
     void DisableNagle( TCPSocket socket ) const;
     void DisableSigPipe( TCPSocket socket ) const;
+    void EnableKeepAlive( TCPSocket socket ) const;
     void SetLargeBufferSizes( TCPSocket socket ) const;
     void SetNonBlocking( TCPSocket socket ) const;
 

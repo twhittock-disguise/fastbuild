@@ -19,6 +19,7 @@
 // System
 #if defined( __WINDOWS__ )
     #include "Core/Env/WindowsHeader.h"
+    #include <mstcpip.h> // tcp_keepalive, SIO_KEEPALIVE_VALS
 #elif defined( __APPLE__ ) || defined( __LINUX__ )
     #include <arpa/inet.h>
     #include <errno.h>
@@ -290,6 +291,7 @@ const ConnectionInfo * TCPConnectionPool::Connect( uint32_t hostIP, uint16_t por
     // Configure socket
     DisableSigPipe( sockfd );       // Prevent socket inheritence by child processes
     DisableNagle( sockfd );         // Disable Nagle's algorithm
+    EnableKeepAlive( sockfd );      // Keep idle connections alive
     SetLargeBufferSizes( sockfd );  // Set large send/recv buffer sizes
     SetNonBlocking( sockfd );       // Set non-blocking
 
@@ -644,7 +646,6 @@ bool TCPConnectionPool::SendInternal( const ConnectionInfo * connection, const T
                 select( (int)( connection->m_Socket + 1 ), nullptr, &writeFds, nullptr, &tv );
                 continue;
             }
-            // error
             TCPDEBUG( "send() failed (A). Error: %s (Sent: %u, Socket: %x)\n", LAST_NETWORK_ERROR_STR, sent, (uint32_t)( connection->m_Socket ) );
             Disconnect( connection );
             sendOK = false;
@@ -1039,6 +1040,7 @@ void TCPConnectionPool::ListenThreadFunction( ConnectionInfo * ci )
         // Configure socket
         DisableSigPipe( newSocket );        // Prevent socket inheritence by child processes
         DisableNagle( newSocket );          // Disable Nagle's algorithm
+        EnableKeepAlive( newSocket );       // Keep idle connections alive
         SetLargeBufferSizes( newSocket );   // Set send/recv buffer sizes
         SetNonBlocking( newSocket );        // Set non-blocking
 
@@ -1221,6 +1223,39 @@ void TCPConnectionPool::DisableNagle( TCPSocket socket ) const
     {
         TCPDEBUG( "setsockopt(TCP_NODELAY) failed. Error: %s\n", LAST_NETWORK_ERROR_STR );
     }
+}
+
+// EnableKeepAlive
+//------------------------------------------------------------------------------
+void TCPConnectionPool::EnableKeepAlive( TCPSocket socket ) const
+{
+    // Enable TCP keepalive probes to detect dead connections and prevent
+    // intermediate devices (NAT, VPN tunnels) from dropping idle connections.
+    // Without this, connections that are idle during long remote builds
+    // can be silently dropped.
+    const int enable = 1;
+    const int ret = setsockopt( socket, SOL_SOCKET, SO_KEEPALIVE, (const char *)&enable, sizeof( enable ) );
+    if ( ret != 0 )
+    {
+        TCPDEBUG( "setsockopt(SO_KEEPALIVE) failed. Error: %s\n", LAST_NETWORK_ERROR_STR );
+    }
+#if defined( __WINDOWS__ )
+    // Set keepalive interval: start probing after 10s idle, probe every 10s
+    struct tcp_keepalive keepAlive;
+    keepAlive.onoff = 1;
+    keepAlive.keepalivetime = 10000;     // 10s before first probe
+    keepAlive.keepaliveinterval = 10000; // 10s between probes
+    DWORD bytesReturned = 0;
+    WSAIoctl( socket, SIO_KEEPALIVE_VALS, &keepAlive, sizeof( keepAlive ),
+              nullptr, 0, &bytesReturned, nullptr, nullptr );
+#elif defined( __LINUX__ )
+    const int idle = 10;    // start probing after 10s idle
+    const int intvl = 10;   // probe every 10s
+    const int cnt = 3;      // 3 failed probes = dead
+    setsockopt( socket, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof( idle ) );
+    setsockopt( socket, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof( intvl ) );
+    setsockopt( socket, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof( cnt ) );
+#endif
 }
 
 // DisableSigPipe
