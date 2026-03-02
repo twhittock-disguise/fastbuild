@@ -29,7 +29,7 @@ class ToolManifest;
 class Server : public TCPConnectionPool
 {
 public:
-    Server( uint32_t numThreadsInJobQueue = 0 );
+    Server( uint32_t numThreadsInJobQueue = 0, uint32_t prefetchBuffer = 0 );
     virtual ~Server() override;
 
     static void GetHostForJob( const Job * job, AString & hostName );
@@ -85,6 +85,7 @@ private:
         Timer m_StatusTimer;
     };
 
+    uint32_t m_PrefetchBuffer = 0;
     JobQueueRemote * m_JobQueueRemote;
 
     Atomic<bool> m_ShouldExit; // signal from main thread

@@ -41,14 +41,14 @@
 
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
-Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart )
+Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart, uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
     : m_ConsoleMode( consoleMode )
     , m_PeriodicRestart( periodicRestart )
     , m_BaseArgs( args )
 {
     m_WorkerSettings = FNEW( WorkerSettings );
     m_NetworkStartupHelper = FNEW( NetworkStartupHelper );
-    m_ConnectionPool = FNEW( Server );
+    m_ConnectionPool = FNEW( Server( numThreadsInJobQueue, prefetchBuffer ) );
 
     Env::GetExePath( m_BaseExeName );
 #if defined( __WINDOWS__ )

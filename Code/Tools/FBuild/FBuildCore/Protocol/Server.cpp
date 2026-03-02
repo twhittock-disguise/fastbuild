@@ -18,6 +18,8 @@
 #include "Core/Process/Atomic.h"
 #include "Core/Profile/Profile.h"
 #include "Core/Strings/AStackString.h"
+#include "Core/Time/Timer.h"
+#include "Core/Tracing/Tracing.h"
 
 // Defines
 //------------------------------------------------------------------------------
@@ -28,8 +30,9 @@
 
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
-Server::Server( uint32_t numThreadsInJobQueue )
-    : m_ShouldExit( false )
+Server::Server( uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
+    : m_PrefetchBuffer( prefetchBuffer )
+    , m_ShouldExit( false )
 {
     m_ClientList.SetCapacity( 32 );
 
@@ -668,8 +671,9 @@ void Server::RecalculateCapacityLocked()
         return;
     }
     const uint32_t totalCores = WorkerThreadRemote::GetNumCPUsToUse();
-    const uint32_t perClient = totalCores / numClients;
-    const uint32_t remainder = totalCores % numClients;
+    const uint32_t totalCapacity = totalCores + m_PrefetchBuffer;
+    const uint32_t perClient = totalCapacity / numClients;
+    const uint32_t remainder = totalCapacity % numClients;
     uint32_t i = 0;
     for ( ClientState * cs : m_ClientList )
     {

@@ -35,6 +35,8 @@ public:
     bool m_OverrideWorkMode = false;
     WorkerSettings::Mode m_WorkMode = WorkerSettings::WHEN_IDLE;
     uint32_t m_MinimumFreeMemoryMiB = 0; // Minimum OS free memory including virtual memory to let worker do its work
+    bool m_OverridePrefetch = false;
+    uint32_t m_PrefetchBuffer = 0;      // 0 = use default ceil(cpus/2)
 
     // Console mode
     bool m_ConsoleMode = false;

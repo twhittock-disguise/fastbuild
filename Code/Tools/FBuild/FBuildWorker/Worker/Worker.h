@@ -27,7 +27,7 @@ class WorkerSettings;
 class Worker : public Singleton<Worker>
 {
 public:
-    explicit Worker( const AString & args, bool consoleMode, bool periodicRestart );
+    explicit Worker( const AString & args, bool consoleMode, bool periodicRestart, uint32_t numThreadsInJobQueue = 0, uint32_t prefetchBuffer = 0 );
     ~Worker();
 
     int32_t Work();

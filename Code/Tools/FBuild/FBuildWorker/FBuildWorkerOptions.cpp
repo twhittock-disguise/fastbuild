@@ -64,7 +64,7 @@ bool FBuildWorkerOptions::ProcessCommandLine( const AString & commandLine )
                 }
                 else if ( num > 0 )
                 {
-                    m_CPUAllocation = (uint32_t)Math::Clamp( num, 1, numCPUs );
+                    m_CPUAllocation = (uint32_t)num; // allow exceeding numCPUs for oversubscription testing
                     m_OverrideCPUAllocation = true;
                     continue;
                 }
@@ -101,6 +101,17 @@ bool FBuildWorkerOptions::ProcessCommandLine( const AString & commandLine )
             m_WorkMode = WorkerSettings::PROPORTIONAL;
             m_OverrideWorkMode = true;
             continue;
+        }
+        else if ( token.BeginsWith( "-prefetch=" ) )
+        {
+            uint32_t num( 0 );
+            if ( AString::ScanS( token.Get() + 10, "%u", &num ) == 1 )
+            {
+                m_PrefetchBuffer = num;
+                m_OverridePrefetch = true;
+                continue;
+            }
+            // problem... fall through
         }
         else if ( token == "-periodicrestart" )
         {
@@ -166,6 +177,9 @@ void FBuildWorkerOptions::ShowUsageError()
                        "        - proportional : Accept work proportional to free CPUs.\n"
                        " -minfreememory <MiB>\n"
                        "        Set minimum free memory (MiB) required to accept work.\n"
+                       " -prefetch=<n>\n"
+                       "        Extra jobs to buffer locally for gapless execution.\n"
+                       "        Default: ceil(cpus/2). Use 0 to disable.\n"
                        " -nosubprocess\n"
                        "        (Windows) Don't spawn a sub-process worker copy.\n"
                        " -periodicrestart\n"

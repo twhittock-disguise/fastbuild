@@ -15,7 +15,7 @@
 
 #include "Core/Process/Atomic.h"
 #include "Core/Process/Thread.h"
-#include "Core/Time/Timer.h"
+#include "Core/Tracing/Tracing.h"
 
 // Static
 //------------------------------------------------------------------------------

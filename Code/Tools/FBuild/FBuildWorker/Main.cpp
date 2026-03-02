@@ -126,7 +126,14 @@ int Main( const AString & args )
     // start the worker and wait for it to be closed
     int ret;
     {
-        Worker worker( args, options.m_ConsoleMode, options.m_PeriodicRestart );
+        const uint32_t cpuAllocation = options.m_OverrideCPUAllocation ? options.m_CPUAllocation : 0;
+        const uint32_t effectiveCpus = cpuAllocation ? cpuAllocation : Env::GetNumProcessors();
+        const uint32_t prefetch = options.m_OverridePrefetch
+            ? options.m_PrefetchBuffer
+            : ( effectiveCpus + 1 ) / 2; // ceil(cpus/2)
+
+        Worker worker( args, options.m_ConsoleMode, options.m_PeriodicRestart,
+                       cpuAllocation, prefetch );
         if ( options.m_OverrideCPUAllocation )
         {
             WorkerSettings::Get().SetNumCPUsToUse( options.m_CPUAllocation );
