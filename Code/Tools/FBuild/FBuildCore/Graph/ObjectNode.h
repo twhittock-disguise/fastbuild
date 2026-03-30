@@ -292,6 +292,7 @@ private:
     AString m_CompilerOptionsDeoptimized;
     AString m_CompilerInputFile;
     AString m_PCHObjectFileName;
+    AString m_PCHUndefsFileName;
     bool m_DeoptimizeWritableFiles = false;
     bool m_DeoptimizeWritableFilesWithToken = false;
     Array<AString> m_CompilerForceUsing;

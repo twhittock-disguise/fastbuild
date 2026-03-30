@@ -34,14 +34,9 @@ public:
 
     // On the coordinator: strip PCH content from preprocessed output, prepend
     // an #include trigger + undef block, and attach PCH metadata to the job.
-    // pchCreationOptions/pchSourceFile are from the PCH creation node (has /Yc).
     static bool BundleForDistribution( Job * job,
                                        const AString & compilerOptions,
-                                       const AString & sourceFileName,
-                                       const AString & compilerExe,
-                                       const char * compilerEnvironment,
-                                       const AString & pchCreationOptions,
-                                       const AString & pchSourceFile );
+                                       const AString & sourceFileName );
 
     // On the worker: detect a PCH-bundled payload and strip the header.
     // Returns true if PCH bundle was found; dataToWrite/Size are updated
@@ -57,32 +52,18 @@ public:
                                const void * & outPreprocessedData,
                                size_t & outPreprocessedSize );
 
-    // Run the MSVC /PD macro dump pass and generate an #undef block for all
-    // macros defined by the PCH. Uses disk cache keyed by pchId.
-    static bool GetUndefBlock( const AString & compilerExe,
-                               const char * compilerEnvironment,
-                               const AString & pchCreationOptions,
-                               const AString & pchSourceFile,
-                               uint64_t pchId,
-                               AString & outUndefBlock );
+    // Generate .undefs file from PCH creation options using /PD macro dump.
+    // Called during PCH creation to produce the .undefs file alongside the .pch.
+    static bool GenerateUndefsFile( const AString & compilerExe,
+                                    const char * compilerEnvironment,
+                                    const AString & pchCreationOptions,
+                                    const AString & pchSourceFile,
+                                    const AString & outputPath );
 
 private:
-    // Run cl.exe with the PCH creation command, but /Yc replaced by
-    // /Zc:preprocessor /PD to dump macro definitions instead of creating a PCH.
-    static bool RunMacroDumpPass( const AString & compilerExe,
-                                  const char * compilerEnvironment,
-                                  const AString & pchCreationOptions,
-                                  const AString & pchSourceFile,
-                                  uint64_t pchId,
-                                  AString & outUndefBlock );
-
     // Parse /PD output lines and generate #undef block
     static void ParseMacroDumpOutput( const AString & pdOutput,
                                       AString & outUndefBlock );
-
-    // Disk cache helpers
-    static bool LoadUndefBlockFromDisk( uint64_t pchId, AString & outBlock );
-    static void SaveUndefBlockToDisk( uint64_t pchId, const AString & block );
 };
 
 //------------------------------------------------------------------------------

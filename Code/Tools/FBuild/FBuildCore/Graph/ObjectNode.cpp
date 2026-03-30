@@ -74,6 +74,7 @@ REFLECT_NODE_BEGIN( ObjectNode, Node, MetaNone() )
     REFLECT( m_CompilerOptionsDeoptimized,          "CompilerOptionsDeoptimized",       MetaOptional() )
     REFLECT( m_CompilerInputFile,                   "CompilerInputFile",                MetaFile() )
     REFLECT( m_PCHObjectFileName,                   "PCHObjectFileName",                MetaOptional() + MetaFile() )
+    REFLECT( m_PCHUndefsFileName,                   "PCHUndefsFileName",                MetaOptional() + MetaFile() )
     REFLECT( m_DeoptimizeWritableFiles,             "DeoptimizeWritableFiles",          MetaOptional() )
     REFLECT( m_DeoptimizeWritableFilesWithToken,    "DeoptimizeWritableFilesWithToken", MetaOptional() )
     REFLECT_ARRAY( m_CompilerForceUsing,            "CompilerForceUsing",               MetaOptional() + MetaFile() )
@@ -224,6 +225,10 @@ ObjectNode::~ObjectNode()
             {
                 return BuildResult::eFailed; // HandleFileDeletion will have emitted an error
             }
+            if ( !m_PCHUndefsFileName.IsEmpty() )
+            {
+                DoPreBuildFileDeletion( m_PCHUndefsFileName );
+            }
         }
     }
 
@@ -249,22 +254,40 @@ ObjectNode::~ObjectNode()
     // Graphing the current amount of distributable jobs
     FLOG_MONITOR( "GRAPH FASTBuild \"Distributable Jobs MemUsage\" MB %f\n", (double)( (float)Job::GetTotalLocalDataMemoryUsage() / (float)MEGABYTE ) );
 
+    BuildResult result;
     if ( usePreProcessor || useSimpleDist )
     {
-        return DoBuildWithPreProcessor( job, useDeoptimization, useCache, useSimpleDist );
+        result = DoBuildWithPreProcessor( job, useDeoptimization, useCache, useSimpleDist );
     }
-
-    if ( IsMSVC() )
+    else if ( IsMSVC() )
     {
-        return DoBuildMSCL_NoCache( job, useDeoptimization );
+        result = DoBuildMSCL_NoCache( job, useDeoptimization );
     }
-
-    if ( IsQtRCC() )
+    else if ( IsQtRCC() )
     {
-        return DoBuild_QtRCC( job );
+        result = DoBuild_QtRCC( job );
+    }
+    else
+    {
+        result = DoBuildOther( job, useDeoptimization );
     }
 
-    return DoBuildOther( job, useDeoptimization );
+    // Generate the .undefs file alongside the .pch for PCH distribution
+    #if defined( __WINDOWS__ )
+    if ( result == BuildResult::eOk && IsCreatingPCH() && IsMSVC() && !m_PCHUndefsFileName.IsEmpty() )
+    {
+        if ( PchDistribution::GenerateUndefsFile( GetCompiler()->GetExecutable(),
+                                                   GetCompiler()->GetEnvironmentString(),
+                                                   m_CompilerOptions,
+                                                   GetSourceFile()->GetName(),
+                                                   m_PCHUndefsFileName ) == false )
+        {
+            result = BuildResult::eFailed;
+        }
+    }
+    #endif
+
+    return result;
 }
 
 // DoBuild_Remote
@@ -278,7 +301,24 @@ ObjectNode::~ObjectNode()
     const bool useDeoptimization = job->IsLocal() && ShouldUseDeoptimization();
     const bool stealingRemoteJob = job->IsLocal(); // are we stealing a remote job?
     const bool isFollowingLightCacheMiss = false;
-    return DoBuildWithPreProcessor2( job, useDeoptimization, stealingRemoteJob, racingRemoteJob, isFollowingLightCacheMiss );
+    BuildResult result = DoBuildWithPreProcessor2( job, useDeoptimization, stealingRemoteJob, racingRemoteJob, isFollowingLightCacheMiss );
+
+    // Generate .undefs alongside the .pch (second-pass build for PCH creation)
+    #if defined( __WINDOWS__ )
+    if ( result == BuildResult::eOk && IsCreatingPCH() && IsMSVC() && !m_PCHUndefsFileName.IsEmpty() )
+    {
+        if ( PchDistribution::GenerateUndefsFile( GetCompiler()->GetExecutable(),
+                                                   GetCompiler()->GetEnvironmentString(),
+                                                   m_CompilerOptions,
+                                                   GetSourceFile()->GetName(),
+                                                   m_PCHUndefsFileName ) == false )
+        {
+            result = BuildResult::eFailed;
+        }
+    }
+    #endif
+
+    return result;
 }
 
 // Finalize
@@ -502,14 +542,9 @@ Node::BuildResult ObjectNode::DoBuildWithPreProcessor( Job * job, bool useDeopti
     #if defined( __WINDOWS__ )
     if ( pass == PASS_PREPROCESSOR_ONLY && IsMSVC() && IsUsingPCH() && !IsCreatingPCH() )
     {
-        ObjectNode * pchNode = GetPrecompiledHeader();
         if ( PchDistribution::BundleForDistribution( job,
                                                      m_CompilerOptions,
-                                                     GetSourceFile()->GetName(),
-                                                     GetCompiler()->GetExecutable(),
-                                                     GetCompiler()->GetEnvironmentString(),
-                                                     pchNode->m_CompilerOptions,
-                                                     pchNode->GetSourceFile()->GetName() ) == false )
+                                                     GetSourceFile()->GetName() ) == false )
         {
             return BuildResult::eFailed;
         }
@@ -1723,6 +1758,11 @@ void ObjectNode::GetExtraCacheFilePaths( const Job * job, Array<AString> & outFi
     {
         // .pch.obj
         outFileNames.Append( m_PCHObjectFileName );
+        // .pch.undefs (for PCH distribution)
+        if ( !m_PCHUndefsFileName.IsEmpty() )
+        {
+            outFileNames.Append( m_PCHUndefsFileName );
+        }
     }
 
     // MSVC static analysis adds extra files

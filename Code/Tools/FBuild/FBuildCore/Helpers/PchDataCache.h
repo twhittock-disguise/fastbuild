@@ -21,7 +21,6 @@ public:
         uint64_t    pchId;              // xxHash64 of PCH content
         uint32_t    uncompressedSize;   // PCH file size
         AString     filePath;           // Absolute path to .pch on coordinator
-        AString     undefBlock;         // #undef block for PCH macros (populated lazily)
     };
 
     // Store PCH metadata (thread-safe, skips if pchId already present)
@@ -32,9 +31,6 @@ public:
 
     // Find a cached PCH by file path (thread-safe, copies entry while mutex held)
     bool FindByPath( const AString & filePath, Entry & outEntry ) const;
-
-    // Update the undef block for an existing entry (thread-safe)
-    void SetUndefBlock( uint64_t pchId, const AString & undefBlock );
 
     // Clear all cached entries (call at build end)
     void Clear();

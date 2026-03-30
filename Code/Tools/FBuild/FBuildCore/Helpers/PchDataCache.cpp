@@ -71,22 +71,6 @@ bool PchDataCache::FindByPath( const AString & filePath, Entry & outEntry ) cons
     return false;
 }
 
-// SetUndefBlock
-//------------------------------------------------------------------------------
-void PchDataCache::SetUndefBlock( uint64_t pchId, const AString & undefBlock )
-{
-    MutexHolder mh( m_Mutex );
-
-    for ( Entry & e : m_Entries )
-    {
-        if ( e.pchId == pchId )
-        {
-            e.undefBlock = undefBlock;
-            return;
-        }
-    }
-}
-
 // Clear
 //------------------------------------------------------------------------------
 void PchDataCache::Clear()

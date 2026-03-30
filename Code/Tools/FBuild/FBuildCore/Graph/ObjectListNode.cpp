@@ -802,6 +802,11 @@ ObjectNode * ObjectListNode::CreateObjectNode( NodeGraph & nodeGraph,
     node->m_CompilerOptionsDeoptimized = compilerOptionsDeoptimized;
     node->m_CompilerInputFile = objectInput;
     node->m_PCHObjectFileName = pchObjectName;
+    if ( flags.IsCreatingPCH() && flags.IsMSVC() )
+    {
+        node->m_PCHUndefsFileName = objectName;
+        node->m_PCHUndefsFileName += ".undefs";
+    }
     if ( flags.IsCreatingPCH() )
     {
         // Precompiled headers are never de-optimized
