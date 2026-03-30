@@ -14,15 +14,20 @@
 #include "Tools/FBuild/FBuildCore/Graph/ObjectNode.h"
 #include "Tools/FBuild/FBuildCore/Helpers/BuildProfiler.h"
 #include "Tools/FBuild/FBuildCore/Helpers/MultiBuffer.h"
+#include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchDataCache.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueue.h"
 
 // Core
+#include "Core/Containers/UniquePtr.h"
 #include "Core/Env/ErrorFormat.h"
 #include "Core/FileIO/ConstMemoryStream.h"
+#include "Core/FileIO/FileStream.h"
 #include "Core/FileIO/MemoryStream.h"
+#include "Core/Mem/Mem.h"
 #include "Core/Math/Random.h"
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
@@ -123,6 +128,7 @@ private:
     void Process( const ConnectionInfo * connection, const Protocol::MsgRequestManifest * msg );
     void Process( const ConnectionInfo * connection, const Protocol::MsgRequestFile * msg );
     void Process( const Protocol::MsgConnectionAck * msg );
+    void Process( const Protocol::MsgPchInventory * msg, const void * payload, size_t payloadSize );
 
     void ProcessJobResultCommon( bool isCompressed, const void * payload, size_t payloadSize );
 
@@ -157,6 +163,7 @@ private:
     Atomic<uint32_t> m_WorkerCapacity{ 0 };
     Atomic<uint32_t> m_JobsInFlight{ 0 };
     Array<uint64_t> m_SentToolchains; // Protected by m_Mutex
+    Array<uint64_t> m_SentPchIds;     // Protected by m_Mutex
 
     // Queue of messages to send
     Mutex m_SendQueueMutex;
@@ -509,6 +516,12 @@ void Client::CommunicateJobAvailability()
             Process( msg );
             break;
         }
+        case Protocol::MSG_PCH_INVENTORY:
+        {
+            const Protocol::MsgPchInventory * msg = static_cast<const Protocol::MsgPchInventory *>( imsg );
+            Process( msg, payload, payloadSize );
+            break;
+        }
         default:
         {
             // unknown message type
@@ -652,6 +665,46 @@ void ClientToWorkerConnection::Process( const Protocol::MsgConnectionAck * msg )
     PushJobsToWorker();
 }
 
+// Process( MsgPchInventory )
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::Process( const Protocol::MsgPchInventory * msg,
+                                        const void * payload,
+                                        size_t payloadSize )
+{
+    PROFILE_SECTION( "MsgPchInventory" );
+
+    const uint32_t numEntries = msg->GetNumEntries();
+    if ( numEntries == 0 )
+    {
+        return;
+    }
+
+    // Validate payload size
+    const size_t expectedSize = (size_t)numEntries * sizeof( uint64_t );
+    if ( payloadSize < expectedSize )
+    {
+        DIST_INFO( " - Worker %s sent truncated PCH inventory (%zu < %zu)\n",
+                   m_Worker->m_Address.Get(), payloadSize, expectedSize );
+        return;
+    }
+
+    // Pre-populate m_SentPchIds with all IDs the worker already has
+    const uint64_t * pchIds = static_cast<const uint64_t *>( payload );
+    {
+        MutexHolder mh( m_Mutex );
+        for ( uint32_t i = 0; i < numEntries; ++i )
+        {
+            if ( m_SentPchIds.Find( pchIds[ i ] ) == nullptr )
+            {
+                m_SentPchIds.Append( pchIds[ i ] );
+            }
+        }
+    }
+
+    DIST_INFO( " - Worker %s has %u cached PCH entries\n",
+               m_Worker->m_Address.Get(), numEntries );
+}
+
 // PushJobsToWorker
 //------------------------------------------------------------------------------
 void ClientToWorkerConnection::PushJobsToWorker()
@@ -703,6 +756,57 @@ void ClientToWorkerConnection::PushJobsToWorker()
                     }
                 }
                 m_SentToolchains.Append( toolId );
+            }
+        }
+
+        // Push PCH data if not yet sent to this worker
+        const uint64_t pchId = job->GetPchId();
+        if ( pchId != 0 )
+        {
+            // Check under lock whether we've already sent this PCH
+            bool needsSend = false;
+            PchDataCache::Entry entry;
+            {
+                MutexHolder mh( m_Mutex );
+                if ( m_SentPchIds.Find( pchId ) == nullptr )
+                {
+                    needsSend = PchDataCache::Get().Find( pchId, entry );
+                    if ( needsSend )
+                    {
+                        m_SentPchIds.Append( pchId ); // Mark as in-flight to prevent duplicates
+                    }
+                }
+            }
+
+            // Read + compress outside the lock to avoid blocking the connection
+            if ( needsSend )
+            {
+                FileStream pchFile;
+                if ( pchFile.Open( entry.filePath.Get(), FileStream::READ_ONLY ) == false )
+                {
+                    FLOG_WARN( "PCH distribution: failed to open '%s' for sending\n", entry.filePath.Get() );
+                }
+                else
+                {
+                    const uint32_t fileSize = entry.uncompressedSize;
+                    UniquePtr<char, FreeDeletor> pchData( (char *)ALLOC( fileSize ) );
+                    if ( pchFile.Read( pchData.Get(), fileSize ) == fileSize )
+                    {
+                        pchFile.Close();
+
+                        Compressor c;
+                        c.Compress( pchData.Get(), fileSize );
+
+                        MemoryStream ms;
+                        ms.WriteBuffer( c.GetResult(), c.GetResultSize() );
+
+                        EnqueueSend( Protocol::MsgPchFile( pchId, entry.uncompressedSize ),
+                                     Move( ConstMemoryStream( Move( ms ) ) ) );
+
+                        DIST_INFO( " - Sent PCH 0x%016" PRIx64 " to %s (%zu bytes compressed)\n",
+                                   pchId, m_Worker->m_Address.Get(), c.GetResultSize() );
+                    }
+                }
             }
         }
 

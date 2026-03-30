@@ -19,6 +19,8 @@ namespace Protocol
     class MsgJob;
     class MsgManifest;
     class MsgNoJobAvailable;
+    class MsgPchFile;
+    class MsgPchInventory;
     class MsgStatus;
     class MsgFile;
 }
@@ -49,6 +51,7 @@ private:
     void Process( const ConnectionInfo * connection, const Protocol::MsgJob * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgManifest * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgFile * msg, const void * payload, size_t payloadSize );
+    void Process( const ConnectionInfo * connection, const Protocol::MsgPchFile * msg, const void * payload, size_t payloadSize );
 
     static uint32_t ThreadFuncStatic( void * param );
     void ThreadFunc();
@@ -95,6 +98,18 @@ private:
 
     mutable Mutex m_ToolManifestsMutex;
     Array<ToolManifest *> m_Tools;
+
+    // PCH cache for distributed builds
+    struct PchCacheEntry
+    {
+        uint64_t    pchId;
+        AString     filePath;
+    };
+    void ScanPchCache();
+    bool FindCachedPch( uint64_t pchId, AString & outPath ) const;
+    mutable Mutex m_PchCacheMutex;
+    Array<PchCacheEntry> m_PchCache;
+    bool m_PchCacheScanned = false;
 
 #if defined( __OSX__ ) || defined( __LINUX__ )
     Timer m_TouchToolchainTimer;

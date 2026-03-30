@@ -184,6 +184,8 @@ void Job::Serialize( IOStream & stream )
 
     stream.Write( m_DataSize );
     stream.Write( m_Data, m_DataSize );
+
+    stream.Write( m_PchId );
 }
 
 // Deserialize
@@ -208,6 +210,8 @@ void Job::Deserialize( IOStream & stream )
     stream.Read( data, dataSize );
 
     OwnData( data, dataSize, compressed );
+
+    stream.Read( m_PchId );
 }
 
 // GetMessagesForLog

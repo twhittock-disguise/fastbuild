@@ -18,6 +18,7 @@
 #include "Graph/SettingsNode.h"
 #include "Helpers/BuildProfiler.h"
 #include "Helpers/CompilationDatabase.h"
+#include "Helpers/PchDataCache.h"
 #include "Protocol/Client.h"
 #include "Protocol/Protocol.h"
 #include "WorkerPool/JobQueue.h"
@@ -131,6 +132,7 @@ FBuild::~FBuild()
     }
 
     LightCache::ClearCachedFiles();
+    PchDataCache::Get().Clear();
 
     if ( BuildProfiler::IsValid() )
     {

@@ -32,7 +32,7 @@ namespace Protocol
 
     // Protocol Version
     inline static const uint32_t kVersionMajor = 23; // Changes here make workers incompatible
-    inline static const uint8_t kVersionMinor = 5; // Changes must be forwards and backwards compatible
+    inline static const uint8_t kVersionMinor = 6; // Changes must be forwards and backwards compatible
 
     inline static const uint16_t kTestPort = kPort + 1; // Different port for use by tests
 
@@ -64,6 +64,10 @@ namespace Protocol
         // v22.4 or later supports Zstd compression (no packet changes)
 
         // v22.5 or later support /dynamicdeopt for MSVC 2022 v17.44.x or later
+
+        // v23.6 or later
+        MSG_PCH_FILE = 13, // Server <- Client : Send a PCH file for distributed PCH compilation
+        MSG_PCH_INVENTORY = 14, // Server -> Client : Advertise cached PCH IDs
 
         NUM_MESSAGES            // leave last
     };
@@ -282,6 +286,36 @@ namespace Protocol
         uint64_t m_ToolId;
     };
     static_assert( sizeof( MsgFile ) == sizeof( IMessage ) + 12, "MsgFile message has incorrect size" );
+
+    // MsgPchFile
+    //------------------------------------------------------------------------------
+    class MsgPchFile : public IMessage
+    {
+    public:
+        MsgPchFile( uint64_t pchId, uint32_t uncompressedSize );
+
+        uint64_t GetPchId() const { return m_PchId; }
+        uint32_t GetUncompressedSize() const { return m_UncompressedSize; }
+
+    private:
+        uint64_t m_PchId;
+        uint32_t m_UncompressedSize;
+    };
+    static_assert( sizeof( MsgPchFile ) == sizeof( IMessage ) + 20, "MsgPchFile message has incorrect size" );
+
+    // MsgPchInventory
+    //------------------------------------------------------------------------------
+    class MsgPchInventory : public IMessage
+    {
+    public:
+        explicit MsgPchInventory( uint32_t numEntries );
+
+        uint32_t GetNumEntries() const { return m_NumEntries; }
+
+    private:
+        uint32_t m_NumEntries;
+    };
+    static_assert( sizeof( MsgPchInventory ) == sizeof( IMessage ) + 4, "MsgPchInventory message has incorrect size" );
 
     // MsgServerStatus
     //------------------------------------------------------------------------------

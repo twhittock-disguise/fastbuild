@@ -9,6 +9,7 @@
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/Graph/CompilerNode.h"
 #include "Tools/FBuild/FBuildCore/Graph/ObjectNode.h"
+#include "Tools/FBuild/FBuildCore/FLog.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Args.h"
 
 // Core
@@ -69,15 +70,42 @@ CompilerDriver_CL::~CompilerDriver_CL() = default;
                                                                     bool isLocal,
                                                                     Args & outFullArgs ) const
 {
-    // Can't use the precompiled header when compiling the preprocessed output
-    // as this would prevent cacheing.
-    if ( StripTokenWithArg_MSVC( "Yu", token, index ) )
+    // When a remote PCH is available, keep /Yu and replace /Fp with the
+    // worker's cached PCH path. Otherwise strip both (original behavior).
+    if ( HasRemotePch() )
     {
-        return true;
+        // Keep /Yu as-is — must match the /Yc name used to create the PCH
+        if ( IsStartOfCompilerArg_MSVC( token, "Yu" ) )
+        {
+            return false; // keep token unchanged
+        }
+
+        // Replace /Fp path with worker's cached PCH path
+        if ( IsStartOfCompilerArg_MSVC( token, "Fp" ) )
+        {
+            FLOG_VERBOSE( "CL PCH: replacing /Fp '%s' -> '%s'\n", token.Get(), m_RemotePchPath.Get() );
+            outFullArgs += "/Fp\"";
+            outFullArgs += m_RemotePchPath;
+            outFullArgs += '"';
+            outFullArgs.AddDelimiter();
+            StripTokenWithArg_MSVC( "Fp", token, index );
+            return true;
+        }
     }
-    if ( StripTokenWithArg_MSVC( "Fp", token, index ) )
+    else
     {
-        return true;
+        // Can't use the precompiled header when compiling the preprocessed output
+        // as this would prevent cacheing.
+        if ( StripTokenWithArg_MSVC( "Yu", token, index ) )
+        {
+            FLOG_VERBOSE( "CL PCH: stripping /Yu (no remote PCH)\n" );
+            return true;
+        }
+        if ( StripTokenWithArg_MSVC( "Fp", token, index ) )
+        {
+            FLOG_VERBOSE( "CL PCH: stripping /Fp (no remote PCH)\n" );
+            return true;
+        }
     }
 
     // Remote compilation writes to a temp pdb
@@ -131,7 +159,9 @@ CompilerDriver_CL::~CompilerDriver_CL() = default;
         }
     }
 
-    // Strip "Force Includes" statements (as they are merged in already during preprocessing)
+    // Strip "Force Includes" — they are already merged during preprocessing.
+    // For remote PCH, the prepended #include handles the /Yu stop-point on the worker,
+    // so /FI is not needed and would cause a double-include.
     if ( StripTokenWithArg_MSVC( "FI", token, index ) )
     {
         return true;

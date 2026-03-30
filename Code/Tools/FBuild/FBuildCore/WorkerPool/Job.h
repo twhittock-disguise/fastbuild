@@ -50,6 +50,12 @@ public:
     void SetToolManifest( ToolManifest * manifest ) { m_ToolManifest = manifest; }
     ToolManifest * GetToolManifest() const { return m_ToolManifest; }
 
+    void SetPchCachePath( const AString & path ) { m_PchCachePath = path; }
+    const AString & GetPchCachePath() const { return m_PchCachePath; }
+
+    void SetPchId( uint64_t id ) { m_PchId = id; }
+    uint64_t GetPchId() const { return m_PchId; }
+
     bool IsDataCompressed() const { return m_DataIsCompressed; }
     bool IsLocal() const { return m_IsLocal; }
 
@@ -128,6 +134,8 @@ private:
     AString m_CacheName;
     BuildProfilerScope * m_BuildProfilerScope = nullptr; // Additional context when profiling a build
     ToolManifest * m_ToolManifest = nullptr;
+    uint64_t m_PchId = 0;
+    AString m_PchCachePath;
 
     Array<AString> m_Messages;
 

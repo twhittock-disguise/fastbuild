@@ -12,14 +12,22 @@
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
 
+#include "Core/Containers/UniquePtr.h"
 #include "Core/Env/Env.h"
 #include "Core/FileIO/ConstMemoryStream.h"
+#include "Core/FileIO/FileIO.h"
+#include "Core/FileIO/FileStream.h"
 #include "Core/FileIO/MemoryStream.h"
+#include "Core/FileIO/PathUtils.h"
 #include "Core/Process/Atomic.h"
 #include "Core/Profile/Profile.h"
+#include "Core/Mem/Mem.h"
 #include "Core/Strings/AStackString.h"
 #include "Core/Time/Timer.h"
 #include "Core/Tracing/Tracing.h"
+
+#include "Tools/FBuild/FBuildCore/FBuild.h"
+#include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 
 // Defines
 //------------------------------------------------------------------------------
@@ -39,6 +47,9 @@ Server::Server( uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
     m_JobQueueRemote = FNEW( JobQueueRemote( numThreadsInJobQueue ? numThreadsInJobQueue : Env::GetNumProcessors() ) );
 
     m_Thread.Start( ThreadFuncStatic, "Server", this );
+
+    // Pre-scan PCH cache so it's ready before any connections arrive
+    ScanPchCache();
 }
 
 // DESTRUCTOR
@@ -255,6 +266,12 @@ bool Server::IsSynchingTool( AString & statusStr ) const
             Process( connection, msg, payload, payloadSize );
             break;
         }
+        case Protocol::MSG_PCH_FILE:
+        {
+            const Protocol::MsgPchFile * msg = static_cast<const Protocol::MsgPchFile *>( imsg );
+            Process( connection, msg, payload, payloadSize );
+            break;
+        }
         default:
         {
             // unknown message type
@@ -314,6 +331,28 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
         const Protocol::MsgConnectionAck ack( (uint8_t)cs->m_AllocatedCapacity );
         ack.Send( connection );
     }
+
+    // Send PCH inventory if client supports it (protocol minor >= 6)
+    if ( msg->GetProtocolVersionMinor() >= 6 )
+    {
+        MutexHolder mh( m_PchCacheMutex );
+        const uint32_t numEntries = (uint32_t)m_PchCache.GetSize();
+        const Protocol::MsgPchInventory inventoryMsg( numEntries );
+        if ( numEntries > 0 )
+        {
+            // Build payload: array of uint64_t pchIds
+            MemoryStream ms;
+            for ( const PchCacheEntry & e : m_PchCache )
+            {
+                ms.Write( e.pchId );
+            }
+            inventoryMsg.Send( connection, ms );
+        }
+        else
+        {
+            inventoryMsg.Send( connection );
+        }
+    }
 }
 
 // Process( MsgStatus )
@@ -356,6 +395,25 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
 
         // Zstd is supported by all v23+ clients
         job->SetResultCompressionLevel( msg->GetResultCompressionLevel(), true /*allowZstdUse*/ );
+
+        // Resolve PCH cache path if job was bundled with PCH distribution data
+        const uint64_t pchId = job->GetPchId();
+        if ( pchId != 0 )
+        {
+            AString pchPath;
+            if ( FindCachedPch( pchId, pchPath ) )
+            {
+                job->SetPchCachePath( pchPath );
+                FLOG_VERBOSE( "MsgJob: PCH resolved pchId=0x%016" PRIx64 " -> '%s' for '%s'\n",
+                              pchId, pchPath.Get(), job->GetRemoteName().Get() );
+            }
+            else
+            {
+                FLOG_WARN( "MsgJob: PCH NOT FOUND pchId=0x%016" PRIx64 " for '%s' (cache has %u entries)\n",
+                           pchId, job->GetRemoteName().Get(), (uint32_t)m_PchCache.GetSize() );
+            }
+
+        }
 
         // Get ToolId
         const uint64_t toolId = msg->GetToolId();
@@ -555,6 +613,233 @@ void Server::CheckWaitingJobs( const ToolManifest * manifest )
             }
         }
     }
+}
+
+// Process( MsgPchFile )
+//------------------------------------------------------------------------------
+void Server::Process( const ConnectionInfo * /*connection*/, const Protocol::MsgPchFile * msg, const void * payload, size_t /*payloadSize*/ )
+{
+    const uint64_t pchId = msg->GetPchId();
+    const uint32_t uncompressedSize = msg->GetUncompressedSize();
+
+    // Build persistent path: <tmpDir>/.fbuild.tmp/worker/pch.<pchId hex>/pch.pch
+    AStackString pchDir;
+    if ( FBuild::GetTempDir( pchDir ) == false )
+    {
+        FLOG_WARN( "Failed to get temp dir for PCH cache\n" );
+        return;
+    }
+#if defined( __WINDOWS__ )
+    pchDir.AppendFormat( ".fbuild.tmp\\worker\\pch.%016" PRIx64 "\\", pchId );
+#else
+    pchDir.AppendFormat( "_fbuild.tmp/worker/pch.%016" PRIx64 "/", pchId );
+#endif
+
+    AStackString pchFilePath( pchDir );
+    pchFilePath += "pch.pch";
+
+    // Check if already cached on disk (size match is sufficient — pchId
+    // in the directory name already identifies the content)
+    bool alreadyCached = false;
+    {
+        FileStream f;
+        if ( f.Open( pchFilePath.Get() ) )
+        {
+            alreadyCached = ( (uint32_t)f.GetFileSize() == uncompressedSize );
+        }
+    }
+
+    if ( alreadyCached == false )
+    {
+        // Decompress payload
+        Compressor c;
+        if ( c.Decompress( payload ) == false )
+        {
+            FLOG_WARN( "Failed to decompress PCH data for pchId 0x%016" PRIx64 "\n", pchId );
+            return;
+        }
+
+        // Validate decompressed size
+        if ( (uint32_t)c.GetResultSize() != uncompressedSize )
+        {
+            FLOG_WARN( "PCH size mismatch for pchId 0x%016" PRIx64 " (expected %u, got %zu)\n",
+                       pchId, uncompressedSize, c.GetResultSize() );
+            return;
+        }
+
+        // Ensure directory exists and write file
+        if ( FileIO::EnsurePathExists( pchDir ) == false )
+        {
+            FLOG_WARN( "Failed to create PCH cache dir: %s\n", pchDir.Get() );
+            return;
+        }
+
+        FileStream f;
+        if ( f.Open( pchFilePath.Get(), FileStream::WRITE_ONLY ) == false )
+        {
+            FLOG_WARN( "Failed to open PCH cache file for writing: %s\n", pchFilePath.Get() );
+            return;
+        }
+        if ( f.Write( c.GetResult(), c.GetResultSize() ) != c.GetResultSize() )
+        {
+            FLOG_WARN( "Failed to write PCH cache file: %s\n", pchFilePath.Get() );
+            return;
+        }
+    }
+
+    // Touch timestamp to prevent periodic cleanup
+    FileIO::SetFileLastWriteTimeToNow( pchFilePath );
+
+    // Add to in-memory cache
+    {
+        MutexHolder mh( m_PchCacheMutex );
+
+        // Check not already in cache (race with another connection)
+        for ( const PchCacheEntry & e : m_PchCache )
+        {
+            if ( e.pchId == pchId )
+            {
+                return; // Already cached
+            }
+        }
+
+        PchCacheEntry entry;
+        entry.pchId = pchId;
+        entry.filePath = pchFilePath;
+        m_PchCache.Append( Move( entry ) );
+    }
+
+    FLOG_OUTPUT( "PCH cached: 0x%016" PRIx64 " -> %s (cached=%s)\n",
+                 pchId, pchFilePath.Get(), alreadyCached ? "disk" : "new" );
+}
+
+// ScanPchCache
+//------------------------------------------------------------------------------
+void Server::ScanPchCache()
+{
+    PROFILE_FUNCTION;
+
+    // Only scan once
+    if ( m_PchCacheScanned )
+    {
+        return;
+    }
+    m_PchCacheScanned = true;
+
+    // Build base path: <tmpDir>/.fbuild.tmp/worker/
+    AStackString basePath;
+    if ( FBuild::GetTempDir( basePath ) == false )
+    {
+        return;
+    }
+#if defined( __WINDOWS__ )
+    basePath += ".fbuild.tmp\\worker\\";
+#else
+    basePath += "_fbuild.tmp/worker/";
+#endif
+
+    if ( FileIO::DirectoryExists( basePath ) == false )
+    {
+        return;
+    }
+
+    // Use GetFilesEx to get timestamps for LRU eviction
+    struct PchScanEntry
+    {
+        uint64_t    pchId;
+        uint64_t    lastWriteTime;
+        AString     filePath;
+    };
+    Array<PchScanEntry> scannedEntries;
+
+    // Scan for pch.pch files under pch.<hex> subdirs.
+    // Parse pchId from the directory name rather than reading/hashing each file.
+    Array<FileIO::FileInfo> pchFiles;
+    AStackString pchWildcard( "pch.pch" );
+    Array<AString> pchPatterns;
+    pchPatterns.Append( pchWildcard );
+    if ( FileIO::GetFilesEx( basePath, &pchPatterns, true /*recurse*/, &pchFiles ) )
+    {
+        for ( const FileIO::FileInfo & fi : pchFiles )
+        {
+            // Path is: <basePath>/pch.<hex>/pch.pch — extract hex from parent dir
+            const char * pchDot = fi.m_Name.Find( "pch." );
+            if ( pchDot == nullptr ) { continue; }
+            const char * hexStart = pchDot + 4; // skip "pch."
+            uint64_t pchId = 0;
+            for ( const char * p = hexStart; *p && *p != NATIVE_SLASH && *p != '/'; ++p )
+            {
+                char c = *p;
+                uint8_t nibble;
+                if ( c >= '0' && c <= '9' )      { nibble = (uint8_t)( c - '0' ); }
+                else if ( c >= 'a' && c <= 'f' ) { nibble = (uint8_t)( c - 'a' + 10 ); }
+                else if ( c >= 'A' && c <= 'F' ) { nibble = (uint8_t)( c - 'A' + 10 ); }
+                else { pchId = 0; break; } // Invalid hex
+                pchId = ( pchId << 4 ) | nibble;
+            }
+            if ( pchId == 0 ) { continue; }
+
+            PchScanEntry scanEntry;
+            scanEntry.pchId = pchId;
+            scanEntry.lastWriteTime = fi.m_LastWriteTime;
+            scanEntry.filePath = fi.m_Name;
+            scannedEntries.Append( Move( scanEntry ) );
+        }
+    }
+
+    if ( scannedEntries.IsEmpty() )
+    {
+        return;
+    }
+
+    // LRU eviction: sort by lastWriteTime descending (newest first), keep max 20 entries
+    const uint32_t maxEntries = 20;
+    if ( scannedEntries.GetSize() > maxEntries )
+    {
+        // Sort by lastWriteTime descending
+        scannedEntries.Sort( []( const PchScanEntry & a, const PchScanEntry & b ) -> bool
+        {
+            return a.lastWriteTime > b.lastWriteTime;
+        });
+
+        // Delete old entries from disk
+        for ( size_t i = maxEntries; i < scannedEntries.GetSize(); ++i )
+        {
+            FileIO::FileDelete( scannedEntries[ i ].filePath.Get() );
+        }
+        scannedEntries.SetSize( maxEntries );
+    }
+
+    // Populate in-memory cache
+    {
+        MutexHolder mh( m_PchCacheMutex );
+        for ( const PchScanEntry & se : scannedEntries )
+        {
+            PchCacheEntry entry;
+            entry.pchId = se.pchId;
+            entry.filePath = se.filePath;
+            m_PchCache.Append( Move( entry ) );
+        }
+    }
+
+    FLOG_OUTPUT( "PCH inventory: %u entries scanned from disk cache\n",
+                 (uint32_t)scannedEntries.GetSize() );
+}
+
+// FindCachedPch
+//------------------------------------------------------------------------------
+bool Server::FindCachedPch( uint64_t pchId, AString & outPath ) const
+{
+    MutexHolder mh( m_PchCacheMutex );
+    for ( const PchCacheEntry & e : m_PchCache )
+    {
+        if ( e.pchId == pchId )
+        {
+            outPath = e.filePath;
+            return true;
+        }
+    }
+    return false;
 }
 
 // ThreadFuncStatic

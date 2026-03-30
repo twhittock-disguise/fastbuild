@@ -31,6 +31,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/BuildProfiler.h"
 #include "Tools/FBuild/FBuildCore/Helpers/CIncludeParser.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchDistribution.h"
 #include "Tools/FBuild/FBuildCore/Helpers/MultiBuffer.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ResponseFile.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
@@ -496,6 +497,24 @@ Node::BuildResult ObjectNode::DoBuildWithPreProcessor( Job * job, bool useDeopti
             return BuildResult::eFailed; // BuildPreprocessedOutput will have emitted an error
         }
     }
+
+    // Strip PCH section and bundle .pch data for remote workers
+    #if defined( __WINDOWS__ )
+    if ( pass == PASS_PREPROCESSOR_ONLY && IsMSVC() && IsUsingPCH() && !IsCreatingPCH() )
+    {
+        ObjectNode * pchNode = GetPrecompiledHeader();
+        if ( PchDistribution::BundleForDistribution( job,
+                                                     m_CompilerOptions,
+                                                     GetSourceFile()->GetName(),
+                                                     GetCompiler()->GetExecutable(),
+                                                     GetCompiler()->GetEnvironmentString(),
+                                                     pchNode->m_CompilerOptions,
+                                                     pchNode->GetSourceFile()->GetName() ) == false )
+        {
+            return BuildResult::eFailed;
+        }
+    }
+    #endif
 
     // Do Clang unity fixup if needed
     if ( IsUnity() &&
@@ -1840,6 +1859,10 @@ bool ObjectNode::BuildArgs( const Job * job, Args & fullArgs, Pass pass, bool us
     driver->SetRelativeBasePath( basePath );
     driver->SetForceColoredDiagnostics( forceColoredDiagnostics );
     driver->SetUseSourceMapping( ( useSourceMapping && job->IsLocal() ) ? GetCompiler()->GetSourceMapping() : AString::GetEmpty() );
+    if ( !job->GetPchCachePath().IsEmpty() )
+    {
+        driver->SetRemotePchPath( job->GetPchCachePath() );
+    }
 
     // Adjust args for as needed for the given compiler
     const size_t numTokens = tokens.GetSize();
@@ -2222,6 +2245,10 @@ bool ObjectNode::WriteTmpFile( Job * job, AString & tmpDirectory, AString & tmpF
         dataToWrite = c.GetResult();
         dataToWriteSize = c.GetResultSize();
     }
+
+    // Extract PCH distribution header if present
+    // (updates dataToWrite/dataToWriteSize to skip the PCH header)
+    PchDistribution::ExtractBundle( dataToWrite, dataToWriteSize, job );
 
     const CompilerNode * compiler = job->GetNode()->CastTo<ObjectNode>()->GetCompiler();
     if ( compiler && compiler->GetUseDeterministicPaths() )

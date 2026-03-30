@@ -42,6 +42,8 @@ const char * GetProtocolMessageDebugName( Protocol::MessageType msgType )
         "File",
         "JobResultCompressed",
         "ConnectionAck",
+        "PchFile",
+        "PchInventory",
     };
     // clang-format on
     static_assert( ( sizeof( msgNames ) / sizeof( const char * ) ) == Protocol::NUM_MESSAGES, "msgNames item count doesn't match NUM_MESSAGES" );
@@ -216,6 +218,23 @@ Protocol::MsgFile::MsgFile( uint64_t toolId, uint32_t fileId )
     : Protocol::IMessage( Protocol::MSG_FILE, sizeof( MsgFile ), true )
     , m_FileId( fileId )
     , m_ToolId( toolId )
+{
+}
+
+// MsgPchFile
+//------------------------------------------------------------------------------
+Protocol::MsgPchFile::MsgPchFile( uint64_t pchId, uint32_t uncompressedSize )
+    : Protocol::IMessage( Protocol::MSG_PCH_FILE, sizeof( MsgPchFile ), true )
+    , m_PchId( pchId )
+    , m_UncompressedSize( uncompressedSize )
+{
+}
+
+// MsgPchInventory
+//------------------------------------------------------------------------------
+Protocol::MsgPchInventory::MsgPchInventory( uint32_t numEntries )
+    : Protocol::IMessage( Protocol::MSG_PCH_INVENTORY, sizeof( MsgPchInventory ), numEntries > 0 )
+    , m_NumEntries( numEntries )
 {
 }
 

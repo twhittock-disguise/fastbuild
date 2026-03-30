@@ -30,6 +30,7 @@ namespace Protocol
     class MsgJobResultCompressed;
     class MsgRequestJob;
     class MsgRequestManifest;
+    class MsgPchInventory;
     class MsgRequestFile;
     class MsgServerStatus;
 }
