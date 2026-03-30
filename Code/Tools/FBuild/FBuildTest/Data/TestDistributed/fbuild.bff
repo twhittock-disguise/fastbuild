@@ -79,6 +79,25 @@ Library( "AnonymousNamespaces" )
     }
 #endif
 
+// PCH with macro that collides via push_macro/undef/pop_macro pattern
+// Tests that the .undefs file prevents macro re-expansion on the remote worker
+#if __WINDOWS__
+    Library( "DistTestPCHMacro" )
+    {
+        .PCHInputFile       = "Tools/FBuild/FBuildTest/Data/TestDistributed/PCHMacro/pch_macro.cpp"
+        .PCHOutputFile      = "$Out$/Test/Distributed/PCHMacro/pch_macro.pch"
+        .LibrarianOutput    = "$Out$/Test/Distributed/PCHMacro/distpchmacro.lib"
+        .CompilerInputFiles = "Tools/FBuild/FBuildTest/Data/TestDistributed/PCHMacro/consumer_macro.cpp"
+        .CompilerOutputPath = "$Out$/Test/Distributed/PCHMacro/"
+        .CompilerOptions    + ' /Yu"pch_macro.h" /Fp"$PCHOutputFile$"'
+                            + ' /I"Tools/FBuild/FBuildTest/Data/TestDistributed/PCHMacro"'
+        // Override the default /Yc"PrecompiledHeader.h" with our header name
+        .PCHOptions         - ' /Yc"PrecompiledHeader.h"'
+        .PCHOptions         + ' /Yc"pch_macro.h"'
+                            + ' /I"Tools/FBuild/FBuildTest/Data/TestDistributed/PCHMacro"'
+    }
+#endif
+
 // Check handling of Zi debug format
 // Make sure we link to check that debug info is correctly retained
 #if __WINDOWS__

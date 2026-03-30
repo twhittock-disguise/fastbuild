@@ -33,6 +33,7 @@ private:
     void TestWith1RemoteWorkerThread() const;
     void TestWith4RemoteWorkerThreads() const;
     void WithPCH() const;
+    void WithPCHMacroUndefs() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
     void RemoteRaceWinRemote();
@@ -64,6 +65,9 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( TestWith1RemoteWorkerThread )
     REGISTER_TEST( TestWith4RemoteWorkerThreads )
     REGISTER_TEST( WithPCH )
+#if defined( __WINDOWS__ )
+    REGISTER_TEST( WithPCHMacroUndefs )
+#endif
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
     REGISTER_TEST( RemoteRaceWinRemote )
@@ -148,6 +152,19 @@ void TestDistributed::TestWith4RemoteWorkerThreads() const
 void TestDistributed::WithPCH() const
 {
     const char * target( "../tmp/Test/Distributed/distpch.lib" );
+    TestHelper( target, 4 );
+}
+
+// WithPCHMacroUndefs
+//------------------------------------------------------------------------------
+void TestDistributed::WithPCHMacroUndefs() const
+{
+    // Tests that the #undef block generated alongside the .pch prevents
+    // macro re-expansion on the remote worker. The PCH defines MYMACRO and
+    // includes a header that uses push_macro/undef/pop_macro to temporarily
+    // disable it. Without the undef block, the remote compile would fail
+    // because /Yu restores the macro state and re-expands the function name.
+    const char * target( "../tmp/Test/Distributed/PCHMacro/distpchmacro.lib" );
     TestHelper( target, 4 );
 }
 
