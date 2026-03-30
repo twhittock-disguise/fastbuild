@@ -238,6 +238,7 @@ private:
     void TransferPreprocessedData( const char * data, size_t dataSize, Job * job ) const;
     bool WriteTmpFile( Job * job, AString & tmpDirectory, AString & tmpFileName ) const;
     BuildResult BuildFinalOutput( Job * job, const Args & fullArgs ) const;
+    BuildResult GeneratePchUndefs( BuildResult currentResult ) const;
 
     static void HandleSystemFailures( Job * job, int result, const AString & stdOut, const AString & stdErr );
     bool ShouldUseDeoptimization() const;

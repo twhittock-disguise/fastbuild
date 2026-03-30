@@ -627,23 +627,7 @@ bool TCPConnectionPool::SendInternal( const ConnectionInfo * connection, const T
                     break;
                 }
 
-                // Wait for socket to become writable instead of sleeping.
-                // Thread::Sleep(1) on Windows sleeps 1-15ms due to timer
-                // resolution; select() returns as soon as buffer space is available.
-                fd_set writeFds;
-                FD_ZERO( &writeFds );
-                #if defined( __WINDOWS__ )
-                    __pragma( warning( push ) )
-                    __pragma( warning( disable : 4548 ) ) // FD_SET macro triggers C4548
-                #endif
-                FD_SET( connection->m_Socket, &writeFds );
-                #if defined( __WINDOWS__ )
-                    __pragma( warning( pop ) )
-                #endif
-                struct timeval tv;
-                tv.tv_sec = 0;
-                tv.tv_usec = 100000; // 100ms max wait
-                select( (int)( connection->m_Socket + 1 ), nullptr, &writeFds, nullptr, &tv );
+                WaitForSocket( connection->m_Socket, true /*forWrite*/ );
                 continue;
             }
             TCPDEBUG( "send() failed (A). Error: %s (Sent: %u, Socket: %x)\n", LAST_NETWORK_ERROR_STR, sent, (uint32_t)( connection->m_Socket ) );
@@ -714,24 +698,7 @@ bool TCPConnectionPool::HandleRead( ConnectionInfo * ci )
                     return false;
                 }
 
-                // Wait for socket to become readable instead of sleeping.
-                // Thread::Sleep(1) on Windows sleeps 1-15ms due to timer
-                // resolution, which throttles the receive path and causes
-                // TCP window back-pressure on the sender.
-                fd_set readFds;
-                FD_ZERO( &readFds );
-                #if defined( __WINDOWS__ )
-                    __pragma( warning( push ) )
-                    __pragma( warning( disable : 4548 ) ) // FD_SET macro triggers C4548
-                #endif
-                FD_SET( ci->m_Socket, &readFds );
-                #if defined( __WINDOWS__ )
-                    __pragma( warning( pop ) )
-                #endif
-                struct timeval tv;
-                tv.tv_sec = 0;
-                tv.tv_usec = 100000; // 100ms max wait
-                select( (int)( ci->m_Socket + 1 ), &readFds, nullptr, nullptr, &tv );
+                WaitForSocket( ci->m_Socket, false /*forWrite*/ );
                 continue;
             }
             TCPDEBUG( "recv() failed (A). Error: %s (Read: %i, Socket: %x)\n", LAST_NETWORK_ERROR_STR, numBytes, (uint32_t)( ci->m_Socket ) );
@@ -766,21 +733,7 @@ bool TCPConnectionPool::HandleRead( ConnectionInfo * ci )
                     return false;
                 }
 
-                // Wait for socket to become readable instead of sleeping.
-                fd_set readFds;
-                FD_ZERO( &readFds );
-                #if defined( __WINDOWS__ )
-                    __pragma( warning( push ) )
-                    __pragma( warning( disable : 4548 ) ) // FD_SET macro triggers C4548
-                #endif
-                FD_SET( ci->m_Socket, &readFds );
-                #if defined( __WINDOWS__ )
-                    __pragma( warning( pop ) )
-                #endif
-                struct timeval tv;
-                tv.tv_sec = 0;
-                tv.tv_usec = 100000; // 100ms max wait
-                select( (int)( ci->m_Socket + 1 ), &readFds, nullptr, nullptr, &tv );
+                WaitForSocket( ci->m_Socket, false /*forWrite*/ );
                 continue;
             }
             TCPDEBUG( "recv() failed (B). Error: %s (Read: %i, Socket: %x)\n", LAST_NETWORK_ERROR_STR, numBytes, (uint32_t)( ci->m_Socket ) );
@@ -1256,6 +1209,36 @@ void TCPConnectionPool::EnableKeepAlive( TCPSocket socket ) const
     setsockopt( socket, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof( intvl ) );
     setsockopt( socket, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof( cnt ) );
 #endif
+}
+
+// WaitForSocket
+//------------------------------------------------------------------------------
+/*static*/ void TCPConnectionPool::WaitForSocket( TCPSocket socket, bool forWrite )
+{
+    // Use select() instead of Thread::Sleep(1) which on Windows sleeps
+    // 1-15ms due to timer resolution. select() returns as soon as the
+    // socket is ready, avoiding unnecessary latency.
+    fd_set fds;
+    FD_ZERO( &fds );
+    #if defined( __WINDOWS__ )
+        __pragma( warning( push ) )
+        __pragma( warning( disable : 4548 ) ) // FD_SET macro triggers C4548
+    #endif
+    FD_SET( socket, &fds );
+    #if defined( __WINDOWS__ )
+        __pragma( warning( pop ) )
+    #endif
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000; // 100ms max wait
+    if ( forWrite )
+    {
+        select( (int)( socket + 1 ), nullptr, &fds, nullptr, &tv );
+    }
+    else
+    {
+        select( (int)( socket + 1 ), &fds, nullptr, nullptr, &tv );
+    }
 }
 
 // DisableSigPipe

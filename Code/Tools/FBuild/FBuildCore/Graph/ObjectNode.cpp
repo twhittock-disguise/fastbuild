@@ -272,20 +272,7 @@ ObjectNode::~ObjectNode()
         result = DoBuildOther( job, useDeoptimization );
     }
 
-    // Generate the .undefs file alongside the .pch for PCH distribution
-    #if defined( __WINDOWS__ )
-    if ( result == BuildResult::eOk && IsCreatingPCH() && IsMSVC() && !m_PCHUndefsFileName.IsEmpty() )
-    {
-        if ( PchDistribution::GenerateUndefsFile( GetCompiler()->GetExecutable(),
-                                                   GetCompiler()->GetEnvironmentString(),
-                                                   m_CompilerOptions,
-                                                   GetSourceFile()->GetName(),
-                                                   m_PCHUndefsFileName ) == false )
-        {
-            result = BuildResult::eFailed;
-        }
-    }
-    #endif
+    result = GeneratePchUndefs( result );
 
     return result;
 }
@@ -303,20 +290,7 @@ ObjectNode::~ObjectNode()
     const bool isFollowingLightCacheMiss = false;
     BuildResult result = DoBuildWithPreProcessor2( job, useDeoptimization, stealingRemoteJob, racingRemoteJob, isFollowingLightCacheMiss );
 
-    // Generate .undefs alongside the .pch (second-pass build for PCH creation)
-    #if defined( __WINDOWS__ )
-    if ( result == BuildResult::eOk && IsCreatingPCH() && IsMSVC() && !m_PCHUndefsFileName.IsEmpty() )
-    {
-        if ( PchDistribution::GenerateUndefsFile( GetCompiler()->GetExecutable(),
-                                                   GetCompiler()->GetEnvironmentString(),
-                                                   m_CompilerOptions,
-                                                   GetSourceFile()->GetName(),
-                                                   m_PCHUndefsFileName ) == false )
-        {
-            result = BuildResult::eFailed;
-        }
-    }
-    #endif
+    result = GeneratePchUndefs( result );
 
     return result;
 }
@@ -1738,6 +1712,26 @@ void ObjectNode::WriteToCache_FromCompressedData( Job * job,
                          cacheFileName.Get() );
         }
     }
+}
+
+// GeneratePchUndefs
+//------------------------------------------------------------------------------
+Node::BuildResult ObjectNode::GeneratePchUndefs( BuildResult currentResult ) const
+{
+    #if defined( __WINDOWS__ )
+    if ( currentResult == BuildResult::eOk && IsCreatingPCH() && IsMSVC() && !m_PCHUndefsFileName.IsEmpty() )
+    {
+        if ( PchDistribution::GenerateUndefsFile( GetCompiler()->GetExecutable(),
+                                                   GetCompiler()->GetEnvironmentString(),
+                                                   m_CompilerOptions,
+                                                   GetSourceFile()->GetName(),
+                                                   m_PCHUndefsFileName ) == false )
+        {
+            return BuildResult::eFailed;
+        }
+    }
+    #endif
+    return currentResult;
 }
 
 // GetExtraCacheFilePaths
