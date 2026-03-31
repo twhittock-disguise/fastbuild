@@ -352,6 +352,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
 
     // Resolve PCH cache path if job was bundled with PCH distribution data
     const uint64_t pchId = job->GetPchId();
+    bool pchReady = true;
     if ( pchId != 0 )
     {
         AString pchPath;
@@ -363,8 +364,9 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
         }
         else
         {
-            FLOG_WARN( "MsgJob: PCH NOT FOUND pchId=0x%016" PRIx64 " for '%s' (cache has %u entries)\n",
-                       pchId, job->GetRemoteName().Get(), (uint32_t)m_PchCache.GetSize() );
+            FLOG_VERBOSE( "MsgJob: PCH not yet available pchId=0x%016" PRIx64 " for '%s' — waiting\n",
+                          pchId, job->GetRemoteName().Get() );
+            pchReady = false;
         }
     }
 
@@ -380,8 +382,8 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
     {
         job->SetToolManifest( manifest );
 
-        // Tool fully synchronized — queue immediately
-        if ( manifest->IsSynchronized() )
+        // Tool fully synchronized and PCH ready — queue immediately
+        if ( manifest->IsSynchronized() && pchReady )
         {
             JobQueueRemote::Get().QueueJob( job );
             return;
@@ -402,7 +404,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
         m_Tools.Append( manifest );
     }
 
-    // Can't start job yet - put it on hold
+    // Can't start job yet - put it on hold (waiting for toolchain and/or PCH)
     cs->m_WaitingJobs.Append( job );
 }
 
@@ -553,10 +555,68 @@ void Server::CheckWaitingJobs( const ToolManifest * manifest )
             ASSERT( manifestForThisJob );
             if ( manifestForThisJob == manifest )
             {
+                // Also check PCH is available if needed
+                const uint64_t pchId = job->GetPchId();
+                if ( pchId != 0 && job->GetPchCachePath().IsEmpty() )
+                {
+                    AString pchPath;
+                    if ( FindCachedPch( pchId, pchPath ) )
+                    {
+                        job->SetPchCachePath( pchPath );
+                    }
+                    else
+                    {
+                        continue; // Still waiting for PCH
+                    }
+                }
+
                 cs->m_WaitingJobs.EraseIndex( (size_t)i );
                 JobQueueRemote::Get().QueueJob( job );
                 PROTOCOL_DEBUG( "Server: Job %x can now be started\n", job );
             }
+        }
+    }
+}
+
+// CheckWaitingJobsForPch
+//------------------------------------------------------------------------------
+void Server::CheckWaitingJobsForPch( uint64_t pchId )
+{
+    MutexHolder mhC( m_ClientListMutex );
+    for ( ClientState * cs : m_ClientList )
+    {
+        MutexHolder mh2( cs->m_Mutex );
+
+        const int32_t numJobs = (int32_t)cs->m_WaitingJobs.GetSize();
+        for ( int32_t i = ( numJobs - 1 ); i >= 0; --i )
+        {
+            Job * job = cs->m_WaitingJobs[ (size_t)i ];
+            if ( job->GetPchId() != pchId )
+            {
+                continue;
+            }
+
+            // Resolve the PCH path
+            AString pchPath;
+            if ( FindCachedPch( pchId, pchPath ) )
+            {
+                job->SetPchCachePath( pchPath );
+            }
+            else
+            {
+                continue; // Shouldn't happen — we just cached it
+            }
+
+            // Check toolchain is also ready
+            const ToolManifest * manifest = job->GetToolManifest();
+            if ( manifest && !manifest->IsSynchronized() )
+            {
+                continue; // Still waiting for toolchain
+            }
+
+            cs->m_WaitingJobs.EraseIndex( (size_t)i );
+            JobQueueRemote::Get().QueueJob( job );
+            PROTOCOL_DEBUG( "Server: Job %x can now be started (PCH ready)\n", job );
         }
     }
 }
@@ -657,6 +717,10 @@ void Server::Process( const ConnectionInfo * /*connection*/, const Protocol::Msg
 
     FLOG_OUTPUT( "PCH cached: 0x%016" PRIx64 " -> %s (cached=%s)\n",
                  pchId, pchFilePath.Get(), alreadyCached ? "disk" : "new" );
+
+    // Release any jobs that were waiting for this PCH
+    CheckWaitingJobsForPch( pchId );
+    JobQueueRemote::Get().WakeMainThread();
 }
 
 // ScanPchCache

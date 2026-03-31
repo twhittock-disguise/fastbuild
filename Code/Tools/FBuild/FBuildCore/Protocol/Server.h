@@ -55,6 +55,7 @@ private:
     void FinalizeCompletedJobs();
     void TouchToolchains();
     void CheckWaitingJobs( const ToolManifest * manifest );
+    void CheckWaitingJobsForPch( uint64_t pchId );
 
     void RequestMissingFiles( const ConnectionInfo * connection, ToolManifest * manifest ) const;
     void RecalculateCapacity();        // Takes m_ClientListMutex
