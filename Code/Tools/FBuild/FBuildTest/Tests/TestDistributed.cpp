@@ -100,7 +100,7 @@ void TestDistributed::TestHelper( const char * target, uint32_t numRemoteWorkers
     options.m_NumWorkerThreads = 1;
     options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
     options.m_AllowLocalRace = allowRace;
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
 
     TEST_ASSERT( fBuild.Initialize() );
 
@@ -208,7 +208,7 @@ void TestDistributed::RemoteRaceWinRemote()
     options.m_NumWorkerThreads = 1;
     options.m_ForceCleanBuild = true;
     options.m_NoLocalConsumptionOfRemoteJobs = true;
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
 
     TEST_ASSERT( fBuild.Initialize() );
 
@@ -235,7 +235,7 @@ void TestDistributed::RemoteRaceSystemFailure()
     options.m_ForceCleanBuild = true;
     options.m_NoLocalConsumptionOfRemoteJobs = true;
     options.m_DistVerbose = true;
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
 
     TEST_ASSERT( fBuild.Initialize() );
 
@@ -286,7 +286,7 @@ void TestDistributed::ErrorsAreCorrectlyReported_MSVC() const
     options.m_AllowLocalRace = false;
     options.m_ForceCleanBuild = true;
 
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
     // start a client to emulate the other end
@@ -312,7 +312,7 @@ void TestDistributed::ErrorsAreCorrectlyReported_Clang() const
     options.m_AllowLocalRace = false;
     options.m_ForceCleanBuild = true;
 
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
     // start a client to emulate the other end
@@ -338,7 +338,7 @@ void TestDistributed::WarningsAreCorrectlyReported_MSVC() const
     options.m_AllowLocalRace = false;
     options.m_ForceCleanBuild = true;
 
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
     // start a client to emulate the other end
@@ -364,7 +364,7 @@ void TestDistributed::WarningsAreCorrectlyReported_Clang() const
     options.m_AllowLocalRace = false;
     options.m_ForceCleanBuild = true;
 
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
     // start a client to emulate the other end
@@ -394,7 +394,7 @@ void TestDistributed::ShutdownMemoryLeak() const
     options.m_ForceCleanBuild = true;
 
     // Init
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
     // NOTE: No remote server created so jobs stay in m_DistributableJobs_Available queue
@@ -452,7 +452,7 @@ void TestDistributed::TestZiDebugFormat() const
     options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
     options.m_AllowLocalRace = false;
     options.m_ForceCleanBuild = true;
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
 
     TEST_ASSERT( fBuild.Initialize() );
 
@@ -471,7 +471,7 @@ void TestDistributed::TestZiDebugFormat_Local() const
     options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
     options.m_AllowDistributed = true;
     options.m_ForceCleanBuild = true;
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
 
     TEST_ASSERT( fBuild.Initialize() );
 
@@ -493,7 +493,7 @@ void TestDistributed::D8049_ToolLongDebugRecord() const
     options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
     options.m_AllowLocalRace = false;
     options.m_ForceCleanBuild = true;
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
 
     TEST_ASSERT( fBuild.Initialize() );
 
@@ -516,7 +516,7 @@ void TestDistributed::DynamicDeoptimization() const
     options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
     options.m_AllowLocalRace = false;
     options.m_ForceCleanBuild = true;
-    FBuild fBuild( options );
+    FBuildForTest fBuild( options );
 
     TEST_ASSERT( fBuild.Initialize() );
 

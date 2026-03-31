@@ -15,6 +15,7 @@
 
 #include "AliasNode.h"
 #include "CSNode.h"
+#include "CompilerInfoNode.h"
 #include "CompilerNode.h"
 #include "CopyDirNode.h"
 #include "CopyFileNode.h"
@@ -317,7 +318,7 @@ NodeGraph::LoadResult NodeGraph::Load( ConstMemoryStream & stream, const char * 
             return LoadResult::LOAD_ERROR; // error reading
         }
 
-        const uint64_t dataHash = xxHash3::Calc64( mem.Get(), size );
+        const uint64_t dataHash = xxHash3::Calc64Big( mem.Get(), size );
         if ( dataHash == usedFiles[ i ].m_DataHash )
         {
             // file didn't change, update stored timestamp to save time on the next run
@@ -562,7 +563,7 @@ void NodeGraph::Save( ChainedMemoryStream & stream, const char * nodeGraphDBFile
                 dataSize -= sizeof( NodeGraphHeader );
             }
 
-            accumulator.AddData( data, dataSize );
+            accumulator.AddDataBig( data, dataSize );
         }
         const uint64_t hash = accumulator.Finalize64();
 
@@ -896,6 +897,7 @@ Node * NodeGraph::CreateNode( Node::Type type, AString && name, uint32_t nameHas
         case Node::SETTINGS_NODE: node = FNEW( SettingsNode() ); break;
         case Node::TEXT_FILE_NODE: node = FNEW( TextFileNode() ); break;
         case Node::LIST_DEPENDENCIES_NODE: node = FNEW( ListDependenciesNode() ); break;
+        case Node::COMPILER_INFO_NODE: node = FNEW( CompilerInfoNode() ); break;
         case Node::NUM_NODE_TYPES: ASSERT( false ); return nullptr;
     }
 
@@ -1737,7 +1739,7 @@ bool NodeGraph::ReadHeaderAndUsedFiles( ConstMemoryStream & nodeGraphStream, con
         ASSERT( tell == sizeof( NodeGraphHeader ) ); // Stream should be after header
         const char * data = ( static_cast<const char *>( nodeGraphStream.GetData() ) + tell );
         const size_t remainingSize = ( nodeGraphStream.GetSize() - tell );
-        const uint64_t hash = xxHash3::Calc64( data, remainingSize );
+        const uint64_t hash = xxHash3::Calc64Big( data, remainingSize );
         if ( hash != ngh.GetContentHash() )
         {
             return false; // DB is corrupt
@@ -2258,7 +2260,9 @@ void NodeGraph::MigrateProperty( const void * oldBase, void * newBase, const Ref
             ASSERT( property.IsArray() == false );
             const Node * nodeA = *property.GetPtrToPropertyCustom<Node *>( baseA );
             const Node * nodeB = *property.GetPtrToPropertyCustom<Node *>( baseB );
-            if ( nodeA->GetName() != nodeB->GetName() )
+            const bool same = ( nodeA && nodeB ) ? ( nodeA->GetName() == nodeB->GetName() )
+                                                 : ( ( nodeA == nullptr ) && ( nodeB == nullptr ) );
+            if ( !same )
             {
                 return false;
             }

@@ -88,6 +88,7 @@
     "VSExtProj",
     "TextFile",
     "ListDependencies",
+    "CompilerInfo",
 };
 // clang-format on
 static Mutex g_NodeEnvStringMutex;
@@ -144,7 +145,7 @@ IMetaData & MetaIgnoreForComparison()
 
 // Reflection
 //------------------------------------------------------------------------------
-REFLECT_STRUCT_BEGIN_ABSTRACT( Node, Struct, MetaNone() )
+REFLECT_STRUCT_BEGIN_ABSTRACT( Node, Struct )
 REFLECT_END( Node )
 
 // CONSTRUCTOR
@@ -596,8 +597,15 @@ void Node::SetLastBuildTime( uint32_t ms )
         case PT_CUSTOM_1:
         {
             const Node * node = *property.GetPtrToPropertyCustom<Node *>( base );
-            const uint32_t nodeIndex = node->GetBuildPassTag();
-            stream.Write( nodeIndex );
+            if ( node )
+            {
+                const uint32_t nodeIndex = node->GetBuildPassTag();
+                stream.Write( nodeIndex );
+            }
+            else
+            {
+                stream.Write( INVALID_NODE_INDEX );
+            }
             return;
         }
         default:
@@ -730,8 +738,8 @@ void Node::SetLastBuildTime( uint32_t ms )
         {
             uint32_t index;
             VERIFY( stream.Read( index ) );
-            Node * node = nodeGraph.GetNodeByIndex( index );
-            ASSERT( node );
+            Node * node = ( index == INVALID_NODE_INDEX ) ? nullptr
+                                                          : nodeGraph.GetNodeByIndex( index );
             Node ** propertyPtr = property.GetPtrToPropertyCustom<Node *>( base );
             *propertyPtr = node;
             return;
