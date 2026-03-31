@@ -31,19 +31,16 @@ const char * GetProtocolMessageDebugName( Protocol::MessageType msgType )
     {
         "",
         "Connection",
-        "Status",
-        "RequestJob",
-        "NoJobAvailable",
         "Job",
         "JobResult",
-        "RequestManifest",
-        "Manifest",
-        "RequestFile",
-        "File",
         "JobResultCompressed",
+        "Manifest",
+        "File",
         "ConnectionAck",
         "PchFile",
         "PchInventory",
+        "RequestManifest",
+        "RequestFile",
     };
     // clang-format on
     static_assert( ( sizeof( msgNames ) / sizeof( const char * ) ) == Protocol::NUM_MESSAGES, "msgNames item count doesn't match NUM_MESSAGES" );
@@ -109,10 +106,9 @@ bool Protocol::IMessage::Broadcast( TCPConnectionPool * pool ) const
 
 // MsgConnection
 //------------------------------------------------------------------------------
-Protocol::MsgConnection::MsgConnection( uint32_t numJobsAvailable )
+Protocol::MsgConnection::MsgConnection()
     : Protocol::IMessage( Protocol::MSG_CONNECTION, sizeof( MsgConnection ), false )
     , m_ProtocolVersion( kVersionMajor )
-    , m_NumJobsAvailable( numJobsAvailable )
     , m_Platform( Env::GetPlatform() )
     , m_ProtocolVersionMinor( kVersionMinor )
 {
@@ -134,28 +130,6 @@ Protocol::MsgConnectionAck::MsgConnectionAck( uint8_t capacity )
     , m_WorkerCapacity( capacity )
 {
     memset( m_Padding2, 0, sizeof( m_Padding2 ) );
-}
-
-// MsgStatus
-//------------------------------------------------------------------------------
-Protocol::MsgStatus::MsgStatus( uint32_t numJobsAvailable )
-    : Protocol::IMessage( Protocol::MSG_STATUS, sizeof( MsgStatus ), false )
-    , m_NumJobsAvailable( numJobsAvailable )
-{
-}
-
-// MsgRequestJob
-//------------------------------------------------------------------------------
-Protocol::MsgRequestJob::MsgRequestJob()
-    : Protocol::IMessage( Protocol::MSG_REQUEST_JOB, sizeof( MsgRequestJob ), false )
-{
-}
-
-// MsgNoJobAvailable
-//------------------------------------------------------------------------------
-Protocol::MsgNoJobAvailable::MsgNoJobAvailable()
-    : Protocol::IMessage( Protocol::MSG_NO_JOB_AVAILABLE, sizeof( MsgNoJobAvailable ), false )
-{
 }
 
 // MsgJob

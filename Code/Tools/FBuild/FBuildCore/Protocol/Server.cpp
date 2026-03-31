@@ -236,18 +236,6 @@ bool Server::IsSynchingTool( AString & statusStr ) const
             Process( connection, msg );
             break;
         }
-        case Protocol::MSG_STATUS:
-        {
-            const Protocol::MsgStatus * msg = static_cast<const Protocol::MsgStatus *>( imsg );
-            Process( connection, msg );
-            break;
-        }
-        case Protocol::MSG_NO_JOB_AVAILABLE:
-        {
-            const Protocol::MsgNoJobAvailable * msg = static_cast<const Protocol::MsgNoJobAvailable *>( imsg );
-            Process( connection, msg );
-            break;
-        }
         case Protocol::MSG_JOB:
         {
             const Protocol::MsgJob * msg = static_cast<const Protocol::MsgJob *>( imsg );
@@ -315,8 +303,6 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     ClientState * cs = (ClientState *)connection->GetUserData();
     {
         MutexHolder mh( cs->m_Mutex );
-        cs->m_NumJobsAvailable.Store( msg->GetNumJobsAvailable() );
-        cs->m_ProtocolVersionMinor = msg->GetProtocolVersionMinor();
         cs->m_HostName = msg->GetHostName();
     }
 
@@ -324,23 +310,17 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     // (must NOT hold cs->m_Mutex here to avoid lock ordering with FinalizeCompletedJobs)
     RecalculateCapacity();
 
-    // If Client is new enough, send an ack message with capacity
-    if ( msg->GetProtocolVersionMinor() >= 3 )
-    {
-        // Send Ack to client with allocated capacity
-        const Protocol::MsgConnectionAck ack( (uint8_t)cs->m_AllocatedCapacity );
-        ack.Send( connection );
-    }
+    // Send ack with allocated capacity
+    const Protocol::MsgConnectionAck ack( (uint8_t)cs->m_AllocatedCapacity );
+    ack.Send( connection );
 
-    // Send PCH inventory if client supports it (protocol minor >= 6)
-    if ( msg->GetProtocolVersionMinor() >= 6 )
+    // Send PCH inventory so coordinator knows what's already cached
     {
         MutexHolder mh( m_PchCacheMutex );
         const uint32_t numEntries = (uint32_t)m_PchCache.GetSize();
         const Protocol::MsgPchInventory inventoryMsg( numEntries );
         if ( numEntries > 0 )
         {
-            // Build payload: array of uint64_t pchIds
             MemoryStream ms;
             for ( const PchCacheEntry & e : m_PchCache )
             {
@@ -355,109 +335,75 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     }
 }
 
-// Process( MsgStatus )
-//------------------------------------------------------------------------------
-void Server::Process( const ConnectionInfo * connection, const Protocol::MsgStatus * msg )
-{
-    // take note of latest status of client
-    ClientState * cs = (ClientState *)connection->GetUserData();
-    cs->m_NumJobsAvailable.Store( msg->GetNumJobsAvailable() );
-
-    // Wake main thread to request jobs
-    JobQueueRemote::Get().WakeMainThread();
-}
-
-// Process( MsgNoJobAvailable )
-//------------------------------------------------------------------------------
-void Server::Process( const ConnectionInfo * connection, const Protocol::MsgNoJobAvailable * )
-{
-    // In push mode, jobs are pushed directly by the coordinator, so this
-    // message should not normally be received. Ignore it.
-    (void)connection;
-}
-
 // Process( MsgJob )
 //------------------------------------------------------------------------------
 void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob * msg, const void * payload, size_t payloadSize )
 {
     ClientState * cs = (ClientState *)connection->GetUserData();
+    cs->m_NumJobsActive.Increment();
+
+    MutexHolder mh( cs->m_Mutex );
+
+    // deserialize job
+    ConstMemoryStream ms( payload, payloadSize );
+    Job * job = FNEW( Job( ms ) );
+    job->SetUserData( cs );
+    job->SetResultCompressionLevel( msg->GetResultCompressionLevel(), true /*allowZstdUse*/ );
+
+    // Resolve PCH cache path if job was bundled with PCH distribution data
+    const uint64_t pchId = job->GetPchId();
+    if ( pchId != 0 )
     {
-        // In push mode, jobs are pushed by the coordinator — no request tracking needed
-        cs->m_NumJobsActive.Increment();
-
-        MutexHolder mh( cs->m_Mutex );
-
-        // deserialize job
-        ConstMemoryStream ms( payload, payloadSize );
-
-        Job * job = FNEW( Job( ms ) );
-        job->SetUserData( cs );
-
-        // Zstd is supported by all v23+ clients
-        job->SetResultCompressionLevel( msg->GetResultCompressionLevel(), true /*allowZstdUse*/ );
-
-        // Resolve PCH cache path if job was bundled with PCH distribution data
-        const uint64_t pchId = job->GetPchId();
-        if ( pchId != 0 )
+        AString pchPath;
+        if ( FindCachedPch( pchId, pchPath ) )
         {
-            AString pchPath;
-            if ( FindCachedPch( pchId, pchPath ) )
-            {
-                job->SetPchCachePath( pchPath );
-                FLOG_VERBOSE( "MsgJob: PCH resolved pchId=0x%016" PRIx64 " -> '%s' for '%s'\n",
-                              pchId, pchPath.Get(), job->GetRemoteName().Get() );
-            }
-            else
-            {
-                FLOG_WARN( "MsgJob: PCH NOT FOUND pchId=0x%016" PRIx64 " for '%s' (cache has %u entries)\n",
-                           pchId, job->GetRemoteName().Get(), (uint32_t)m_PchCache.GetSize() );
-            }
-
+            job->SetPchCachePath( pchPath );
+            FLOG_VERBOSE( "MsgJob: PCH resolved pchId=0x%016" PRIx64 " -> '%s' for '%s'\n",
+                          pchId, pchPath.Get(), job->GetRemoteName().Get() );
         }
-
-        // Get ToolId
-        const uint64_t toolId = msg->GetToolId();
-        ASSERT( toolId );
-
+        else
         {
-            // Find or create the manifest
-            MutexHolder manifestMH( m_ToolManifestsMutex );
-
-            ToolManifest ** found = m_Tools.FindDeref( toolId );
-            ToolManifest * manifest = found ? *found : nullptr;
-            if ( manifest )
-            {
-                job->SetToolManifest( manifest );
-
-                // Is tool fully synchronized?
-                if ( manifest->IsSynchronized() )
-                {
-                    // we have all the files - we can do the job
-                    JobQueueRemote::Get().QueueJob( job );
-                    return;
-                }
-
-                // In push mode, manifest and files are sent proactively by the coordinator.
-                // Just wait for synchronization to complete.
-                if ( manifest->GetUserData() == nullptr )
-                {
-                    manifest->SetUserData( (void *)connection );
-                }
-            }
-            else
-            {
-                // first time seeing this tool — create manifest object
-                // In push mode, the coordinator will send MsgManifest + MsgFile proactively
-                manifest = FNEW( ToolManifest( toolId ) );
-                manifest->SetUserData( (void *)connection );
-                job->SetToolManifest( manifest );
-                m_Tools.Append( manifest );
-            }
-
-            // can't start job yet - put it on hold
-            cs->m_WaitingJobs.Append( job );
+            FLOG_WARN( "MsgJob: PCH NOT FOUND pchId=0x%016" PRIx64 " for '%s' (cache has %u entries)\n",
+                       pchId, job->GetRemoteName().Get(), (uint32_t)m_PchCache.GetSize() );
         }
     }
+
+    // Find or create the manifest
+    const uint64_t toolId = msg->GetToolId();
+    ASSERT( toolId );
+
+    MutexHolder manifestMH( m_ToolManifestsMutex );
+
+    ToolManifest ** found = m_Tools.FindDeref( toolId );
+    ToolManifest * manifest = found ? *found : nullptr;
+    if ( manifest )
+    {
+        job->SetToolManifest( manifest );
+
+        // Tool fully synchronized — queue immediately
+        if ( manifest->IsSynchronized() )
+        {
+            JobQueueRemote::Get().QueueJob( job );
+            return;
+        }
+
+        // Wait for synchronization to complete
+        if ( manifest->GetUserData() == nullptr )
+        {
+            manifest->SetUserData( (void *)connection );
+        }
+    }
+    else
+    {
+        // First time seeing this tool — coordinator will send MsgManifest + MsgFile
+        manifest = FNEW( ToolManifest( toolId ) );
+        manifest->SetUserData( (void *)connection );
+        job->SetToolManifest( manifest );
+        m_Tools.Append( manifest );
+    }
+
+    // Can't start job yet - put it on hold
+    cs->m_WaitingJobs.Append( job );
 }
 
 // Process( MsgManifest )

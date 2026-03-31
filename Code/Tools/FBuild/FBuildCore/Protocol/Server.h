@@ -18,10 +18,8 @@ namespace Protocol
     class MsgConnection;
     class MsgJob;
     class MsgManifest;
-    class MsgNoJobAvailable;
     class MsgPchFile;
     class MsgPchInventory;
-    class MsgStatus;
     class MsgFile;
 }
 class ToolManifest;
@@ -46,8 +44,6 @@ private:
 
     // helpers to handle messages
     void Process( const ConnectionInfo * connection, const Protocol::MsgConnection * msg );
-    void Process( const ConnectionInfo * connection, const Protocol::MsgStatus * msg );
-    void Process( const ConnectionInfo * connection, const Protocol::MsgNoJobAvailable * msg );
     void Process( const ConnectionInfo * connection, const Protocol::MsgJob * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgManifest * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgFile * msg, const void * payload, size_t payloadSize );
@@ -76,11 +72,9 @@ private:
 
         const Protocol::IMessage * m_CurrentMessage = nullptr;
         const ConnectionInfo * m_Connection = nullptr;
-        Atomic<uint32_t> m_NumJobsAvailable;
         Atomic<uint32_t> m_NumJobsActive;
         uint32_t m_AllocatedCapacity = 0;
 
-        uint8_t m_ProtocolVersionMinor = 0;
         AString m_HostName;
 
         Array<Job *> m_WaitingJobs; // jobs waiting for manifests/toolchains

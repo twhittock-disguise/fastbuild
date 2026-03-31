@@ -108,21 +108,17 @@ public:
 
     ClientWorkerInfo * GetWorker() const { return m_Worker; }
 
-    Atomic<uint32_t> m_NumJobsAvailableSentToClient{ 0 }; // num jobs we've told this server we have available
-
     void PushJobsToWorker();
 
     template <class T>
     void EnqueueSend( const T & msg );
     template <class T>
     void EnqueueSend( const T & msg, ConstMemoryStream && payload );
-    void EnqueueSendJobAvailability( uint32_t numAvailable );
 
 private:
     virtual void OnDisconnected( const ConnectionInfo * connection ) override;
     virtual void OnReceive( const ConnectionInfo * connection, void * data, uint32_t size, bool & keepMemory ) override;
 
-    void Process( const Protocol::MsgRequestJob * msg );
     void Process( const Protocol::MsgJobResult *, const void * payload, size_t payloadSize );
     void Process( const Protocol::MsgJobResultCompressed * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgRequestManifest * msg );
@@ -167,7 +163,6 @@ private:
 
     // Queue of messages to send
     Mutex m_SendQueueMutex;
-    ClientSendQueueItem m_MsgStatus;
     Array<ClientSendQueueItem> m_SendQueue;
 };
 
@@ -436,6 +431,12 @@ void Client::CommunicateJobAvailability()
 {
     PROFILE_FUNCTION;
 
+    // Early out when there are no distributable jobs
+    if ( JobQueue::Get().GetNumDistributableJobsAvailable() == 0 )
+    {
+        return;
+    }
+
     // Push jobs directly to workers that have capacity
     for ( UniquePtr<ClientToWorkerConnection> & ss : m_ActiveConnections )
     {
@@ -480,12 +481,6 @@ void Client::CommunicateJobAvailability()
 
     switch ( messageType )
     {
-        case Protocol::MSG_REQUEST_JOB:
-        {
-            const Protocol::MsgRequestJob * msg = static_cast<const Protocol::MsgRequestJob *>( imsg );
-            Process( msg );
-            break;
-        }
         case Protocol::MSG_JOB_RESULT:
         {
             const Protocol::MsgJobResult * msg = static_cast<const Protocol::MsgJobResult *>( imsg );
@@ -536,85 +531,6 @@ void Client::CommunicateJobAvailability()
     FREE( (void *)( m_CurrentMessage ) );
     FREE( payload );
     m_CurrentMessage = nullptr;
-}
-
-// Process( MsgRequestJob )
-//------------------------------------------------------------------------------
-void ClientToWorkerConnection::Process( const Protocol::MsgRequestJob * )
-{
-    PROFILE_SECTION( "MsgRequestJob" );
-
-    // no jobs for deny listed workers
-    if ( m_Worker->m_DenyListed )
-    {
-        EnqueueSend( Protocol::MsgNoJobAvailable() );
-        return;
-    }
-
-    // Some jobs require Server (Worker) changes which can be validated by
-    // comparing the minor protocol version.
-    const uint8_t workerMinorProtocolVersion = m_ProtocolVersionMinor.Load();
-
-    Job * job = JobQueue::Get().GetDistributableJobToProcess( true, workerMinorProtocolVersion );
-
-    if ( job == nullptr )
-    {
-        PROFILE_SECTION( "NoJob" );
-        // tell the client we don't have anything right now
-        // (we completed or gave away the job already)
-        EnqueueSend( Protocol::MsgNoJobAvailable() );
-        return;
-    }
-
-    // send the job to the client
-    MemoryStream stream;
-    job->Serialize( stream );
-
-    MutexHolder mh( m_Mutex );
-
-    m_Jobs.Append( job ); // Track in-flight job
-
-    // Reset the Available Jobs count for this worker. This ensures that we send
-    // another status update message to communicate new jobs becoming available.
-    // Without this, we might return to the same count as before requesting the
-    // current job, resulting in a missed update message.
-    m_NumJobsAvailableSentToClient.Store( 0 );
-
-    // if tool is explicitly specified, get the id of the tool manifest
-    const Node * n = job->GetNode()->CastTo<ObjectNode>()->GetCompiler();
-    const ToolManifest & manifest = n->CastTo<CompilerNode>()->GetManifest();
-    const uint64_t toolId = manifest.GetToolId();
-    ASSERT( toolId );
-
-    // output to signify remote start
-    if ( FBuild::Get().GetOptions().m_ShowCommandSummary )
-    {
-        FLOG_OUTPUT( "-> Obj: %s <REMOTE: %s>\n", job->GetNode()->GetName().Get(), m_Worker->m_Address.Get() );
-    }
-    FLOG_MONITOR( "START_JOB %s \"%s\" \n", m_Worker->m_Address.Get(), job->GetNode()->GetName().Get() );
-
-    // Determine compression level we'd like the Server to use for returning the results
-    int16_t resultCompressionLevel = -1; // Default compression level
-    if ( FBuild::IsValid() )
-    {
-        // If we will write the results to the cache, and this node is cacheable
-        // then we want to respect higher cache compression levels if set
-        const int16_t cacheCompressionLevel = FBuild::Get().GetOptions().m_CacheCompressionLevel;
-        if ( ( cacheCompressionLevel != 0 ) &&
-             ( FBuild::Get().GetOptions().m_UseCacheWrite ) &&
-             ( job->GetNode()->CastTo<ObjectNode>()->ShouldUseCache() ) )
-        {
-            resultCompressionLevel = Math::Max( resultCompressionLevel, cacheCompressionLevel );
-        }
-    }
-
-    // Take note of the results compression level so we know to expect
-    // compressed results
-    const bool allowZstdUse = true; // We can accept Zstd results
-    job->SetResultCompressionLevel( resultCompressionLevel, allowZstdUse );
-
-    EnqueueSend( Protocol::MsgJob( toolId, resultCompressionLevel ),
-                 Move( ConstMemoryStream( Move( stream ) ) ) );
 }
 
 // Process( MsgJobResult )
@@ -1349,18 +1265,6 @@ void ClientToWorkerConnection::EnqueueSend( const T & msg, ConstMemoryStream && 
 }
 
 //------------------------------------------------------------------------------
-void ClientToWorkerConnection::EnqueueSendJobAvailability( uint32_t numJobsAvailable )
-{
-    {
-        MutexHolder lock( m_SendQueueMutex );
-        const Protocol::MsgStatus msg( numJobsAvailable );
-        m_MsgStatus = ClientSendQueueItem( msg ); // Moved
-        m_NumJobsAvailableSentToClient.Store( numJobsAvailable );
-    }
-    m_SendThreadWakeSemaphore.Signal();
-}
-
-//------------------------------------------------------------------------------
 /*static*/ uint32_t ClientToWorkerConnection::SendQueueThreadFuncStatic( void * param )
 {
     ClientToWorkerConnection * c = static_cast<ClientToWorkerConnection *>( param );
@@ -1399,10 +1303,8 @@ void ClientToWorkerConnection::SendQueueThreadFunc()
     ClientWorkerInfo::s_NumConnections.Increment();
     DIST_INFO( " - connection: %s (OK)\n", m_Worker->m_Address.Get() );
 
-    // Immediately send connection message including initial job availability
-    const uint32_t num = static_cast<uint32_t>( JobQueue::Get().GetNumDistributableJobsAvailable() );
-    m_NumJobsAvailableSentToClient.Store( num );
-    const Protocol::MsgConnection msg( num );
+    // Send initial connection handshake
+    const Protocol::MsgConnection msg;
     if ( msg.Send( ci ) )
     {
         SendQueueMainLoop( ci );
@@ -1419,19 +1321,11 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
     // Send messages
     while ( true )
     {
-        // Take queue of messages to process, or take the MsgStatus and
-        // send that first if needed. Drain fully before blocking on semaphore.
+        // Take queued messages. Drain fully before blocking on semaphore.
         Array<ClientSendQueueItem> sendQueue;
         {
             MutexHolder lock( m_SendQueueMutex );
-            if ( m_MsgStatus.m_Message.GetSize() > 0 )
-            {
-                sendQueue.EmplaceBack( Move( m_MsgStatus ) );
-            }
-            else
-            {
-                m_SendQueue.Swap( sendQueue );
-            }
+            m_SendQueue.Swap( sendQueue );
         }
 
         // If nothing to send, block until signaled

@@ -40,34 +40,17 @@ namespace Protocol
     //------------------------------------------------------------------------------
     enum MessageType : uint8_t
     {
-        MSG_CONNECTION = 1, // Server <- Client : Initial handshake
-        MSG_STATUS = 2, // Server <- Client : Update status (work available)
-
-        MSG_REQUEST_JOB = 3, // Server -> Client : Ask for a job to do
-        MSG_NO_JOB_AVAILABLE = 4, // Server <- Client : Respond that no jobs are available
-        MSG_JOB = 5, // Server <- Client : Respond with a job to do
-
-        MSG_JOB_RESULT = 6, // Server -> Client : Return completed job (uncompressed)
-
-        MSG_REQUEST_MANIFEST = 7, // Server -> Client : Ask client for the manifest of tools required for a job
-        MSG_MANIFEST = 8, // Server <- Client : Respond with manifest details
-
-        MSG_REQUEST_FILE = 9, // Server -> Client : Ask client for a file
-        MSG_FILE = 10,// Server <- Client : Send a requested file
-
-        // v22.1 or later
-        MSG_JOB_RESULT_COMPRESSED = 11, // Server -> Client : Return completed job (compressed)
-
-        // v22.3 or later
-        MSG_CONNECTION_ACK = 12,// Server -> Client : Handshake ack
-
-        // v22.4 or later supports Zstd compression (no packet changes)
-
-        // v22.5 or later support /dynamicdeopt for MSVC 2022 v17.44.x or later
-
-        // v23.6 or later
-        MSG_PCH_FILE = 13, // Server <- Client : Send a PCH file for distributed PCH compilation
-        MSG_PCH_INVENTORY = 14, // Server -> Client : Advertise cached PCH IDs
+        MSG_CONNECTION = 1,             // Client -> Worker : Initial handshake
+        MSG_JOB = 2,                    // Client -> Worker : Push a job to execute
+        MSG_JOB_RESULT = 3,             // Worker -> Client : Return completed job (uncompressed)
+        MSG_JOB_RESULT_COMPRESSED = 4,  // Worker -> Client : Return completed job (compressed)
+        MSG_MANIFEST = 5,               // Client -> Worker : Push tool manifest
+        MSG_FILE = 6,                   // Client -> Worker : Push a tool file
+        MSG_CONNECTION_ACK = 7,         // Worker -> Client : Handshake ack with capacity
+        MSG_PCH_FILE = 8,              // Client -> Worker : Push a PCH file
+        MSG_PCH_INVENTORY = 9,         // Worker -> Client : Advertise cached PCH IDs
+        MSG_REQUEST_MANIFEST = 10,      // Worker -> Client : Request manifest (disconnect recovery)
+        MSG_REQUEST_FILE = 11,          // Worker -> Client : Request file (disconnect recovery)
 
         NUM_MESSAGES            // leave last
     };
@@ -109,23 +92,21 @@ namespace Protocol
     class MsgConnection : public IMessage
     {
     public:
-        explicit MsgConnection( uint32_t numJobsAvailable );
+        MsgConnection();
 
         uint32_t GetProtocolVersion() const { return m_ProtocolVersion; }
-        uint32_t GetNumJobsAvailable() const { return m_NumJobsAvailable; }
         uint8_t GetPlatform() const { return m_Platform; }
         const char * GetHostName() const { return m_HostName; }
         uint8_t GetProtocolVersionMinor() const { return m_ProtocolVersionMinor; }
 
     private:
         uint32_t m_ProtocolVersion;
-        uint32_t m_NumJobsAvailable;
         uint8_t m_Platform;
         uint8_t m_ProtocolVersionMinor;
         uint8_t m_Padding2[ 2 ];
         char m_HostName[ 64 ];
     };
-    static_assert( sizeof( MsgConnection ) == sizeof( IMessage ) + 76, "MsgConnection message has incorrect size" );
+    static_assert( sizeof( MsgConnection ) == sizeof( IMessage ) + 72, "MsgConnection message has incorrect size" );
 
     // MsgConnectionAck
     //------------------------------------------------------------------------------
@@ -147,38 +128,6 @@ namespace Protocol
         char m_Padding2[ 3 ];
     };
     static_assert( sizeof( MsgConnectionAck ) == sizeof( IMessage ) + 8, "MsgConnectionAck message has incorrect size" );
-
-    // MsgStatus
-    //------------------------------------------------------------------------------
-    class MsgStatus : public IMessage
-    {
-    public:
-        explicit MsgStatus( uint32_t numJobsAvailable );
-
-        uint32_t GetNumJobsAvailable() const { return m_NumJobsAvailable; }
-
-    private:
-        uint32_t m_NumJobsAvailable;
-    };
-    static_assert( sizeof( MsgStatus ) == sizeof( IMessage ) + 4, "MsgStatus message has incorrect size" );
-
-    // MsgRequestJob
-    //------------------------------------------------------------------------------
-    class MsgRequestJob : public IMessage
-    {
-    public:
-        MsgRequestJob();
-    };
-    static_assert( sizeof( MsgRequestJob ) == sizeof( IMessage ), "MsgRequestJob message has incorrect size" );
-
-    // MsgNoJobAvailable
-    //------------------------------------------------------------------------------
-    class MsgNoJobAvailable : public IMessage
-    {
-    public:
-        MsgNoJobAvailable();
-    };
-    static_assert( sizeof( MsgNoJobAvailable ) == sizeof( IMessage ), "MsgNoJobAvailable message has incorrect size" );
 
     // MsgJob
     //------------------------------------------------------------------------------

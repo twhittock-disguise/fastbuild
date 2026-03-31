@@ -28,7 +28,6 @@ namespace Protocol
     class MsgConnectionAck;
     class MsgJobResult;
     class MsgJobResultCompressed;
-    class MsgRequestJob;
     class MsgRequestManifest;
     class MsgPchInventory;
     class MsgRequestFile;
