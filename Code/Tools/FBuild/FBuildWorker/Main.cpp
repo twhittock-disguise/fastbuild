@@ -10,6 +10,7 @@
 
 // Core
 #include "Core/Env/Assert.h"
+#include "Core/Env/CPUInfo.h"
 #include "Core/Env/Env.h"
 #include "Core/Env/ErrorFormat.h"
 #include "Core/FileIO/FileIO.h"
@@ -120,7 +121,7 @@ int Main( const AString & args )
     int ret;
     {
         const uint32_t cpuAllocation = options.m_OverrideCPUAllocation ? options.m_CPUAllocation : 0;
-        const uint32_t effectiveCpus = cpuAllocation ? cpuAllocation : Env::GetNumProcessors();
+        const uint32_t effectiveCpus = cpuAllocation ? cpuAllocation : CPUInfo::Get().GetNumUsefulCores();
         const uint32_t prefetch = options.m_OverridePrefetch
             ? options.m_PrefetchBuffer
             : ( effectiveCpus + 1 ) / 2; // ceil(cpus/2)
