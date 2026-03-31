@@ -272,7 +272,13 @@ ObjectNode::~ObjectNode()
         result = DoBuildOther( job, useDeoptimization );
     }
 
-    result = GeneratePchUndefs( result );
+    // Generate .undefs for non-preprocessor paths (DoBuildMSCL_NoCache, etc.)
+    // The preprocessor path handles this inside DoBuildWithPreProcessor2
+    // before the cache write.
+    if ( !( usePreProcessor || useSimpleDist ) )
+    {
+        result = GeneratePchUndefs( result );
+    }
 
     return result;
 }
@@ -288,11 +294,7 @@ ObjectNode::~ObjectNode()
     const bool useDeoptimization = job->IsLocal() && ShouldUseDeoptimization();
     const bool stealingRemoteJob = job->IsLocal(); // are we stealing a remote job?
     const bool isFollowingLightCacheMiss = false;
-    BuildResult result = DoBuildWithPreProcessor2( job, useDeoptimization, stealingRemoteJob, racingRemoteJob, isFollowingLightCacheMiss );
-
-    result = GeneratePchUndefs( result );
-
-    return result;
+    return DoBuildWithPreProcessor2( job, useDeoptimization, stealingRemoteJob, racingRemoteJob, isFollowingLightCacheMiss );
 }
 
 // Finalize
@@ -730,6 +732,13 @@ Node::BuildResult ObjectNode::DoBuildWithPreProcessor2( Job * job, bool useDeopt
     {
         // record new file time
         RecordStampFromBuiltFile();
+
+        // Generate .undefs before cache write so it can be bundled
+        const BuildResult undefsResult = GeneratePchUndefs( BuildResult::eOk );
+        if ( undefsResult != BuildResult::eOk )
+        {
+            return undefsResult;
+        }
 
         const bool useCache = ShouldUseCache();
         if ( m_Stamp && useCache )
