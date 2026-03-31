@@ -31,6 +31,13 @@
         //
         // Use Visual Studio installation
         //
+        #if file_exists( "C:/Program Files/Microsoft Visual Studio/2022/Professional/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe" )
+            // v17.14.9
+            .VS2022_BasePath        = 'C:/Program Files/Microsoft Visual Studio/2022/Professional/VC'
+            .VS2022_Version         = '14.44.35207'
+            .VS2022_MSC_VER         = '1944'
+            #define MSVC_DYNAMIC_DEOPT_AVAILABLE
+        #else
         #if file_exists( "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe" )
             // v17.14.9
             .VS2022_BasePath        = 'C:/Program Files/Microsoft Visual Studio/2022/Community/VC'
@@ -58,6 +65,7 @@
                 .VS2022_Version         = .Set_Version_Here // <-- Set version here
                 .VS2022_MSC_VER         = .Set_MSC_VER_Here // <-- Set MSC_VER here
             #endif
+        #endif
         #endif
     #endif
 #endif

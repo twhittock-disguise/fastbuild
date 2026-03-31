@@ -27,6 +27,7 @@
                 // Default Install
                 .Clang18_BasePath = 'C:/Program Files/LLVM'
                 .Clang18_Version    = '18.x.x'
+                #define CLANG18_DEFAULT_INSTALL
             #else
                 //
                 // Failed
@@ -49,12 +50,14 @@ Print( 'Using Clang $Clang18_Version$ from $Clang18_BasePath$' )
 Compiler( 'Compiler-Clang18' )
 {
     .Root                           = '$Clang18_BasePath$'
-    .ExtraFiles                     = {
+    #if !CLANG18_DEFAULT_INSTALL
+        .ExtraFiles                 = {
                                         '$Root$/bin/concrt140.dll'
                                         '$Root$/bin/msvcp140.dll'
                                         '$Root$/bin/vcruntime140.dll'
                                         '$Root$/bin/vcruntime140_1.dll'
                                       }
+    #endif
     .Executable                     = '$Root$\bin\clang-cl.exe'
 
     // Allow tests to activate some experimental behavior
@@ -71,10 +74,12 @@ Compiler( 'Compiler-Clang18' )
 Compiler( 'Compiler-Clang18-NonCL' )
 {
     .Root                           = '$Clang18_BasePath$'
-    .ExtraFiles                     = {
+    #if !CLANG18_DEFAULT_INSTALL
+        .ExtraFiles                 = {
                                         '$Root$/bin/msvcp140.dll'
                                         '$Root$/bin/vcruntime140.dll'
                                       }
+    #endif
     .Executable                     = '$Root$\bin\clang.exe'
 
     // Allow tests to activate some experimental behavior
