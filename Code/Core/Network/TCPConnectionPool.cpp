@@ -1220,14 +1220,15 @@ void TCPConnectionPool::EnableKeepAlive( TCPSocket socket ) const
     // socket is ready, avoiding unnecessary latency.
     fd_set fds;
     FD_ZERO( &fds );
-    #if defined( __WINDOWS__ )
-        __pragma( warning( push ) )
-        __pragma( warning( disable : 4548 ) ) // FD_SET macro triggers C4548
-    #endif
+    PRAGMA_DISABLE_PUSH_MSVC( 4548 ) // FD_SET macro triggers C4548
+    PRAGMA_DISABLE_PUSH_CLANG_WINDOWS( "-Wreserved-identifier" )
+    PRAGMA_DISABLE_PUSH_CLANG_WINDOWS( "-Wcomma" )
+    PRAGMA_DISABLE_PUSH_CLANG_WINDOWS( "-Wunused-value" )
     FD_SET( socket, &fds );
-    #if defined( __WINDOWS__ )
-        __pragma( warning( pop ) )
-    #endif
+    PRAGMA_DISABLE_POP_CLANG_WINDOWS
+    PRAGMA_DISABLE_POP_CLANG_WINDOWS
+    PRAGMA_DISABLE_POP_CLANG_WINDOWS
+    PRAGMA_DISABLE_POP_MSVC
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 100000; // 100ms max wait

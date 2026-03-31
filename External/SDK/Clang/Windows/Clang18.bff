@@ -136,6 +136,8 @@ Compiler( 'Compiler-Clang18-NonCL' )
                                     + ' -Wno-missing-noreturn'          // function '%s' could be declared with attribute 'noreturn'
                                     + ' -Wno-old-style-cast'            // use of old-style cast
                                     + ' -Wno-unsafe-buffer-usage'       // unsafe pointer arithmetic
+                                    + ' -Wno-padded'                    // padding size of 'X' with N bytes to alignment boundary
+                                    + ' -Wno-unique-object-duplication' // mutable static may be duplicated in shared libraries
 
     // File Extensions
     .LibExtension                   = '.a'

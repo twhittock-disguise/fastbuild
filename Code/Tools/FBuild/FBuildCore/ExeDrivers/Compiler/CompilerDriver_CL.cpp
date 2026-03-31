@@ -46,14 +46,21 @@ CompilerDriver_CL::~CompilerDriver_CL() = default;
         return true;
     }
 
-    // Remove static analyzer from clang preprocessor
+    // clang-cl specific stripping
     if ( m_IsClangCL )
     {
+        // Remove static analyzer
         if ( StripToken( "--analyze", token ) ||
              StripTokenWithArg( "-Xanalyzer", token, index ) ||
              StripTokenWithArg( "-analyzer-output", token, index ) ||
              StripTokenWithArg( "-analyzer-config", token, index ) ||
              StripTokenWithArg( "-analyzer-checker", token, index ) )
+        {
+            return true;
+        }
+
+        // clang-cl errors on -c with /E; MSVC silently ignores it
+        if ( StripToken( "-c", token ) )
         {
             return true;
         }

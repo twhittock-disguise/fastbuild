@@ -102,7 +102,7 @@
             uint32_t lineNum = 0;
             while ( p < lineEnd && *p >= '0' && *p <= '9' )
             {
-                lineNum = lineNum * 10 + ( *p - '0' );
+                lineNum = lineNum * 10 + (uint32_t)( *p - '0' );
                 ++p;
             }
 
@@ -160,7 +160,7 @@
                             outStart = pos;
                             outSize = (size_t)( end - pos );
                             FLOG_VERBOSE( "PCH strip: boundary at offset %zu, kept %.1f KB\n",
-                                          (size_t)( pos - data ), (float)outSize / 1024.0f );
+                                          (size_t)( pos - data ), (double)outSize / 1024.0 );
                             return true;
                         }
                     }
@@ -298,10 +298,10 @@
 
     FLOG_VERBOSE( "PCH distribution: '%s' stripped %.1f KB -> %.1f KB (%.1f%% reduction, undef %.1f KB)\n",
                   job->GetNode()->GetName().Get(),
-                  (float)jobDataSize / 1024.0f,
-                  (float)( newSize - headerSize ) / 1024.0f,
-                  100.0f * ( 1.0f - (float)( newSize - headerSize ) / (float)jobDataSize ),
-                  (float)undefBlock.GetLength() / 1024.0f );
+                  (double)jobDataSize / 1024.0,
+                  (double)( newSize - headerSize ) / 1024.0,
+                  100.0 * ( 1.0 - (double)( newSize - headerSize ) / (double)jobDataSize ),
+                  (double)undefBlock.GetLength() / 1024.0 );
 
     job->OwnData( newData, newSize );
     job->SetPchId( pchId );
