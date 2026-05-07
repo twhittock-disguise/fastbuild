@@ -54,8 +54,7 @@ private:
 
     void FinalizeCompletedJobs();
     void TouchToolchains();
-    void CheckWaitingJobs( const ToolManifest * manifest );
-    void CheckWaitingJobsForPch( uint64_t pchId );
+    void ReleaseReadyWaitingJobs();
 
     void RequestMissingFiles( const ConnectionInfo * connection, ToolManifest * manifest ) const;
     void RecalculateCapacity();        // Takes m_ClientListMutex
@@ -79,8 +78,6 @@ private:
         AString m_HostName;
 
         Array<Job *> m_WaitingJobs; // jobs waiting for manifests/toolchains
-
-        Timer m_StatusTimer;
     };
 
     uint32_t m_PrefetchBuffer = 0;

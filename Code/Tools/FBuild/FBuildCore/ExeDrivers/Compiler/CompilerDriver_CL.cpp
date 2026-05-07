@@ -78,7 +78,7 @@ CompilerDriver_CL::~CompilerDriver_CL() = default;
                                                                     Args & outFullArgs ) const
 {
     // When a remote PCH is available, keep /Yu and replace /Fp with the
-    // worker's cached PCH path. Otherwise strip both (original behavior).
+    // worker's cached PCH path. Otherwise strip both.
     if ( HasRemotePch() )
     {
         // Keep /Yu as-is — must match the /Yc name used to create the PCH

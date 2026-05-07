@@ -38,6 +38,35 @@
     #define SERVER_TOOLCHAIN_TIMESTAMP_REFRESH_INTERVAL_SECS ( 60.0f * 60.0f * 4.0f )
 #endif
 
+namespace
+{
+    constexpr uint32_t kMaxCachedPchEntries = 20;
+
+    // Persistent on-disk PCH cache layout:
+    //   <tmpDir>/<.fbuild|_fbuild>.tmp/worker/pch.<pchId hex>/pch.pch
+    bool BuildPchCacheRoot( AStackString<> & outRoot )
+    {
+        if ( FBuild::GetTempDir( outRoot ) == false ) { return false; }
+    #if defined( __WINDOWS__ )
+        outRoot += ".fbuild.tmp\\worker\\";
+    #else
+        outRoot += "_fbuild.tmp/worker/";
+    #endif
+        return true;
+    }
+
+    bool BuildPchCacheDir( uint64_t pchId, AStackString<> & outDir )
+    {
+        if ( BuildPchCacheRoot( outDir ) == false ) { return false; }
+    #if defined( __WINDOWS__ )
+        outDir.AppendFormat( "pch.%016" PRIx64 "\\", pchId );
+    #else
+        outDir.AppendFormat( "pch.%016" PRIx64 "/", pchId );
+    #endif
+        return true;
+    }
+}
+
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
 Server::Server( uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
@@ -454,7 +483,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgMani
     // be synchronized
     if ( manifest->IsSynchronized() )
     {
-        CheckWaitingJobs( manifest );
+        ReleaseReadyWaitingJobs();
         return;
     }
 
@@ -530,62 +559,18 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgFile
         manifest->SetUserData( nullptr );
     }
 
-    // ToolChain is now synchronized
-    // Allow any jobs that were waiting on it to start
-    CheckWaitingJobs( manifest );
+    // ToolChain is now synchronized — allow any jobs waiting on it to start
+    ReleaseReadyWaitingJobs();
     JobQueueRemote::Get().WakeMainThread();
 }
 
-// CheckWaitingJobs
+// ReleaseReadyWaitingJobs
 //------------------------------------------------------------------------------
-void Server::CheckWaitingJobs( const ToolManifest * manifest )
+void Server::ReleaseReadyWaitingJobs()
 {
-    // Queue for start any jobs that may now be ready.
-    // NOTE: In push mode, the coordinator sends the toolchain proactively
-    // before/alongside jobs, so it's valid for the toolchain to sync before
-    // any jobs arrive (m_WaitingJobs may be empty).
-    MutexHolder mhC( m_ClientListMutex );
-    for ( ClientState * cs : m_ClientList )
-    {
-        // For each connected client...
-        MutexHolder mh2( cs->m_Mutex );
-
-        // .. check all jobs waiting for ToolManifests
-        const int32_t numJobs = (int32_t)cs->m_WaitingJobs.GetSize();
-        for ( int32_t i = ( numJobs - 1 ); i >= 0; --i )
-        {
-            Job * job = cs->m_WaitingJobs[ (size_t)i ];
-            const ToolManifest * manifestForThisJob = job->GetToolManifest();
-            ASSERT( manifestForThisJob );
-            if ( manifestForThisJob == manifest )
-            {
-                // Also check PCH is available if needed
-                const uint64_t pchId = job->GetPchId();
-                if ( pchId != 0 && job->GetPchCachePath().IsEmpty() )
-                {
-                    AString pchPath;
-                    if ( FindCachedPch( pchId, pchPath ) )
-                    {
-                        job->SetPchCachePath( pchPath );
-                    }
-                    else
-                    {
-                        continue; // Still waiting for PCH
-                    }
-                }
-
-                cs->m_WaitingJobs.EraseIndex( (size_t)i );
-                JobQueueRemote::Get().QueueJob( job );
-                PROTOCOL_DEBUG( "Server: Job %x can now be started\n", job );
-            }
-        }
-    }
-}
-
-// CheckWaitingJobsForPch
-//------------------------------------------------------------------------------
-void Server::CheckWaitingJobsForPch( uint64_t pchId )
-{
+    // Queue any jobs whose toolchain has finished syncing AND whose PCH (if
+    // any) is now in the cache. Called whenever a dependency lands —
+    // typically the final MsgFile of a toolchain or a MsgPchFile.
     MutexHolder mhC( m_ClientListMutex );
     for ( ClientState * cs : m_ClientList )
     {
@@ -595,32 +580,25 @@ void Server::CheckWaitingJobsForPch( uint64_t pchId )
         for ( int32_t i = ( numJobs - 1 ); i >= 0; --i )
         {
             Job * job = cs->m_WaitingJobs[ (size_t)i ];
-            if ( job->GetPchId() != pchId )
-            {
-                continue;
-            }
 
-            // Resolve the PCH path
-            AString pchPath;
-            if ( FindCachedPch( pchId, pchPath ) )
-            {
-                job->SetPchCachePath( pchPath );
-            }
-            else
-            {
-                continue; // Shouldn't happen — we just cached it
-            }
-
-            // Check toolchain is also ready
             const ToolManifest * manifest = job->GetToolManifest();
-            if ( manifest && !manifest->IsSynchronized() )
+            ASSERT( manifest );
+            if ( !manifest->IsSynchronized() ) { continue; }
+
+            const uint64_t pchId = job->GetPchId();
+            if ( pchId != 0 && job->GetPchCachePath().IsEmpty() )
             {
-                continue; // Still waiting for toolchain
+                AString pchPath;
+                if ( FindCachedPch( pchId, pchPath ) == false )
+                {
+                    continue;
+                }
+                job->SetPchCachePath( pchPath );
             }
 
             cs->m_WaitingJobs.EraseIndex( (size_t)i );
             JobQueueRemote::Get().QueueJob( job );
-            PROTOCOL_DEBUG( "Server: Job %x can now be started (PCH ready)\n", job );
+            PROTOCOL_DEBUG( "Server: Job %x can now be started\n", job );
         }
     }
 }
@@ -632,18 +610,12 @@ void Server::Process( const ConnectionInfo * /*connection*/, const Protocol::Msg
     const uint64_t pchId = msg->GetPchId();
     const uint32_t uncompressedSize = msg->GetUncompressedSize();
 
-    // Build persistent path: <tmpDir>/.fbuild.tmp/worker/pch.<pchId hex>/pch.pch
     AStackString pchDir;
-    if ( FBuild::GetTempDir( pchDir ) == false )
+    if ( BuildPchCacheDir( pchId, pchDir ) == false )
     {
         FLOG_WARN( "Failed to get temp dir for PCH cache\n" );
         return;
     }
-#if defined( __WINDOWS__ )
-    pchDir.AppendFormat( ".fbuild.tmp\\worker\\pch.%016" PRIx64 "\\", pchId );
-#else
-    pchDir.AppendFormat( "_fbuild.tmp/worker/pch.%016" PRIx64 "/", pchId );
-#endif
 
     AStackString pchFilePath( pchDir );
     pchFilePath += "pch.pch";
@@ -723,7 +695,7 @@ void Server::Process( const ConnectionInfo * /*connection*/, const Protocol::Msg
                  pchId, pchFilePath.Get(), alreadyCached ? "disk" : "new" );
 
     // Release any jobs that were waiting for this PCH
-    CheckWaitingJobsForPch( pchId );
+    ReleaseReadyWaitingJobs();
     JobQueueRemote::Get().WakeMainThread();
 }
 
@@ -740,17 +712,11 @@ void Server::ScanPchCache()
     }
     m_PchCacheScanned = true;
 
-    // Build base path: <tmpDir>/.fbuild.tmp/worker/
     AStackString basePath;
-    if ( FBuild::GetTempDir( basePath ) == false )
+    if ( BuildPchCacheRoot( basePath ) == false )
     {
         return;
     }
-#if defined( __WINDOWS__ )
-    basePath += ".fbuild.tmp\\worker\\";
-#else
-    basePath += "_fbuild.tmp/worker/";
-#endif
 
     if ( FileIO::DirectoryExists( basePath ) == false )
     {
@@ -806,22 +772,18 @@ void Server::ScanPchCache()
         return;
     }
 
-    // LRU eviction: sort by lastWriteTime descending (newest first), keep max 20 entries
-    const uint32_t maxEntries = 20;
-    if ( scannedEntries.GetSize() > maxEntries )
+    // LRU eviction: sort by lastWriteTime descending (newest first), then trim
+    if ( scannedEntries.GetSize() > kMaxCachedPchEntries )
     {
-        // Sort by lastWriteTime descending
         scannedEntries.Sort( []( const PchScanEntry & a, const PchScanEntry & b ) -> bool
         {
             return a.lastWriteTime > b.lastWriteTime;
         });
-
-        // Delete old entries from disk
-        for ( size_t i = maxEntries; i < scannedEntries.GetSize(); ++i )
+        for ( size_t i = kMaxCachedPchEntries; i < scannedEntries.GetSize(); ++i )
         {
             FileIO::FileDelete( scannedEntries[ i ].filePath.Get() );
         }
-        scannedEntries.SetSize( maxEntries );
+        scannedEntries.SetSize( kMaxCachedPchEntries );
     }
 
     // Populate in-memory cache

@@ -265,15 +265,6 @@ namespace Protocol
         uint32_t m_NumEntries;
     };
     static_assert( sizeof( MsgPchInventory ) == sizeof( IMessage ) + 4, "MsgPchInventory message has incorrect size" );
-
-    // MsgServerStatus
-    //------------------------------------------------------------------------------
-    class MsgServerStatus : public IMessage
-    {
-    public:
-        MsgServerStatus();
-    };
-    static_assert( sizeof( MsgServerStatus ) == sizeof( IMessage ), "MsgServerStatus message has incorrect size" );
 }
 
 //------------------------------------------------------------------------------

@@ -295,9 +295,6 @@ void ToolManifest::SerializeForRemote( IOStream & ms ) const
 //------------------------------------------------------------------------------
 bool ToolManifest::DeserializeFromRemote( IOStream & ms )
 {
-    // Validate stream integrity during deserialization.
-    // Corruption detection remains useful even without backwards compat concerns.
-
     // Should not be called more than once
     ASSERT( m_Files.IsEmpty() );
     ASSERT( m_CustomEnvironmentVariables.IsEmpty() );
