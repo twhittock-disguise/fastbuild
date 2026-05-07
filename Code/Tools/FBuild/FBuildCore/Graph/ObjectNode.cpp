@@ -1719,9 +1719,13 @@ Node::BuildResult ObjectNode::GeneratePchUndefs( BuildResult currentResult ) con
     #if defined( __WINDOWS__ )
     if ( currentResult == BuildResult::eOk && IsCreatingPCH() && IsMSVC() && !m_PCHUndefsFileName.IsEmpty() )
     {
+        // The /PD pass mirrors the PCH-creation command (with /Yc), then rewrites
+        // /Yc -> /Zc:preprocessor /PD and /c -> /P. The consumer's option set has
+        // /Yu instead, so the rewrite would no-op and the .i file would lack the
+        // #define lines we need to dump.
         if ( PchDistribution::GenerateUndefsFile( GetCompiler()->GetExecutable(),
                                                    GetCompiler()->GetEnvironmentString(),
-                                                   m_OwnerObjectList->GetCompilerOptions(),
+                                                   m_OwnerObjectList->GetCompilerOptionsPCH(),
                                                    GetSourceFile()->GetName(),
                                                    m_PCHUndefsFileName ) == false )
         {

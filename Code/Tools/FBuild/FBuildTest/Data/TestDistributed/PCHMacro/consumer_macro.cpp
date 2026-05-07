@@ -1,6 +1,4 @@
-#include "pch_macro.h"
+#include "pch_macro.h"          // PCH trigger
+#include "pch_macro_pusher.h"   // non-PCH; survives /E with literal MYMACRO tokens
 
-// Trivial code — the macro collision is in the PCH headers themselves.
-// If the undef block is missing, the MYMACRO function declaration in
-// pch_macro_pusher.h will be re-expanded by /Yu and cause a compile error.
-int g_pchMacroConsumer = 1;
+int g_pchMacroConsumer = CallMYMACRO();
