@@ -17,14 +17,14 @@ public:
     static bool IsValidData( const void * data, size_t dataSize );
     static uint32_t GetUncompressedSize( const void * data, size_t dataSize );
 
+    // Zstd level for toolchain and PCH files pushed to workers
+    inline static const int32_t kZstdTransferLevel = 3;
+
     // compressionLevel:
     //   < 0 : use LZ4, with values directly mapping to "acceleration level"
     //  == 0 : disable compression
     //   > 0 : use LZ4HC, with values directly mapping to "compression level"
     bool Compress( const void * data, size_t dataSize, int32_t compressionLevel = -1 ); // -1 = default LZ4 compression level
-
-    // Zstd level for toolchain and PCH files pushed to workers
-    inline static const int32_t kZstdTransferLevel = 3;
 
     // Zstd
     bool CompressZstd( const void * data, size_t dataSize, int32_t compressionLevel = -1 ); // -1 = default Zstd compression level

@@ -16,6 +16,14 @@ class PchDataCache
 public:
     static PchDataCache & Get();
 
+    explicit PchDataCache( uint32_t maxCompressAttempts = kMaxCompressAttempts,
+                           uint32_t retryDelayMS = kRetryDelayMS );
+    ~PchDataCache();
+
+    // Non-copyable
+    explicit PchDataCache( const PchDataCache & other ) = delete;
+    PchDataCache & operator=( const PchDataCache & other ) = delete;
+
     struct Entry
     {
         uint64_t    pchId;              // xxHash64 of PCH content
@@ -36,19 +44,48 @@ public:
     {
         COMPRESSING,
         READY,
-        FAILED, // reported once, a later call retries
+        FAILED, // gave up after the maximum number of attempts
     };
 
-    // Compressed copy of a PCH for sending to workers. Compression runs once on a
-    // background thread however many connections ask. When READY, the data stays
-    // valid until Clear().
+    // Compressed copy of a PCH for sending to workers. The first request starts
+    // compression on a background thread, however many connections ask. Reading
+    // or compressing is retried after a short delay when it fails. When READY, the
+    // data stays valid until Clear().
     CompressedState GetCompressed( const Entry & entry, const void *& outData, size_t & outSize );
+    uint32_t GetFailedAttempts( uint64_t pchId ) const;
+    bool HasCompressionFailed( uint64_t pchId ) const;
+    size_t GetNumCompressions() const; // PCHs for which compression was started
+
+    struct ReadyPch
+    {
+        uint64_t        pchId;
+        uint32_t        uncompressedSize;
+        const void *    data;
+        size_t          dataSize;
+    };
+
+    // Resolves the PCH ids a connection needs to send. Ids it has already sent, and
+    // ids with no entry, are dropped from pending. READY ones move to sent and
+    // outReady. Ones still compressing stay pending. Returns false if any failed
+    // for good (those are dropped from pending and not marked as sent).
+    bool TakeReadyPchs( Array<uint64_t> & pending,
+                        Array<uint64_t> & sent,
+                        Array<ReadyPch> & outReady );
 
     // Clear all cached entries (call at build end)
     void Clear();
 
+    static const uint32_t kMaxCompressAttempts = 3;
+    static const uint32_t kRetryDelayMS = 200;
+
 private:
     class CompressedPch;
+
+    // PCHs compress one at a time to bound memory and CPU
+    Mutex m_CompressMutex;
+
+    const uint32_t m_MaxCompressAttempts;
+    const uint32_t m_RetryDelayMS;
 
     mutable Mutex m_Mutex;
     Array<Entry> m_Entries;

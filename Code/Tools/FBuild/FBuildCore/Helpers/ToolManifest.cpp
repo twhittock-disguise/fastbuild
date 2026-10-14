@@ -102,7 +102,7 @@ void ToolManifestFile::StoreCompressedContent( const void * uncompressedData, co
     ASSERT( m_CompressedContent == nullptr );
     m_UncompressedContentSize = uncompressedDataSize;
     Compressor c;
-    c.CompressZstd( uncompressedData, m_UncompressedContentSize, Compressor::kZstdTransferLevel );
+    (void)c.CompressZstd( uncompressedData, m_UncompressedContentSize, Compressor::kZstdTransferLevel ); // Result is valid even if compression did not help
     m_CompressedContentSize = (uint32_t)c.GetResultSize();
     m_CompressedContent = c.ReleaseResult();
 }
