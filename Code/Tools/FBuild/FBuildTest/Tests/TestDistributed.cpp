@@ -7,6 +7,8 @@
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/Graph/ObjectNode.h"
+#include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchDataCache.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
@@ -14,7 +16,10 @@
 
 // Core
 #include "Core/FileIO/FileIO.h"
+#include "Core/FileIO/FileStream.h"
+#include "Core/Process/Thread.h"
 #include "Core/Strings/AStackString.h"
+#include "Core/Time/Timer.h"
 #include "Core/Tracing/Tracing.h"
 
 // Defines
@@ -35,6 +40,7 @@ private:
     void WithPCH() const;
     void WithPCHMacroUndefs() const;
     void PchCacheEvictionPolicy() const;
+    void PchCompressedCache() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
     void RemoteRaceWinRemote();
@@ -70,6 +76,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( WithPCHMacroUndefs )
 #endif
     REGISTER_TEST( PchCacheEvictionPolicy )
+    REGISTER_TEST( PchCompressedCache )
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
     REGISTER_TEST( RemoteRaceWinRemote )
@@ -212,6 +219,80 @@ void TestDistributed::PchCacheEvictionPolicy() const
     inUse.Append( 4 );
     Server::SelectPchEvictions( entries, 2, inUse, evictions );
     TEST_ASSERT( evictions.IsEmpty() );
+}
+
+// PchCompressedCache
+//------------------------------------------------------------------------------
+void TestDistributed::PchCompressedCache() const
+{
+    PchDataCache & cache = PchDataCache::Get();
+    cache.Clear();
+
+    // Waits for the background compression to leave the COMPRESSING state
+    auto waitForResult = [ &cache ]( const PchDataCache::Entry & entry, const void *& data, size_t & dataSize )
+    {
+        const Timer timer;
+        PchDataCache::CompressedState state = cache.GetCompressed( entry, data, dataSize );
+        while ( ( state == PchDataCache::COMPRESSING ) && ( timer.GetElapsed() < 30.0f ) )
+        {
+            Thread::Sleep( 10 );
+            state = cache.GetCompressed( entry, data, dataSize );
+        }
+        return state;
+    };
+
+    // A compressible file with some variation
+    const AStackString<> dir( "../tmp/Test/Distributed/PchCompressedCache/" );
+    const AStackString<> path( "../tmp/Test/Distributed/PchCompressedCache/test.pch" );
+    const uint32_t fileSize = ( 3 * 1024 * 1024 );
+    Array<char> content;
+    content.SetSize( fileSize );
+    for ( uint32_t i = 0; i < fileSize; ++i )
+    {
+        content[ i ] = (char)( ( i % 251 ) ^ ( ( i / 4096 ) & 0xFF ) );
+    }
+    TEST_ASSERT( FileIO::EnsurePathExists( dir ) );
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( path.Get(), FileStream::WRITE_ONLY ) );
+        TEST_ASSERT( f.Write( content.Begin(), fileSize ) == fileSize );
+    }
+
+    PchDataCache::Entry entry;
+    entry.pchId = 0x1234;
+    entry.uncompressedSize = fileSize;
+    entry.filePath = path;
+    cache.Store( entry );
+
+    // Compressed once: later requests, whichever connection makes them, see the same buffer
+    const void * data1 = nullptr;
+    size_t size1 = 0;
+    TEST_ASSERT( waitForResult( entry, data1, size1 ) == PchDataCache::READY );
+    const void * data2 = nullptr;
+    size_t size2 = 0;
+    TEST_ASSERT( cache.GetCompressed( entry, data2, size2 ) == PchDataCache::READY );
+    TEST_ASSERT( data1 == data2 );
+    TEST_ASSERT( size1 == size2 );
+    TEST_ASSERT( size1 < fileSize );
+
+    // The worker side decodes it back to the original
+    Compressor c;
+    TEST_ASSERT( Compressor::IsValidData( data1, size1 ) );
+    TEST_ASSERT( c.Decompress( data1 ) );
+    TEST_ASSERT( c.GetResultSize() == fileSize );
+    TEST_ASSERT( memcmp( c.GetResult(), content.Begin(), fileSize ) == 0 );
+
+    // An unreadable file is reported as failed, and asking again retries instead of staying failed
+    PchDataCache::Entry missing;
+    missing.pchId = 0x5678;
+    missing.uncompressedSize = 1024;
+    missing.filePath = "../tmp/Test/Distributed/PchCompressedCache/missing.pch";
+    const void * data3 = nullptr;
+    size_t size3 = 0;
+    TEST_ASSERT( waitForResult( missing, data3, size3 ) == PchDataCache::FAILED );
+    TEST_ASSERT( cache.GetCompressed( missing, data3, size3 ) == PchDataCache::COMPRESSING );
+
+    cache.Clear();
 }
 
 // RegressionTest_RemoteCrashOnErrorFormatting

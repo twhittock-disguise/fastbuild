@@ -34,11 +34,47 @@
 #include "Core/Profile/Profile.h"
 #include "Core/Time/Timer.h"
 
+#include <time.h>
+
 // Defines
 //------------------------------------------------------------------------------
 #define CONNECTION_REATTEMPT_DELAY_TIME ( 10.0f )
 #define SYSTEM_ERROR_ATTEMPT_COUNT ( 3u )
 #define DIST_INFO( ... ) do { if ( m_DetailedLogging ) { FLOG_OUTPUT( __VA_ARGS__ ); } } while ( false )
+
+//------------------------------------------------------------------------------
+namespace
+{
+    // Append to <temp dir>/FBuild-distribution-stats.log (best effort)
+    void AppendDistributionStats( const AString & text )
+    {
+        static Mutex s_Mutex;
+        MutexHolder mh( s_Mutex );
+
+        AStackString<> path;
+        if ( FBuild::GetTempDir( path ) == false )
+        {
+            return;
+        }
+        path += "FBuild-distribution-stats.log";
+
+        FileStream f;
+        if ( f.Open( path.Get(), FileStream::OPEN_OR_CREATE_READ_WRITE ) == false )
+        {
+            return;
+        }
+        const uint64_t kMaxLogSize = ( 4 * 1024 * 1024 );
+        if ( f.GetFileSize() > kMaxLogSize )
+        {
+            f.Truncate();
+        }
+        else
+        {
+            f.Seek( f.GetFileSize() );
+        }
+        f.WriteBuffer( text.Get(), text.GetLength() );
+    }
+}
 
 //------------------------------------------------------------------------------
 class ClientWorkerInfo
@@ -58,6 +94,16 @@ public:
 };
 
 //------------------------------------------------------------------------------
+enum class SendKind : uint8_t
+{
+    Control,
+    Toolchain,
+    Pch,
+    Job,
+    NumKinds
+};
+
+//------------------------------------------------------------------------------
 class ClientSendQueueItem
 {
 public:
@@ -69,10 +115,14 @@ public:
         VERIFY( m_Message.WriteBuffer( &msg, msg.GetSize() ) == msg.GetSize() );
     }
     explicit ClientSendQueueItem( const Protocol::IMessage & msg,
-                                  ConstMemoryStream && payload )
+                                  ConstMemoryStream && payload,
+                                  SendKind kind,
+                                  uint64_t rawBytes )
         : m_Message( msg.GetSize() ) // Prealloc exact size needed
         , m_HasPayload( true )
         , m_Payload( Move( payload ) )
+        , m_Kind( kind )
+        , m_RawBytes( rawBytes )
     {
         VERIFY( m_Message.WriteBuffer( &msg, msg.GetSize() ) == msg.GetSize() );
     }
@@ -88,6 +138,8 @@ public:
     MemoryStream m_Message;
     bool m_HasPayload = false;
     ConstMemoryStream m_Payload;
+    SendKind m_Kind = SendKind::Control;
+    uint64_t m_RawBytes = 0; // Size before compression, for stats
 };
 
 //------------------------------------------------------------------------------
@@ -108,11 +160,15 @@ public:
     ClientWorkerInfo * GetWorker() const { return m_Worker; }
 
     void PushJobsToWorker();
+    void SendPendingPchs();
 
     template <class T>
     void EnqueueSend( const T & msg );
     template <class T>
-    void EnqueueSend( const T & msg, ConstMemoryStream && payload );
+    void EnqueueSend( const T & msg,
+                      ConstMemoryStream && payload,
+                      SendKind kind = SendKind::Control,
+                      uint64_t rawBytes = 0 );
 
 private:
     virtual void OnDisconnected( const ConnectionInfo * connection ) override;
@@ -134,6 +190,7 @@ private:
     static uint32_t SendQueueThreadFuncStatic( void * param );
     void SendQueueThreadFunc();
     void SendQueueMainLoop( const ConnectionInfo * ci );
+    void WriteStats() const;
 
     // Initialization data
     Client * const m_Client; // Owner Client class
@@ -159,6 +216,21 @@ private:
     Atomic<uint32_t> m_JobsInFlight{ 0 };
     Array<uint64_t> m_SentToolchains; // Protected by m_Mutex
     Array<uint64_t> m_SentPchIds;     // Protected by m_Mutex
+    Array<uint64_t> m_PendingPchIds;  // Needed by this worker, compression not finished. Protected by m_Mutex
+
+    // Stats written to the distribution log when the connection closes
+    struct SendStats
+    {
+        uint32_t m_Messages = 0;
+        uint64_t m_RawBytes = 0;
+        uint64_t m_SentBytes = 0;
+        float m_SendTime = 0.0f;    // Time spent handing data to the socket
+        float m_LastSentAt = 0.0f;  // Connection time when the last message was handed over
+    };
+    SendStats m_SendStats[ (size_t)SendKind::NumKinds ]; // Send thread only
+    Timer m_ConnectionTimer;
+    Atomic<uint32_t> m_ResultsReceived{ 0 };
+    Atomic<uint64_t> m_ResultBytesReceived{ 0 };
 
     // Queue of messages to send
     Mutex m_SendQueueMutex;
@@ -430,6 +502,12 @@ void Client::CommunicateJobAvailability()
 {
     PROFILE_FUNCTION;
 
+    // PCHs finish compressing independently of job availability
+    for ( UniquePtr<ClientToWorkerConnection> & ss : m_ActiveConnections )
+    {
+        ss->SendPendingPchs();
+    }
+
     // Early out when there are no distributable jobs
     if ( JobQueue::Get().GetNumDistributableJobsAvailable() == 0 )
     {
@@ -657,7 +735,8 @@ void ClientToWorkerConnection::PushJobsToWorker()
                 MemoryStream ms;
                 manifest.SerializeForRemote( ms );
                 EnqueueSend( Protocol::MsgManifest( toolId ),
-                             Move( ConstMemoryStream( Move( ms ) ) ) );
+                             Move( ConstMemoryStream( Move( ms ) ) ),
+                             SendKind::Toolchain );
 
                 const Array<ToolManifestFile> & files = manifest.GetFiles();
                 for ( uint32_t i = 0; i < files.GetSize(); ++i )
@@ -667,61 +746,26 @@ void ClientToWorkerConnection::PushJobsToWorker()
                     if ( data )
                     {
                         EnqueueSend( Protocol::MsgFile( toolId, i ),
-                                     Move( ConstMemoryStream( data, dataSize ) ) );
+                                     Move( ConstMemoryStream( data, dataSize ) ),
+                                     SendKind::Toolchain,
+                                     files[ i ].GetUncompressedContentSize() );
                     }
                 }
                 m_SentToolchains.Append( toolId );
             }
         }
 
-        // Push PCH data if not yet sent to this worker
+        // Queue PCH data if not yet sent to this worker
         const uint64_t pchId = job->GetPchId();
         if ( pchId != 0 )
         {
-            // Check under lock whether we've already sent this PCH
-            bool needsSend = false;
             PchDataCache::Entry entry;
+            MutexHolder mh( m_Mutex );
+            if ( ( m_SentPchIds.Find( pchId ) == nullptr ) &&
+                 ( m_PendingPchIds.Find( pchId ) == nullptr ) &&
+                 PchDataCache::Get().Find( pchId, entry ) )
             {
-                MutexHolder mh( m_Mutex );
-                if ( m_SentPchIds.Find( pchId ) == nullptr )
-                {
-                    needsSend = PchDataCache::Get().Find( pchId, entry );
-                    if ( needsSend )
-                    {
-                        m_SentPchIds.Append( pchId ); // Mark as in-flight to prevent duplicates
-                    }
-                }
-            }
-
-            // Read + compress outside the lock to avoid blocking the connection
-            if ( needsSend )
-            {
-                FileStream pchFile;
-                if ( pchFile.Open( entry.filePath.Get(), FileStream::READ_ONLY ) == false )
-                {
-                    FLOG_WARN( "PCH distribution: failed to open '%s' for sending\n", entry.filePath.Get() );
-                }
-                else
-                {
-                    const uint32_t fileSize = entry.uncompressedSize;
-                    UniquePtr<char, FreeDeletor> pchData( (char *)ALLOC( fileSize ) );
-                    if ( pchFile.Read( pchData.Get(), fileSize ) == fileSize )
-                    {
-                        pchFile.Close();
-
-                        Compressor c;
-                        c.Compress( pchData.Get(), fileSize );
-
-                        MemoryStream ms;
-                        ms.WriteBuffer( c.GetResult(), c.GetResultSize() );
-
-                        EnqueueSend( Protocol::MsgPchFile( pchId, entry.uncompressedSize ),
-                                     Move( ConstMemoryStream( Move( ms ) ) ) );
-
-                        DIST_INFO( " - Sent PCH 0x%016" PRIx64 " to %s (%zu bytes compressed)\n",
-                                   pchId, m_Worker->m_Address.Get(), c.GetResultSize() );
-                    }
-                }
+                m_PendingPchIds.Append( pchId );
             }
         }
 
@@ -759,9 +803,63 @@ void ClientToWorkerConnection::PushJobsToWorker()
         job->SetResultCompressionLevel( resultCompressionLevel, allowZstdUse );
 
         EnqueueSend( Protocol::MsgJob( toolId, resultCompressionLevel ),
-                     Move( ConstMemoryStream( Move( stream ) ) ) );
+                     Move( ConstMemoryStream( Move( stream ) ) ),
+                     SendKind::Job );
 
         toSend--;
+    }
+}
+
+// SendPendingPchs
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::SendPendingPchs()
+{
+    MutexHolder mh( m_Mutex );
+
+    for ( size_t i = m_PendingPchIds.GetSize(); i > 0; --i )
+    {
+        const uint64_t pchId = m_PendingPchIds[ i - 1 ];
+
+        // The worker may have reported it since it was queued
+        bool send = ( m_SentPchIds.Find( pchId ) == nullptr );
+        PchDataCache::Entry entry;
+        const void * data = nullptr;
+        size_t dataSize = 0;
+        if ( send )
+        {
+            if ( PchDataCache::Get().Find( pchId, entry ) == false )
+            {
+                send = false;
+            }
+            else
+            {
+                const PchDataCache::CompressedState state = PchDataCache::Get().GetCompressed( entry, data, dataSize );
+                if ( state == PchDataCache::COMPRESSING )
+                {
+                    continue;
+                }
+                if ( state == PchDataCache::FAILED )
+                {
+                    FLOG_WARN( "PCH distribution: could not prepare PCH 0x%016" PRIx64 " for %s\n",
+                               pchId, m_Worker->m_Address.Get() );
+                    send = false; // Not marked as sent, so a later job asks again
+                }
+            }
+        }
+        m_PendingPchIds.EraseIndex( i - 1 );
+        if ( send == false )
+        {
+            continue;
+        }
+
+        m_SentPchIds.Append( pchId );
+        EnqueueSend( Protocol::MsgPchFile( pchId, entry.uncompressedSize ),
+                     Move( ConstMemoryStream( data, dataSize ) ),
+                     SendKind::Pch,
+                     entry.uncompressedSize );
+
+        DIST_INFO( " - Sent PCH 0x%016" PRIx64 " to %s (%zu bytes compressed)\n",
+                   pchId, m_Worker->m_Address.Get(), dataSize );
     }
 }
 
@@ -778,6 +876,9 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
 
     // Decrement in-flight count immediately
     m_JobsInFlight.Decrement();
+
+    m_ResultsReceived.Increment();
+    m_ResultBytesReceived.Add( payloadSize );
 
     ConstMemoryStream ms( payload, payloadSize );
 
@@ -1199,7 +1300,8 @@ void ClientToWorkerConnection::Process( const ConnectionInfo * connection,
 
     // Send file to worker
     EnqueueSend( Protocol::MsgFile( toolId, fileId ),
-                 Move( ms ) );
+                 Move( ms ),
+                 SendKind::Toolchain );
 }
 
 // FindManifest
@@ -1266,11 +1368,14 @@ void ClientToWorkerConnection::EnqueueSend( const T & msg )
 
 //------------------------------------------------------------------------------
 template <class T>
-void ClientToWorkerConnection::EnqueueSend( const T & msg, ConstMemoryStream && payload )
+void ClientToWorkerConnection::EnqueueSend( const T & msg,
+                                            ConstMemoryStream && payload,
+                                            SendKind kind,
+                                            uint64_t rawBytes )
 {
     {
         MutexHolder lock( m_SendQueueMutex );
-        m_SendQueue.EmplaceBack( msg, Move( payload ) );
+        m_SendQueue.EmplaceBack( msg, Move( payload ), kind, rawBytes );
     }
     m_SendThreadWakeSemaphore.Signal();
 }
@@ -1320,10 +1425,60 @@ void ClientToWorkerConnection::SendQueueThreadFunc()
     {
         SendQueueMainLoop( ci );
     }
+    WriteStats();
 
     // Note terminated connection
     ASSERT( ClientWorkerInfo::s_NumConnections.Load() > 0 );
     ClientWorkerInfo::s_NumConnections.Decrement();
+}
+
+// WriteStats
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::WriteStats() const
+{
+    const float mb = ( 1024.0f * 1024.0f );
+    const SendStats & toolchain = m_SendStats[ (size_t)SendKind::Toolchain ];
+    const SendStats & pch = m_SendStats[ (size_t)SendKind::Pch ];
+    const SendStats & jobs = m_SendStats[ (size_t)SendKind::Job ];
+
+    uint64_t totalSent = 0;
+    float totalSendTime = 0.0f;
+    for ( const SendStats & s : m_SendStats )
+    {
+        totalSent += s.m_SentBytes;
+        totalSendTime += s.m_SendTime;
+    }
+    const float mbPerSecond = ( totalSendTime > 0.0f ) ? ( ( (float)totalSent / mb ) / totalSendTime ) : 0.0f;
+
+    const time_t now = time( nullptr );
+    char timeBuffer[ 32 ] = "";
+    PRAGMA_DISABLE_PUSH_MSVC( 4996 ) // This function or variable may be unsafe...
+    PRAGMA_DISABLE_PUSH_CLANG_WINDOWS( "-Wdeprecated-declarations" )
+    const struct tm * timeInfo = localtime( &now );
+    PRAGMA_DISABLE_POP_CLANG_WINDOWS
+    PRAGMA_DISABLE_POP_MSVC
+    if ( timeInfo )
+    {
+        strftime( timeBuffer, sizeof( timeBuffer ), "%Y-%m-%d %H:%M:%S", timeInfo );
+    }
+
+    AStackString<> block;
+    block.AppendFormat( "[%s] worker %s, connected %.1fs\n",
+                        timeBuffer, m_Worker->m_Address.Get(), m_ConnectionTimer.GetElapsed() );
+    block.AppendFormat( "  toolchain: %u msgs, %.1f MB raw, %.1f MB sent, send time %.1fs, done at %.1fs\n",
+                        toolchain.m_Messages, (float)toolchain.m_RawBytes / mb, (float)toolchain.m_SentBytes / mb,
+                        toolchain.m_SendTime, toolchain.m_LastSentAt );
+    block.AppendFormat( "  pch:       %u msgs, %.1f MB raw, %.1f MB sent, send time %.1fs, done at %.1fs\n",
+                        pch.m_Messages, (float)pch.m_RawBytes / mb, (float)pch.m_SentBytes / mb,
+                        pch.m_SendTime, pch.m_LastSentAt );
+    block.AppendFormat( "  jobs:      %u sent, %.1f MB, send time %.1fs\n",
+                        jobs.m_Messages, (float)jobs.m_SentBytes / mb, jobs.m_SendTime );
+    block.AppendFormat( "  results:   %u received, %.1f MB\n",
+                        m_ResultsReceived.Load(), (float)m_ResultBytesReceived.Load() / mb );
+    block.AppendFormat( "  upload:    %.1f MB in %.1fs of send time = %.2f MB/s (%.1f Mbit/s)\n\n",
+                        (float)totalSent / mb, totalSendTime, mbPerSecond, mbPerSecond * 8.0f );
+
+    AppendDistributionStats( block );
 }
 
 //------------------------------------------------------------------------------
@@ -1357,6 +1512,7 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
             PROFILE_SECTION( "SendMsg" );
 
             // Send message
+            const Timer sendTimer;
             const bool sendOk = item.m_HasPayload ? Send( ci,
                                                           item.m_Message.GetData(),
                                                           item.m_Message.GetSize(),
@@ -1368,7 +1524,16 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
 
             // If the send fails, we should be disconnected
             ASSERT( sendOk || ( m_SendThreadQuit.Load() == true ) );
-            (void)sendOk;
+
+            if ( sendOk )
+            {
+                SendStats & stats = m_SendStats[ (size_t)item.m_Kind ];
+                stats.m_Messages++;
+                stats.m_RawBytes += item.m_RawBytes;
+                stats.m_SentBytes += ( item.m_Message.GetSize() + ( item.m_HasPayload ? item.m_Payload.GetSize() : 0 ) );
+                stats.m_SendTime += sendTimer.GetElapsed();
+                stats.m_LastSentAt = m_ConnectionTimer.GetElapsed();
+            }
 
             // If signaled to exit for any reason, don't process additional items
             // (exit signal can come from a send failure above, or a receive failure

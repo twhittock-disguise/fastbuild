@@ -32,12 +32,27 @@ public:
     // Find a cached PCH by file path (thread-safe, copies entry while mutex held)
     bool FindByPath( const AString & filePath, Entry & outEntry ) const;
 
+    enum CompressedState
+    {
+        COMPRESSING,
+        READY,
+        FAILED, // reported once, a later call retries
+    };
+
+    // Compressed copy of a PCH for sending to workers. Compression runs once on a
+    // background thread however many connections ask. When READY, the data stays
+    // valid until Clear().
+    CompressedState GetCompressed( const Entry & entry, const void *& outData, size_t & outSize );
+
     // Clear all cached entries (call at build end)
     void Clear();
 
 private:
+    class CompressedPch;
+
     mutable Mutex m_Mutex;
     Array<Entry> m_Entries;
+    Array<CompressedPch *> m_Compressed;
 };
 
 //------------------------------------------------------------------------------
