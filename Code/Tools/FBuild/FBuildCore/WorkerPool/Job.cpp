@@ -8,6 +8,7 @@
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/FLog.h"
 #include "Tools/FBuild/FBuildCore/Graph/Node.h"
+#include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 
 // Core
 #include "Core/Env/Assert.h"
@@ -62,7 +63,24 @@ Job::~Job()
         FDELETE m_Node;
     }
 
+    if ( m_ToolManifest )
+    {
+        m_ToolManifest->ReleaseUse();
+    }
+
     ASSERT( m_BuildProfilerScope == nullptr ); // If set, must be unhooked
+}
+
+// SetToolManifest
+//------------------------------------------------------------------------------
+void Job::SetToolManifest( ToolManifest * manifest )
+{
+    ASSERT( m_ToolManifest == nullptr );
+    m_ToolManifest = manifest;
+    if ( m_ToolManifest )
+    {
+        m_ToolManifest->AcquireUse();
+    }
 }
 
 // Cancel

@@ -144,6 +144,7 @@ private:
     void Process( const ConnectionInfo * connection, const Protocol::MsgRequestFile * msg );
     void Process( const Protocol::MsgConnectionAck * msg );
     void Process( const Protocol::MsgPchInventory * msg, const void * payload, size_t payloadSize );
+    void Process( const Protocol::MsgToolchainInventory * msg, const void * payload, size_t payloadSize );
 
     void ProcessJobResultCommon( bool isCompressed, const void * payload, size_t payloadSize );
 
@@ -178,7 +179,12 @@ private:
     // Push-based job tracking
     Atomic<uint32_t> m_WorkerCapacity{ 0 };
     Atomic<uint32_t> m_JobsInFlight{ 0 };
+    Atomic<bool> m_AckReceived{ false };
+    Atomic<bool> m_AwaitingInventory{ true }; // Jobs wait for the worker's toolchain inventory, so they are not sent what it already has
     Array<uint64_t> m_SentToolchains; // Protected by m_Mutex
+    Array<uint64_t> m_CachedToolchains; // Reported by the worker. Protected by m_Mutex
+    mutable Mutex m_SkippedToolchainsMutex; // Separate from m_Mutex as the send thread reads it while m_Mutex is held to wait for that thread
+    Array<uint64_t> m_SkippedToolchains; // Of those, the ones we would otherwise have sent
     Array<uint64_t> m_SentPchIds;     // Protected by m_Mutex
     Array<uint64_t> m_PendingPchIds;  // Needed by this worker, not yet queued. Protected by m_Mutex
 
@@ -230,6 +236,11 @@ uint32_t Client::GetNumConnections() const
 {
     MutexHolder mh( m_Mutex );
     DIST_INFO( "Disconnected: %s\n", m_Worker->m_Address.Get() );
+    if ( m_AckReceived.Load() == false )
+    {
+        FLOG_WARN( "Worker %s closed the connection before completing the handshake. A worker with a different protocol version does this (this client uses v%u). FBuild and FBuildWorker must be updated together.\n",
+                   m_Worker->m_Address.Get(), Protocol::kVersionMajor );
+    }
     if ( m_Jobs.IsEmpty() == false )
     {
         for ( Job * job : m_Jobs )
@@ -550,6 +561,12 @@ void Client::CommunicateJobAvailability()
             Process( msg, payload, payloadSize );
             break;
         }
+        case Protocol::MSG_TOOLCHAIN_INVENTORY:
+        {
+            const Protocol::MsgToolchainInventory * msg = static_cast<const Protocol::MsgToolchainInventory *>( imsg );
+            Process( msg, payload, payloadSize );
+            break;
+        }
         default:
         {
             // unknown message type
@@ -602,6 +619,7 @@ void ClientToWorkerConnection::Process( const Protocol::MsgConnectionAck * msg )
     m_WorkerVersion.Store( msg->GetWorkerVersion() );
     m_ProtocolVersionMinor.Store( msg->GetProtocolVersionMinor() );
     m_WorkerCapacity.Store( msg->GetWorkerCapacity() );
+    m_AckReceived.Store( true );
     DIST_INFO( " - Worker %s is v%u.%u (protocol v%u.%u) capacity=%u\n",
                m_Worker->m_Address.Get(),
                ( m_WorkerVersion.Load() / 100U ),
@@ -610,8 +628,7 @@ void ClientToWorkerConnection::Process( const Protocol::MsgConnectionAck * msg )
                m_ProtocolVersionMinor.Load(),
                msg->GetWorkerCapacity() );
 
-    // Push initial batch of jobs to fill worker capacity
-    PushJobsToWorker();
+    // The initial batch of jobs is pushed once the toolchain inventory arrives, right behind the ack
 }
 
 // Process( MsgPchInventory )
@@ -654,6 +671,40 @@ void ClientToWorkerConnection::Process( const Protocol::MsgPchInventory * msg,
                m_Worker->m_Address.Get(), numEntries );
 }
 
+// Process( MsgToolchainInventory )
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::Process( const Protocol::MsgToolchainInventory * msg,
+                                        const void * payload,
+                                        size_t payloadSize )
+{
+    PROFILE_SECTION( "MsgToolchainInventory" );
+
+    const uint32_t numEntries = msg->GetNumEntries();
+    if ( payloadSize < ( (size_t)numEntries * sizeof( uint64_t ) ) )
+    {
+        DIST_INFO( " - Worker %s sent truncated toolchain inventory\n", m_Worker->m_Address.Get() );
+    }
+    else if ( numEntries > 0 )
+    {
+        // Pre-populate m_SentToolchains with all the toolchains the worker already has
+        const uint64_t * toolIds = static_cast<const uint64_t *>( payload );
+        MutexHolder mh( m_Mutex );
+        for ( uint32_t i = 0; i < numEntries; ++i )
+        {
+            if ( m_SentToolchains.Find( toolIds[ i ] ) == nullptr )
+            {
+                m_SentToolchains.Append( toolIds[ i ] );
+                m_CachedToolchains.Append( toolIds[ i ] );
+            }
+        }
+        DIST_INFO( " - Worker %s has %u cached toolchains\n", m_Worker->m_Address.Get(), numEntries );
+    }
+
+    // Both inventories have now been processed
+    m_AwaitingInventory.Store( false );
+    PushJobsToWorker();
+}
+
 // PushJobsToWorker
 //------------------------------------------------------------------------------
 void ClientToWorkerConnection::PushJobsToWorker()
@@ -662,7 +713,7 @@ void ClientToWorkerConnection::PushJobsToWorker()
 
     const uint32_t capacity = m_WorkerCapacity.Load();
     const uint32_t inFlight = m_JobsInFlight.Load();
-    if ( ( inFlight >= capacity ) || m_Worker->m_DenyListed || ( capacity == 0 ) || m_SendThreadQuit.Load() )
+    if ( ( inFlight >= capacity ) || m_Worker->m_DenyListed || ( capacity == 0 ) || m_SendThreadQuit.Load() || m_AwaitingInventory.Load() )
     {
         return;
     }
@@ -708,6 +759,15 @@ void ClientToWorkerConnection::PushJobsToWorker()
                     }
                 }
                 m_SentToolchains.Append( toolId );
+            }
+            else if ( m_CachedToolchains.Find( toolId ) != nullptr )
+            {
+                MutexHolder skippedMH( m_SkippedToolchainsMutex );
+                if ( m_SkippedToolchains.Find( toolId ) == nullptr )
+                {
+                    m_SkippedToolchains.Append( toolId );
+                    DIST_INFO( " - Toolchain 0x%016" PRIx64 " is cached on %s\n", toolId, m_Worker->m_Address.Get() );
+                }
             }
         }
 
@@ -1393,6 +1453,10 @@ void ClientToWorkerConnection::WriteStats() const
 
     stats.m_WorkerAddress = m_Worker->m_Address;
     stats.m_ConnectedTime = m_ConnectionTimer.GetElapsed();
+    {
+        MutexHolder mh( m_SkippedToolchainsMutex );
+        stats.m_SkippedToolchains = m_SkippedToolchains;
+    }
     DistributionStats::WriteToTempLog( stats );
 }
 

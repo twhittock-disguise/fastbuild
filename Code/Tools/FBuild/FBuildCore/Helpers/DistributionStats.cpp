@@ -44,6 +44,10 @@ namespace
     outText.AppendFormat( "[%s] worker %s, connected %.1fs\n",
                           timestamp, stats.m_WorkerAddress.Get(), stats.m_ConnectedTime );
     AppendBulkLine( outText, "toolchain:", stats.m_Toolchain );
+    for ( const uint64_t toolId : stats.m_SkippedToolchains )
+    {
+        outText.AppendFormat( "  toolchain: 0x%016" PRIx64 " skipped (cached on worker)\n", toolId );
+    }
     AppendBulkLine( outText, "pch:", stats.m_Pch );
     outText.AppendFormat( "  jobs:      %u sent, %.1f MB, send time %.1fs\n",
                           stats.m_Jobs.m_Messages, ToMB( stats.m_Jobs.m_SentBytes ), stats.m_Jobs.m_SendTime );

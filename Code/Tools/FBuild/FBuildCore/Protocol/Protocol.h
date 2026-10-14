@@ -31,7 +31,7 @@ namespace Protocol
     inline static const uint16_t kPort = 31264; // Arbitrarily chosen port
 
     // Protocol Version
-    inline static const uint32_t kVersionMajor = 23; // Changes here make workers incompatible
+    inline static const uint32_t kVersionMajor = 24; // Changes here make workers incompatible
     inline static const uint8_t kVersionMinor = 6; // Changes must be forwards and backwards compatible
 
     inline static const uint16_t kTestPort = kPort + 1; // Different port for use by tests
@@ -51,6 +51,7 @@ namespace Protocol
         MSG_PCH_INVENTORY = 9,         // Worker -> Client : Advertise cached PCH IDs
         MSG_REQUEST_MANIFEST = 10,      // Worker -> Client : Request manifest (disconnect recovery)
         MSG_REQUEST_FILE = 11,          // Worker -> Client : Request file (disconnect recovery)
+        MSG_TOOLCHAIN_INVENTORY = 12,   // Worker -> Client : Advertise cached toolchain IDs
 
         NUM_MESSAGES            // leave last
     };
@@ -265,6 +266,20 @@ namespace Protocol
         uint32_t m_NumEntries;
     };
     static_assert( sizeof( MsgPchInventory ) == sizeof( IMessage ) + 4, "MsgPchInventory message has incorrect size" );
+
+    // MsgToolchainInventory
+    //------------------------------------------------------------------------------
+    class MsgToolchainInventory : public IMessage
+    {
+    public:
+        explicit MsgToolchainInventory( uint32_t numEntries );
+
+        uint32_t GetNumEntries() const { return m_NumEntries; }
+
+    private:
+        uint32_t m_NumEntries;
+    };
+    static_assert( sizeof( MsgToolchainInventory ) == sizeof( IMessage ) + 4, "MsgToolchainInventory message has incorrect size" );
 }
 
 //------------------------------------------------------------------------------

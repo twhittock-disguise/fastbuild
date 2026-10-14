@@ -4,6 +4,7 @@
 
 // Includes
 //------------------------------------------------------------------------------
+#include "Core/Containers/Array.h"
 #include "Core/Env/Types.h"
 #include "Core/Strings/AString.h"
 
@@ -25,6 +26,7 @@ struct DistributionConnectionStats
     AString                 m_WorkerAddress;
     double                  m_ConnectedTime = 0.0;
     DistributionSendStats   m_Toolchain;
+    Array<uint64_t>         m_SkippedToolchains; // Already cached on the worker
     DistributionSendStats   m_Pch;
     DistributionSendStats   m_Jobs;
     uint32_t                m_ResultsReceived = 0;

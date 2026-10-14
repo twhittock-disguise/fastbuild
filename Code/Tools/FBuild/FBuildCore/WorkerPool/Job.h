@@ -47,7 +47,7 @@ public:
     void SetUserData( void * data ) { m_UserData = data; }
     void * GetUserData() const { return m_UserData; }
 
-    void SetToolManifest( ToolManifest * manifest ) { m_ToolManifest = manifest; }
+    void SetToolManifest( ToolManifest * manifest ); // The job uses the manifest until it is destroyed
     ToolManifest * GetToolManifest() const { return m_ToolManifest; }
 
     void SetPchCachePath( const AString & path ) { m_PchCachePath = path; }

@@ -41,6 +41,7 @@ const char * GetProtocolMessageDebugName( Protocol::MessageType msgType )
         "PchInventory",
         "RequestManifest",
         "RequestFile",
+        "ToolchainInventory",
     };
     // clang-format on
     static_assert( ( sizeof( msgNames ) / sizeof( const char * ) ) == Protocol::NUM_MESSAGES, "msgNames item count doesn't match NUM_MESSAGES" );
@@ -208,6 +209,14 @@ Protocol::MsgPchFile::MsgPchFile( uint64_t pchId, uint32_t uncompressedSize )
 //------------------------------------------------------------------------------
 Protocol::MsgPchInventory::MsgPchInventory( uint32_t numEntries )
     : Protocol::IMessage( Protocol::MSG_PCH_INVENTORY, sizeof( MsgPchInventory ), numEntries > 0 )
+    , m_NumEntries( numEntries )
+{
+}
+
+// MsgToolchainInventory
+//------------------------------------------------------------------------------
+Protocol::MsgToolchainInventory::MsgToolchainInventory( uint32_t numEntries )
+    : Protocol::IMessage( Protocol::MSG_TOOLCHAIN_INVENTORY, sizeof( MsgToolchainInventory ), numEntries > 0 )
     , m_NumEntries( numEntries )
 {
 }

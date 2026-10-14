@@ -79,6 +79,7 @@ private:
         AString m_HostName;
 
         Array<Job *> m_WaitingJobs; // jobs waiting for manifests/toolchains
+        Array<ToolManifest *> m_KnownTools; // toolchains this client may send jobs for, each holding a use
     };
 
     uint32_t m_PrefetchBuffer = 0;
@@ -91,6 +92,23 @@ private:
 
     mutable Mutex m_ToolManifestsMutex;
     Array<ToolManifest *> m_Tools;
+
+    // Toolchain cache: synchronized toolchains stay on disk (with a persisted manifest) across
+    // connections and worker restarts, and are advertised to clients that support it
+    struct ToolchainEvictionEntry
+    {
+        uint64_t    lastUsed;
+        bool        isProtected; // in use, or just added
+    };
+    void ScanToolchainCache();
+    void SendToolchainInventory( const ConnectionInfo * connection, ClientState * cs );
+    void OnToolchainSynchronized( ToolManifest * manifest );
+    void EvictToolchains( const ToolManifest * keep );
+    static void SelectToolchainEvictions( const Array<ToolchainEvictionEntry> & entries,
+                                          uint32_t maxEntries,
+                                          Array<size_t> & outIndicesToEvict );
+    Atomic<uint32_t> m_NumManifestsReceived;
+    Atomic<uint32_t> m_NumToolFilesReceived;
 
     // PCH cache for distributed builds
     struct PchCacheEntry

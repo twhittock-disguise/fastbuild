@@ -13,6 +13,7 @@ class Node;
 //------------------------------------------------------------------------------
 #include "Core/Containers/Array.h"
 #include "Core/Env/Types.h"
+#include "Core/Process/Atomic.h"
 #include "Core/Process/Mutex.h"
 #include "Core/Reflection/ReflectionMacros.h"
 #include "Core/Reflection/Struct.h"
@@ -25,7 +26,7 @@ class ToolManifestFile : public Struct
     REFLECT_STRUCT_DECLARE( ToolManifestFile )
 public:
     ToolManifestFile();
-    explicit ToolManifestFile( const AString & name, uint64_t stamp, uint32_t hash, uint32_t size );
+    explicit ToolManifestFile( const AString & name, uint64_t stamp, uint64_t hash, uint32_t size );
     ~ToolManifestFile();
 
     enum SyncState
@@ -44,13 +45,14 @@ public:
     // Access state
     const AString & GetName() const { return m_Name; }
     uint64_t GetTimeStamp() const { return m_TimeStamp; }
-    uint32_t GetHash() const { return m_Hash; }
+    uint64_t GetHash() const { return m_Hash; }
     uint32_t GetUncompressedContentSize() const { return m_UncompressedContentSize; }
     SyncState GetSyncState() const { return m_SyncState; }
 
     // Modify state
     void SetSyncState( SyncState state ) { m_SyncState = state; }
     void SetFileLock( FileStream * fileLock ) { m_FileLock = fileLock; }
+    void ReleaseFileLock();
 
 protected:
     bool LoadFile( void *& uncompressedContent, uint32_t & uncompressedContentSize ) const;
@@ -58,7 +60,7 @@ protected:
     // common members
     AString m_Name;
     uint64_t m_TimeStamp = 0;
-    uint32_t m_Hash = 0;
+    uint64_t m_Hash = 0;
     mutable uint32_t m_UncompressedContentSize = 0;
     mutable uint32_t m_CompressedContentSize = 0;
 
@@ -89,6 +91,21 @@ public:
 
     void SerializeForRemote( IOStream & ms ) const;
     bool DeserializeFromRemote( IOStream & ms );
+
+    // Worker-side persistence, so a toolchain survives a worker restart
+    bool SaveToDisk();
+    static ToolManifest * LoadFromDisk( const AString & manifestPath ); // Only returns a toolchain whose files all verify
+    static const char * GetPersistedFileName();
+    void GetPersistedPath( AString & path ) const;
+    void DeleteFromDisk();
+
+    // Worker-side use tracking: a toolchain with users must not be evicted.
+    // Users are jobs, and connections that expect the toolchain to remain available.
+    void AcquireUse() { m_NumUsers.Increment(); }
+    void ReleaseUse() { m_NumUsers.Decrement(); }
+    bool IsInUse() const { return ( m_NumUsers.Load() > 0 ); }
+    uint64_t GetLastUsed() const { return m_LastUsed; }
+    void MarkUsed();
 
     bool IsSynchronized() const { return m_Synchronized; }
     bool GetSynchronizationStatus( uint32_t & syncDone, uint32_t & syncTotal ) const;
@@ -137,6 +154,9 @@ private:
     bool m_Synchronized;
     const char * m_RemoteEnvironmentString;
     void * m_UserData;
+    Atomic<uint32_t> m_NumUsers;
+    uint64_t m_LastUsed = 0; // Worker-side recency for eviction, protected by the owner's lock
+    bool m_Persisted = false;
 };
 
 //------------------------------------------------------------------------------

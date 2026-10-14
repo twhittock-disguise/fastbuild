@@ -17,6 +17,7 @@
 #include "Core/Math/xxHash.h"
 #include "Core/Profile/Profile.h"
 #include "Core/Strings/AStackString.h"
+#include "Core/Time/Time.h"
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/FLog.h"
@@ -25,6 +26,15 @@
 
 // system
 #include <memory.h> // memcpy
+
+// Defines
+//------------------------------------------------------------------------------
+namespace
+{
+    // Start of a manifest stored in a worker's toolchain directory
+    constexpr uint32_t kPersistedManifestMagic = 0x4d544246; // 'FBTM'
+    constexpr const char * kPersistedManifestName = "fbuild_toolchain.manifest";
+}
 
 // Reflection
 //------------------------------------------------------------------------------
@@ -50,7 +60,7 @@ ToolManifestFile::ToolManifestFile() = default;
 
 // CONSTRUCTOR (ToolManifestFile)
 //------------------------------------------------------------------------------
-ToolManifestFile::ToolManifestFile( const AString & name, uint64_t stamp, uint32_t hash, uint32_t size )
+ToolManifestFile::ToolManifestFile( const AString & name, uint64_t stamp, uint64_t hash, uint32_t size )
     : m_Name( name )
     , m_TimeStamp( stamp )
     , m_Hash( hash )
@@ -64,6 +74,14 @@ ToolManifestFile::~ToolManifestFile()
 {
     FREE( m_CompressedContent );
     FDELETE( m_FileLock );
+}
+
+// ReleaseFileLock (ToolManifestFile)
+//------------------------------------------------------------------------------
+void ToolManifestFile::ReleaseFileLock()
+{
+    FDELETE m_FileLock;
+    m_FileLock = nullptr;
 }
 
 // CONSTRUCTOR
@@ -131,7 +149,7 @@ bool ToolManifestFile::DoBuild( bool skipHashing )
         }
 
         // We hash the NAME instead of the CONTENT.
-        m_Hash = xxHash3::Calc32( m_Name );
+        m_Hash = xxHash3::Calc64( m_Name );
         m_TimeStamp = lastWriteTime;
         return true; // We're done, skip the expensive file I/O below
     }
@@ -158,7 +176,7 @@ bool ToolManifestFile::DoBuild( bool skipHashing )
     m_UncompressedContentSize = uncompressedContentSize;
 
     // Store the hash and timestamp
-    m_Hash = xxHash::Calc32( uncompressedContent, uncompressedContentSize ); // TODO:C Switch to 64 bit hash
+    m_Hash = xxHash3::Calc64Big( uncompressedContent, uncompressedContentSize );
     m_TimeStamp = FileIO::GetFileLastWriteTime( m_Name );
 
     // Compress and keep the data if it might be useful
@@ -216,23 +234,28 @@ bool ToolManifest::DoBuild( const Dependencies & dependencies, bool skipHashing 
     }
 
     // create a hash for the whole tool chain
+    struct FileIdentity
+    {
+        uint64_t m_ContentHash;
+        uint32_t m_Size;
+        uint32_t m_PathHash;
+    };
     const size_t numFiles( m_Files.GetSize() );
-    const size_t memSize( numFiles * sizeof( uint32_t ) * 2 );
-    uint32_t * mem = (uint32_t *)ALLOC( memSize );
-    uint32_t * pos = mem;
+    const size_t memSize( numFiles * sizeof( FileIdentity ) );
+    FileIdentity * mem = (FileIdentity *)ALLOC( memSize );
     for ( size_t i = 0; i < numFiles; ++i )
     {
         const ToolManifestFile & f = m_Files[ i ];
+        FileIdentity & id = mem[ i ];
 
         // file contents
-        *pos = f.GetHash();
-        ++pos;
+        id.m_ContentHash = f.GetHash();
+        id.m_Size = f.GetUncompressedContentSize();
 
         // file name & sub-path (relative to remote folder)
         AStackString relativePath;
         GetRelativePath( m_MainExecutableRootPath, f.GetName(), relativePath );
-        *pos = xxHash::Calc32( relativePath );
-        ++pos;
+        id.m_PathHash = xxHash::Calc32( relativePath );
     }
     m_ToolId = xxHash3::Calc64( mem, memSize );
     FREE( mem );
@@ -320,7 +343,7 @@ bool ToolManifest::DeserializeFromRemote( IOStream & ms )
     {
         AStackString name;
         uint64_t timeStamp( 0 );
-        uint32_t hash( 0 );
+        uint64_t hash( 0 );
         uint32_t uncompressedContentSize( 0 );
         if ( !ms.Read( name ) ||
              !ms.Read( timeStamp ) ||
@@ -387,7 +410,7 @@ bool ToolManifest::DeserializeFromRemote( IOStream & ms )
         {
             continue; // problem reading file
         }
-        if ( xxHash::Calc32( mem.Get(), (size_t)f.GetFileSize() ) != m_Files[ i ].GetHash() )
+        if ( xxHash3::Calc64Big( mem.Get(), (size_t)f.GetFileSize() ) != m_Files[ i ].GetHash() )
         {
             continue; // file contents unexpected
         }
@@ -745,6 +768,146 @@ void ToolManifest::GetRemotePath( AString & path ) const
     subDir.Format( "_fbuild.tmp/worker/toolchain.%016" PRIx64 "/", m_ToolId );
 #endif
     path += subDir;
+}
+
+// GetPersistedFileName
+//------------------------------------------------------------------------------
+/*static*/ const char * ToolManifest::GetPersistedFileName()
+{
+    return kPersistedManifestName;
+}
+
+// GetPersistedPath
+//------------------------------------------------------------------------------
+void ToolManifest::GetPersistedPath( AString & path ) const
+{
+    GetRemotePath( path );
+    path += kPersistedManifestName;
+}
+
+// SaveToDisk
+//------------------------------------------------------------------------------
+bool ToolManifest::SaveToDisk()
+{
+    ASSERT( m_Synchronized );
+    if ( m_Persisted )
+    {
+        return true;
+    }
+    MemoryStream ms;
+    ms.Write( kPersistedManifestMagic );
+    SerializeForRemote( ms );
+
+    AStackString path;
+    GetPersistedPath( path );
+    FileStream f;
+    if ( ( f.Open( path.Get(), FileStream::WRITE_ONLY ) == false ) ||
+         ( f.Write( ms.GetData(), ms.GetSize() ) != ms.GetSize() ) )
+    {
+        return false;
+    }
+    f.Close();
+
+    m_Persisted = true;
+    return true;
+}
+
+// LoadFromDisk
+//------------------------------------------------------------------------------
+/*static*/ ToolManifest * ToolManifest::LoadFromDisk( const AString & manifestPath )
+{
+    FileStream f;
+    if ( f.Open( manifestPath.Get() ) == false )
+    {
+        return nullptr;
+    }
+    const uint64_t fileSize = f.GetFileSize();
+    if ( ( fileSize == 0 ) || ( fileSize > (uint64_t)( 64 * MEGABYTE ) ) )
+    {
+        return nullptr;
+    }
+    UniquePtr<char, FreeDeletor> mem( (char *)ALLOC( (size_t)fileSize ) );
+    if ( f.Read( mem.Get(), (size_t)fileSize ) != fileSize )
+    {
+        return nullptr;
+    }
+    f.Close();
+
+    ConstMemoryStream ms( mem.Get(), (size_t)fileSize );
+    uint32_t magic( 0 );
+    uint64_t toolId( 0 );
+    if ( !ms.Read( magic ) || ( magic != kPersistedManifestMagic ) || !ms.Read( toolId ) || ( toolId == 0 ) )
+    {
+        return nullptr;
+    }
+    ms.Seek( sizeof( magic ) ); // DeserializeFromRemote reads the toolId itself
+
+    // Reads every file of the toolchain, so only an intact toolchain ends up synchronized
+    UniquePtr<ToolManifest> manifest( FNEW( ToolManifest( toolId ) ) );
+    if ( ( manifest->DeserializeFromRemote( ms ) == false ) ||
+         ( manifest->IsSynchronized() == false ) )
+    {
+        return nullptr;
+    }
+
+    manifest->m_Persisted = true;
+    manifest->m_LastUsed = FileIO::GetFileLastWriteTime( manifestPath );
+    return manifest.ReleaseOwnership();
+}
+
+// MarkUsed
+//------------------------------------------------------------------------------
+void ToolManifest::MarkUsed()
+{
+    m_LastUsed = Time::GetCurrentFileTime();
+    if ( m_Persisted )
+    {
+        // Keeps the recency across worker restarts
+        AStackString path;
+        GetPersistedPath( path );
+        FileIO::SetFileLastWriteTimeToNow( path );
+    }
+}
+
+// DeleteFromDisk
+//------------------------------------------------------------------------------
+void ToolManifest::DeleteFromDisk()
+{
+    AStackString root;
+    GetRemotePath( root );
+    root.Trim( 0, 1 ); // trailing slash
+
+    // Files are held open to prevent their deletion
+    Array<AString> directories;
+    directories.Append( root );
+    for ( size_t i = 0; i < m_Files.GetSize(); ++i )
+    {
+        m_Files[ i ].ReleaseFileLock();
+
+        AStackString path;
+        GetRemoteFilePath( (uint32_t)i, path );
+        FileIO::FileDelete( path.Get() );
+
+        // Directories between the file and the root
+        AStackString directory( path.Get(), path.FindLast( NATIVE_SLASH ) );
+        while ( ( directory.GetLength() > root.GetLength() ) && ( directories.Find( directory ) == nullptr ) )
+        {
+            directories.Append( directory );
+            directory.SetLength( (uint32_t)( directory.FindLast( NATIVE_SLASH ) - directory.Get() ) );
+        }
+    }
+
+    AStackString persistedPath;
+    GetPersistedPath( persistedPath );
+    FileIO::FileDelete( persistedPath.Get() );
+    m_Persisted = false;
+
+    // Deepest first, so a directory is empty by the time it is removed
+    directories.Sort( []( const AString & a, const AString & b ) { return a.GetLength() > b.GetLength(); } );
+    for ( const AString & directory : directories )
+    {
+        FileIO::DirectoryDelete( directory );
+    }
 }
 
 // LoadFile (ToolManifestFile)
