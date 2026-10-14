@@ -172,59 +172,46 @@ void TestDistributed::WithPCHMacroUndefs() const
 
 // PchCacheEvictionPolicy
 //------------------------------------------------------------------------------
-namespace
-{
-    bool PchNeverInUse( uint64_t ) { return false; }
-    bool PchAlwaysInUse( uint64_t ) { return true; }
-    bool PchOnlyId1InUse( uint64_t pchId ) { return ( pchId == 1 ); }
-}
-
 void TestDistributed::PchCacheEvictionPolicy() const
 {
-    // Under the cap: nothing evicted
-    {
-        Array<Server::PchCacheEntry> entries;
-        entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100 } );
-        entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200 } );
-        Array<size_t> evictions;
-        Server::SelectPchEvictions( entries, 2, PchNeverInUse, evictions );
-        TEST_ASSERT( evictions.IsEmpty() );
-    }
+    // Entries are deliberately not in age order, so the sort is exercised
+    Array<Server::PchCacheEntry> entries;
+    entries.Append( Server::PchCacheEntry{ 3, AString( "dummy3" ), 300 } );
+    entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100 } );
+    entries.Append( Server::PchCacheEntry{ 4, AString( "dummy4" ), 400 } );
+    entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200 } );
 
-    // Over the cap, nothing in use: the oldest (lowest lastWriteTime) is evicted
-    {
-        Array<Server::PchCacheEntry> entries;
-        entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100 } ); // oldest
-        entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200 } );
-        entries.Append( Server::PchCacheEntry{ 3, AString( "dummy3" ), 300 } ); // newest
-        Array<size_t> evictions;
-        Server::SelectPchEvictions( entries, 2, PchNeverInUse, evictions );
-        TEST_ASSERT( evictions.GetSize() == 1 );
-        TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 1 );
-    }
+    Array<uint64_t> inUse;
+    Array<size_t> evictions;
 
-    // Over the cap, the oldest is in use: it's skipped, the next-oldest is evicted instead
-    {
-        Array<Server::PchCacheEntry> entries;
-        entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100 } ); // oldest, but in use
-        entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200 } );
-        entries.Append( Server::PchCacheEntry{ 3, AString( "dummy3" ), 300 } );
-        Array<size_t> evictions;
-        Server::SelectPchEvictions( entries, 2, PchOnlyId1InUse, evictions );
-        TEST_ASSERT( evictions.GetSize() == 1 );
-        TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 2 );
-    }
+    // Under or at the cap: nothing evicted
+    Server::SelectPchEvictions( entries, 4, inUse, evictions );
+    TEST_ASSERT( evictions.IsEmpty() );
 
-    // Over the cap, everything in use: nothing can be evicted
-    {
-        Array<Server::PchCacheEntry> entries;
-        entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100 } );
-        entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200 } );
-        entries.Append( Server::PchCacheEntry{ 3, AString( "dummy3" ), 300 } );
-        Array<size_t> evictions;
-        Server::SelectPchEvictions( entries, 2, PchAlwaysInUse, evictions );
-        TEST_ASSERT( evictions.IsEmpty() );
-    }
+    // Over the cap by two: the two oldest go, whatever their position
+    Server::SelectPchEvictions( entries, 2, inUse, evictions );
+    TEST_ASSERT( evictions.GetSize() == 2 );
+    TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 1 );
+    TEST_ASSERT( entries[ evictions[ 1 ] ].pchId == 2 );
+
+    // The oldest is in use: it is skipped and the next-oldest go instead
+    inUse.Append( 1 );
+    Server::SelectPchEvictions( entries, 2, inUse, evictions );
+    TEST_ASSERT( evictions.GetSize() == 2 );
+    TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 2 );
+    TEST_ASSERT( entries[ evictions[ 1 ] ].pchId == 3 );
+
+    // Everything but the newest is in use: only what is free can go, so the cap is exceeded
+    inUse.Append( 2 );
+    inUse.Append( 3 );
+    Server::SelectPchEvictions( entries, 2, inUse, evictions );
+    TEST_ASSERT( evictions.GetSize() == 1 );
+    TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 4 );
+
+    // The newest is the only one free but is itself in use (just received): nothing to evict
+    inUse.Append( 4 );
+    Server::SelectPchEvictions( entries, 2, inUse, evictions );
+    TEST_ASSERT( evictions.IsEmpty() );
 }
 
 // RegressionTest_RemoteCrashOnErrorFormatting

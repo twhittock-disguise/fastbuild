@@ -295,17 +295,17 @@ void JobQueueRemote::FinishedProcessingJob( Job * job, Node::BuildResult result 
     WakeMainThread();
 }
 
-// IsPchInUse
+// GetPchIdsInUse
 //------------------------------------------------------------------------------
-bool JobQueueRemote::IsPchInUse( uint64_t pchId ) const
+void JobQueueRemote::GetPchIdsInUse( Array<uint64_t> & outPchIds ) const
 {
     {
         MutexHolder mh( m_PendingJobsMutex );
         for ( const Job * job : m_PendingJobs )
         {
-            if ( job->GetPchId() == pchId )
+            if ( job->GetPchId() != 0 )
             {
-                return true;
+                outPchIds.Append( job->GetPchId() );
             }
         }
     }
@@ -313,12 +313,11 @@ bool JobQueueRemote::IsPchInUse( uint64_t pchId ) const
     MutexHolder mh( m_InFlightJobsMutex );
     for ( const Job * job : m_InFlightJobs )
     {
-        if ( job->GetPchId() == pchId )
+        if ( job->GetPchId() != 0 )
         {
-            return true;
+            outPchIds.Append( job->GetPchId() );
         }
     }
-    return false;
 }
 
 // DoBuild

@@ -66,18 +66,6 @@ namespace
     #endif
         return true;
     }
-
-    // Used when trimming the cache during startup scan, before any jobs exist
-    bool PchNeverInUse( uint64_t )
-    {
-        return false;
-    }
-
-    // Used when trimming the cache on the runtime insert path
-    bool PchInUseByLiveJob( uint64_t pchId )
-    {
-        return JobQueueRemote::Get().IsPchInUse( pchId );
-    }
 }
 
 // CONSTRUCTOR
@@ -685,43 +673,36 @@ void Server::Process( const ConnectionInfo * /*connection*/, const Protocol::Msg
     // Touch timestamp to prevent periodic cleanup
     FileIO::SetFileLastWriteTimeToNow( pchFilePath );
 
+    // Snapshot the PCHs still needed before taking m_PchCacheMutex: the waiting-job scan
+    // takes m_ClientListMutex, which ReleaseReadyWaitingJobs holds while calling FindCachedPch.
+    // The PCH just received is protected too, as the jobs waiting for it are not queued yet.
+    Array<uint64_t> pchIdsInUse;
+    CollectPchIdsInUse( pchIdsInUse );
+    pchIdsInUse.Append( pchId );
+
     // Add to in-memory cache
     {
         MutexHolder mh( m_PchCacheMutex );
 
+        const uint64_t now = Time::GetCurrentFileTime();
+
         // Check not already in cache (race with another connection)
-        bool alreadyInMemory = false;
         for ( PchCacheEntry & e : m_PchCache )
         {
             if ( e.pchId == pchId )
             {
-                e.lastWriteTime = Time::GetCurrentFileTime(); // Refresh LRU recency
-                alreadyInMemory = true;
-                break;
+                e.lastWriteTime = now;
+                return;
             }
-        }
-
-        if ( alreadyInMemory )
-        {
-            return; // Already cached
         }
 
         PchCacheEntry entry;
         entry.pchId = pchId;
         entry.filePath = pchFilePath;
-        entry.lastWriteTime = Time::GetCurrentFileTime();
+        entry.lastWriteTime = now;
         m_PchCache.Append( Move( entry ) );
 
-        // Evict oldest entries not currently in use by a live job, once over the cap
-        Array<size_t> evictions;
-        SelectPchEvictions( m_PchCache, kMaxCachedPchEntries, PchInUseByLiveJob, evictions );
-        evictions.Sort();
-        for ( size_t i = evictions.GetSize(); i > 0; --i )
-        {
-            const size_t idx = evictions[ i - 1 ];
-            FileIO::FileDelete( m_PchCache[ idx ].filePath.Get() );
-            m_PchCache.EraseIndex( idx );
-        }
+        EvictPchs( m_PchCache, pchIdsInUse );
     }
 
     FLOG_OUTPUT( "PCH cached: 0x%016" PRIx64 " -> %s (cached=%s)\n",
@@ -799,37 +780,64 @@ void Server::ScanPchCache()
         return;
     }
 
-    // Evict oldest entries beyond the cap (nothing can be "in use" yet at startup)
-    {
-        Array<size_t> evictions;
-        SelectPchEvictions( scannedEntries, kMaxCachedPchEntries, PchNeverInUse, evictions );
-        evictions.Sort();
-        for ( size_t i = evictions.GetSize(); i > 0; --i )
-        {
-            const size_t idx = evictions[ i - 1 ];
-            FileIO::FileDelete( scannedEntries[ idx ].filePath.Get() );
-            scannedEntries.EraseIndex( idx );
-        }
-    }
+    // No jobs exist yet at startup, so nothing is in use
+    EvictPchs( scannedEntries, Array<uint64_t>() );
 
     // Populate in-memory cache
     {
         MutexHolder mh( m_PchCacheMutex );
-        for ( const PchCacheEntry & se : scannedEntries )
+        for ( PchCacheEntry & se : scannedEntries )
         {
-            m_PchCache.Append( se );
+            m_PchCache.Append( Move( se ) );
         }
     }
 
     FLOG_OUTPUT( "PCH inventory: %u entries scanned from disk cache\n",
-                 (uint32_t)scannedEntries.GetSize() );
+                 (uint32_t)m_PchCache.GetSize() );
+}
+
+// CollectPchIdsInUse
+//------------------------------------------------------------------------------
+void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
+{
+    JobQueueRemote::Get().GetPchIdsInUse( outPchIds );
+
+    // Jobs waiting for their toolchain or PCH are not in the job queue yet
+    MutexHolder mhC( m_ClientListMutex );
+    for ( ClientState * cs : m_ClientList )
+    {
+        MutexHolder mh( cs->m_Mutex );
+        for ( const Job * job : cs->m_WaitingJobs )
+        {
+            if ( job->GetPchId() != 0 )
+            {
+                outPchIds.Append( job->GetPchId() );
+            }
+        }
+    }
+}
+
+// EvictPchs
+//------------------------------------------------------------------------------
+/*static*/ void Server::EvictPchs( Array<PchCacheEntry> & entries,
+                                    const Array<uint64_t> & pchIdsInUse )
+{
+    Array<size_t> evictions;
+    SelectPchEvictions( entries, kMaxCachedPchEntries, pchIdsInUse, evictions );
+    evictions.Sort();
+    for ( size_t i = evictions.GetSize(); i > 0; --i )
+    {
+        const size_t idx = evictions[ i - 1 ];
+        FileIO::FileDelete( entries[ idx ].filePath.Get() );
+        entries.EraseIndex( idx );
+    }
 }
 
 // SelectPchEvictions
 //------------------------------------------------------------------------------
 /*static*/ void Server::SelectPchEvictions( const Array<PchCacheEntry> & entries,
                                              uint32_t maxEntries,
-                                             bool ( * isInUse )( uint64_t pchId ),
+                                             const Array<uint64_t> & pchIdsInUse,
                                              Array<size_t> & outIndicesToEvict )
 {
     outIndicesToEvict.Clear();
@@ -858,9 +866,9 @@ void Server::ScanPchCache()
         {
             break;
         }
-        if ( isInUse( entries[ idx ].pchId ) )
+        if ( pchIdsInUse.Find( entries[ idx ].pchId ) )
         {
-            continue; // Still referenced by a live job — leave it, cache may temporarily exceed the cap
+            continue; // cache may temporarily exceed the cap
         }
         outIndicesToEvict.Append( idx );
         --remaining;
@@ -869,13 +877,14 @@ void Server::ScanPchCache()
 
 // FindCachedPch
 //------------------------------------------------------------------------------
-bool Server::FindCachedPch( uint64_t pchId, AString & outPath ) const
+bool Server::FindCachedPch( uint64_t pchId, AString & outPath )
 {
     MutexHolder mh( m_PchCacheMutex );
-    for ( const PchCacheEntry & e : m_PchCache )
+    for ( PchCacheEntry & e : m_PchCache )
     {
         if ( e.pchId == pchId )
         {
+            e.lastWriteTime = Time::GetCurrentFileTime();
             outPath = e.filePath;
             return true;
         }

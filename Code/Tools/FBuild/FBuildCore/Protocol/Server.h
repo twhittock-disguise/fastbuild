@@ -86,7 +86,7 @@ private:
 
     Atomic<bool> m_ShouldExit; // signal from main thread
     Thread m_Thread; // the thread to manage workload
-    Mutex m_ClientListMutex;
+    mutable Mutex m_ClientListMutex;
     Array<ClientState *> m_ClientList;
 
     mutable Mutex m_ToolManifestsMutex;
@@ -97,17 +97,20 @@ private:
     {
         uint64_t    pchId;
         AString     filePath;
-        uint64_t    lastWriteTime; // used for LRU eviction ordering
+        uint64_t    lastWriteTime;
     };
     void ScanPchCache();
-    bool FindCachedPch( uint64_t pchId, AString & outPath ) const;
+    bool FindCachedPch( uint64_t pchId, AString & outPath ); // refreshes LRU recency
 
-    // Selects which entries to evict once "entries" exceeds "maxEntries", oldest
-    // (by lastWriteTime) first, skipping any entry for which isInUse returns true.
+    // PCH ids referenced by jobs that are waiting, pending or in flight
+    void CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const;
+
+    // Oldest entries first, skipping those in pchIdsInUse
     static void SelectPchEvictions( const Array<PchCacheEntry> & entries,
                                      uint32_t maxEntries,
-                                     bool ( * isInUse )( uint64_t pchId ),
+                                     const Array<uint64_t> & pchIdsInUse,
                                      Array<size_t> & outIndicesToEvict );
+    static void EvictPchs( Array<PchCacheEntry> & entries, const Array<uint64_t> & pchIdsInUse );
 
     mutable Mutex m_PchCacheMutex;
     Array<PchCacheEntry> m_PchCache;
