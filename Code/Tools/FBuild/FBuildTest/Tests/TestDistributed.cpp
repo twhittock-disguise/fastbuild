@@ -6,6 +6,7 @@
 #include "Tools/FBuild/FBuildTest/Tests/FBuildTest.h"
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
+#include "Tools/FBuild/FBuildCore/Graph/CompilerNode.h"
 #include "Tools/FBuild/FBuildCore/Graph/ObjectNode.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/DistributionStats.h"
@@ -18,7 +19,10 @@
 
 // Core
 #include "Core/FileIO/FileIO.h"
+#include "Core/Containers/UniquePtr.h"
 #include "Core/FileIO/FileStream.h"
+#include "Core/Mem/Mem.h"
+#include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
 #include "Core/Process/Thread.h"
 #include "Core/Strings/AStackString.h"
@@ -49,6 +53,11 @@ private:
     void PchTakeReadyPchs() const;
     void DistributionStatsLog() const;
     void PayloadsAcceptedByWorker() const;
+    void ToolchainCacheEvictionPolicy() const;
+    void ToolchainCachedAcrossWorkerRestart() const;
+    void ToolchainCorruptedFileIsResent() const;
+    void ToolchainInventoryFollowsAck() const;
+    void MismatchedProtocolVersionIsRefused() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
     void RemoteRaceWinRemote();
@@ -91,6 +100,9 @@ private:
                                                              size_t & outSize );
     static bool DecodesTo( const void * data, size_t dataSize, const Array<char> & content );
     static uint32_t RequestCompression( void * param );
+    void BuildOnNewWorker( uint32_t & outManifestsReceived,
+                           uint32_t & outToolFilesReceived,
+                           AString & outWorkerToolchainFile ) const;
 };
 
 // Register Tests
@@ -108,6 +120,11 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchTakeReadyPchs )
     REGISTER_TEST( DistributionStatsLog )
     REGISTER_TEST( PayloadsAcceptedByWorker )
+    REGISTER_TEST( ToolchainCacheEvictionPolicy )
+    REGISTER_TEST( ToolchainCachedAcrossWorkerRestart )
+    REGISTER_TEST( ToolchainCorruptedFileIsResent )
+    REGISTER_TEST( ToolchainInventoryFollowsAck )
+    REGISTER_TEST( MismatchedProtocolVersionIsRefused )
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
     REGISTER_TEST( RemoteRaceWinRemote )
@@ -639,6 +656,277 @@ void TestDistributed::PayloadsAcceptedByWorker() const
     TEST_ASSERT( toolData );
     TEST_ASSERT( toolDataSize < fileSize );
     TEST_ASSERT( DecodesTo( toolData, toolDataSize, content ) );
+}
+
+// ToolchainCacheEvictionPolicy
+//------------------------------------------------------------------------------
+void TestDistributed::ToolchainCacheEvictionPolicy() const
+{
+    // Entries are deliberately not in age order, so the sort is exercised
+    Array<Server::ToolchainEvictionEntry> entries;
+    entries.Append( Server::ToolchainEvictionEntry{ 300, false } );
+    entries.Append( Server::ToolchainEvictionEntry{ 100, false } );
+    entries.Append( Server::ToolchainEvictionEntry{ 400, false } );
+    entries.Append( Server::ToolchainEvictionEntry{ 200, false } );
+
+    Array<size_t> evictions;
+
+    // At the cap: nothing evicted
+    Server::SelectToolchainEvictions( entries, 4, evictions );
+    TEST_ASSERT( evictions.IsEmpty() );
+
+    // Over the cap by two: the two oldest go, whatever their position
+    Server::SelectToolchainEvictions( entries, 2, evictions );
+    TEST_ASSERT( evictions.GetSize() == 2 );
+    TEST_ASSERT( entries[ evictions[ 0 ] ].lastUsed == 100 );
+    TEST_ASSERT( entries[ evictions[ 1 ] ].lastUsed == 200 );
+
+    // The oldest is protected (in use, or just added): the next-oldest go instead
+    entries[ 1 ].isProtected = true;
+    Server::SelectToolchainEvictions( entries, 2, evictions );
+    TEST_ASSERT( evictions.GetSize() == 2 );
+    TEST_ASSERT( entries[ evictions[ 0 ] ].lastUsed == 200 );
+    TEST_ASSERT( entries[ evictions[ 1 ] ].lastUsed == 300 );
+
+    // Everything but one entry is protected: only that one can go, so the cap is exceeded
+    entries[ 0 ].isProtected = true;
+    entries[ 3 ].isProtected = true;
+    Server::SelectToolchainEvictions( entries, 2, evictions );
+    TEST_ASSERT( evictions.GetSize() == 1 );
+    TEST_ASSERT( entries[ evictions[ 0 ] ].lastUsed == 400 );
+
+    // Everything is protected: nothing can go
+    entries[ 2 ].isProtected = true;
+    Server::SelectToolchainEvictions( entries, 2, evictions );
+    TEST_ASSERT( evictions.IsEmpty() );
+}
+
+// BuildOnNewWorker
+//------------------------------------------------------------------------------
+// Builds with a worker that is created for the build, so it only knows what it
+// has kept on disk from earlier builds.
+void TestDistributed::BuildOnNewWorker( uint32_t & outManifestsReceived,
+                                        uint32_t & outToolFilesReceived,
+                                        AString & outWorkerToolchainFile ) const
+{
+    const char * target( "../tmp/Test/Distributed/dist.lib" );
+
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    Server s( 1 );
+    s.Listen( Protocol::kTestPort );
+
+    Array<AString> files;
+    FileIO::GetFiles( AStackString( "../tmp/Test/Distributed" ), AStackString( "*.*" ), true, &files );
+    for ( const AString & file : files )
+    {
+        FileIO::FileDelete( file.Get() );
+    }
+
+    TEST_ASSERT( fBuild.Build( target ) );
+    TEST_ASSERT( FileIO::FileExists( target ) );
+
+    outManifestsReceived = s.m_NumManifestsReceived.Load();
+    outToolFilesReceived = s.m_NumToolFilesReceived.Load();
+
+    // Where the worker keeps the compiler used for the objects
+    Array<const Node *> objects;
+    fBuild.GetNodesOfType( Node::OBJECT_NODE, objects );
+    outWorkerToolchainFile.Clear();
+    for ( const Node * object : objects )
+    {
+        if ( object->GetName().Find( "a_normal" ) )
+        {
+            const ToolManifest & manifest = object->CastTo<ObjectNode>()->GetCompiler()->GetManifest();
+            manifest.GetRemoteFilePath( 0, outWorkerToolchainFile );
+            break;
+        }
+    }
+    TEST_ASSERT( outWorkerToolchainFile.IsEmpty() == false );
+}
+
+// ToolchainCachedAcrossWorkerRestart
+//------------------------------------------------------------------------------
+void TestDistributed::ToolchainCachedAcrossWorkerRestart() const
+{
+    uint32_t manifests( 0 );
+    uint32_t files( 0 );
+    AStackString toolchainFile;
+
+    // Whether or not an earlier run left the toolchain behind, it is there afterwards
+    BuildOnNewWorker( manifests, files, toolchainFile );
+
+    // A new worker finds the toolchain on disk, so the coordinator never sends it
+    BuildOnNewWorker( manifests, files, toolchainFile );
+    TEST_ASSERT( manifests == 0 );
+    TEST_ASSERT( files == 0 );
+}
+
+// ToolchainCorruptedFileIsResent
+//------------------------------------------------------------------------------
+void TestDistributed::ToolchainCorruptedFileIsResent() const
+{
+    uint32_t manifests( 0 );
+    uint32_t files( 0 );
+    AStackString toolchainFile;
+    BuildOnNewWorker( manifests, files, toolchainFile );
+
+    // Change one byte of the worker's copy of the compiler, keeping the size
+    {
+        FileStream in;
+        TEST_ASSERT( in.Open( toolchainFile.Get() ) );
+        const size_t size = (size_t)in.GetFileSize();
+        TEST_ASSERT( size > 0 );
+        UniquePtr<char, FreeDeletor> data( (char *)ALLOC( size ) );
+        TEST_ASSERT( in.Read( data.Get(), size ) == size );
+        in.Close();
+
+        data.Get()[ size / 2 ] ^= 0x55;
+
+        FileStream out;
+        TEST_ASSERT( out.Open( toolchainFile.Get(), FileStream::WRITE_ONLY ) );
+        TEST_ASSERT( out.Write( data.Get(), size ) == size );
+    }
+
+    // The worker does not trust the toolchain, so it is not advertised and is sent again
+    BuildOnNewWorker( manifests, files, toolchainFile );
+    TEST_ASSERT( manifests > 0 );
+    TEST_ASSERT( files > 0 );
+
+    // The sent copy replaced the corrupt one
+    BuildOnNewWorker( manifests, files, toolchainFile );
+    TEST_ASSERT( manifests == 0 );
+    TEST_ASSERT( files == 0 );
+}
+
+// Handshake tests
+//------------------------------------------------------------------------------
+namespace
+{
+    // Connects to a worker and records the messages it sends back, in order
+    class HandshakeProbe : public TCPConnectionPool
+    {
+    public:
+        size_t GetNumMessages() const
+        {
+            MutexHolder mh( m_Mutex );
+            return m_MessageTypes.GetSize();
+        }
+        uint8_t GetMessageType( size_t index ) const
+        {
+            MutexHolder mh( m_Mutex );
+            return m_MessageTypes[ index ];
+        }
+        bool IsDisconnected() const { return m_Disconnected.Load(); }
+
+        // Waits for a condition that depends on messages from the worker
+        template <class FUNC>
+        static bool WaitFor( const FUNC & condition )
+        {
+            const Timer timer;
+            while ( condition() == false )
+            {
+                if ( timer.GetElapsed() > 5.0f )
+                {
+                    return false;
+                }
+                Thread::Sleep( 10 );
+            }
+            return true;
+        }
+
+    private:
+        virtual void OnReceive( const ConnectionInfo *, void * data, uint32_t, bool & keepMemory ) override
+        {
+            keepMemory = true; // freed below
+
+            void * payload = nullptr;
+            if ( m_CurrentMessage == nullptr )
+            {
+                m_CurrentMessage = static_cast<const Protocol::IMessage *>( data );
+                if ( m_CurrentMessage->HasPayload() )
+                {
+                    return;
+                }
+            }
+            else
+            {
+                payload = data;
+            }
+
+            {
+                MutexHolder mh( m_Mutex );
+                m_MessageTypes.Append( (uint8_t)m_CurrentMessage->GetType() );
+            }
+
+            FREE( (void *)m_CurrentMessage );
+            FREE( payload );
+            m_CurrentMessage = nullptr;
+        }
+        virtual void OnDisconnected( const ConnectionInfo * ) override { m_Disconnected.Store( true ); }
+
+        mutable Mutex m_Mutex;
+        Array<uint8_t> m_MessageTypes;
+        Atomic<bool> m_Disconnected{ false };
+        const Protocol::IMessage * m_CurrentMessage = nullptr;
+    };
+}
+
+// ToolchainInventoryFollowsAck
+//------------------------------------------------------------------------------
+void TestDistributed::ToolchainInventoryFollowsAck() const
+{
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    TEST_ASSERT( ci );
+    const Protocol::MsgConnection msg;
+    TEST_ASSERT( probe.Send( ci, &msg, sizeof( msg ) ) );
+
+    TEST_ASSERT( HandshakeProbe::WaitFor( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
+
+    // The coordinator holds back its jobs until the last of these arrives
+    TEST_ASSERT( probe.GetNumMessages() == 3 );
+    TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
+    TEST_ASSERT( probe.GetMessageType( 1 ) == Protocol::MSG_PCH_INVENTORY );
+    TEST_ASSERT( probe.GetMessageType( 2 ) == Protocol::MSG_TOOLCHAIN_INVENTORY );
+
+    probe.ShutdownAllConnections();
+}
+
+// MismatchedProtocolVersionIsRefused
+//------------------------------------------------------------------------------
+void TestDistributed::MismatchedProtocolVersionIsRefused() const
+{
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    TEST_ASSERT( ci );
+
+    // Handshake from a client with the previous protocol version
+    const Protocol::MsgConnection msg;
+    uint8_t bytes[ sizeof( msg ) ];
+    memcpy( bytes, &msg, sizeof( msg ) );
+    const size_t versionOffset = sizeof( Protocol::IMessage );
+    TEST_ASSERT( bytes[ versionOffset ] == Protocol::kVersionMajor ); // Found the right byte
+    bytes[ versionOffset ] = (uint8_t)( Protocol::kVersionMajor - 1 );
+    TEST_ASSERT( probe.Send( ci, bytes, sizeof( bytes ) ) );
+
+    // The worker drops the connection without acknowledging it
+    TEST_ASSERT( HandshakeProbe::WaitFor( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( probe.GetNumMessages() == 0 );
+
+    probe.ShutdownAllConnections();
 }
 
 // RegressionTest_RemoteCrashOnErrorFormatting
