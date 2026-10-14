@@ -4,6 +4,8 @@
 
 // Includes
 //------------------------------------------------------------------------------
+#include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
+
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
 #include "Core/Time/Timer.h"
@@ -69,6 +71,10 @@ private:
             m_WaitingJobs.SetCapacity( 16 );
         }
 
+        // Non-copyable
+        explicit ClientState( const ClientState & other ) = delete;
+        ClientState & operator=( const ClientState & other ) = delete;
+
         Mutex m_Mutex;
 
         const Protocol::IMessage * m_CurrentMessage = nullptr;
@@ -79,6 +85,10 @@ private:
         AString m_HostName;
 
         Array<Job *> m_WaitingJobs; // jobs waiting for manifests/toolchains
+
+        // Jobs are compressed against the earlier ones from the same connection,
+        // so they are decoded in arrival order on the connection's receive thread
+        JobStreamDecoder m_JobDecoder;
         Array<ToolManifest *> m_KnownTools; // toolchains this client may send jobs for, each holding a use
     };
 
@@ -109,6 +119,8 @@ private:
                                           Array<size_t> & outIndicesToEvict );
     Atomic<uint32_t> m_NumManifestsReceived;
     Atomic<uint32_t> m_NumToolFilesReceived;
+    Atomic<uint64_t> m_JobBytesReceived; // Compressed
+    Atomic<uint64_t> m_JobBytesDecoded;
 
     // PCH cache for distributed builds
     struct PchCacheEntry

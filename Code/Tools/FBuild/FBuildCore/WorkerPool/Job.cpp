@@ -30,7 +30,6 @@ static uint32_t s_LastJobId( 0 );
 //------------------------------------------------------------------------------
 Job::Job( Node * node )
     : m_Node( node )
-    , m_DataIsCompressed( false )
     , m_IsLocal( true )
     , m_AllowZstdUse( false )
 {
@@ -42,8 +41,7 @@ Job::Job( Node * node )
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
 Job::Job( IOStream & stream )
-    : m_DataIsCompressed( false )
-    , m_IsLocal( false )
+    : m_IsLocal( false )
     , m_AllowZstdUse( false )
 {
     Deserialize( stream );
@@ -55,7 +53,7 @@ Job::~Job()
 {
     if ( m_Data )
     {
-        OwnData( nullptr, 0, false );
+        OwnData( nullptr, 0 );
     }
 
     if ( m_IsLocal == false )
@@ -101,7 +99,7 @@ void Job::CancelDueToRemoteRaceWin()
 
 // OwnData
 //------------------------------------------------------------------------------
-void Job::OwnData( void * data, size_t size, bool compressed )
+void Job::OwnData( void * data, size_t size )
 {
     ASSERT( size <= 0xFFFFFFFF ); // only 32bit data supported
     ASSERT( data != m_Data ); // Invalid to set redundantly
@@ -121,7 +119,6 @@ void Job::OwnData( void * data, size_t size, bool compressed )
     // Track new data
     m_Data = data;
     m_DataSize = (uint32_t)size;
-    m_DataIsCompressed = compressed;
 
     // Update total memory use tracking
     if ( m_IsLocal )
@@ -198,8 +195,6 @@ void Job::Serialize( IOStream & stream )
     // write properties of node
     Node::SaveRemote( stream, m_Node );
 
-    stream.Write( IsDataCompressed() );
-
     stream.Write( m_DataSize );
     stream.Write( m_Data, m_DataSize );
 
@@ -218,16 +213,13 @@ void Job::Deserialize( IOStream & stream )
     // read properties of node
     m_Node = Node::LoadRemote( stream );
 
-    bool compressed;
-    stream.Read( compressed );
-
     // read extra data
     uint32_t dataSize;
     stream.Read( dataSize );
     void * data = ALLOC( dataSize );
     stream.Read( data, dataSize );
 
-    OwnData( data, dataSize, compressed );
+    OwnData( data, dataSize );
 
     stream.Read( m_PchId );
 }

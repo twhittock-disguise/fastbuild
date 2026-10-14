@@ -441,13 +441,29 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
 void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob * msg, const void * payload, size_t payloadSize )
 {
     ClientState * cs = (ClientState *)connection->GetUserData();
+
+    // Decode in arrival order: the stream is compressed against the jobs before it
+    void * jobData = nullptr;
+    size_t jobDataSize = 0;
+    if ( cs->m_JobDecoder.Decode( payload, payloadSize, jobData, jobDataSize ) == false )
+    {
+        AStackString remoteAddr;
+        TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
+        FLOG_WARN( "Disconnecting '%s' (%s) as its job data could not be decoded (corrupt, out of order or window above %u MiB)\n",
+                   remoteAddr.Get(), cs->m_HostName.Get(), ( 1u << JobStream::kWindowLog ) / (uint32_t)MEGABYTE );
+        Disconnect( connection );
+        return;
+    }
+    m_JobBytesReceived.Add( payloadSize );
+    m_JobBytesDecoded.Add( jobDataSize );
     cs->m_NumJobsActive.Increment();
 
     MutexHolder mh( cs->m_Mutex );
 
     // deserialize job
-    ConstMemoryStream ms( payload, payloadSize );
+    ConstMemoryStream ms( jobData, jobDataSize );
     Job * job = FNEW( Job( ms ) );
+    FREE( jobData );
     job->SetUserData( cs );
     job->SetResultCompressionLevel( msg->GetResultCompressionLevel(), true /*allowZstdUse*/ );
 

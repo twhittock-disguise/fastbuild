@@ -16,6 +16,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/MultiBuffer.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/DistributionStats.h"
+#include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchDataCache.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
@@ -38,6 +39,7 @@
 //------------------------------------------------------------------------------
 #define CONNECTION_REATTEMPT_DELAY_TIME ( 10.0f )
 #define SYSTEM_ERROR_ATTEMPT_COUNT ( 3u )
+#define MAX_UNSENT_JOBS ( 4u ) // Per connection. Bounds the uncompressed job data waiting for the send thread.
 #define DIST_INFO( ... ) do { if ( m_DetailedLogging ) { FLOG_OUTPUT( __VA_ARGS__ ); } } while ( false )
 
 //------------------------------------------------------------------------------
@@ -81,12 +83,14 @@ public:
     explicit ClientSendQueueItem( const Protocol::IMessage & msg,
                                   ConstMemoryStream && payload,
                                   SendKind kind,
-                                  uint64_t rawBytes )
+                                  uint64_t rawBytes,
+                                  bool streamCompress )
         : m_Message( msg.GetSize() ) // Prealloc exact size needed
         , m_HasPayload( true )
         , m_Payload( Move( payload ) )
         , m_Kind( kind )
         , m_RawBytes( rawBytes )
+        , m_StreamCompress( streamCompress )
     {
         VERIFY( m_Message.WriteBuffer( &msg, msg.GetSize() ) == msg.GetSize() );
     }
@@ -104,6 +108,7 @@ public:
     ConstMemoryStream m_Payload;
     SendKind m_Kind = SendKind::Control;
     uint64_t m_RawBytes = 0; // Size before compression, for stats
+    bool m_StreamCompress = false; // Payload is compressed by the send thread, against the jobs sent before it
 };
 
 //------------------------------------------------------------------------------
@@ -133,6 +138,7 @@ public:
                       ConstMemoryStream && payload,
                       SendKind kind = SendKind::Control,
                       uint64_t rawBytes = 0 );
+    void EnqueueJob( const Protocol::MsgJob & msg, ConstMemoryStream && payload );
 
 private:
     virtual void OnDisconnected( const ConnectionInfo * connection ) override;
@@ -187,6 +193,8 @@ private:
     Array<uint64_t> m_SkippedToolchains; // Of those, the ones we would otherwise have sent
     Array<uint64_t> m_SentPchIds;     // Protected by m_Mutex
     Array<uint64_t> m_PendingPchIds;  // Needed by this worker, not yet queued. Protected by m_Mutex
+    Atomic<uint32_t> m_UnsentJobs{ 0 }; // Queued for the send thread, not yet sent
+    JobStreamEncoder m_JobEncoder; // Send thread only. A new connection starts a new stream.
 
     DistributionSendStats m_SendStats[ (size_t)SendKind::NumKinds ]; // Send thread only
     Timer m_ConnectionTimer;
@@ -723,6 +731,13 @@ void ClientToWorkerConnection::PushJobsToWorker()
 
     while ( toSend > 0 )
     {
+        // Jobs are compressed as they are sent. Take no more than the send thread can use,
+        // as the rest are better left for other workers than held as uncompressed copies.
+        if ( m_UnsentJobs.Load() >= MAX_UNSENT_JOBS )
+        {
+            break;
+        }
+
         Job * job = JobQueue::Get().GetDistributableJobToProcess( true, workerMinorProtocolVersion );
         if ( job == nullptr )
         {
@@ -825,9 +840,8 @@ void ClientToWorkerConnection::PushJobsToWorker()
         const bool allowZstdUse = true;
         job->SetResultCompressionLevel( resultCompressionLevel, allowZstdUse );
 
-        EnqueueSend( Protocol::MsgJob( toolId, resultCompressionLevel ),
-                     Move( ConstMemoryStream( Move( stream ) ) ),
-                     SendKind::Job );
+        EnqueueJob( Protocol::MsgJob( toolId, resultCompressionLevel ),
+                    Move( ConstMemoryStream( Move( stream ) ) ) );
 
         toSend--;
     }
@@ -1377,7 +1391,19 @@ void ClientToWorkerConnection::EnqueueSend( const T & msg,
 {
     {
         MutexHolder lock( m_SendQueueMutex );
-        m_SendQueue.EmplaceBack( msg, Move( payload ), kind, rawBytes );
+        m_SendQueue.EmplaceBack( msg, Move( payload ), kind, rawBytes, false );
+    }
+    m_SendThreadWakeSemaphore.Signal();
+}
+
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::EnqueueJob( const Protocol::MsgJob & msg, ConstMemoryStream && payload )
+{
+    m_UnsentJobs.Increment();
+    const uint64_t rawBytes = payload.GetSize();
+    {
+        MutexHolder lock( m_SendQueueMutex );
+        m_SendQueue.EmplaceBack( msg, Move( payload ), SendKind::Job, rawBytes, true );
     }
     m_SendThreadWakeSemaphore.Signal();
 }
@@ -1490,16 +1516,36 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
         {
             PROFILE_SECTION( "SendMsg" );
 
+            // Compress here, in the order jobs go out, as each is compressed against the ones before it
+            const void * payload = item.m_Payload.GetData();
+            size_t payloadSize = item.m_Payload.GetSize();
+            if ( item.m_StreamCompress )
+            {
+                PROFILE_SECTION( "CompressJob" );
+                if ( m_JobEncoder.Encode( payload, payloadSize ) == false )
+                {
+                    FLOG_WARN( "Failed to compress a job for %s. Closing the connection.\n", m_Worker->m_Address.Get() );
+                    m_SendThreadQuit.Store( true );
+                    return;
+                }
+                payload = m_JobEncoder.GetResult();
+                payloadSize = m_JobEncoder.GetResultSize();
+            }
+
             // Send message
             const Timer sendTimer;
             const bool sendOk = item.m_HasPayload ? Send( ci,
                                                           item.m_Message.GetData(),
                                                           item.m_Message.GetSize(),
-                                                          item.m_Payload.GetData(),
-                                                          item.m_Payload.GetSize() )
+                                                          payload,
+                                                          payloadSize )
                                                   : Send( ci,
                                                           item.m_Message.GetData(),
                                                           item.m_Message.GetSize() );
+            if ( item.m_Kind == SendKind::Job )
+            {
+                m_UnsentJobs.Decrement();
+            }
 
             // If the send fails, we should be disconnected
             ASSERT( sendOk || ( m_SendThreadQuit.Load() == true ) );
@@ -1509,7 +1555,7 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
                 DistributionSendStats & stats = m_SendStats[ (size_t)item.m_Kind ];
                 stats.m_Messages++;
                 stats.m_RawBytes += item.m_RawBytes;
-                stats.m_SentBytes += ( item.m_Message.GetSize() + ( item.m_HasPayload ? item.m_Payload.GetSize() : 0 ) );
+                stats.m_SentBytes += ( item.m_Message.GetSize() + ( item.m_HasPayload ? payloadSize : 0 ) );
                 stats.m_SendTime += sendTimer.GetElapsed();
                 stats.m_LastSentAt = m_ConnectionTimer.GetElapsed();
             }

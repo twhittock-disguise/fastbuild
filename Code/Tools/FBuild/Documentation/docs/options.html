@@ -84,10 +84,6 @@
     <td>Enable distributed compilation.</td>
   </tr>
   <tr>
-    <td><a href="#distcompressionlevel">-distcompressionlevel [level]</a></td>
-    <td>Control compression level of jobs sent out for distribution. (Default -1)</td>
-  </tr>
-  <tr>
     <td><a href="#distverbose">-distverbose</a></td>
     <td>Enable detailed logging for distributed compilation.</td>
   </tr>
@@ -367,47 +363,6 @@ be reproduced in the debugger.</p>
     <div class='newsitemheader' id="dist">-dist</div>
     <div class='newsitembody'>
 <p>Enable distributed compilation. Requires some build configuration.</p>
-
-    <div class='newsitemheader' id="distcompressionlevel">-distcompressionlevel [level]</div>
-    <div class='newsitembody'>
-<p>Control compression level of jobs sent out for distribution. (Default -1)</p>
-<p>This can be used to increase the level of compression for jobs sent out for distribution, trading increased CPU time
-        in order to reduce network transfer. This can be useful in network bandwidth limited environments. Note that
-        this value does not affect the compression level of the responses sent back from workers.</p>
-<table>
-    <tr><th width=150>Level</th><th>Description</th></tr>
-    <tr><td>-128 to -1</td><td>LZ4 compression. Lower values are faster but compress less. Default is -1.</td></tr>
-    <tr><td>0</td><td>Compression is disabled.</td>
-    <tr><td>1 to 12</td><td>LZ4 HC compression. Higher values compress more, but are slower.</td></tr>
-</table>
-<p>Timings will vary depending on hardware and source code being preprocessed, but example timings compressing a
-~1.8MiB flattened source file are as follows:
-    <div class="code">
-File : Tools/FBuild/FBuildTest/Data/TestCompressor/TestPreprocessedFile.ii
-Size : 1802697
-
-        Compression             Decompression
-Level | Time (ms)  MB/s  Ratio | Time (ms)  MB/s
-------------------------------------------------
-0     |    0.289  5943.6  1.00 |    0.283  6066.8
--256  |    0.739  2324.8  1.25 |    0.224  7663.8
--128  |    0.822  2091.3  1.44 |    0.248  6944.6
--64   |    0.742  2315.8  1.86 |    0.356  4824.0
--32   |    1.027  1674.6  2.53 |    0.431  3989.9
--16   |    1.191  1443.5  3.37 |    0.467  3681.7
--8    |    1.311  1311.0  4.05 |    0.484  3550.5
--4    |    1.455  1181.6  4.53 |    0.511  3365.3
--2    |    1.423  1208.1  4.80 |    0.476  3614.2
-<b>-1    |    1.474  1166.2  4.94 |    0.507  3387.7  &lt;--- Default</b>
-1     |    2.312   743.6  5.43 |    0.489  3514.5
-3     |    6.322   271.9  6.44 |    0.496  3469.3
-6     |   11.180   153.8  6.67 |    0.416  4129.6
-9     |   25.354    67.8  6.72 |    0.390  4411.8
-12    |   86.380    19.9  6.82 |    0.386  4451.4
-------------------------------------------------
-    </div>
-</p>
-</div>
 
     <div class='newsitemheader' id="distverbose">-distverbose</div>
     <div class='newsitembody'>

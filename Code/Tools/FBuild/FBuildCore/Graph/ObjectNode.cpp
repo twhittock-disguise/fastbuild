@@ -507,13 +507,8 @@ Node::BuildResult ObjectNode::DoBuildWithPreProcessor( Job * job, bool useDeopti
     const bool belowMemoryLimit = ( ( Job::GetTotalLocalDataMemoryUsage() / MEGABYTE ) < FBuild::Get().GetSettings()->GetDistributableJobMemoryLimitMiB() );
     if ( canDistribute && belowMemoryLimit )
     {
-        // compress job data
-        Compressor c;
-        c.Compress( job->GetData(), job->GetDataSize(), FBuild::Get().GetOptions().m_DistributionCompressionLevel );
-        const size_t compressedSize = c.GetResultSize();
-        job->OwnData( c.ReleaseResult(), compressedSize, true );
-
         // yes... re-queue for secondary build
+        // (job data stays uncompressed, as it is compressed against the other jobs for the worker it is sent to)
         return BuildResult::eNeedSecondPass;
     }
 
@@ -2261,21 +2256,6 @@ bool ObjectNode::WriteTmpFile( Job * job, AString & tmpDirectory, AString & tmpF
     void const * dataToWrite = job->GetData();
     size_t dataToWriteSize = job->GetDataSize();
 
-    // handle compressed data
-    Compressor c; // scoped here so we can access decompression buffer
-    if ( job->IsDataCompressed() )
-    {
-        if ( c.Decompress( dataToWrite ) == false )
-        {
-            // Decompression failure would indicate a bug
-            job->Error( "Decompression failed. Target: '%s'", GetName().Get() );
-            job->OnSystemError();
-            return false;
-        }
-        dataToWrite = c.GetResult();
-        dataToWriteSize = c.GetResultSize();
-    }
-
     // Extract PCH distribution header if present
     // (updates dataToWrite/dataToWriteSize to skip the PCH header)
     PchDistribution::ExtractBundle( dataToWrite, dataToWriteSize, job );
@@ -2327,11 +2307,11 @@ bool ObjectNode::WriteTmpFile( Job * job, AString & tmpDirectory, AString & tmpF
 
     FileIO::WorkAroundForWindowsFilePermissionProblem( tmpFileName );
 
-    // On remote workers, free compressed buffer as we don't need it anymore
+    // On remote workers, free the job data as we don't need it anymore
     // This reduces memory consumed on the remote worker.
     if ( job->IsLocal() == false )
     {
-        job->OwnData( nullptr, 0, false ); // Free compressed buffer
+        job->OwnData( nullptr, 0 );
     }
 
     return true;
@@ -2938,7 +2918,6 @@ void ObjectNode::DoClangUnityFixup( Job * job ) const
     // Sanity checks
     ASSERT( IsClang() || IsClangCl() ); // Only necessary for Clang
     ASSERT( IsUnity() ); // Only makes sense to for Unity
-    ASSERT( job->IsDataCompressed() == false ); // Can't fixup compressed data
     ASSERT( job->IsLocal() ); // Assuming we're doing this on the local machine (using FBuild singleton lower)
 
     // We'll walk the output and fix it up in-place

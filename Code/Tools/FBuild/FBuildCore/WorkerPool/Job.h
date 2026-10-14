@@ -39,7 +39,7 @@ public:
     void CancelDueToRemoteRaceWin();
 
     // associate some data with this object, and destroy it when freed
-    void OwnData( void * data, size_t size, bool compressed = false );
+    void OwnData( void * data, size_t size );
 
     void * GetData() const { return m_Data; }
     size_t GetDataSize() const { return m_DataSize; }
@@ -56,7 +56,6 @@ public:
     void SetPchId( uint64_t id ) { m_PchId = id; }
     uint64_t GetPchId() const { return m_PchId; }
 
-    bool IsDataCompressed() const { return m_DataIsCompressed; }
     bool IsLocal() const { return m_IsLocal; }
 
     const Array<AString> & GetMessages() const { return m_Messages; }
@@ -122,7 +121,6 @@ private:
     void * m_Data = nullptr;
     void * m_UserData = nullptr;
     Atomic<bool> m_Abort{ false };
-    bool m_DataIsCompressed:1;
     bool m_IsLocal:1;
     bool m_AllowZstdUse:1; // Can client accept Zstd results?
     uint8_t m_SystemErrorCount = 0; // On client, the total error count, on the worker a flag for the current attempt

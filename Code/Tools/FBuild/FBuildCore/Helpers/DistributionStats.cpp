@@ -49,8 +49,7 @@ namespace
         outText.AppendFormat( "  toolchain: 0x%016" PRIx64 " skipped (cached on worker)\n", toolId );
     }
     AppendBulkLine( outText, "pch:", stats.m_Pch );
-    outText.AppendFormat( "  jobs:      %u sent, %.1f MB, send time %.1fs\n",
-                          stats.m_Jobs.m_Messages, ToMB( stats.m_Jobs.m_SentBytes ), stats.m_Jobs.m_SendTime );
+    AppendBulkLine( outText, "jobs:", stats.m_Jobs );
     outText.AppendFormat( "  results:   %u received, %.1f MB\n",
                           stats.m_ResultsReceived, ToMB( stats.m_ResultBytesReceived ) );
     outText.AppendFormat( "  upload:    %.1f MB in %.1fs of send time = %.2f MB/s (%.1f Mbit/s)\n\n",

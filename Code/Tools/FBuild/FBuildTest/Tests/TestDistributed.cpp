@@ -57,6 +57,7 @@ private:
     void ToolchainCachedAcrossWorkerRestart() const;
     void ToolchainCorruptedFileIsResent() const;
     void ToolchainInventoryFollowsAck() const;
+    void JobStreamDistributed() const;
     void MismatchedProtocolVersionIsRefused() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
@@ -124,6 +125,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ToolchainCachedAcrossWorkerRestart )
     REGISTER_TEST( ToolchainCorruptedFileIsResent )
     REGISTER_TEST( ToolchainInventoryFollowsAck )
+    REGISTER_TEST( JobStreamDistributed )
     REGISTER_TEST( MismatchedProtocolVersionIsRefused )
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
@@ -529,6 +531,7 @@ void TestDistributed::DistributionStatsLog() const
         stats.m_Pch.m_SentBytes = ( 1 * (uint64_t)MEGABYTE );
         stats.m_Pch.m_SendTime = 0.5;
         stats.m_Jobs.m_Messages = 3;
+        stats.m_Jobs.m_RawBytes = ( 24 * (uint64_t)MEGABYTE );
         stats.m_Jobs.m_SentBytes = ( 3 * (uint64_t)MEGABYTE );
         stats.m_Jobs.m_SendTime = 0.5;
         stats.m_ResultsReceived = 3;
@@ -538,7 +541,7 @@ void TestDistributed::DistributionStatsLog() const
         DistributionStats::Format( stats, "2026-01-02 03:04:05", text );
         TEST_ASSERT( text.Find( "[2026-01-02 03:04:05] worker 10.0.0.7, connected 12.5s" ) );
         TEST_ASSERT( text.Find( "toolchain: 18 msgs, 40.0 MB raw, 2.0 MB sent" ) );
-        TEST_ASSERT( text.Find( "jobs:      3 sent, 3.0 MB" ) );
+        TEST_ASSERT( text.Find( "jobs:      3 msgs, 24.0 MB raw, 3.0 MB sent" ) );
         TEST_ASSERT( text.Find( "results:   3 received, 1.0 MB" ) );
         TEST_ASSERT( text.Find( "upload:    6.0 MB in 2.0s of send time = 3.00 MB/s (24.0 Mbit/s)" ) );
     }
@@ -803,6 +806,47 @@ void TestDistributed::ToolchainCorruptedFileIsResent() const
     BuildOnNewWorker( manifests, files, toolchainFile );
     TEST_ASSERT( manifests == 0 );
     TEST_ASSERT( files == 0 );
+}
+
+// JobStreamDistributed
+//------------------------------------------------------------------------------
+void TestDistributed::JobStreamDistributed() const
+{
+    const char * target( "../tmp/Test/Distributed/dist.lib" );
+
+    // Each build has its own worker, so each connection starts a new stream
+    for ( uint32_t build = 0; build < 2; ++build )
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+
+        Server s( 1 );
+        s.Listen( Protocol::kTestPort );
+
+        Array<AString> files;
+        FileIO::GetFiles( AStackString( "../tmp/Test/Distributed" ), AStackString( "*.*" ), true, &files );
+        for ( const AString & file : files )
+        {
+            FileIO::FileDelete( file.Get() );
+        }
+
+        TEST_ASSERT( fBuild.Build( target ) );
+        TEST_ASSERT( FileIO::FileExists( target ) );
+
+        // The jobs were built by the worker, from data it decoded
+        const uint64_t received = s.m_JobBytesReceived.Load();
+        const uint64_t decoded = s.m_JobBytesDecoded.Load();
+        TEST_ASSERT( decoded > 0 );
+        OUTPUT( "JobStreamDistributed: build %u, jobs %u bytes received for %u bytes decoded\n", build, (uint32_t)received, (uint32_t)decoded );
+
+        // and they were compressed against each other, not one by one
+        TEST_ASSERT( received < ( decoded / 3 ) );
+    }
 }
 
 // Handshake tests
