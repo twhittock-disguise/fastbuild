@@ -25,6 +25,7 @@
 #include "Core/Profile/Profile.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Strings/AStackString.h"
+#include "Core/Time/Time.h"
 #include "Core/Time/Timer.h"
 #include "Core/Tracing/Tracing.h"
 
@@ -64,6 +65,18 @@ namespace
         outDir.AppendFormat( "pch.%016" PRIx64 "/", pchId );
     #endif
         return true;
+    }
+
+    // Used when trimming the cache during startup scan, before any jobs exist
+    bool PchNeverInUse( uint64_t )
+    {
+        return false;
+    }
+
+    // Used when trimming the cache on the runtime insert path
+    bool PchInUseByLiveJob( uint64_t pchId )
+    {
+        return JobQueueRemote::Get().IsPchInUse( pchId );
     }
 }
 
@@ -677,18 +690,38 @@ void Server::Process( const ConnectionInfo * /*connection*/, const Protocol::Msg
         MutexHolder mh( m_PchCacheMutex );
 
         // Check not already in cache (race with another connection)
-        for ( const PchCacheEntry & e : m_PchCache )
+        bool alreadyInMemory = false;
+        for ( PchCacheEntry & e : m_PchCache )
         {
             if ( e.pchId == pchId )
             {
-                return; // Already cached
+                e.lastWriteTime = Time::GetCurrentFileTime(); // Refresh LRU recency
+                alreadyInMemory = true;
+                break;
             }
+        }
+
+        if ( alreadyInMemory )
+        {
+            return; // Already cached
         }
 
         PchCacheEntry entry;
         entry.pchId = pchId;
         entry.filePath = pchFilePath;
+        entry.lastWriteTime = Time::GetCurrentFileTime();
         m_PchCache.Append( Move( entry ) );
+
+        // Evict oldest entries not currently in use by a live job, once over the cap
+        Array<size_t> evictions;
+        SelectPchEvictions( m_PchCache, kMaxCachedPchEntries, PchInUseByLiveJob, evictions );
+        evictions.Sort();
+        for ( size_t i = evictions.GetSize(); i > 0; --i )
+        {
+            const size_t idx = evictions[ i - 1 ];
+            FileIO::FileDelete( m_PchCache[ idx ].filePath.Get() );
+            m_PchCache.EraseIndex( idx );
+        }
     }
 
     FLOG_OUTPUT( "PCH cached: 0x%016" PRIx64 " -> %s (cached=%s)\n",
@@ -724,13 +757,7 @@ void Server::ScanPchCache()
     }
 
     // Use GetFilesEx to get timestamps for LRU eviction
-    struct PchScanEntry
-    {
-        uint64_t    pchId;
-        uint64_t    lastWriteTime;
-        AString     filePath;
-    };
-    Array<PchScanEntry> scannedEntries;
+    Array<PchCacheEntry> scannedEntries;
 
     // Scan for pch.pch files under pch.<hex> subdirs.
     // Parse pchId from the directory name rather than reading/hashing each file.
@@ -759,11 +786,11 @@ void Server::ScanPchCache()
             }
             if ( pchId == 0 ) { continue; }
 
-            PchScanEntry scanEntry;
-            scanEntry.pchId = pchId;
-            scanEntry.lastWriteTime = fi.m_LastWriteTime;
-            scanEntry.filePath = fi.m_Name;
-            scannedEntries.Append( Move( scanEntry ) );
+            PchCacheEntry entry;
+            entry.pchId = pchId;
+            entry.filePath = fi.m_Name;
+            entry.lastWriteTime = fi.m_LastWriteTime;
+            scannedEntries.Append( Move( entry ) );
         }
     }
 
@@ -772,34 +799,72 @@ void Server::ScanPchCache()
         return;
     }
 
-    // LRU eviction: sort by lastWriteTime descending (newest first), then trim
-    if ( scannedEntries.GetSize() > kMaxCachedPchEntries )
+    // Evict oldest entries beyond the cap (nothing can be "in use" yet at startup)
     {
-        scannedEntries.Sort( []( const PchScanEntry & a, const PchScanEntry & b ) -> bool
+        Array<size_t> evictions;
+        SelectPchEvictions( scannedEntries, kMaxCachedPchEntries, PchNeverInUse, evictions );
+        evictions.Sort();
+        for ( size_t i = evictions.GetSize(); i > 0; --i )
         {
-            return a.lastWriteTime > b.lastWriteTime;
-        });
-        for ( size_t i = kMaxCachedPchEntries; i < scannedEntries.GetSize(); ++i )
-        {
-            FileIO::FileDelete( scannedEntries[ i ].filePath.Get() );
+            const size_t idx = evictions[ i - 1 ];
+            FileIO::FileDelete( scannedEntries[ idx ].filePath.Get() );
+            scannedEntries.EraseIndex( idx );
         }
-        scannedEntries.SetSize( kMaxCachedPchEntries );
     }
 
     // Populate in-memory cache
     {
         MutexHolder mh( m_PchCacheMutex );
-        for ( const PchScanEntry & se : scannedEntries )
+        for ( const PchCacheEntry & se : scannedEntries )
         {
-            PchCacheEntry entry;
-            entry.pchId = se.pchId;
-            entry.filePath = se.filePath;
-            m_PchCache.Append( Move( entry ) );
+            m_PchCache.Append( se );
         }
     }
 
     FLOG_OUTPUT( "PCH inventory: %u entries scanned from disk cache\n",
                  (uint32_t)scannedEntries.GetSize() );
+}
+
+// SelectPchEvictions
+//------------------------------------------------------------------------------
+/*static*/ void Server::SelectPchEvictions( const Array<PchCacheEntry> & entries,
+                                             uint32_t maxEntries,
+                                             bool ( * isInUse )( uint64_t pchId ),
+                                             Array<size_t> & outIndicesToEvict )
+{
+    outIndicesToEvict.Clear();
+
+    if ( entries.GetSize() <= maxEntries )
+    {
+        return;
+    }
+
+    // Visit indices oldest (lowest lastWriteTime) first
+    Array<size_t> indicesOldestFirst;
+    indicesOldestFirst.SetCapacity( entries.GetSize() );
+    for ( size_t i = 0; i < entries.GetSize(); ++i )
+    {
+        indicesOldestFirst.Append( i );
+    }
+    indicesOldestFirst.Sort( [ &entries ]( size_t a, size_t b ) -> bool
+    {
+        return ( entries[ a ].lastWriteTime < entries[ b ].lastWriteTime );
+    } );
+
+    size_t remaining = entries.GetSize();
+    for ( const size_t idx : indicesOldestFirst )
+    {
+        if ( remaining <= maxEntries )
+        {
+            break;
+        }
+        if ( isInUse( entries[ idx ].pchId ) )
+        {
+            continue; // Still referenced by a live job — leave it, cache may temporarily exceed the cap
+        }
+        outIndicesToEvict.Append( idx );
+        --remaining;
+    }
 }
 
 // FindCachedPch

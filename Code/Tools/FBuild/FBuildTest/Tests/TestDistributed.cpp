@@ -34,6 +34,7 @@ private:
     void TestWith4RemoteWorkerThreads() const;
     void WithPCH() const;
     void WithPCHMacroUndefs() const;
+    void PchCacheEvictionPolicy() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
     void RemoteRaceWinRemote();
@@ -68,6 +69,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( WithPCHMacroUndefs )
 #endif
+    REGISTER_TEST( PchCacheEvictionPolicy )
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
     REGISTER_TEST( RemoteRaceWinRemote )
@@ -166,6 +168,63 @@ void TestDistributed::WithPCHMacroUndefs() const
     // because /Yu restores the macro state and re-expands the function name.
     const char * target( "../tmp/Test/Distributed/PCHMacro/distpchmacro.lib" );
     TestHelper( target, 4 );
+}
+
+// PchCacheEvictionPolicy
+//------------------------------------------------------------------------------
+namespace
+{
+    bool PchNeverInUse( uint64_t ) { return false; }
+    bool PchAlwaysInUse( uint64_t ) { return true; }
+    bool PchOnlyId1InUse( uint64_t pchId ) { return ( pchId == 1 ); }
+}
+
+void TestDistributed::PchCacheEvictionPolicy() const
+{
+    // Under the cap: nothing evicted
+    {
+        Array<Server::PchCacheEntry> entries;
+        entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100 } );
+        entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200 } );
+        Array<size_t> evictions;
+        Server::SelectPchEvictions( entries, 2, PchNeverInUse, evictions );
+        TEST_ASSERT( evictions.IsEmpty() );
+    }
+
+    // Over the cap, nothing in use: the oldest (lowest lastWriteTime) is evicted
+    {
+        Array<Server::PchCacheEntry> entries;
+        entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100 } ); // oldest
+        entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200 } );
+        entries.Append( Server::PchCacheEntry{ 3, AString( "dummy3" ), 300 } ); // newest
+        Array<size_t> evictions;
+        Server::SelectPchEvictions( entries, 2, PchNeverInUse, evictions );
+        TEST_ASSERT( evictions.GetSize() == 1 );
+        TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 1 );
+    }
+
+    // Over the cap, the oldest is in use: it's skipped, the next-oldest is evicted instead
+    {
+        Array<Server::PchCacheEntry> entries;
+        entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100 } ); // oldest, but in use
+        entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200 } );
+        entries.Append( Server::PchCacheEntry{ 3, AString( "dummy3" ), 300 } );
+        Array<size_t> evictions;
+        Server::SelectPchEvictions( entries, 2, PchOnlyId1InUse, evictions );
+        TEST_ASSERT( evictions.GetSize() == 1 );
+        TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 2 );
+    }
+
+    // Over the cap, everything in use: nothing can be evicted
+    {
+        Array<Server::PchCacheEntry> entries;
+        entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100 } );
+        entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200 } );
+        entries.Append( Server::PchCacheEntry{ 3, AString( "dummy3" ), 300 } );
+        Array<size_t> evictions;
+        Server::SelectPchEvictions( entries, 2, PchAlwaysInUse, evictions );
+        TEST_ASSERT( evictions.IsEmpty() );
+    }
 }
 
 // RegressionTest_RemoteCrashOnErrorFormatting

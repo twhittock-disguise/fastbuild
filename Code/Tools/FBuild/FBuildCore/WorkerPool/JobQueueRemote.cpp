@@ -295,6 +295,32 @@ void JobQueueRemote::FinishedProcessingJob( Job * job, Node::BuildResult result 
     WakeMainThread();
 }
 
+// IsPchInUse
+//------------------------------------------------------------------------------
+bool JobQueueRemote::IsPchInUse( uint64_t pchId ) const
+{
+    {
+        MutexHolder mh( m_PendingJobsMutex );
+        for ( const Job * job : m_PendingJobs )
+        {
+            if ( job->GetPchId() == pchId )
+            {
+                return true;
+            }
+        }
+    }
+
+    MutexHolder mh( m_InFlightJobsMutex );
+    for ( const Job * job : m_InFlightJobs )
+    {
+        if ( job->GetPchId() == pchId )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 // DoBuild
 //------------------------------------------------------------------------------
 /*static*/ Node::BuildResult JobQueueRemote::DoBuild( Job * job, bool racingRemoteJob )

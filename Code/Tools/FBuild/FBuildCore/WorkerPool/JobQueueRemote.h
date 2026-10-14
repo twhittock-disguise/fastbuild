@@ -43,6 +43,9 @@ public:
     void MainThreadWait( uint32_t timeoutMS );
     void WakeMainThread();
 
+    // True if a pending or in-flight job still references this PCH (safe to evict otherwise)
+    bool IsPchInUse( uint64_t pchId ) const;
+
     // Worker threads can wait:
     void WorkerThreadWait();    // Wait for a job to be available (active thread)
     void WorkerThreadSleep();   // Sleep (inactive thread)

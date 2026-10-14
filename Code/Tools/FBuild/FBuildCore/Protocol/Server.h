@@ -28,6 +28,7 @@ class ToolManifest;
 //------------------------------------------------------------------------------
 class Server : public TCPConnectionPool
 {
+    friend class TestDistributed;
 public:
     Server( uint32_t numThreadsInJobQueue = 0, uint32_t prefetchBuffer = 0 );
     virtual ~Server() override;
@@ -96,9 +97,18 @@ private:
     {
         uint64_t    pchId;
         AString     filePath;
+        uint64_t    lastWriteTime; // used for LRU eviction ordering
     };
     void ScanPchCache();
     bool FindCachedPch( uint64_t pchId, AString & outPath ) const;
+
+    // Selects which entries to evict once "entries" exceeds "maxEntries", oldest
+    // (by lastWriteTime) first, skipping any entry for which isInUse returns true.
+    static void SelectPchEvictions( const Array<PchCacheEntry> & entries,
+                                     uint32_t maxEntries,
+                                     bool ( * isInUse )( uint64_t pchId ),
+                                     Array<size_t> & outIndicesToEvict );
+
     mutable Mutex m_PchCacheMutex;
     Array<PchCacheEntry> m_PchCache;
     bool m_PchCacheScanned = false;
