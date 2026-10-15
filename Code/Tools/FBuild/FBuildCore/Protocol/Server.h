@@ -133,6 +133,7 @@ private:
     };
     void ScanPchCache();
     static void RemoveStaleTempPchFiles( const AString & basePath ); // Left by a crashed worker
+    static void RemoveEmptyPchDirectories( const AString & basePath ); // Left by evicted PCHs
     bool FindCachedPch( uint64_t pchId, AString & outPath ); // refreshes LRU recency
 
     // PCH ids referenced by jobs that are waiting, pending or in flight

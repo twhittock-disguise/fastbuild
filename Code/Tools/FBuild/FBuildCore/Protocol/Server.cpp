@@ -50,6 +50,19 @@ namespace
     // for this long, as that process may be receiving a PCH
     constexpr uint64_t kStaleTempPchFileSeconds = ( 60 * 60 );
 
+    // Collects the directories found while listing files
+    class DirectoryCollector : public GetFilesHelper
+    {
+    public:
+        virtual bool OnDirectory( const AString & dirPath ) override
+        {
+            m_Directories.Append( dirPath );
+            return GetFilesHelper::OnDirectory( dirPath );
+        }
+
+        Array<AString> m_Directories;
+    };
+
     // Picks entries to evict, least recently used first, until at most maxEntries remain.
     // Protected entries are never picked, so more than maxEntries may remain.
     template <class AGE, class PROTECTED>
@@ -883,6 +896,7 @@ void Server::ScanPchCache()
     }
 
     RemoveStaleTempPchFiles( basePath );
+    RemoveEmptyPchDirectories( basePath );
 
     if ( scannedEntries.IsEmpty() )
     {
@@ -936,6 +950,35 @@ void Server::ScanPchCache()
     }
 }
 
+// RemoveEmptyPchDirectories
+//------------------------------------------------------------------------------
+/*static*/ void Server::RemoveEmptyPchDirectories( const AString & basePath )
+{
+    DirectoryCollector collector;
+    FileIO::GetFiles( basePath, collector );
+
+    // A PCH directory is removed when the PCH in it was evicted. Deleting a directory only works
+    // when it is empty, so one with a PCH or a PCH being received is left.
+    for ( const AString & directory : collector.m_Directories )
+    {
+        AStackString<> path( directory );
+        if ( path.EndsWith( NATIVE_SLASH ) )
+        {
+            path.SetLength( path.GetLength() - 1 );
+        }
+        const char * lastSlash = path.FindLast( NATIVE_SLASH );
+        if ( lastSlash == nullptr )
+        {
+            continue;
+        }
+        const AStackString<> parent( path.Get(), lastSlash + 1 );
+        if ( ( parent == basePath ) && ( AString::StrNCmp( lastSlash + 1, "pch.", 4 ) == 0 ) )
+        {
+            FileIO::DirectoryDelete( path );
+        }
+    }
+}
+
 // CollectPchIdsInUse
 //------------------------------------------------------------------------------
 void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
@@ -968,7 +1011,15 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
     for ( size_t i = evictions.GetSize(); i > 0; --i )
     {
         const size_t idx = evictions[ i - 1 ];
-        FileIO::FileDelete( entries[ idx ].filePath.Get() );
+        const AString & file = entries[ idx ].filePath;
+        FileIO::FileDelete( file.Get() );
+
+        // The directory goes with it, unless something else is in it
+        const char * lastSlash = file.FindLast( NATIVE_SLASH );
+        if ( lastSlash )
+        {
+            FileIO::DirectoryDelete( AStackString<>( file.Get(), lastSlash ) );
+        }
         entries.EraseIndex( idx );
     }
 }

@@ -67,6 +67,8 @@ private:
     void PchTakeReadyPchs() const;
     void PchChangedAfterItWasRecorded() const;
     void PchStartupScanRemovesStaleTempFiles() const;
+    void PchEvictionRemovesTheDirectory() const;
+    void PchStartupScanRemovesEmptyDirectories() const;
     void DistributionStatsLog() const;
     void PayloadsAcceptedByWorker() const;
     void PchChunksReachTheWorker() const;
@@ -196,6 +198,8 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchTakeReadyPchs )
     REGISTER_TEST( PchChangedAfterItWasRecorded )
     REGISTER_TEST( PchStartupScanRemovesStaleTempFiles )
+    REGISTER_TEST( PchEvictionRemovesTheDirectory )
+    REGISTER_TEST( PchStartupScanRemovesEmptyDirectories )
     REGISTER_TEST( DistributionStatsLog )
     REGISTER_TEST( PayloadsAcceptedByWorker )
     REGISTER_TEST( PchChunksReachTheWorker )
@@ -735,6 +739,95 @@ void TestDistributed::PchStartupScanRemovesStaleTempFiles() const
     TEST_ASSERT( FileIO::FileExists( fresh.Get() ) );
     TEST_ASSERT( FileIO::FileExists( own.Get() ) );
     TEST_ASSERT( FileIO::FileExists( unrelated.Get() ) );
+}
+
+// PchEvictionRemovesTheDirectory
+//------------------------------------------------------------------------------
+void TestDistributed::PchEvictionRemovesTheDirectory() const
+{
+    // Two more PCHs than a worker keeps, the two oldest first
+    AStackString<> root;
+    VERIFY( FBuild::GetWorkerCacheDir( root ) );
+    const uint32_t kNumPchs = ( 20 + 2 ); // The most a worker keeps is 20
+    Array<Server::PchCacheEntry> entries;
+    Array<AString> dirs;
+    for ( uint32_t i = 0; i < kNumPchs; ++i )
+    {
+        AStackString<> dir;
+        dir.Format( "%spch.%016" PRIx64 "%c", root.Get(), (uint64_t)( 0x8000 + i ), (char)NATIVE_SLASH );
+        AStackString<> file( dir );
+        file += "pch.pch";
+        TEST_ASSERT( FileIO::EnsurePathExistsForFile( file ) );
+        FileStream f;
+        TEST_ASSERT( f.Open( file.Get(), FileStream::WRITE_ONLY ) );
+        const char data[] = "data";
+        TEST_ASSERT( f.Write( data, sizeof( data ) ) == sizeof( data ) );
+
+        Server::PchCacheEntry entry;
+        entry.pchId = ( 0x8000 + i );
+        entry.filePath = file;
+        entry.lastWriteTime = ( 1000 + i );
+        entries.Append( entry );
+        dirs.Append( dir );
+    }
+
+    Server::EvictPchs( entries, Array<uint64_t>() );
+
+    // The oldest are gone, with their directories, and the rest are as they were
+    TEST_ASSERT( entries.GetSize() == 20 );
+    for ( uint32_t i = 0; i < kNumPchs; ++i )
+    {
+        const bool evicted = ( i < 2 );
+        AStackString<> file( dirs[ i ] );
+        file += "pch.pch";
+        TEST_ASSERT( FileIO::FileExists( file.Get() ) == ( evicted == false ) );
+        TEST_ASSERT( FileIO::DirectoryExists( dirs[ i ] ) == ( evicted == false ) );
+    }
+}
+
+// PchStartupScanRemovesEmptyDirectories
+//------------------------------------------------------------------------------
+void TestDistributed::PchStartupScanRemovesEmptyDirectories() const
+{
+    AStackString<> root;
+    VERIFY( FBuild::GetWorkerCacheDir( root ) );
+    auto makeDir = [ & ]( uint64_t pchId, const char * fileName, AString & outDir )
+    {
+        outDir.Format( "%spch.%016" PRIx64 "%c", root.Get(), pchId, (char)NATIVE_SLASH );
+        TEST_ASSERT( FileIO::EnsurePathExists( outDir ) );
+        if ( fileName )
+        {
+            AStackString<> file( outDir );
+            file += fileName;
+            FileStream f;
+            TEST_ASSERT( f.Open( file.Get(), FileStream::WRITE_ONLY ) );
+            const char data[] = "data";
+            TEST_ASSERT( f.Write( data, sizeof( data ) ) == sizeof( data ) );
+        }
+    };
+
+    // What evicted and crashed workers leave: an empty PCH directory, one with a PCH, and one with a
+    // PCH being received by another process
+    AStackString<> emptyDir;
+    AStackString<> pchDir;
+    AStackString<> receivingDir;
+    AStackString<> otherDir;
+    AStackString<> receivingName;
+    receivingName.Format( "incoming.%u.1.pch", Process::GetCurrentId() + 1 );
+    makeDir( 0x9001, nullptr, emptyDir );
+    makeDir( 0x9002, "pch.pch", pchDir );
+    makeDir( 0x9003, receivingName.Get(), receivingDir );
+    otherDir.Format( "%sother%c", root.Get(), (char)NATIVE_SLASH ); // Not a PCH directory
+    TEST_ASSERT( FileIO::EnsurePathExists( otherDir ) );
+
+    Server s( 1 );
+
+    TEST_ASSERT( FileIO::DirectoryExists( emptyDir ) == false );
+    TEST_ASSERT( FileIO::DirectoryExists( pchDir ) );
+    TEST_ASSERT( FileIO::DirectoryExists( receivingDir ) );
+    TEST_ASSERT( FileIO::DirectoryExists( otherDir ) );
+    AStackString<> cachedPath;
+    TEST_ASSERT( s.FindCachedPch( 0x9002, cachedPath ) );
 }
 
 // DistributionStatsLog
