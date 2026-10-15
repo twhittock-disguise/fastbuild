@@ -65,7 +65,11 @@ private:
     void TestWith4RemoteWorkerThreads() const;
     void WithPCH() const;
     void WithPCHMacroUndefs() const;
+    void PchCacheBudget() const;
     void PchCacheEvictionPolicy() const;
+    void PchStartupScanAppliesTheBudget() const;
+    void PchBudgetFollowsTheFreeSpace() const;
+    void PchInsertEvictsToTheBudget() const;
     void PchCompressedCache() const;
     void PchCompressRetry() const;
     void PchTakeReadyPchs() const;
@@ -222,7 +226,11 @@ REGISTER_TESTS_BEGIN( TestDistributed )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( WithPCHMacroUndefs )
 #endif
+    REGISTER_TEST( PchCacheBudget )
     REGISTER_TEST( PchCacheEvictionPolicy )
+    REGISTER_TEST( PchStartupScanAppliesTheBudget )
+    REGISTER_TEST( PchBudgetFollowsTheFreeSpace )
+    REGISTER_TEST( PchInsertEvictsToTheBudget )
     REGISTER_TEST( PchCompressedCache )
     REGISTER_TEST( PchCompressRetry )
     REGISTER_TEST( PchTakeReadyPchs )
@@ -398,48 +406,196 @@ void TestDistributed::WithPCHMacroUndefs() const
     TestHelper( target, 4 );
 }
 
+// PchCacheBudget
+//------------------------------------------------------------------------------
+void TestDistributed::PchCacheBudget() const
+{
+    const uint64_t GiB = ( 1024ull * 1024 * 1024 );
+    const uint64_t kNoLimit = ~(uint64_t)0;
+    auto isAbout = []( uint64_t actual, uint64_t expected )
+    {
+        const uint64_t difference = ( actual > expected ) ? ( actual - expected ) : ( expected - actual );
+        return ( difference < ( 1024 * 1024 ) );
+    };
+
+    // A big disk keeps what the limit allows, however much the cache holds
+    TEST_ASSERT( Server::CalculatePchCacheBudget( 1800 * GiB, 0 ) == Server::kMaxPchCacheBytes );
+    TEST_ASSERT( Server::CalculatePchCacheBudget( 1800 * GiB, 12 * GiB ) == Server::kMaxPchCacheBytes );
+    TEST_ASSERT( Server::kMaxPchCacheBytes == ( 12 * GiB ) );
+
+    // A small disk keeps a share of what could be used: free space and what the cache already has
+    TEST_ASSERT( isAbout( Server::CalculatePchCacheBudget( 10 * GiB, 0 ), 4 * GiB ) );
+    TEST_ASSERT( isAbout( Server::CalculatePchCacheBudget( 20 * GiB, 0 ), 8 * GiB ) );
+    TEST_ASSERT( isAbout( Server::CalculatePchCacheBudget( 6 * GiB, 4 * GiB ), 4 * GiB ) );
+
+    // The bytes the cache holds are counted: the budget does not shrink as the cache fills the disk
+    TEST_ASSERT( isAbout( Server::CalculatePchCacheBudget( 4 * GiB, 6 * GiB ), 4 * GiB ) );
+    TEST_ASSERT( isAbout( Server::CalculatePchCacheBudget( 0, 5 * GiB ), 2 * GiB ) );
+    TEST_ASSERT( Server::CalculatePchCacheBudget( 0, 5 * GiB ) > Server::CalculatePchCacheBudget( 0, 4 * GiB ) );
+
+    // A disk that is nearly full still gets the floor
+    TEST_ASSERT( Server::CalculatePchCacheBudget( 0, 0 ) == Server::kMinPchCacheBytes );
+    TEST_ASSERT( Server::CalculatePchCacheBudget( 1 * GiB, 0 ) == Server::kMinPchCacheBytes );
+    TEST_ASSERT( Server::CalculatePchCacheBudget( 2 * GiB, 0 ) == Server::kMinPchCacheBytes );
+    TEST_ASSERT( Server::kMinPchCacheBytes == ( 1 * GiB ) );
+    TEST_ASSERT( isAbout( Server::CalculatePchCacheBudget( 3 * GiB, 0 ), ( 3 * GiB * 4 ) / 10 ) ); // Above it
+    TEST_ASSERT( Server::CalculatePchCacheBudget( 3 * GiB, 0 ) > Server::kMinPchCacheBytes );
+
+    // Values near the limit of the type do not wrap around
+    TEST_ASSERT( Server::CalculatePchCacheBudget( kNoLimit, kNoLimit ) == Server::kMaxPchCacheBytes );
+    TEST_ASSERT( Server::CalculatePchCacheBudget( kNoLimit, 1 ) == Server::kMaxPchCacheBytes );
+}
+
 // PchCacheEvictionPolicy
 //------------------------------------------------------------------------------
 void TestDistributed::PchCacheEvictionPolicy() const
 {
-    // Entries are deliberately not in age order, so the sort is exercised
+    const uint64_t kNoLimit = ~(uint64_t)0;
+
+    // Entries are deliberately not in age order, so the sort is exercised. Each takes 100 bytes.
     Array<Server::PchCacheEntry> entries;
-    entries.Append( Server::PchCacheEntry{ 3, AString( "dummy3" ), 300 } );
-    entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100 } );
-    entries.Append( Server::PchCacheEntry{ 4, AString( "dummy4" ), 400 } );
-    entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200 } );
+    entries.Append( Server::PchCacheEntry{ 3, AString( "dummy3" ), 300, 100 } );
+    entries.Append( Server::PchCacheEntry{ 1, AString( "dummy1" ), 100, 100 } );
+    entries.Append( Server::PchCacheEntry{ 4, AString( "dummy4" ), 400, 100 } );
+    entries.Append( Server::PchCacheEntry{ 2, AString( "dummy2" ), 200, 100 } );
 
     Array<uint64_t> inUse;
     Array<size_t> evictions;
 
-    // Under or at the cap: nothing evicted
-    Server::SelectPchEvictions( entries, 4, inUse, evictions );
+    // Within the budget: nothing is evicted
+    Server::SelectPchEvictions( entries, 400, 0, inUse, evictions );
     TEST_ASSERT( evictions.IsEmpty() );
 
-    // Over the cap by two: the two oldest go, whatever their position
-    Server::SelectPchEvictions( entries, 2, inUse, evictions );
+    // Over it by two PCHs: the two oldest go, whatever their position
+    Server::SelectPchEvictions( entries, 200, 0, inUse, evictions );
     TEST_ASSERT( evictions.GetSize() == 2 );
     TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 1 );
     TEST_ASSERT( entries[ evictions[ 1 ] ].pchId == 2 );
 
+    // What counts is the bytes: 250 holds two, 199 only one
+    Server::SelectPchEvictions( entries, 250, 0, inUse, evictions );
+    TEST_ASSERT( evictions.GetSize() == 2 );
+    Server::SelectPchEvictions( entries, 199, 0, inUse, evictions );
+    TEST_ASSERT( evictions.GetSize() == 3 );
+    TEST_ASSERT( entries[ evictions[ 2 ] ].pchId == 3 );
+
+    // PCHs differ in size, so one large old PCH makes room for several small ones: the oldest alone is
+    // enough here, though the count of entries is not over any limit
+    {
+        Array<Server::PchCacheEntry> mixed;
+        mixed.Append( Server::PchCacheEntry{ 11, AString( "dummy11" ), 100, 300 } );
+        mixed.Append( Server::PchCacheEntry{ 12, AString( "dummy12" ), 200, 100 } );
+        mixed.Append( Server::PchCacheEntry{ 13, AString( "dummy13" ), 300, 100 } );
+        mixed.Append( Server::PchCacheEntry{ 14, AString( "dummy14" ), 400, 100 } );
+        Server::SelectPchEvictions( mixed, 400, 0, inUse, evictions );
+        TEST_ASSERT( evictions.GetSize() == 1 );
+        TEST_ASSERT( mixed[ evictions[ 0 ] ].pchId == 11 );
+
+        // and when the newest is the large one, the oldest small ones go until it fits
+        mixed[ 0 ].size = 100;
+        mixed[ 3 ].size = 300;
+        Server::SelectPchEvictions( mixed, 400, 0, inUse, evictions );
+        TEST_ASSERT( evictions.GetSize() == 2 );
+        TEST_ASSERT( mixed[ evictions[ 0 ] ].pchId == 11 );
+        TEST_ASSERT( mixed[ evictions[ 1 ] ].pchId == 12 );
+    }
+
     // The oldest is in use: it is skipped and the next-oldest go instead
     inUse.Append( 1 );
-    Server::SelectPchEvictions( entries, 2, inUse, evictions );
+    Server::SelectPchEvictions( entries, 200, 0, inUse, evictions );
     TEST_ASSERT( evictions.GetSize() == 2 );
     TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 2 );
     TEST_ASSERT( entries[ evictions[ 1 ] ].pchId == 3 );
 
-    // Everything but the newest is in use: only what is free can go, so the cap is exceeded
+    // Everything but the newest is in use: only what is free can go, so the budget is exceeded
     inUse.Append( 2 );
     inUse.Append( 3 );
-    Server::SelectPchEvictions( entries, 2, inUse, evictions );
+    Server::SelectPchEvictions( entries, 200, 0, inUse, evictions );
     TEST_ASSERT( evictions.GetSize() == 1 );
     TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 4 );
 
     // The newest is the only one free but is itself in use (just received): nothing to evict
     inUse.Append( 4 );
-    Server::SelectPchEvictions( entries, 2, inUse, evictions );
+    Server::SelectPchEvictions( entries, 200, 0, inUse, evictions );
     TEST_ASSERT( evictions.IsEmpty() );
+
+    // A PCH that is larger than the whole budget is kept while it is the only one in use
+    {
+        Array<Server::PchCacheEntry> big;
+        big.Append( Server::PchCacheEntry{ 21, AString( "dummy21" ), 100, 1000 } );
+        Array<uint64_t> bigInUse;
+        bigInUse.Append( 21 );
+        Server::SelectPchEvictions( big, 10, 0, bigInUse, evictions );
+        TEST_ASSERT( evictions.IsEmpty() );
+    }
+
+    // The floor: the newest PCHs stay however far over the budget they are
+    inUse.Clear();
+    Server::SelectPchEvictions( entries, 0, 3, inUse, evictions );
+    TEST_ASSERT( evictions.GetSize() == 1 );
+    TEST_ASSERT( entries[ evictions[ 0 ] ].pchId == 1 );
+    Server::SelectPchEvictions( entries, 0, 4, inUse, evictions );
+    TEST_ASSERT( evictions.IsEmpty() );
+    Server::SelectPchEvictions( entries, 0, 0, inUse, evictions );
+    TEST_ASSERT( evictions.GetSize() == 4 );
+    TEST_ASSERT( Server::kMinCachedPchEntries >= 4 );
+
+    // However small the PCHs are, there is a limit to how many are kept: the oldest go
+    {
+        const uint32_t kNumEntries = ( Server::kMaxCachedPchEntries + 44 );
+        Array<Server::PchCacheEntry> many;
+        for ( uint32_t i = 0; i < kNumEntries; ++i )
+        {
+            many.Append( Server::PchCacheEntry{ 1000 + i, AString( "dummy" ), (uint64_t)( 5000 - i ), 0 } ); // The later ones are older
+        }
+        Server::SelectPchEvictions( many, kNoLimit, 0, inUse, evictions );
+        TEST_ASSERT( evictions.GetSize() == 44 );
+        for ( const size_t index : evictions )
+        {
+            TEST_ASSERT( index >= Server::kMaxCachedPchEntries );
+        }
+    }
+}
+
+// PchStartupScanAppliesTheBudget
+//------------------------------------------------------------------------------
+void TestDistributed::PchStartupScanAppliesTheBudget() const
+{
+    // Six PCHs of 5 bytes on disk, written one after the other
+    AStackString<> root;
+    VERIFY( FBuild::GetWorkerCacheDir( root ) );
+    const uint32_t kNumPchs = 6;
+    Array<AString> files;
+    for ( uint32_t i = 0; i < kNumPchs; ++i )
+    {
+        AStackString<> dir;
+        dir.Format( "%spch.%016" PRIx64 "%c", root.Get(), (uint64_t)( 0xA000 + i ), (char)NATIVE_SLASH );
+        AStackString<> file;
+        TEST_ASSERT( MakeSmallFile( dir, "pch.pch", file ) );
+        files.Append( file );
+        Thread::Sleep( 30 );
+    }
+
+    Server s( 1 );
+    TEST_ASSERT( s.m_PchCache.GetSize() == kNumPchs ); // The real budget has room for them
+    for ( const Server::PchCacheEntry & e : s.m_PchCache )
+    {
+        TEST_ASSERT( e.size == 5 );
+    }
+
+    // Scanned again with room for two of them, the newest are kept
+    s.SetPchCacheLimitsForTesting( 10, 1 );
+    s.m_PchCache.Clear();
+    s.m_PchCacheScanned = false;
+    s.ScanPchCache();
+    TEST_ASSERT( s.m_PchCache.GetSize() == 2 );
+    AStackString<> path;
+    TEST_ASSERT( s.FindCachedPch( 0xA004, path ) );
+    TEST_ASSERT( s.FindCachedPch( 0xA005, path ) );
+    for ( uint32_t i = 0; i < kNumPchs; ++i )
+    {
+        TEST_ASSERT( FileIO::FileExists( files[ i ].Get() ) == ( i >= 4 ) );
+    }
 }
 
 // PchDataCache helpers
@@ -1133,6 +1289,8 @@ void TestDistributed::PchStartupScanRemovesStaleTempFiles() const
     // that a running process may still be writing, that is being written by this one, or that is not ours
     AStackString<> cachedPath;
     TEST_ASSERT( s.FindCachedPch( kPchId, cachedPath ) );
+    TEST_ASSERT( s.m_PchCache.GetSize() == 1 );
+    TEST_ASSERT( s.m_PchCache[ 0 ].size == 5 ); // "data" and its terminator
     TEST_ASSERT( FileIO::FileExists( pch.Get() ) );
     TEST_ASSERT( FileIO::FileExists( stale.Get() ) == false );
     TEST_ASSERT( FileIO::FileExists( running.Get() ) );
@@ -1140,14 +1298,64 @@ void TestDistributed::PchStartupScanRemovesStaleTempFiles() const
     TEST_ASSERT( FileIO::FileExists( unrelated.Get() ) );
 }
 
+// PchBudgetFollowsTheFreeSpace
+//------------------------------------------------------------------------------
+void TestDistributed::PchBudgetFollowsTheFreeSpace() const
+{
+    const uint64_t GiB = ( 1024ull * 1024 * 1024 );
+    auto isAbout = []( uint64_t actual, uint64_t expected )
+    {
+        const uint64_t difference = ( actual > expected ) ? ( actual - expected ) : ( expected - actual );
+        return ( difference < ( 1024 * 1024 ) );
+    };
+
+    // The budget comes from the free space of the volume and what the cache holds
+    {
+        Server s( 1 );
+        s.SetFreeSpaceForTesting( 10 * GiB );
+        TEST_ASSERT( isAbout( s.GetPchCacheBudget( 0 ), 4 * GiB ) );
+        TEST_ASSERT( isAbout( s.GetPchCacheBudget( 5 * GiB ), 6 * GiB ) );
+        s.SetFreeSpaceForTesting( 1800 * GiB );
+        TEST_ASSERT( s.GetPchCacheBudget( 0 ) == Server::kMaxPchCacheBytes );
+        s.SetFreeSpaceForTesting( 0 );
+        TEST_ASSERT( s.GetPchCacheBudget( 0 ) == Server::kMinPchCacheBytes );
+
+        // and it is what the cache is kept to: 5 PCHs of 1.5 GiB are 7.5 GiB, and 40% of 10 + 7.5 GiB is 7 GiB
+        s.SetFreeSpaceForTesting( 10 * GiB );
+        Array<Server::PchCacheEntry> entries;
+        for ( uint32_t i = 0; i < 5; ++i )
+        {
+            entries.Append( Server::PchCacheEntry{ 1 + i, AString( "dummy" ), (uint64_t)( 100 + i ), ( 3 * GiB ) / 2 } );
+        }
+        s.EvictPchsToBudget( entries, Array<uint64_t>() );
+        TEST_ASSERT( entries.GetSize() == 4 );
+        TEST_ASSERT( entries[ 0 ].pchId == 2 ); // The oldest went
+    }
+
+    // The real free space of the volume is used when nothing is set: the PCH cache directory is there
+    Server real( 1 );
+    AStackString<> cacheDir;
+    VERIFY( FBuild::GetWorkerCacheDir( cacheDir ) );
+    uint64_t freeBefore = 0;
+    TEST_ASSERT( FileIO::EnsurePathExists( cacheDir ) );
+    TEST_ASSERT( FileIO::GetFreeDiskSpace( cacheDir, freeBefore ) );
+    const uint64_t budget = real.GetPchCacheBudget( 0 );
+    uint64_t freeAfter = 0;
+    TEST_ASSERT( FileIO::GetFreeDiskSpace( cacheDir, freeAfter ) );
+    const uint64_t lowest = Server::CalculatePchCacheBudget( Math::Min( freeBefore, freeAfter ), 0 );
+    const uint64_t highest = Server::CalculatePchCacheBudget( Math::Max( freeBefore, freeAfter ), 0 );
+    TEST_ASSERT( ( budget >= lowest ) && ( budget <= highest ) );
+}
+
 // PchEvictionRemovesTheDirectory
 //------------------------------------------------------------------------------
 void TestDistributed::PchEvictionRemovesTheDirectory() const
 {
-    // Two more PCHs than a worker keeps, the two oldest first
+    // Two more PCHs than the budget has room for, the two oldest first
     AStackString<> root;
     VERIFY( FBuild::GetWorkerCacheDir( root ) );
-    const uint32_t kNumPchs = ( 20 + 2 ); // The most a worker keeps is 20
+    const uint32_t kMaxPchs = 20;
+    const uint32_t kNumPchs = ( kMaxPchs + 2 );
     Array<Server::PchCacheEntry> entries;
     Array<AString> dirs;
     for ( uint32_t i = 0; i < kNumPchs; ++i )
@@ -1166,14 +1374,15 @@ void TestDistributed::PchEvictionRemovesTheDirectory() const
         entry.pchId = ( 0x8000 + i );
         entry.filePath = file;
         entry.lastWriteTime = ( 1000 + i );
+        entry.size = 1;
         entries.Append( entry );
         dirs.Append( dir );
     }
 
-    Server::EvictPchs( entries, Array<uint64_t>() );
+    Server::EvictPchs( entries, kMaxPchs, 0, Array<uint64_t>() );
 
     // The oldest are gone, with their directories, and the rest are as they were
-    TEST_ASSERT( entries.GetSize() == 20 );
+    TEST_ASSERT( entries.GetSize() == kMaxPchs );
     for ( uint32_t i = 0; i < kNumPchs; ++i )
     {
         const bool evicted = ( i < 2 );
@@ -3593,6 +3802,40 @@ void TestDistributed::MSVCWorkerFailuresAreRetriedElsewhere() const
     {
         TEST_ASSERT( ObjectNode::IsMSVCSystemFailure( AStackString<>( text ) ) == false );
     }
+}
+
+// PchInsertEvictsToTheBudget
+//------------------------------------------------------------------------------
+void TestDistributed::PchInsertEvictsToTheBudget() const
+{
+    Server s( 1 );
+    s.SetPchCacheLimitsForTesting( 1, 0 ); // Room for nothing beyond the PCH that has just arrived
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    PchSender sender;
+    TEST_ASSERT( sender.ConnectToWorker() );
+    uint64_t pchIds[ 2 ] = {};
+    for ( uint32_t i = 0; i < 2; ++i )
+    {
+        Array<char> content;
+        MakeRandomBytes( 100000, ( 21 + i ), content );
+        Compressor compressed;
+        compressed.CompressZstd( content.Begin(), content.GetSize(), Compressor::kZstdTransferLevel );
+        pchIds[ i ] = PchId::Calc( content.Begin(), content.GetSize() );
+        const uint32_t compressedSize = (uint32_t)compressed.GetResultSize();
+        TEST_ASSERT( sender.SendChunks( pchIds[ i ], (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) ) );
+        TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ i ] ); } ) );
+    }
+
+    // The first is gone, with its file, and the one that has just arrived is kept
+    AStackString<> firstDir;
+    GetWorkerPchDir( pchIds[ 0 ], firstDir );
+    TEST_ASSERT( WaitUntil( [ & ]() { return ( s.IsPchCached( pchIds[ 0 ] ) == false ); } ) );
+    TEST_ASSERT( FileIO::DirectoryExists( firstDir ) == false );
+    TEST_ASSERT( s.IsPchCached( pchIds[ 1 ] ) );
+    AStackString<> secondPath;
+    TEST_ASSERT( s.FindCachedPch( pchIds[ 1 ], secondPath ) );
+    TEST_ASSERT( FileIO::FileExists( secondPath.Get() ) );
 }
 
 // RegressionTest_RemoteCrashOnErrorFormatting

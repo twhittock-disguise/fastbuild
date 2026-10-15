@@ -103,6 +103,8 @@ private:
     static void SendIdInventory( ClientState & cs, const Array<uint64_t> & ids );
     void RequestMissingFiles( ClientState & cs, ToolManifest * manifest ) const;
 
+    bool IsPchCached( uint64_t pchId ) const; // Does not refresh LRU recency
+
     uint32_t m_PrefetchBuffer = 0;
     JobQueueRemote * m_JobQueueRemote;
 
@@ -130,7 +132,28 @@ private:
         uint64_t    pchId;
         AString     filePath;
         uint64_t    lastWriteTime;
+        uint64_t    size = 0;   // Bytes on disk
     };
+
+    // How much the PCH cache may hold. A worker is a shared machine and its free space varies from a few
+    // GiB to a lot, so the cache keeps to a share of what the volume has left, counting what the cache
+    // itself holds: budget = min( kMaxPchCacheBytes, kPchCacheSharePercent of ( free + cache ) ), and
+    // never less than kMinPchCacheBytes. The oldest PCHs beyond the budget are evicted (never one that
+    // a job waits for, is running with, or that has just arrived), but at least kMinCachedPchEntries
+    // stay, and kMaxCachedPchEntries is a limit on the count whatever the sizes. Checked whenever a PCH
+    // is added and at startup.
+    static constexpr uint64_t kMaxPchCacheBytes = ( 12ull * 1024 * 1024 * 1024 );
+    static constexpr uint64_t kMinPchCacheBytes = ( 1ull * 1024 * 1024 * 1024 );
+    static constexpr uint32_t kPchCacheSharePercent = 40;
+    static constexpr uint32_t kMinCachedPchEntries = 4;
+    static constexpr uint32_t kMaxCachedPchEntries = 256;
+    static uint64_t CalculatePchCacheBudget( uint64_t freeBytes, uint64_t cacheBytes ); // Pure
+    uint64_t GetPchCacheBudget( uint64_t cacheBytes ) const; // Queries the free space of the cache volume
+
+    // Test knobs: replace the budget and the number of entries that always stay, or the free space
+    // that is found on the cache volume
+    void SetPchCacheLimitsForTesting( uint64_t budgetBytes, uint32_t minEntries );
+    void SetFreeSpaceForTesting( uint64_t freeBytes );
     void ScanPchCache();
     static void RemoveEmptyPchDirectories( const AString & basePath ); // Left by evicted PCHs
     bool FindCachedPch( uint64_t pchId, AString & outPath ); // refreshes LRU recency
@@ -138,16 +161,27 @@ private:
     // PCH ids referenced by jobs that are waiting, pending or in flight
     void CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const;
 
-    // Oldest entries first, skipping those in pchIdsInUse
+    // Oldest entries first, skipping those in pchIdsInUse, until the entries are within budgetBytes
+    // and kMaxCachedPchEntries (but not below minEntries because of the bytes)
     static void SelectPchEvictions( const Array<PchCacheEntry> & entries,
-                                     uint32_t maxEntries,
+                                     uint64_t budgetBytes,
+                                     uint32_t minEntries,
                                      const Array<uint64_t> & pchIdsInUse,
                                      Array<size_t> & outIndicesToEvict );
-    static void EvictPchs( Array<PchCacheEntry> & entries, const Array<uint64_t> & pchIdsInUse );
+    static void EvictPchs( Array<PchCacheEntry> & entries,
+                           uint64_t budgetBytes,
+                           uint32_t minEntries,
+                           const Array<uint64_t> & pchIdsInUse );
+    void EvictPchsToBudget( Array<PchCacheEntry> & entries, const Array<uint64_t> & pchIdsInUse ) const;
 
     mutable Mutex m_PchCacheMutex;
     Array<PchCacheEntry> m_PchCache;
     bool m_PchCacheScanned = false;
+    bool m_PchCacheLimitsSet = false; // See SetPchCacheLimitsForTesting
+    uint64_t m_PchCacheBudgetOverride = 0;
+    uint32_t m_PchCacheMinEntriesOverride = 0;
+    bool m_FreeSpaceSet = false; // See SetFreeSpaceForTesting
+    uint64_t m_FreeSpaceOverride = 0;
 
 #if defined( __OSX__ ) || defined( __LINUX__ )
     Timer m_TouchToolchainTimer;

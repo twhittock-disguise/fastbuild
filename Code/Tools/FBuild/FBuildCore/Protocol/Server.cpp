@@ -43,8 +43,6 @@
 
 namespace
 {
-    constexpr uint32_t kMaxCachedPchEntries = 20;
-
     const char * const kPchFileName = "pch.pch";
 
     // Collects the directories found while listing files
@@ -60,18 +58,39 @@ namespace
         Array<AString> m_Directories;
     };
 
-    // Picks entries to evict, least recently used first, until at most maxEntries remain.
-    // Protected entries are never picked, so more than maxEntries may remain.
-    template <class AGE, class PROTECTED>
+    constexpr uint64_t kNoLimit = ~(uint64_t)0;
+
+    struct LruLimits
+    {
+        size_t      m_MaxEntries;
+        size_t      m_MinEntries;   // Not evicted for the sake of m_MaxBytes
+        uint64_t    m_MaxBytes;
+    };
+
+    // Picks entries to evict, least recently used first, until at most m_MaxEntries remain and they
+    // come to at most m_MaxBytes (which never takes the count below m_MinEntries).
+    // Protected entries are never picked, so more may remain.
+    template <class AGE, class SIZE, class PROTECTED>
     void SelectLeastRecentlyUsed( size_t numEntries,
-                                  uint32_t maxEntries,
+                                  const LruLimits & limits,
                                   const AGE & ageOf,
+                                  const SIZE & sizeOf,
                                   const PROTECTED & isProtected,
                                   Array<size_t> & outIndicesToEvict )
     {
         outIndicesToEvict.Clear();
 
-        if ( numEntries <= maxEntries )
+        uint64_t remainingBytes = 0;
+        for ( size_t i = 0; i < numEntries; ++i )
+        {
+            remainingBytes += sizeOf( i );
+        }
+        const auto isOverLimits = [ &limits ]( size_t remaining, uint64_t bytes )
+        {
+            return ( remaining > limits.m_MaxEntries ) ||
+                   ( ( bytes > limits.m_MaxBytes ) && ( remaining > limits.m_MinEntries ) );
+        };
+        if ( isOverLimits( numEntries, remainingBytes ) == false )
         {
             return;
         }
@@ -91,7 +110,7 @@ namespace
         size_t remaining = numEntries;
         for ( const size_t idx : indicesOldestFirst )
         {
-            if ( remaining <= maxEntries )
+            if ( isOverLimits( remaining, remainingBytes ) == false )
             {
                 break;
             }
@@ -101,6 +120,7 @@ namespace
             }
             outIndicesToEvict.Append( idx );
             --remaining;
+            remainingBytes -= sizeOf( idx );
         }
     }
 
@@ -789,6 +809,21 @@ void Server::ReleaseReadyWaitingJobs()
     }
 }
 
+// IsPchCached
+//------------------------------------------------------------------------------
+bool Server::IsPchCached( uint64_t pchId ) const
+{
+    MutexHolder mh( m_PchCacheMutex );
+    for ( const PchCacheEntry & e : m_PchCache )
+    {
+        if ( e.pchId == pchId )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Process( MsgPchFile )
 //------------------------------------------------------------------------------
 void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchFile * msg, const void * payload, size_t payloadSize )
@@ -848,9 +883,10 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
         entry.pchId = pchId;
         entry.filePath = pchFilePath;
         entry.lastWriteTime = now;
+        entry.size = msg->GetUncompressedSize(); // What the file on disk comes to
         m_PchCache.Append( Move( entry ) );
 
-        EvictPchs( m_PchCache, pchIdsInUse );
+        EvictPchsToBudget( m_PchCache, pchIdsInUse );
     }
 
     FLOG_OUTPUT( "PCH cached: 0x%016" PRIx64 " -> %s (cached=%s)\n",
@@ -919,6 +955,7 @@ void Server::ScanPchCache()
             entry.pchId = pchId;
             entry.filePath = fi.m_Name;
             entry.lastWriteTime = fi.m_LastWriteTime;
+            entry.size = fi.m_Size;
             scannedEntries.Append( Move( entry ) );
         }
     }
@@ -932,7 +969,7 @@ void Server::ScanPchCache()
     }
 
     // No jobs exist yet at startup, so nothing is in use
-    EvictPchs( scannedEntries, Array<uint64_t>() );
+    EvictPchsToBudget( scannedEntries, Array<uint64_t>() );
 
     // Populate in-memory cache
     {
@@ -1000,16 +1037,19 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
 // EvictPchs
 //------------------------------------------------------------------------------
 /*static*/ void Server::EvictPchs( Array<PchCacheEntry> & entries,
+                                    uint64_t budgetBytes,
+                                    uint32_t minEntries,
                                     const Array<uint64_t> & pchIdsInUse )
 {
     Array<size_t> evictions;
-    SelectPchEvictions( entries, kMaxCachedPchEntries, pchIdsInUse, evictions );
+    SelectPchEvictions( entries, budgetBytes, minEntries, pchIdsInUse, evictions );
     evictions.Sort();
     for ( size_t i = evictions.GetSize(); i > 0; --i )
     {
         const size_t idx = evictions[ i - 1 ];
         const AString & file = entries[ idx ].filePath;
         FileIO::FileDelete( file.Get() );
+        FLOG_VERBOSE( "PCH cache: evicting 0x%016" PRIx64 " (%u MiB)\n", entries[ idx ].pchId, (uint32_t)( entries[ idx ].size / MEGABYTE ) );
 
         // The directory goes with it, unless something else is in it
         const char * lastSlash = file.FindLast( NATIVE_SLASH );
@@ -1021,16 +1061,80 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
     }
 }
 
+// CalculatePchCacheBudget
+//------------------------------------------------------------------------------
+/*static*/ uint64_t Server::CalculatePchCacheBudget( uint64_t freeBytes, uint64_t cacheBytes )
+{
+    // The space the cache could have: what is free, plus what it already holds
+    const uint64_t available = ( freeBytes > ( kNoLimit - cacheBytes ) ) ? kNoLimit : ( freeBytes + cacheBytes );
+    const uint64_t share = ( available / 100 ) * kPchCacheSharePercent;
+    return Math::Max( kMinPchCacheBytes, Math::Min( kMaxPchCacheBytes, share ) );
+}
+
+// GetPchCacheBudget
+//------------------------------------------------------------------------------
+uint64_t Server::GetPchCacheBudget( uint64_t cacheBytes ) const
+{
+    if ( m_PchCacheLimitsSet )
+    {
+        return m_PchCacheBudgetOverride;
+    }
+
+    AStackString<> dir;
+    uint64_t freeBytes = m_FreeSpaceOverride;
+    if ( m_FreeSpaceSet ||
+         ( FBuild::GetWorkerCacheDir( dir ) && FileIO::EnsurePathExists( dir ) && FileIO::GetFreeDiskSpace( dir, freeBytes ) ) )
+    {
+        return CalculatePchCacheBudget( freeBytes, cacheBytes );
+    }
+    return kMaxPchCacheBytes; // The free space is not known
+}
+
+// SetPchCacheLimitsForTesting
+//------------------------------------------------------------------------------
+void Server::SetPchCacheLimitsForTesting( uint64_t budgetBytes, uint32_t minEntries )
+{
+    m_PchCacheLimitsSet = true;
+    m_PchCacheBudgetOverride = budgetBytes;
+    m_PchCacheMinEntriesOverride = minEntries;
+}
+
+// SetFreeSpaceForTesting
+//------------------------------------------------------------------------------
+void Server::SetFreeSpaceForTesting( uint64_t freeBytes )
+{
+    m_FreeSpaceSet = true;
+    m_FreeSpaceOverride = freeBytes;
+}
+
+// EvictPchsToBudget
+//------------------------------------------------------------------------------
+void Server::EvictPchsToBudget( Array<PchCacheEntry> & entries, const Array<uint64_t> & pchIdsInUse ) const
+{
+    uint64_t cacheBytes = 0;
+    for ( const PchCacheEntry & e : entries )
+    {
+        cacheBytes += e.size;
+    }
+    EvictPchs( entries,
+               GetPchCacheBudget( cacheBytes ),
+               m_PchCacheLimitsSet ? m_PchCacheMinEntriesOverride : kMinCachedPchEntries,
+               pchIdsInUse );
+}
+
 // SelectPchEvictions
 //------------------------------------------------------------------------------
 /*static*/ void Server::SelectPchEvictions( const Array<PchCacheEntry> & entries,
-                                             uint32_t maxEntries,
+                                             uint64_t budgetBytes,
+                                             uint32_t minEntries,
                                              const Array<uint64_t> & pchIdsInUse,
                                              Array<size_t> & outIndicesToEvict )
 {
+    const LruLimits limits = { kMaxCachedPchEntries, minEntries, budgetBytes };
     SelectLeastRecentlyUsed( entries.GetSize(),
-                             maxEntries,
+                             limits,
                              [ &entries ]( size_t i ) { return entries[ i ].lastWriteTime; },
+                             [ &entries ]( size_t i ) { return entries[ i ].size; },
                              [ &entries, &pchIdsInUse ]( size_t i ) { return ( pchIdsInUse.Find( entries[ i ].pchId ) != nullptr ); },
                              outIndicesToEvict );
 }
@@ -1173,9 +1277,11 @@ void Server::EvictToolchains( const ToolManifest * keep )
         }
 
         Array<size_t> evictions;
+        const LruLimits limits = { kMaxCachedToolchains, 0, kNoLimit };
         SelectLeastRecentlyUsed( candidates.GetSize(),
-                                 kMaxCachedToolchains,
+                                 limits,
                                  [ &candidates ]( size_t i ) { return candidates[ i ]->GetLastUsed(); },
+                                 []( size_t ) { return (uint64_t)0; },
                                  [ &candidates, keep ]( size_t i ) { return ( candidates[ i ] == keep ) || candidates[ i ]->IsInUse(); },
                                  evictions );
         for ( const size_t idx : evictions )
