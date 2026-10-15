@@ -17,6 +17,7 @@
 
 // system
 #include <memory.h> // for memset
+#include <stddef.h> // for offsetof
 #if defined( __APPLE__ ) || defined( __LINUX__ )
     #include <unistd.h> // for ::gethostname
 #endif
@@ -109,19 +110,34 @@ bool Protocol::IMessage::Broadcast( TCPConnectionPool * pool ) const
 
 // MsgConnection
 //------------------------------------------------------------------------------
-Protocol::MsgConnection::MsgConnection()
+// The version fields of the handshake messages are where every major puts them, so a peer of another
+// major can tell the versions apart. A change to the offsets is a change to every later major.
+PRAGMA_DISABLE_PUSH_CLANG( "-Winvalid-offsetof" )
+Protocol::MsgConnection::MsgConnection( uint32_t capabilities )
     : Protocol::IMessage( Protocol::MSG_CONNECTION, sizeof( MsgConnection ), false )
     , m_ProtocolVersion( kVersionMajor )
     , m_Platform( Env::GetPlatform() )
     , m_ProtocolVersionMinor( kVersionMinor )
-    , m_Capabilities( kCapabilities )
+    , m_Capabilities( capabilities )
 {
+    static_assert( offsetof( MsgConnection, m_ProtocolVersion ) == 4, "MsgConnection major moved" );
+    static_assert( offsetof( MsgConnection, m_HostName ) == 12, "MsgConnection host name moved" );
     memset( m_Padding2, 0, sizeof( m_Padding2 ) );
     memset( m_HostName, 0, sizeof( m_HostName ) );
     if ( ::gethostname( m_HostName, 64 ) != 0 )
     {
         AString::Copy( "Unavailable", m_HostName, 12 ); // inc terminator in copy
     }
+}
+
+//------------------------------------------------------------------------------
+void Protocol::MsgConnection::GetHostName( uint32_t frameSize, AString & outName ) const
+{
+    // A client does not have to terminate it, and its frame may stop short of it
+    const uint32_t offset = (uint32_t)offsetof( MsgConnection, m_HostName );
+    const uint32_t available = ( frameSize > offset ) ? Math::Min<uint32_t>( frameSize - offset, sizeof( m_HostName ) ) : 0;
+    const char * end = static_cast<const char *>( memchr( m_HostName, 0, available ) );
+    outName.Assign( m_HostName, ( end ? end : ( m_HostName + available ) ) );
 }
 
 // MsgConnectionAck
@@ -134,6 +150,9 @@ Protocol::MsgConnectionAck::MsgConnectionAck( uint8_t capacity, uint32_t capabil
     , m_WorkerCapacity( capacity )
     , m_Capabilities( capabilities )
 {
+    static_assert( offsetof( MsgConnectionAck, m_WorkerVersion ) == 4, "MsgConnectionAck worker version moved" );
+    static_assert( offsetof( MsgConnectionAck, m_ProtocolVersionMajor ) == 6, "MsgConnectionAck major moved" );
+    static_assert( offsetof( MsgConnectionAck, m_ProtocolVersionMinor ) == 7, "MsgConnectionAck minor moved" );
     memset( m_Padding2, 0, sizeof( m_Padding2 ) );
 }
 
@@ -145,7 +164,11 @@ Protocol::MsgRefused::MsgRefused()
     , m_ProtocolVersionMajor( kVersionMajor )
     , m_ProtocolVersionMinor( kVersionMinor )
 {
+    static_assert( offsetof( MsgRefused, m_WorkerVersion ) == 4, "MsgRefused worker version moved" );
+    static_assert( offsetof( MsgRefused, m_ProtocolVersionMajor ) == 6, "MsgRefused major moved" );
+    static_assert( offsetof( MsgRefused, m_ProtocolVersionMinor ) == 7, "MsgRefused minor moved" );
 }
+PRAGMA_DISABLE_POP_CLANG
 
 // MsgJob
 //------------------------------------------------------------------------------
@@ -280,22 +303,60 @@ uint32_t Protocol::GetMinMessageSize( MessageType type )
     return 0;
 }
 
-// IsFrameLongEnough
+// GetPayloadRule
 //------------------------------------------------------------------------------
-bool Protocol::IsFrameLongEnough( const void * frame, uint32_t size )
+Protocol::PayloadRule Protocol::GetPayloadRule( MessageType type )
+{
+    switch ( type )
+    {
+        case MSG_CONNECTION:            return PAYLOAD_NEVER;
+        case MSG_CONNECTION_ACK:        return PAYLOAD_NEVER;
+        case MSG_REFUSED:               return PAYLOAD_NEVER;
+        case MSG_JOB:                   return PAYLOAD_ALWAYS;
+        case MSG_JOB_RESULT:            return PAYLOAD_ALWAYS;
+        case MSG_JOB_RESULT_COMPRESSED: return PAYLOAD_ALWAYS;
+        case MSG_MANIFEST:              return PAYLOAD_ALWAYS;
+        case MSG_FILE:                  return PAYLOAD_ALWAYS;
+        case MSG_PCH_FILE:              return PAYLOAD_ALWAYS;
+        case MSG_PCH_INVENTORY:         return PAYLOAD_OPTIONAL;
+        case MSG_REQUEST_MANIFEST:      return PAYLOAD_NEVER;
+        case MSG_REQUEST_FILE:          return PAYLOAD_NEVER;
+        case MSG_TOOLCHAIN_INVENTORY:   return PAYLOAD_OPTIONAL;
+        case NUM_MESSAGES:              break;
+    }
+    return PAYLOAD_NEVER;
+}
+
+// IsValidHeader
+//------------------------------------------------------------------------------
+bool Protocol::IsValidHeader( const void * frame, uint32_t size )
 {
     if ( size < sizeof( IMessage ) )
     {
         return false; // Not even the type can be read
     }
-    return ( size >= GetMinMessageSize( static_cast<const IMessage *>( frame )->GetType() ) );
+    const IMessage * msg = static_cast<const IMessage *>( frame );
+    const uint32_t minSize = GetMinMessageSize( msg->GetType() );
+    if ( ( minSize == 0 ) || ( size < minSize ) )
+    {
+        return false; // An unknown type, or too short for its type
+    }
+    const PayloadRule rule = GetPayloadRule( msg->GetType() );
+    return ( ( rule == PAYLOAD_OPTIONAL ) || ( ( rule == PAYLOAD_ALWAYS ) == msg->HasPayload() ) );
 }
 
-// GetVersionDescription
+// FormatVersion
 //------------------------------------------------------------------------------
-void Protocol::GetVersionDescription( AString & outText )
+void Protocol::FormatVersion( AString & outText, uint32_t major, uint32_t minor )
 {
-    outText.Format( "protocol v%u.%u", kVersionMajor, (uint32_t)kVersionMinor );
+    outText.Format( "v%u.%u", major, minor );
+}
+
+// GetVersionString
+//------------------------------------------------------------------------------
+void Protocol::GetVersionString( AString & outText )
+{
+    FormatVersion( outText, kVersionMajor, kVersionMinor );
 }
 
 //------------------------------------------------------------------------------

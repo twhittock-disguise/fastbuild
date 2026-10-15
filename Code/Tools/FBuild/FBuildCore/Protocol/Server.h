@@ -84,8 +84,6 @@ private:
         uint32_t m_AllocatedCapacity = 0;
 
         AString m_HostName;
-        uint8_t m_PeerMinor = 0;        // What the client reported in its handshake. Protected by m_Mutex.
-        uint32_t m_PeerCapabilities = 0;
 
         Array<Job *> m_WaitingJobs; // jobs waiting for manifests/toolchains
 

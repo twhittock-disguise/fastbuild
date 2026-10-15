@@ -50,6 +50,7 @@ public:
 
     uint32_t GetNumConnections() const;
     uint32_t GetNumDenyListedWorkers() const; // Workers that refused this client or misbehaved
+    void DenyListWorker( ClientWorkerInfo & worker ); // Called from the receive thread of the worker's connection
 
     // Toolchains the build is about to need on workers
     void AddToolchain( const ToolManifest * manifest );
@@ -84,6 +85,7 @@ private:
 
     // Workers we are connected to (or establishing/cleaning up a connection to)
     Array<UniquePtr<ClientToWorkerConnection>> m_ActiveConnections;
+    Atomic<uint32_t> m_NumDenyListedWorkers{ 0 };
 
     mutable Mutex m_ToolchainsMutex;
     Array<const ToolManifest *> m_Toolchains;

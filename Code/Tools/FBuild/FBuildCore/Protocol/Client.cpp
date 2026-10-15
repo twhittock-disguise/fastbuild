@@ -40,7 +40,6 @@
 
 // Defines
 //------------------------------------------------------------------------------
-#define CONNECTION_REATTEMPT_DELAY_TIME ( 10.0f )
 #define SYSTEM_ERROR_ATTEMPT_COUNT ( 3u )
 #define MAX_UNSENT_JOBS ( 4u ) // Per connection. Bounds the uncompressed job data waiting for the send thread.
 #define DIST_INFO( ... ) do { if ( m_DetailedLogging ) { FLOG_OUTPUT( __VA_ARGS__ ); } } while ( false )
@@ -55,8 +54,8 @@ public:
     AString m_Address; // Address to connect to
     Timer m_ConnectionDelayTimer; // Throttle for reconnection attempts
     bool m_InUse = false; // Connecting, connected or awaiting cleanup
-    bool m_DenyListed = false; // Misbehaving workers are disabled for the rest of the build
-    bool m_ReportedHandshakeFailure = false; // The user is told once per worker that its handshake failed
+    Atomic<bool> m_DenyListed{ false }; // Misbehaving workers are disabled for the rest of the build (see Client::DenyListWorker)
+    Atomic<bool> m_ReportedHandshakeFailure{ false }; // The user is told once per worker that its handshake failed
     uint32_t m_UniqueId = 0; // Index for profiling purposes
 
     // Static Data
@@ -189,7 +188,6 @@ private:
 
     // Info returned by worker
     Atomic<uint16_t> m_WorkerVersion;
-    Atomic<uint8_t> m_ProtocolVersionMinor;
     Atomic<uint32_t> m_WorkerCapabilities{ 0 }; // What the worker and this client both have
     Atomic<bool> m_HandshakeDone{ false };
     Atomic<bool> m_ShuttingDown{ false };
@@ -272,12 +270,18 @@ uint32_t Client::GetNumConnections() const
 //------------------------------------------------------------------------------
 uint32_t Client::GetNumDenyListedWorkers() const
 {
-    uint32_t count = 0;
-    for ( const UniquePtr<ClientWorkerInfo> & worker : m_WorkerPool )
+    return m_NumDenyListedWorkers.Load();
+}
+
+//------------------------------------------------------------------------------
+void Client::DenyListWorker( ClientWorkerInfo & worker )
+{
+    // A worker is only deny-listed from the receive thread of its own connection
+    if ( worker.m_DenyListed.Load() == false )
     {
-        count += ( worker->m_DenyListed ? 1 : 0 );
+        worker.m_DenyListed.Store( true );
+        m_NumDenyListedWorkers.Increment();
     }
-    return count;
 }
 
 //------------------------------------------------------------------------------
@@ -285,12 +289,10 @@ uint32_t Client::GetNumDenyListedWorkers() const
 {
     MutexHolder mh( m_Mutex );
     DIST_INFO( "Disconnected: %s\n", m_Worker->m_Address.Get() );
-    if ( ( m_HandshakeDone.Load() == false ) && ( m_ShuttingDown.Load() == false ) && ( m_Worker->m_ReportedHandshakeFailure == false ) && ( m_Worker->m_DenyListed == false ) )
+    if ( ( m_HandshakeDone.Load() == false ) && ( m_ShuttingDown.Load() == false ) && ( m_Worker->m_ReportedHandshakeFailure.Load() == false ) && ( m_Worker->m_DenyListed.Load() == false ) )
     {
-        // A worker of another major can only drop the connection if it is older than the refusal message
-        m_Worker->m_ReportedHandshakeFailure = true;
-        FLOG_OUTPUT( "Distributed Compilation : worker %s closed the connection during the handshake: it may run another protocol than v%u.%u (update FBuild and FBuildWorker together)\n",
-                     m_Worker->m_Address.Get(), Protocol::kVersionMajor, (uint32_t)Protocol::kVersionMinor );
+        m_Worker->m_ReportedHandshakeFailure.Store( true );
+        FLOG_OUTPUT( "Distributed Compilation : worker %s closed the connection before the handshake finished\n", m_Worker->m_Address.Get() );
     }
     if ( m_Jobs.IsEmpty() == false )
     {
@@ -423,7 +425,7 @@ void Client::RegisterFoundWorkers( const Array<AString> & workerList,
         ClientWorkerInfo & workerInfo = *m_WorkerPool.EmplaceBack( FNEW( ClientWorkerInfo ) ).Get();
         workerInfo.m_Address = worker;
         // Modify timer so there is no connection delay for first attempt
-        workerInfo.m_ConnectionDelayTimer.SetElapsed( CONNECTION_REATTEMPT_DELAY_TIME );
+        workerInfo.m_ConnectionDelayTimer.SetElapsed( FBuild::Get().GetOptions().m_DistributionReconnectDelay );
         workerInfo.m_UniqueId = static_cast<uint32_t>( workerList.GetSize() );
     }
 
@@ -490,13 +492,13 @@ void Client::ConnectToWorkers()
         }
 
         // Ignore deny listed workers
-        if ( worker.m_DenyListed )
+        if ( worker.m_DenyListed.Load() )
         {
             continue;
         }
 
         // Have we tried this worker very recently?
-        if ( worker.m_ConnectionDelayTimer.GetElapsed() < CONNECTION_REATTEMPT_DELAY_TIME )
+        if ( worker.m_ConnectionDelayTimer.GetElapsed() < FBuild::Get().GetOptions().m_DistributionReconnectDelay )
         {
             continue;
         }
@@ -556,9 +558,9 @@ void Client::CommunicateJobAvailability()
     if ( m_CurrentMessage == nullptr )
     {
         // message
-        if ( Protocol::IsFrameLongEnough( data, size ) == false )
+        if ( Protocol::IsValidHeader( data, size ) == false )
         {
-            DIST_INFO( "Protocol Error: %s sent a message that is too short (%u bytes)\n", m_Worker->m_Address.Get(), size );
+            DIST_INFO( "Protocol Error: %s sent an invalid message (%u bytes)\n", m_Worker->m_Address.Get(), size );
             FREE( data );
             Disconnect( connection );
             return;
@@ -677,7 +679,8 @@ void ClientToWorkerConnection::Process( const ConnectionInfo * connection, const
 {
     PROFILE_SECTION( "MsgConnectionAck" );
 
-    // Only the version fields are the same in every major version
+    // An ack has no payload (see IsValidHeader), so size is that of the message itself. Only the version
+    // fields are the same in every major version.
     if ( msg->GetProtocolVersionMajor() != Protocol::kVersionMajor )
     {
         Refuse( connection, msg->GetProtocolVersionMajor(), msg->GetProtocolVersionMinor() );
@@ -690,19 +693,20 @@ void ClientToWorkerConnection::Process( const ConnectionInfo * connection, const
         return;
     }
 
-    // Take note of additional server info
-    const uint32_t capabilities = ( msg->GetCapabilities() & Protocol::kCapabilities ); // What both sides have
+    // Take note of additional server info. The worker advertises what both sides have, which it works
+    // out from what this client advertised, so only that is used here.
+    const uint32_t capabilities = Protocol::Negotiate( msg->GetCapabilities(), FBuild::Get().GetOptions().m_DistributionCapabilities );
     m_WorkerVersion.Store( msg->GetWorkerVersion() );
-    m_ProtocolVersionMinor.Store( msg->GetProtocolVersionMinor() );
     m_WorkerCapabilities.Store( capabilities );
     m_WorkerCapacity.Store( msg->GetWorkerCapacity() );
     m_HandshakeDone.Store( true );
-    DIST_INFO( " - Worker %s is v%u.%u (protocol v%u.%u) capacity=%u\n",
+    AStackString<> protocolVersion;
+    Protocol::FormatVersion( protocolVersion, Protocol::kVersionMajor, msg->GetProtocolVersionMinor() );
+    DIST_INFO( " - Worker %s is v%u.%u (protocol %s) capacity=%u\n",
                m_Worker->m_Address.Get(),
                ( m_WorkerVersion.Load() / 100U ),
                ( m_WorkerVersion.Load() % 100U ),
-               Protocol::kVersionMajor,
-               m_ProtocolVersionMinor.Load(),
+               protocolVersion.Get(),
                msg->GetWorkerCapacity() );
 
     // The initial batch of jobs waits for the last inventory the worker sends. It follows the ack,
@@ -726,13 +730,17 @@ void ClientToWorkerConnection::Process( const ConnectionInfo * connection, const
 // The worker is another version: tell the user once, and leave it alone for the rest of the build
 void ClientToWorkerConnection::Refuse( const ConnectionInfo * connection, uint32_t workerMajor, uint32_t workerMinor )
 {
-    if ( m_Worker->m_ReportedHandshakeFailure == false )
+    if ( m_Worker->m_ReportedHandshakeFailure.Load() == false )
     {
-        m_Worker->m_ReportedHandshakeFailure = true;
-        FLOG_OUTPUT( "Distributed Compilation : worker %s runs protocol v%u.%u, this FBuild is v%u.%u: update FBuild and FBuildWorker together\n",
-                     m_Worker->m_Address.Get(), workerMajor, workerMinor, Protocol::kVersionMajor, (uint32_t)Protocol::kVersionMinor );
+        m_Worker->m_ReportedHandshakeFailure.Store( true );
+        AStackString<> workerVersion;
+        AStackString<> ourVersion;
+        Protocol::FormatVersion( workerVersion, workerMajor, workerMinor );
+        Protocol::GetVersionString( ourVersion );
+        FLOG_OUTPUT( "Distributed Compilation : worker %s runs protocol %s, this FBuild is %s: update FBuild and FBuildWorker together\n",
+                     m_Worker->m_Address.Get(), workerVersion.Get(), ourVersion.Get() );
     }
-    m_Worker->m_DenyListed = true;
+    m_Client->DenyListWorker( *m_Worker );
     Disconnect( connection );
 }
 
@@ -857,7 +865,7 @@ bool ClientToWorkerConnection::QueueToolchain( const ToolManifest & manifest )
 void ClientToWorkerConnection::PushToolchainsToWorker()
 {
     // Toolchains go out ahead of any PCH queued after them: they are small and every job needs one
-    if ( m_AwaitingInventory.Load() || m_Worker->m_DenyListed || m_SendThreadQuit.Load() )
+    if ( m_AwaitingInventory.Load() || m_Worker->m_DenyListed.Load() || m_SendThreadQuit.Load() )
     {
         return;
     }
@@ -885,7 +893,7 @@ void ClientToWorkerConnection::PushToolchainsToWorker()
 //------------------------------------------------------------------------------
 void ClientToWorkerConnection::QueuePchsToWorker()
 {
-    if ( m_AwaitingInventory.Load() || m_Worker->m_DenyListed || m_SendThreadQuit.Load() )
+    if ( m_AwaitingInventory.Load() || m_Worker->m_DenyListed.Load() || m_SendThreadQuit.Load() )
     {
         return;
     }
@@ -935,7 +943,7 @@ void ClientToWorkerConnection::PushJobsToWorker()
 
     const uint32_t capacity = m_WorkerCapacity.Load();
     const uint32_t inFlight = m_JobsInFlight.Load();
-    if ( ( inFlight >= capacity ) || m_Worker->m_DenyListed || ( capacity == 0 ) || m_SendThreadQuit.Load() || m_AwaitingInventory.Load() )
+    if ( ( inFlight >= capacity ) || m_Worker->m_DenyListed.Load() || ( capacity == 0 ) || m_SendThreadQuit.Load() || m_AwaitingInventory.Load() )
     {
         return;
     }
@@ -1181,7 +1189,7 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
     // For system failures, mark worker so no more jobs are scheduled to it
     if ( systemError )
     {
-        m_Worker->m_DenyListed = true;
+        m_Client->DenyListWorker( *m_Worker );
 
         // -distverbose message
         DIST_INFO( "Remote System Failure!\n"
@@ -1669,7 +1677,7 @@ void ClientToWorkerConnection::SendQueueThreadFunc()
     DIST_INFO( " - connection: %s (OK)\n", m_Worker->m_Address.Get() );
 
     // Send initial connection handshake
-    const Protocol::MsgConnection msg;
+    const Protocol::MsgConnection msg( FBuild::Get().GetOptions().m_DistributionCapabilities );
     if ( msg.Send( ci ) )
     {
         SendQueueMainLoop( ci );

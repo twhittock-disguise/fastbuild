@@ -66,6 +66,8 @@ public:
     }
     ~NodeGraphHeader() = default;
 
+    // Bumped for every change to a reflected type. After merging upstream, set it to
+    // max(upstream, ours) + 1 so the versions can not collide.
     inline static const uint8_t kCurrentVersion = 193;
 
     bool IsValid() const;

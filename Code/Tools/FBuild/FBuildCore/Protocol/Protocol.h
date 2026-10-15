@@ -31,34 +31,24 @@ namespace Protocol
 {
     inline static const uint16_t kPort = 31264; // Arbitrarily chosen port
 
-    // Protocol Version
-    //
-    // Major: any change to the wire format or to what a message means. A worker and a client of
-    //   different majors refuse each other at the handshake. The header of every message and the
-    //   version fields of MsgConnection, MsgConnectionAck and MsgRefused keep their offsets in every
-    //   major, so a mismatch can always be told apart and explained (see kHandshakePrefixSize).
-    // Minor: additive changes that an older peer can safely not know about.
-    // Capabilities: optional features negotiated for each connection. Each side advertises its
-    //   capabilities in the handshake and uses a feature only if the other advertised it, and never
-    //   sends a message type the other did not advertise. A receiver ignores the trailing bytes of a
-    //   message it knows and the capability bits it does not know.
-    // The build database version (NodeGraph kCurrentVersion) is bumped for every change to a reflected
-    //   type. After merging upstream it is set to max(upstream, ours) + 1 so versions can not collide.
+    // Major: a change to the wire format or to what a message means. Peers of different majors refuse
+    //   each other at the handshake, whose version fields keep their place in every major.
+    // Minor: an additive change that an older peer can safely ignore.
+    // Capabilities: optional features negotiated for each connection. One is used only if both sides
+    //   advertise its bit, and a bit is added together with the feature (and the fallback) it stands for.
+    // A receiver ignores the trailing bytes of a message it knows and the capability bits it does not.
     inline static const uint32_t kVersionMajor = 24;
     inline static const uint8_t kVersionMinor = 0;
 
-    // Optional features of a connection. A feature is in use when both sides advertise its bit. Every
-    // 24.0 peer has all of them: the bits exist so that a later version can drop or skip one without a
-    // new major. Without the bit the feature's messages are not sent, and not waited for.
     enum Capability : uint32_t
     {
         CAP_PCH_INVENTORY = ( 1u << 0 ),        // The worker sends MSG_PCH_INVENTORY after the ack
         CAP_TOOLCHAIN_INVENTORY = ( 1u << 1 ),  // The worker sends MSG_TOOLCHAIN_INVENTORY after the PCH inventory
-        CAP_PCH_CHUNKS = ( 1u << 2 ),           // The client sends PCHs as MSG_PCH_FILE chunks
-        CAP_JOB_STREAM = ( 1u << 3 ),           // Jobs are compressed as one stream for the connection
-        CAP_RESULT_COMPRESSION = ( 1u << 4 ),   // Results come back as MSG_JOB_RESULT_COMPRESSED
     };
-    inline static const uint32_t kCapabilities = ( CAP_PCH_INVENTORY | CAP_TOOLCHAIN_INVENTORY | CAP_PCH_CHUNKS | CAP_JOB_STREAM | CAP_RESULT_COMPRESSION );
+    inline static const uint32_t kCapabilities = ( CAP_PCH_INVENTORY | CAP_TOOLCHAIN_INVENTORY );
+
+    // The capabilities in use when one side advertises ours and the other theirs
+    inline uint32_t Negotiate( uint32_t ours, uint32_t theirs ) { return ( ours & theirs & kCapabilities ); }
 
     inline static const uint16_t kTestPort = kPort + 1; // Different port for use by tests
 
@@ -119,27 +109,23 @@ namespace Protocol
     };
     static_assert( sizeof( IMessage ) == 3 + 1 /*padding*/, "Message base class has incorrect size" );
 
-    // Handshake messages. Everything up to this many bytes is the header and the version fields, which
-    // keep their layout in every major version. What follows belongs to the major, so a frame of
-    // another major is only read this far.
+    // The header and version fields of a handshake message: all of it that another major can be read by
     inline static const uint32_t kHandshakePrefixSize = 8;
-    inline static const uint32_t kConnectionVersionOffset = 4;      // MsgConnection : uint32_t major
-    inline static const uint32_t kAckWorkerVersionOffset = 4;       // MsgConnectionAck, MsgRefused : uint16_t
-    inline static const uint32_t kAckProtocolMajorOffset = 6;       // MsgConnectionAck, MsgRefused : uint8_t
-    inline static const uint32_t kAckProtocolMinorOffset = 7;       // MsgConnectionAck, MsgRefused : uint8_t
 
     // MsgConnection
     //------------------------------------------------------------------------------
     class MsgConnection : public IMessage
     {
     public:
-        MsgConnection();
+        explicit MsgConnection( uint32_t capabilities = kCapabilities );
 
         uint32_t GetProtocolVersion() const { return m_ProtocolVersion; }
         uint8_t GetPlatform() const { return m_Platform; }
         uint8_t GetProtocolVersionMinor() const { return m_ProtocolVersionMinor; }
-        const char * GetHostName() const { return m_HostName; }
         uint32_t GetCapabilities() const { return m_Capabilities; }
+
+        // The host name, read only as far as a frame of this many bytes goes
+        void GetHostName( uint32_t frameSize, AString & outName ) const;
 
     private:
         uint32_t m_ProtocolVersion;
@@ -192,16 +178,31 @@ namespace Protocol
         uint8_t m_ProtocolVersionMinor;
     };
     static_assert( sizeof( MsgRefused ) == sizeof( IMessage ) + 4, "MsgRefused message has incorrect size" );
+    static_assert( sizeof( MsgRefused ) == kHandshakePrefixSize, "MsgRefused is only version fields" );
 
-    // The smallest frame a message of this type can arrive in. Handshake frames need only their version
-    // fields. 0 for a type that is not known.
+    // The smallest header frame a message of this type can arrive in. Handshake frames need only their
+    // version fields. 0 for a type that is not known.
     uint32_t GetMinMessageSize( MessageType type );
 
-    // True if the frame is long enough for its type, so its handler can read it
-    bool IsFrameLongEnough( const void * frame, uint32_t size );
+    // Whether the header of a message of this type is followed by a payload frame
+    enum PayloadRule : uint8_t
+    {
+        PAYLOAD_NEVER,
+        PAYLOAD_ALWAYS,
+        PAYLOAD_OPTIONAL, // Inventories: only if they hold ids
+    };
+    PayloadRule GetPayloadRule( MessageType type );
 
-    // "protocol v24.0"
-    void GetVersionDescription( AString & outText );
+    // True if the header frame is of a known type, long enough for it and announces a payload only if
+    // the type has one. Handlers can then read the header without checking it again, and the frame that
+    // follows is a payload only if the header says so.
+    bool IsValidHeader( const void * frame, uint32_t size );
+
+    // "v24.0"
+    void FormatVersion( AString & outText, uint32_t major, uint32_t minor );
+
+    // "v24.0" for this version
+    void GetVersionString( AString & outText );
 
     // MsgJob
     //------------------------------------------------------------------------------

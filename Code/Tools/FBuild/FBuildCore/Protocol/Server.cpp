@@ -344,11 +344,11 @@ bool Server::IsSynchingTool( AString & statusStr ) const
     if ( cs->m_CurrentMessage == nullptr )
     {
         // message
-        if ( Protocol::IsFrameLongEnough( data, size ) == false )
+        if ( Protocol::IsValidHeader( data, size ) == false )
         {
             AStackString remoteAddr;
             TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-            FLOG_WARN( "Disconnecting '%s' as it sent a message that is too short (%u bytes)\n", remoteAddr.Get(), size );
+            FLOG_WARN( "Disconnecting '%s' as it sent an invalid message (%u bytes)\n", remoteAddr.Get(), size );
             FREE( data );
             Disconnect( connection );
             return;
@@ -467,17 +467,16 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     AStackString remoteAddr;
     TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
 
-    // A client of another major version is told which version this worker runs. Only the version
-    // fields can be relied on in its message, and only as far as it is long.
+    // A handshake has no payload (see IsValidHeader), so size is that of the message itself. A client of
+    // another major only has its version fields to be relied on, and the host name as far as it goes.
+    AStackString<> hostName;
+    msg->GetHostName( size, hostName );
     if ( msg->GetProtocolVersion() != Protocol::kVersionMajor )
     {
-        char clientName[ 65 ] = "";
-        if ( size >= ( sizeof( Protocol::MsgConnection ) - sizeof( uint32_t ) ) )
-        {
-            memcpy( clientName, msg->GetHostName(), 64 ); // Where this major keeps it, if the message reaches that far
-        }
-        FLOG_WARN( "Refusing '%s' (%s): it runs protocol v%u, this worker runs v%u.%u. FBuild and FBuildWorker must be updated together.\n",
-                   remoteAddr.Get(), clientName, msg->GetProtocolVersion(), Protocol::kVersionMajor, (uint32_t)Protocol::kVersionMinor );
+        AStackString<> ourVersion;
+        Protocol::GetVersionString( ourVersion );
+        FLOG_WARN( "Refusing '%s' (%s): it runs protocol v%u, this worker runs %s. FBuild and FBuildWorker must be updated together.\n",
+                   remoteAddr.Get(), hostName.Get(), msg->GetProtocolVersion(), ourVersion.Get() );
         const Protocol::MsgRefused refused;
         SendTo( *cs, refused );
         Disconnect( connection );
@@ -490,35 +489,27 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
         return;
     }
 
-    char hostName[ 65 ];
-    memcpy( hostName, msg->GetHostName(), 64 );
-    hostName[ 64 ] = 0; // A client does not have to terminate it
-
     // Check for matching platform
     if ( msg->GetPlatform() != Env::GetPlatform() )
     {
-        FLOG_WARN( "Disconnecting '%s' (%s) due to mismatched platform\n", remoteAddr.Get(), hostName );
+        FLOG_WARN( "Disconnecting '%s' (%s) due to mismatched platform\n", remoteAddr.Get(), hostName.Get() );
         Disconnect( connection );
         return;
     }
 
     // take note of initial status of client
-    uint32_t peerCapabilities = 0;
     {
         MutexHolder mh( cs->m_Mutex );
         cs->m_HostName = hostName;
-        cs->m_PeerMinor = msg->GetProtocolVersionMinor();
-        cs->m_PeerCapabilities = msg->GetCapabilities();
-        peerCapabilities = cs->m_PeerCapabilities;
     }
-    const uint32_t capabilities = ( peerCapabilities & Protocol::kCapabilities ); // What both sides have
+    const uint32_t capabilities = Protocol::Negotiate( msg->GetCapabilities(), Protocol::kCapabilities );
 
     // Recalculate capacity across all connected coordinators
     // (takes m_ClientListMutex, so cs->m_Mutex must not be held)
     RecalculateCapacity();
 
-    // Send ack with allocated capacity
-    const Protocol::MsgConnectionAck ack( (uint8_t)cs->m_AllocatedCapacity );
+    // Send ack with allocated capacity, and what both sides have
+    const Protocol::MsgConnectionAck ack( (uint8_t)cs->m_AllocatedCapacity, capabilities );
     SendTo( *cs, ack );
 
     // Send PCH inventory so coordinator knows what's already cached
