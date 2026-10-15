@@ -32,6 +32,11 @@ public:
     // Decompress (handled all formats including uncompressed)
     bool Decompress( const void * data );
 
+    // Data compressed in pieces by other code is a header followed by a single zstd frame that
+    // states its content size, or by the data itself when compression did not help
+    static constexpr size_t kHeaderSize = 12;
+    static void WriteHeader( void * dest, bool zstd, uint32_t uncompressedSize, uint32_t compressedSize );
+
     const void * GetResult() const { return m_Result; }
     size_t GetResultSize() const { return m_ResultSize; }
 

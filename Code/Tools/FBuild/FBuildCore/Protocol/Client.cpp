@@ -30,6 +30,7 @@
 #include "Core/Containers/UniquePtr.h"
 #include "Core/Env/ErrorFormat.h"
 #include "Core/FileIO/ConstMemoryStream.h"
+#include "Core/FileIO/FileStream.h"
 #include "Core/FileIO/MemoryStream.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Math/Random.h"
@@ -90,6 +91,26 @@ public:
         VERIFY( m_Message.WriteBuffer( &msg, msg.GetSize() ) == msg.GetSize() );
     }
 
+    // A payload read from a file when it is sent, so queued data is not held in memory
+    explicit ClientSendQueueItem( const Protocol::IMessage & msg,
+                                  const AString & payloadFile,
+                                  uint64_t payloadOffset,
+                                  uint32_t payloadLength,
+                                  SendKind kind,
+                                  uint64_t rawBytes,
+                                  uint64_t pchId )
+        : m_Message( msg.GetSize() ) // Prealloc exact size needed
+        , m_HasPayload( true )
+        , m_PayloadFile( payloadFile )
+        , m_PayloadOffset( payloadOffset )
+        , m_PayloadLength( payloadLength )
+        , m_Kind( kind )
+        , m_RawBytes( rawBytes )
+        , m_PchId( pchId )
+    {
+        VERIFY( m_Message.WriteBuffer( &msg, msg.GetSize() ) == msg.GetSize() );
+    }
+
     // non copyable
     explicit ClientSendQueueItem( const ClientSendQueueItem & other ) = delete;
     void operator=( const ClientSendQueueItem & other ) = delete;
@@ -103,6 +124,9 @@ public:
     MemoryStream m_Message;
     bool m_HasPayload = false;
     ConstMemoryStream m_Payload;
+    AString m_PayloadFile; // If set, the payload is this slice of the file
+    uint64_t m_PayloadOffset = 0;
+    uint32_t m_PayloadLength = 0;
     SendKind m_Kind = SendKind::Control;
     uint64_t m_RawBytes = 0; // Size before compression, for stats
     bool m_StreamCompress = false; // Payload is compressed by the send thread, against the jobs sent before it
@@ -141,6 +165,13 @@ public:
                       SendKind kind = SendKind::Control,
                       uint64_t rawBytes = 0,
                       uint64_t pchId = 0 );
+    void EnqueueFileSend( const Protocol::IMessage & msg,
+                          const AString & payloadFile,
+                          uint64_t payloadOffset,
+                          uint32_t payloadLength,
+                          SendKind kind,
+                          uint64_t rawBytes,
+                          uint64_t pchId );
     void EnqueueJob( const Protocol::MsgJob & msg, ConstMemoryStream && payload );
 
 private:
@@ -1070,14 +1101,15 @@ void ClientToWorkerConnection::SendPendingPchs()
         const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( compressedSize, chunkSize );
         for ( uint32_t i = 0; i < numChunks; ++i )
         {
-            const char * chunkData = ( static_cast<const char *>( pch.data ) + ( (size_t)i * chunkSize ) );
-            const uint32_t thisChunkSize = Protocol::MsgPchFile::GetChunkLength( compressedSize, chunkSize, i );
+            // Each chunk is read from the file as it is sent
             const bool isLast = ( ( i + 1 ) == numChunks );
-            EnqueueSend( Protocol::MsgPchFile( pch.pchId, pch.uncompressedSize, compressedSize, chunkSize, i ),
-                         Move( ConstMemoryStream( chunkData, thisChunkSize ) ),
-                         SendKind::Pch,
-                         ( i == 0 ) ? pch.uncompressedSize : 0,
-                         isLast ? pch.pchId : 0 );
+            EnqueueFileSend( Protocol::MsgPchFile( pch.pchId, pch.uncompressedSize, compressedSize, chunkSize, i ),
+                             pch.filePath,
+                             (uint64_t)i * chunkSize,
+                             Protocol::MsgPchFile::GetChunkLength( compressedSize, chunkSize, i ),
+                             SendKind::Pch,
+                             ( i == 0 ) ? pch.uncompressedSize : 0,
+                             isLast ? pch.pchId : 0 );
         }
 
         DIST_INFO( " - Sent PCH 0x%016" PRIx64 " to %s (%zu bytes compressed, %u chunks)\n",
@@ -1625,6 +1657,23 @@ void ClientToWorkerConnection::EnqueueSend( const T & msg,
 }
 
 //------------------------------------------------------------------------------
+void ClientToWorkerConnection::EnqueueFileSend( const Protocol::IMessage & msg,
+                                                const AString & payloadFile,
+                                                uint64_t payloadOffset,
+                                                uint32_t payloadLength,
+                                                SendKind kind,
+                                                uint64_t rawBytes,
+                                                uint64_t pchId )
+{
+    ClientSendQueueItem item( msg, payloadFile, payloadOffset, payloadLength, kind, rawBytes, pchId );
+    {
+        MutexHolder lock( m_SendQueueMutex );
+        m_SendQueue.Push( Move( item ) );
+    }
+    m_SendThreadWakeSemaphore.Signal();
+}
+
+//------------------------------------------------------------------------------
 void ClientToWorkerConnection::EnqueueJob( const Protocol::MsgJob & msg, ConstMemoryStream && payload )
 {
     m_UnsentJobs.Increment();
@@ -1765,6 +1814,24 @@ bool ClientToWorkerConnection::SendItem( const ConnectionInfo * ci, const Client
     // Compress here, in the order jobs go out, as each is compressed against the ones before it
     const void * payload = item.m_Payload.GetData();
     size_t payloadSize = item.m_Payload.GetSize();
+    UniquePtr<char, FreeDeletor> fileSlice;
+    if ( item.m_PayloadFile.IsEmpty() == false )
+    {
+        // Only this slice of a large file is in memory
+        FileStream file;
+        fileSlice.Replace( static_cast<char *>( ALLOC( item.m_PayloadLength ) ) );
+        if ( ( file.Open( item.m_PayloadFile.Get(), FileStream::READ_ONLY ) == false ) ||
+             ( file.Seek( item.m_PayloadOffset ) == false ) ||
+             ( file.Read( fileSlice.Get(), item.m_PayloadLength ) != item.m_PayloadLength ) )
+        {
+            FLOG_WARN( "Failed to read '%s' to send it to %s. Closing the connection.\n",
+                       item.m_PayloadFile.Get(), m_Worker->m_Address.Get() );
+            m_SendThreadQuit.Store( true );
+            return false;
+        }
+        payload = fileSlice.Get();
+        payloadSize = item.m_PayloadLength;
+    }
     double encodeTime = 0.0;
     if ( item.m_StreamCompress )
     {

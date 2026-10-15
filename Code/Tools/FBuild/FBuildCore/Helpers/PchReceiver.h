@@ -14,7 +14,7 @@
 // PchReceiver
 //------------------------------------------------------------------------------
 // One per coordinator connection. The chunks of a PCH are kept in memory as they arrive. The last
-// one decompresses them, checks the size and the id (the xxHash64 of the file) and moves the
+// one decompresses them, checks the size and the id (the PchId of the file) and moves the
 // result into place, so a PCH file is only ever seen complete. The chunks of one PCH arrive in
 // order and without another PCH in between.
 class PchReceiver

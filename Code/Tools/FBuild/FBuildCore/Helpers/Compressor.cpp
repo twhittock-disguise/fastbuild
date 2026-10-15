@@ -62,6 +62,17 @@ Compressor::~Compressor()
     return true;
 }
 
+// WriteHeader
+//------------------------------------------------------------------------------
+/*static*/ void Compressor::WriteHeader( void * dest, bool zstd, uint32_t uncompressedSize, uint32_t compressedSize )
+{
+    static_assert( kHeaderSize == sizeof( Header ), "Header size" );
+    Header * header = static_cast<Header *>( dest );
+    header->m_CompressionType = zstd ? eZstd : eUncompressed;
+    header->m_UncompressedSize = uncompressedSize;
+    header->m_CompressedSize = zstd ? compressedSize : uncompressedSize;
+}
+
 // GetUncompressedSize
 //------------------------------------------------------------------------------
 /*static*/ uint32_t Compressor::GetUncompressedSize( const void * data, size_t dataSize )

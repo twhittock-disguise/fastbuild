@@ -12,6 +12,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/DistributionStats.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchDataCache.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
@@ -67,6 +68,11 @@ private:
     void PchCompressRetry() const;
     void PchTakeReadyPchs() const;
     void PchChangedAfterItWasRecorded() const;
+    void PchIdStreamsLikeOneShot() const;
+    void PchRecordReadsTheFileOnce() const;
+    void PchCompressionAroundChunkSizes() const;
+    void PchCompressedFilesAreCleanedUp() const;
+    void PchCompressionNeedsAPlaceToWrite() const;
     void PchStartupScanRemovesStaleTempFiles() const;
     void PchEvictionRemovesTheDirectory() const;
     void PchStartupScanRemovesEmptyDirectories() const;
@@ -156,16 +162,18 @@ private:
         const PchDataCache::Entry *     m_Entry = nullptr;
         Atomic<bool> *                  m_Go = nullptr;
         PchDataCache::CompressedState   m_State = PchDataCache::COMPRESSING;
-        const void *                    m_Data = nullptr;
-        size_t                          m_Size = 0;
+        AString                         m_FilePath;
+        uint64_t                        m_Size = 0;
     };
     static void MakeTestContent( uint32_t size, uint32_t seed, Array<char> & outContent );
     static bool WriteTestFile( const char * path, uint32_t size, Array<char> & outContent, uint32_t seed = 0 );
     static PchDataCache::CompressedState WaitForCompression( PchDataCache & cache,
                                                              const PchDataCache::Entry & entry,
-                                                             const void *& outData,
-                                                             size_t & outSize );
+                                                             AString & outFilePath,
+                                                             uint64_t & outSize );
+    static bool LoadFile( const AString & path, Array<char> & outData );
     static bool DecodesTo( const void * data, size_t dataSize, const Array<char> & content );
+    static bool DecodesToFile( const AString & path, const Array<char> & content );
     static uint32_t RequestCompression( void * param );
     void BuildOnNewWorker( uint32_t & outManifestsReceived,
                            uint32_t & outToolFilesReceived,
@@ -215,6 +223,11 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchCompressRetry )
     REGISTER_TEST( PchTakeReadyPchs )
     REGISTER_TEST( PchChangedAfterItWasRecorded )
+    REGISTER_TEST( PchIdStreamsLikeOneShot )
+    REGISTER_TEST( PchRecordReadsTheFileOnce )
+    REGISTER_TEST( PchCompressionAroundChunkSizes )
+    REGISTER_TEST( PchCompressedFilesAreCleanedUp )
+    REGISTER_TEST( PchCompressionNeedsAPlaceToWrite )
     REGISTER_TEST( PchStartupScanRemovesStaleTempFiles )
     REGISTER_TEST( PchEvictionRemovesTheDirectory )
     REGISTER_TEST( PchStartupScanRemovesEmptyDirectories )
@@ -450,16 +463,27 @@ void TestDistributed::PchCacheEvictionPolicy() const
 
 /*static*/ PchDataCache::CompressedState TestDistributed::WaitForCompression( PchDataCache & cache,
                                                                               const PchDataCache::Entry & entry,
-                                                                              const void *& outData,
-                                                                              size_t & outSize )
+                                                                              AString & outFilePath,
+                                                                              uint64_t & outSize )
 {
     PchDataCache::CompressedState state = PchDataCache::COMPRESSING;
     WaitUntil( [ & ]()
     {
-        state = cache.GetCompressed( entry, outData, outSize );
+        state = cache.GetCompressed( entry, outFilePath, outSize );
         return ( state != PchDataCache::COMPRESSING );
     } );
     return state;
+}
+
+/*static*/ bool TestDistributed::LoadFile( const AString & path, Array<char> & outData )
+{
+    FileStream f;
+    if ( f.Open( path.Get(), FileStream::READ_ONLY ) == false )
+    {
+        return false;
+    }
+    outData.SetSize( (size_t)f.GetFileSize() );
+    return ( f.Read( outData.Begin(), (uint32_t)outData.GetSize() ) == outData.GetSize() );
 }
 
 // What a worker does with a PCH or toolchain file payload
@@ -472,6 +496,12 @@ void TestDistributed::PchCacheEvictionPolicy() const
            ( memcmp( c.GetResult(), content.Begin(), content.GetSize() ) == 0 );
 }
 
+/*static*/ bool TestDistributed::DecodesToFile( const AString & path, const Array<char> & content )
+{
+    Array<char> blob;
+    return LoadFile( path, blob ) && DecodesTo( blob.Begin(), blob.GetSize(), content );
+}
+
 /*static*/ uint32_t TestDistributed::RequestCompression( void * param )
 {
     CompressionRequest * request = static_cast<CompressionRequest *>( param );
@@ -479,7 +509,7 @@ void TestDistributed::PchCacheEvictionPolicy() const
     {
         Thread::Sleep( 0 );
     }
-    request->m_State = WaitForCompression( *request->m_Cache, *request->m_Entry, request->m_Data, request->m_Size );
+    request->m_State = WaitForCompression( *request->m_Cache, *request->m_Entry, request->m_FilePath, request->m_Size );
     return 0;
 }
 
@@ -496,7 +526,7 @@ void TestDistributed::PchCompressedCache() const
     TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
 
     PchDataCache::Entry entry;
-    entry.pchId = xxHash::Calc64( content.Begin(), fileSize ); // The id is the hash of the file
+    entry.pchId = PchId::Calc( content.Begin(), fileSize ); // The id is the hash of the file
     entry.uncompressedSize = fileSize;
     entry.filePath = path;
     cache.Store( entry );
@@ -519,16 +549,16 @@ void TestDistributed::PchCompressedCache() const
         threads[ i ].Join();
     }
 
-    // One compression, one buffer shared by all of them
+    // One compression, one file shared by all of them
     TEST_ASSERT( cache.GetNumCompressions() == 1 );
     for ( const CompressionRequest & request : requests )
     {
         TEST_ASSERT( request.m_State == PchDataCache::READY );
-        TEST_ASSERT( request.m_Data == requests[ 0 ].m_Data );
+        TEST_ASSERT( request.m_FilePath == requests[ 0 ].m_FilePath );
         TEST_ASSERT( request.m_Size == requests[ 0 ].m_Size );
     }
     TEST_ASSERT( requests[ 0 ].m_Size < fileSize );
-    TEST_ASSERT( DecodesTo( requests[ 0 ].m_Data, requests[ 0 ].m_Size, content ) );
+    TEST_ASSERT( DecodesToFile( requests[ 0 ].m_FilePath, content ) );
 }
 
 // PchCompressRetry
@@ -548,21 +578,21 @@ void TestDistributed::PchCompressRetry() const
         MakeTestContent( fileSize, 0, content );
 
         PchDataCache::Entry entry;
-        entry.pchId = xxHash::Calc64( content.Begin(), fileSize );
+        entry.pchId = PchId::Calc( content.Begin(), fileSize );
         entry.uncompressedSize = fileSize;
         entry.filePath = path;
         cache.Store( entry );
 
-        const void * data = nullptr;
-        size_t size = 0;
-        TEST_ASSERT( cache.GetCompressed( entry, data, size ) == PchDataCache::COMPRESSING );
+        AStackString<> filePath;
+        uint64_t size = 0;
+        TEST_ASSERT( cache.GetCompressed( entry, filePath, size ) == PchDataCache::COMPRESSING );
 
         TEST_ASSERT( WaitUntil( [ & ]() { return ( cache.GetFailedAttempts( entry.pchId ) != 0 ); } ) );
         TEST_ASSERT( cache.GetFailedAttempts( entry.pchId ) == 1 );
         TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
 
-        TEST_ASSERT( WaitForCompression( cache, entry, data, size ) == PchDataCache::READY );
-        TEST_ASSERT( DecodesTo( data, size, content ) );
+        TEST_ASSERT( WaitForCompression( cache, entry, filePath, size ) == PchDataCache::READY );
+        TEST_ASSERT( DecodesToFile( filePath, content ) );
         TEST_ASSERT( cache.HasCompressionFailed( entry.pchId ) == false );
     }
 
@@ -579,15 +609,15 @@ void TestDistributed::PchCompressRetry() const
         cache.Store( entry );
 
         const Timer timer;
-        const void * data = nullptr;
-        size_t size = 0;
-        TEST_ASSERT( WaitForCompression( cache, entry, data, size ) == PchDataCache::FAILED );
+        AStackString<> filePath;
+        uint64_t size = 0;
+        TEST_ASSERT( WaitForCompression( cache, entry, filePath, size ) == PchDataCache::FAILED );
         TEST_ASSERT( timer.GetElapsed() >= ( ( kMaxAttempts - 1 ) * kRetryDelayMS * 0.001f * 0.9f ) );
         TEST_ASSERT( cache.GetFailedAttempts( entry.pchId ) == kMaxAttempts );
         TEST_ASSERT( cache.HasCompressionFailed( entry.pchId ) );
 
         // Asking again neither retries nor starts another compression
-        TEST_ASSERT( cache.GetCompressed( entry, data, size ) == PchDataCache::FAILED );
+        TEST_ASSERT( cache.GetCompressed( entry, filePath, size ) == PchDataCache::FAILED );
         TEST_ASSERT( cache.GetFailedAttempts( entry.pchId ) == kMaxAttempts );
         TEST_ASSERT( cache.GetNumCompressions() == 2 );
     }
@@ -611,8 +641,8 @@ void TestDistributed::PchTakeReadyPchs() const
     TEST_ASSERT( WriteTestFile( shortPath.Get(), 100, shortContent ) );
 
     // The id of a PCH is the hash of the file
-    const uint64_t kGood = xxHash::Calc64( content.Begin(), fileSize );
-    const uint64_t kGoodToo = xxHash::Calc64( goodTooContent.Begin(), fileSize );
+    const uint64_t kGood = PchId::Calc( content.Begin(), fileSize );
+    const uint64_t kGoodToo = PchId::Calc( goodTooContent.Begin(), fileSize );
     const uint64_t kUnreadable = 2;
     const uint64_t kUnknown = 3;
     const uint64_t kWorkerHasIt = 4;
@@ -634,13 +664,13 @@ void TestDistributed::PchTakeReadyPchs() const
     cache.Store( entry );
 
     // Have both readable ones compressed, so they are ready together
-    const void * data = nullptr;
-    size_t dataSize = 0;
+    AStackString<> filePath;
+    uint64_t dataSize = 0;
     PchDataCache::Entry goodEntry;
     TEST_ASSERT( cache.Find( kGood, goodEntry ) );
-    TEST_ASSERT( WaitForCompression( cache, goodEntry, data, dataSize ) == PchDataCache::READY );
+    TEST_ASSERT( WaitForCompression( cache, goodEntry, filePath, dataSize ) == PchDataCache::READY );
     TEST_ASSERT( cache.Find( kGoodToo, goodEntry ) );
-    TEST_ASSERT( WaitForCompression( cache, goodEntry, data, dataSize ) == PchDataCache::READY );
+    TEST_ASSERT( WaitForCompression( cache, goodEntry, filePath, dataSize ) == PchDataCache::READY );
 
     // One still compressing does not hold up the PCHs after it, and stays pending
     Array<uint64_t> pending;
@@ -658,7 +688,7 @@ void TestDistributed::PchTakeReadyPchs() const
     TEST_ASSERT( ready[ 0 ].pchId == kGoodToo );
     TEST_ASSERT( ready[ 1 ].pchId == kGood );
     TEST_ASSERT( ready[ 1 ].uncompressedSize == fileSize );
-    TEST_ASSERT( DecodesTo( ready[ 1 ].data, ready[ 1 ].dataSize, content ) );
+    TEST_ASSERT( DecodesToFile( ready[ 1 ].filePath, content ) );
 
     // The rest: the unreadable one is reported once then dropped, an unknown one and one the
     // worker has are dropped without being sent
@@ -691,7 +721,7 @@ void TestDistributed::PchChangedAfterItWasRecorded() const
     TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
 
     PchDataCache::Entry entry;
-    entry.pchId = xxHash::Calc64( content.Begin(), fileSize );
+    entry.pchId = PchId::Calc( content.Begin(), fileSize );
     entry.uncompressedSize = fileSize;
     entry.filePath = path;
     cache.Store( entry );
@@ -700,10 +730,284 @@ void TestDistributed::PchChangedAfterItWasRecorded() const
     Array<char> other;
     TEST_ASSERT( WriteTestFile( path.Get(), fileSize, other, 1 ) );
 
-    const void * data = nullptr;
-    size_t size = 0;
-    TEST_ASSERT( WaitForCompression( cache, entry, data, size ) == PchDataCache::FAILED );
+    AStackString<> filePath;
+    uint64_t size = 0;
+    TEST_ASSERT( WaitForCompression( cache, entry, filePath, size ) == PchDataCache::FAILED );
     TEST_ASSERT( cache.HasCompressionFailed( entry.pchId ) );
+}
+
+// PchIdStreamsLikeOneShot
+//------------------------------------------------------------------------------
+void TestDistributed::PchIdStreamsLikeOneShot() const
+{
+    // The id of a file read in pieces is the id of its content, whatever the sizes of the file and the pieces
+    const uint32_t kPiece = PchId::kReadChunkSize;
+    const uint32_t sizes[] = { 1, ( kPiece - 1 ), kPiece, ( kPiece + 1 ), ( 3 * kPiece ), ( 3 * kPiece ) + 7 };
+    const AStackString<> path( "../tmp/Test/Distributed/PchIdStreamsLikeOneShot/test.bin" );
+    for ( const uint32_t size : sizes )
+    {
+        Array<char> content;
+        TEST_ASSERT( WriteTestFile( path.Get(), size, content ) );
+        uint64_t id = 0;
+        uint64_t fileSize = 0;
+        TEST_ASSERT( PchId::CalcFile( path, id, fileSize ) );
+        TEST_ASSERT( fileSize == size );
+        TEST_ASSERT( id == PchId::Calc( content.Begin(), size ) );
+    }
+
+    // An empty file, and one that is not there
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( path.Get(), FileStream::WRITE_ONLY ) );
+    }
+    uint64_t id = 0;
+    uint64_t fileSize = 1;
+    TEST_ASSERT( PchId::CalcFile( path, id, fileSize ) );
+    TEST_ASSERT( fileSize == 0 );
+    TEST_ASSERT( id == PchId::Calc( "", 0 ) );
+    TEST_ASSERT( PchId::CalcFile( AStackString<>( "../tmp/Test/Distributed/PchIdStreamsLikeOneShot/missing.bin" ), id, fileSize ) == false );
+}
+
+// PchRecordReadsTheFileOnce
+//------------------------------------------------------------------------------
+namespace
+{
+    struct RecordRequest
+    {
+        PchDataCache *          m_Cache = nullptr;
+        const AString *         m_Path = nullptr;
+        Atomic<bool> *          m_Go = nullptr;
+        PchDataCache::Entry     m_Entry;
+        bool                    m_Ok = false;
+    };
+
+    uint32_t RecordInThread( void * param )
+    {
+        RecordRequest * request = static_cast<RecordRequest *>( param );
+        while ( request->m_Go->Load() == false )
+        {
+            Thread::Sleep( 0 );
+        }
+        request->m_Ok = request->m_Cache->Record( *request->m_Path, request->m_Entry );
+        return 0;
+    }
+}
+
+void TestDistributed::PchRecordReadsTheFileOnce() const
+{
+    PchDataCache cache;
+    Array<char> content;
+    const AStackString<> path( "../tmp/Test/Distributed/PchRecordReadsTheFileOnce/test.pch" );
+    const uint32_t fileSize = ( 32 * MEGABYTE ); // Takes long enough to hash for the requests to overlap
+    TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
+    const uint64_t expectedId = PchId::Calc( content.Begin(), fileSize );
+
+    // Several jobs need the PCH at once
+    const uint32_t before = PchId::GetNumFilesHashed();
+    const uint32_t kNumRequesters = 8;
+    Atomic<bool> go( false );
+    RecordRequest requests[ kNumRequesters ];
+    Thread threads[ kNumRequesters ];
+    for ( uint32_t i = 0; i < kNumRequesters; ++i )
+    {
+        requests[ i ].m_Cache = &cache;
+        requests[ i ].m_Path = &path;
+        requests[ i ].m_Go = &go;
+        threads[ i ].Start( RecordInThread, "PchRecord", &requests[ i ] );
+    }
+    go.Store( true );
+    for ( uint32_t i = 0; i < kNumRequesters; ++i )
+    {
+        threads[ i ].Join();
+    }
+
+    // One read of the file, and all of them have what it gave
+    TEST_ASSERT( PchId::GetNumFilesHashed() == ( before + 1 ) );
+    for ( const RecordRequest & request : requests )
+    {
+        TEST_ASSERT( request.m_Ok );
+        TEST_ASSERT( request.m_Entry.pchId == expectedId );
+        TEST_ASSERT( request.m_Entry.uncompressedSize == fileSize );
+        TEST_ASSERT( request.m_Entry.filePath == path );
+    }
+
+    // Asking again does not read it again
+    PchDataCache::Entry again;
+    TEST_ASSERT( cache.Record( path, again ) );
+    TEST_ASSERT( again.pchId == expectedId );
+    TEST_ASSERT( PchId::GetNumFilesHashed() == ( before + 1 ) );
+
+    // A file that is not there, or is empty, is not recorded
+    PchDataCache::Entry none;
+    TEST_ASSERT( cache.Record( AStackString<>( "../tmp/Test/Distributed/PchRecordReadsTheFileOnce/missing.pch" ), none ) == false );
+    const AStackString<> emptyPath( "../tmp/Test/Distributed/PchRecordReadsTheFileOnce/empty.pch" );
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( emptyPath.Get(), FileStream::WRITE_ONLY ) );
+    }
+    TEST_ASSERT( cache.Record( emptyPath, none ) == false );
+}
+
+// PchCompressionAroundChunkSizes
+//------------------------------------------------------------------------------
+void TestDistributed::PchCompressionAroundChunkSizes() const
+{
+    // Read and compressed in pieces: the file the worker decodes is the PCH, whatever the sizes
+    const uint32_t kPiece = PchId::kReadChunkSize;
+    const uint32_t sizes[] = { 1, ( kPiece - 1 ), kPiece, ( kPiece + 1 ), ( 2 * kPiece ), ( 3 * kPiece ) + 5 };
+    PchDataCache cache;
+    for ( const uint32_t size : sizes )
+    {
+        Array<char> content;
+        AStackString<> path;
+        path.Format( "../tmp/Test/Distributed/PchCompressionAroundChunkSizes/%u.pch", size );
+        TEST_ASSERT( WriteTestFile( path.Get(), size, content ) );
+
+        PchDataCache::Entry entry;
+        entry.pchId = PchId::Calc( content.Begin(), size );
+        entry.uncompressedSize = size;
+        entry.filePath = path;
+        cache.Store( entry );
+
+        AStackString<> filePath;
+        uint64_t compressedSize = 0;
+        TEST_ASSERT( WaitForCompression( cache, entry, filePath, compressedSize ) == PchDataCache::READY );
+        TEST_ASSERT( DecodesToFile( filePath, content ) );
+    }
+
+    // Data that does not compress is kept as it is, with a header
+    {
+        Array<char> content;
+        MakeRandomBytes( ( 2 * kPiece ) + 3, 7, content );
+        const AStackString<> path( "../tmp/Test/Distributed/PchCompressionAroundChunkSizes/random.pch" );
+        {
+            FileStream f;
+            TEST_ASSERT( f.Open( path.Get(), FileStream::WRITE_ONLY ) );
+            TEST_ASSERT( f.Write( content.Begin(), (uint32_t)content.GetSize() ) == content.GetSize() );
+        }
+        PchDataCache::Entry entry;
+        entry.pchId = PchId::Calc( content.Begin(), content.GetSize() );
+        entry.uncompressedSize = (uint32_t)content.GetSize();
+        entry.filePath = path;
+        cache.Store( entry );
+
+        AStackString<> filePath;
+        uint64_t compressedSize = 0;
+        TEST_ASSERT( WaitForCompression( cache, entry, filePath, compressedSize ) == PchDataCache::READY );
+        TEST_ASSERT( compressedSize == ( content.GetSize() + Compressor::kHeaderSize ) );
+        TEST_ASSERT( DecodesToFile( filePath, content ) );
+    }
+}
+
+// PchCompressedFilesAreCleanedUp
+//------------------------------------------------------------------------------
+void TestDistributed::PchCompressedFilesAreCleanedUp() const
+{
+    AStackString<> dir( "../tmp/Test/Distributed/PchCompressedFilesAreCleanedUp/" );
+    Array<AString> old;
+    FileIO::GetFiles( dir, AStackString( "*" ), false, &old );
+    for ( const AString & file : old )
+    {
+        FileIO::FileDelete( file.Get() );
+    }
+
+    const uint32_t thisProcess = Process::GetCurrentId();
+    const uint32_t otherProcess = ( thisProcess + 1 );
+    auto makeFile = [ & ]( const char * name, AString & outFile )
+    {
+        outFile = dir;
+        outFile += name;
+        FileStream f;
+        TEST_ASSERT( FileIO::EnsurePathExistsForFile( outFile ) );
+        TEST_ASSERT( f.Open( outFile.Get(), FileStream::WRITE_ONLY ) );
+        const char data[] = "data";
+        TEST_ASSERT( f.Write( data, sizeof( data ) ) == sizeof( data ) );
+    };
+    AStackString<> staleName;
+    staleName.Format( "%s%u.1.zst", PchDataCache::kTempFilePrefix, otherProcess );
+    AStackString<> freshName;
+    freshName.Format( "%s%u.2.zst", PchDataCache::kTempFilePrefix, otherProcess );
+    AStackString<> ownName;
+    ownName.Format( "%s%u.3.zst", PchDataCache::kTempFilePrefix, thisProcess );
+    AStackString<> stale;
+    AStackString<> fresh;
+    AStackString<> own;
+    AStackString<> unrelated;
+    makeFile( staleName.Get(), stale );
+    makeFile( freshName.Get(), fresh );
+    makeFile( ownName.Get(), own );
+    makeFile( "notes.txt", unrelated );
+
+    // Old enough to be left by a process that is gone: the other process's, and our own as well
+#if defined( __WINDOWS__ )
+    const uint64_t kDay = ( 24ULL * 3600ULL * 10000000ULL );
+#else
+    const uint64_t kDay = ( 24ULL * 3600ULL * 1000000000ULL );
+#endif
+    const uint64_t longAgo = ( Time::GetCurrentFileTime() - kDay );
+    TEST_ASSERT( FileIO::SetFileLastWriteTime( stale, longAgo ) );
+    TEST_ASSERT( FileIO::SetFileLastWriteTime( own, longAgo ) );
+    TEST_ASSERT( FileIO::SetFileLastWriteTime( unrelated, longAgo ) );
+
+    // What another process may still be writing, what this one is writing, and what is not ours stay
+    PchDataCache::RemoveStaleTempFiles( dir );
+    TEST_ASSERT( FileIO::FileExists( stale.Get() ) == false );
+    TEST_ASSERT( FileIO::FileExists( fresh.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( own.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( unrelated.Get() ) );
+
+    // A compressed PCH is a file here until the cache is cleared
+    PchDataCache cache;
+    cache.SetTempDir( dir );
+    Array<char> content;
+    const AStackString<> path( "../tmp/Test/Distributed/PchCompressedFilesAreCleanedUp/test.pch" );
+    const uint32_t fileSize = ( 1 * MEGABYTE );
+    TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
+    PchDataCache::Entry entry;
+    entry.pchId = PchId::Calc( content.Begin(), fileSize );
+    entry.uncompressedSize = fileSize;
+    entry.filePath = path;
+    cache.Store( entry );
+    AStackString<> compressed;
+    uint64_t compressedSize = 0;
+    TEST_ASSERT( WaitForCompression( cache, entry, compressed, compressedSize ) == PchDataCache::READY );
+    TEST_ASSERT( compressed.Find( "PchCompressedFilesAreCleanedUp" ) ); // Where it was told to
+    TEST_ASSERT( compressed.Find( PchDataCache::kTempFilePrefix ) );
+    TEST_ASSERT( FileIO::FileExists( compressed.Get() ) );
+    TEST_ASSERT( DecodesToFile( compressed, content ) );
+    cache.Clear();
+    TEST_ASSERT( FileIO::FileExists( compressed.Get() ) == false );
+}
+
+// PchCompressionNeedsAPlaceToWrite
+//------------------------------------------------------------------------------
+void TestDistributed::PchCompressionNeedsAPlaceToWrite() const
+{
+    // A directory that cannot be made, as a file is where it would go
+    const AStackString<> blocker( "../tmp/Test/Distributed/PchCompressionNeedsAPlaceToWrite/blocker.txt" );
+    {
+        Array<char> ignored;
+        TEST_ASSERT( WriteTestFile( blocker.Get(), 16, ignored ) );
+    }
+    PchDataCache cache( 2, 10 );
+    cache.SetTempDir( AStackString<>( "../tmp/Test/Distributed/PchCompressionNeedsAPlaceToWrite/blocker.txt/sub/" ) );
+
+    Array<char> content;
+    const AStackString<> path( "../tmp/Test/Distributed/PchCompressionNeedsAPlaceToWrite/test.pch" );
+    const uint32_t fileSize = ( 1 * MEGABYTE );
+    TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
+    PchDataCache::Entry entry;
+    entry.pchId = PchId::Calc( content.Begin(), fileSize );
+    entry.uncompressedSize = fileSize;
+    entry.filePath = path;
+    cache.Store( entry );
+
+    // It fails, as a PCH that cannot be read does, and leaves nothing behind
+    AStackString<> filePath;
+    uint64_t size = 0;
+    TEST_ASSERT( WaitForCompression( cache, entry, filePath, size ) == PchDataCache::FAILED );
+    TEST_ASSERT( cache.HasCompressionFailed( entry.pchId ) );
+    TEST_ASSERT( cache.GetFailedAttempts( entry.pchId ) == 2 );
 }
 
 // PchStartupScanRemovesStaleTempFiles
@@ -1046,20 +1350,22 @@ void TestDistributed::PayloadsAcceptedByWorker() const
     // starts empty, so it has to decode the PCH. A PCH's id is the hash of its content.
     PchDataCache cache;
     PchDataCache::Entry entry;
-    entry.pchId = xxHash::Calc64( content.Begin(), fileSize );
+    entry.pchId = PchId::Calc( content.Begin(), fileSize );
     entry.uncompressedSize = fileSize;
     entry.filePath = path;
     cache.Store( entry );
-    const void * data = nullptr;
-    size_t dataSize = 0;
-    TEST_ASSERT( WaitForCompression( cache, entry, data, dataSize ) == PchDataCache::READY );
+    AStackString<> compressedPath;
+    uint64_t dataSize = 0;
+    TEST_ASSERT( WaitForCompression( cache, entry, compressedPath, dataSize ) == PchDataCache::READY );
+    Array<char> data;
+    TEST_ASSERT( LoadFile( compressedPath, data ) );
 
     Server worker( 1 );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
     PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
     const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)dataSize, Protocol::kPchChunkSize );
-    TEST_ASSERT( sender.SendChunks( entry.pchId, fileSize, data, (uint32_t)dataSize, Protocol::kPchChunkSize, 0, numChunks ) );
+    TEST_ASSERT( sender.SendChunks( entry.pchId, fileSize, data.Begin(), (uint32_t)dataSize, Protocol::kPchChunkSize, 0, numChunks ) );
 
     AStackString<> cachedPath;
     TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( entry.pchId, cachedPath ); } ) );
@@ -1097,7 +1403,7 @@ void TestDistributed::PchChunksReachTheWorker() const
     const uint32_t compressedSize = (uint32_t)compressed.GetResultSize();
     const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize );
     TEST_ASSERT( numChunks >= 4 );
-    const uint64_t pchId = xxHash::Calc64( content.Begin(), content.GetSize() );
+    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
 
     Server worker( 1 );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
@@ -1127,7 +1433,7 @@ void TestDistributed::PchLeftHalfSentIsDropped() const
     const uint32_t compressedSize = (uint32_t)compressed.GetResultSize();
     const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize );
     TEST_ASSERT( numChunks >= 4 );
-    const uint64_t pchId = xxHash::Calc64( content.Begin(), content.GetSize() );
+    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
     AStackString<> pchDir;
     GetWorkerPchDir( pchId, pchDir );
 

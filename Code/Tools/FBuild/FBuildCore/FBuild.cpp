@@ -114,7 +114,7 @@ FBuild::~FBuild()
     Function::Destroy();
 
     FDELETE m_DependencyGraph;
-    FDELETE m_Client; // Must precede PchDataCache::Clear: connections send straight from its buffers
+    FDELETE m_Client; // Must precede PchDataCache::Clear: connections read the compressed PCH files it deletes
     FREE( m_EnvironmentString );
 
     if ( m_Cache )

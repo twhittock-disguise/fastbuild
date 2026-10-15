@@ -6,6 +6,7 @@
 #include "FBuildTest.h"
 
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchReceiver.h"
 #include "Tools/FBuild/FBuildCore/Protocol/PrioritySendQueue.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
@@ -99,7 +100,7 @@ REGISTER_TESTS_END
     TEST_ASSERT( compressedSize > headerSize );
     outPch.m_UncompressedSize = ( compressedSize - headerSize );
     MakeRandomBytes( outPch.m_UncompressedSize, seed, outPch.m_Raw );
-    outPch.m_Id = xxHash::Calc64( outPch.m_Raw.Begin(), outPch.m_Raw.GetSize() );
+    outPch.m_Id = PchId::Calc( outPch.m_Raw.Begin(), outPch.m_Raw.GetSize() );
 
     Compressor c;
     c.CompressZstd( outPch.m_Raw.Begin(), outPch.m_Raw.GetSize(), Compressor::kZstdTransferLevel );

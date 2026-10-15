@@ -8,6 +8,7 @@
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/FLog.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
 
 // Core
 #include "Core/FileIO/FileIO.h"
@@ -229,7 +230,7 @@ PchReceiver::Result PchReceiver::Finish( const AString & pchFile, bool & outAlre
     {
         return Fail( m_PchId, "its size is not the one announced" );
     }
-    if ( xxHash::Calc64( decompressor.GetResult(), decompressor.GetResultSize() ) != m_PchId )
+    if ( PchId::Calc( decompressor.GetResult(), decompressor.GetResultSize() ) != m_PchId )
     {
         return Fail( m_PchId, "its content does not match its id" );
     }
