@@ -28,6 +28,30 @@ namespace
     constexpr size_t kOutputSize = FileChunks::kChunkSize;
 }
 
+// RawSink
+//------------------------------------------------------------------------------
+// Hands on what the inverse of a transform makes, which is the data, no more of it than the header says
+class StreamDecompressor::RawSink : public PchTransform::Sink
+{
+public:
+    RawSink( StreamDecompressor & owner, StreamDecompressor::Sink & sink )
+        : m_Owner( owner )
+        , m_Sink( sink )
+    {
+    }
+    explicit RawSink( const RawSink & other ) = delete;
+    RawSink & operator=( const RawSink & other ) = delete;
+    virtual bool OnPiece( const void * data, size_t size ) override
+    {
+        m_Owner.m_Produced += size;
+        return ( ( m_Owner.m_Produced <= m_Owner.m_UncompressedSize ) && m_Sink.OnPiece( data, size ) );
+    }
+
+private:
+    StreamDecompressor & m_Owner;
+    StreamDecompressor::Sink & m_Sink;
+};
+
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
 StreamDecompressor::StreamDecompressor()
@@ -41,6 +65,7 @@ StreamDecompressor::~StreamDecompressor()
 {
     ZSTD_freeDCtx( static_cast<ZSTD_DCtx *>( m_Context ) );
     FREE( m_Output );
+    FDELETE m_Decoder;
 }
 
 // Feed
@@ -65,9 +90,13 @@ bool StreamDecompressor::Feed( const void * data, size_t size, Sink & sink )
         {
             // Of the formats Compressor writes, the ones that are read here
             Compressor::HeaderInfo header = {};
-            const bool valid = ( Compressor::ParseHeader( m_Header, sizeof( m_Header ), header ) &&
+            const bool parsed = Compressor::ParseHeader( m_Header, sizeof( m_Header ), header, true );
+            const bool transformed = ( ( header.m_TransformId | header.m_TransformVersion ) != 0 );
+            const bool valid = ( parsed &&
                                  ( ( header.m_Type == Compressor::eZstd ) ||
-                                   ( ( header.m_Type == Compressor::eUncompressed ) && ( header.m_CompressedSize == header.m_UncompressedSize ) ) ) );
+                                   ( ( header.m_Type == Compressor::eUncompressed ) && ( header.m_CompressedSize == header.m_UncompressedSize ) ) ) &&
+                                 ( ( transformed == false ) ||
+                                   ( ( header.m_TransformId == PchTransform::kPtrXfId ) && ( header.m_TransformVersion == PchTransform::kPtrXfVersion ) ) ) );
             m_Zstd = ( header.m_Type == Compressor::eZstd );
             m_UncompressedSize = header.m_UncompressedSize;
             m_CompressedSize = header.m_CompressedSize;
@@ -75,6 +104,10 @@ bool StreamDecompressor::Feed( const void * data, size_t size, Sink & sink )
             {
                 m_Context = ZSTD_createDCtx();
                 m_Output = static_cast<char *>( ALLOC( kOutputSize ) );
+                if ( transformed )
+                {
+                    m_Decoder = FNEW( PchTransform::Decoder );
+                }
             }
             if ( ( valid == false ) || ( m_Zstd && ( m_Context == nullptr ) ) )
             {
@@ -108,8 +141,7 @@ bool StreamDecompressor::FeedPayload( const char * data, size_t size, Sink & sin
 
     if ( m_Zstd == false )
     {
-        m_Produced += size;
-        return sink.OnPiece( data, size );
+        return OnFrameData( data, size, sink );
     }
 
     if ( m_FrameDone )
@@ -125,14 +157,21 @@ bool StreamDecompressor::FeedPayload( const char * data, size_t size, Sink & sin
         {
             return false;
         }
-        m_Produced += out.pos;
-        if ( ( m_Produced > m_UncompressedSize ) || ( ( out.pos > 0 ) && ( sink.OnPiece( m_Output, out.pos ) == false ) ) )
+        if ( ( out.pos > 0 ) && ( OnFrameData( m_Output, out.pos, sink ) == false ) )
         {
             return false;
         }
         if ( result == 0 )
         {
             m_FrameDone = true;
+            if ( m_Decoder )
+            {
+                RawSink rawSink( *this, sink );
+                if ( m_Decoder->Finish( rawSink ) == false )
+                {
+                    return false;
+                }
+            }
             return ( in.pos == in.size ); // Nothing may follow the frame
         }
 
@@ -142,6 +181,21 @@ bool StreamDecompressor::FeedPayload( const char * data, size_t size, Sink & sin
             return true;
         }
     }
+}
+
+// OnFrameData
+//------------------------------------------------------------------------------
+bool StreamDecompressor::OnFrameData( const void * data, size_t size, Sink & sink )
+{
+    if ( m_Decoder == nullptr )
+    {
+        m_Produced += size;
+        return ( ( m_Produced <= m_UncompressedSize ) && sink.OnPiece( data, size ) );
+    }
+
+    // What the inverse makes is bounded by the size in the header, and it makes at least half as many bytes as it is given
+    RawSink rawSink( *this, sink );
+    return m_Decoder->Feed( data, size, rawSink );
 }
 
 // Finish

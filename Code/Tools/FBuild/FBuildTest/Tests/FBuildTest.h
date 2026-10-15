@@ -65,6 +65,16 @@ protected:
     // Data that does not compress, the same for the same seed
     static void MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes );
 
+    // Data like the heap image of an MSVC PCH, the same for the same seed: 8 byte words, most of them pointers
+    // into the image (words whose high half is the base kPchLikeBase), that repeat or are near each other, and
+    // the rest numbers. It compresses, and better after PchTransform.
+    static constexpr uint32_t kPchLikeBase = 0x6BB;
+    static void MakePchLikeBytes( uint32_t size, uint64_t seed, Array<char> & outBytes );
+
+    // The blob a client makes of a PCH (Compressor::CompressZstdFile, through a file as it does), with the PCH
+    // transform of this base applied, or none if the base is 0. outTransformed says whether it was.
+    static bool MakePchBlob( const Array<char> & pch, uint32_t transformBase, Array<char> & outBlob, bool * outTransformed = nullptr );
+
     // Ids of processes: one that no process has, and one that is running that is not this process
     static uint32_t GetIdOfNoProcess();
     static uint32_t GetIdOfAnotherProcess();

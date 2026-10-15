@@ -8,6 +8,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchTransform.h"
 #include "Tools/FBuild/FBuildCore/Helpers/StreamDecompressor.h"
 
 // Core
@@ -35,6 +36,16 @@ private:
     void UnpackKeepsTheStoredFileWhenAWriteFails() const;
     void UnpackStopsWhenAborted() const;
     void VerifyChecksTheSizeAndTheId() const;
+    void TransformedBlobIsReadLikeAPlainOne() const;
+    void TransformedBlobIsVerifiedAndUnpacked() const;
+    void RejectsTransformedBlobsThatAreNotValid() const;
+    void TransformFallsBackToThePlainBlob() const;
+    void TransformedFrameIsBounded() const;
+
+    // The header of a blob, as words
+    static uint32_t GetHeaderWord( const Array<char> & blob, uint32_t index );
+    static void SetHeaderWord( Array<char> & blob, uint32_t index, uint32_t value );
+    static constexpr uint32_t kTransformedType = ( Compressor::eZstd | ( (uint32_t)PchTransform::kPtrXfId << 8 ) | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) );
 
     // Compressible content with some variation
     static void MakeContent( uint32_t size, uint32_t seed, Array<char> & outContent );
@@ -56,6 +67,11 @@ REGISTER_TESTS_BEGIN( TestPchBlob )
     REGISTER_TEST( UnpackKeepsTheStoredFileWhenAWriteFails )
     REGISTER_TEST( UnpackStopsWhenAborted )
     REGISTER_TEST( VerifyChecksTheSizeAndTheId )
+    REGISTER_TEST( TransformedBlobIsReadLikeAPlainOne )
+    REGISTER_TEST( TransformedBlobIsVerifiedAndUnpacked )
+    REGISTER_TEST( RejectsTransformedBlobsThatAreNotValid )
+    REGISTER_TEST( TransformFallsBackToThePlainBlob )
+    REGISTER_TEST( TransformedFrameIsBounded )
 REGISTER_TESTS_END
 
 // Helpers
@@ -582,6 +598,321 @@ void TestPchBlob::VerifyChecksTheSizeAndTheId() const
     TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId + 1, size ) == false );
     TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId, size + 1 ) == false );
     TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize() - 1, pchId, size ) == false );
+}
+
+// GetHeaderWord
+//------------------------------------------------------------------------------
+/*static*/ uint32_t TestPchBlob::GetHeaderWord( const Array<char> & blob, uint32_t index )
+{
+    uint32_t value;
+    memcpy( &value, blob.Begin() + ( index * sizeof( uint32_t ) ), sizeof( value ) );
+    return value;
+}
+
+// SetHeaderWord
+//------------------------------------------------------------------------------
+/*static*/ void TestPchBlob::SetHeaderWord( Array<char> & blob, uint32_t index, uint32_t value )
+{
+    memcpy( blob.Begin() + ( index * sizeof( uint32_t ) ), &value, sizeof( value ) );
+}
+
+// TransformedBlobIsReadLikeAPlainOne
+//------------------------------------------------------------------------------
+void TestPchBlob::TransformedBlobIsReadLikeAPlainOne() const
+{
+    Array<char> content;
+    MakePchLikeBytes( ( 2 * 1024 * 1024 ) + 5, 3, content );
+    Array<char> plain;
+    Array<char> blob;
+    bool transformed = true;
+    TEST_ASSERT( MakePchBlob( content, 0, plain, &transformed ) );
+    TEST_ASSERT( transformed == false );
+    TEST_ASSERT( MakePchBlob( content, kPchLikeBase, blob, &transformed ) );
+    TEST_ASSERT( transformed );
+
+    // It is smaller than the plain blob, and says what it is
+    OUTPUT( "TransformedBlobIsReadLikeAPlainOne: %zu bytes, %zu with the transform (%.1f%%)\n", plain.GetSize(), blob.GetSize(), ( 100.0 * (double)blob.GetSize() ) / (double)plain.GetSize() );
+    TEST_ASSERT( ( blob.GetSize() * 100 ) < ( plain.GetSize() * 90 ) );
+    TEST_ASSERT( GetHeaderWord( blob, 0 ) == kTransformedType );
+    TEST_ASSERT( GetHeaderWord( blob, 1 ) == content.GetSize() ); // That of the PCH
+    TEST_ASSERT( GetHeaderWord( plain, 0 ) == Compressor::eZstd );
+
+    // A reader that does not read transforms does not take it for data, whether or not it checks the header first
+    Compressor::HeaderInfo header = {};
+    TEST_ASSERT( Compressor::ParseHeader( blob.Begin(), blob.GetSize(), header ) == false );
+    TEST_ASSERT( Compressor::IsValidData( blob.Begin(), blob.GetSize() ) == false );
+    {
+        Compressor decompressor;
+        TEST_ASSERT( decompressor.Decompress( blob.Begin() ) == false );
+    }
+    {
+        // Not even when its frame is the size the header says: what it decodes to is not the PCH
+        Array<char> relabeled;
+        relabeled = plain;
+        SetHeaderWord( relabeled, 0, kTransformedType );
+        Compressor decompressor;
+        TEST_ASSERT( Compressor::IsValidData( relabeled.Begin(), relabeled.GetSize() ) == false );
+        TEST_ASSERT( decompressor.Decompress( relabeled.Begin() ) == false );
+    }
+    TEST_ASSERT( Compressor::ParseHeader( blob.Begin(), blob.GetSize(), header, true ) );
+    TEST_ASSERT( header.m_Type == Compressor::eZstd );
+    TEST_ASSERT( header.m_TransformId == PchTransform::kPtrXfId );
+    TEST_ASSERT( header.m_TransformVersion == PchTransform::kPtrXfVersion );
+    TEST_ASSERT( header.m_UncompressedSize == content.GetSize() );
+    TEST_ASSERT( header.m_CompressedSize == ( blob.GetSize() - Compressor::kHeaderSize ) );
+    TEST_ASSERT( Compressor::ParseHeader( plain.Begin(), plain.GetSize(), header, true ) );
+    TEST_ASSERT( ( header.m_TransformId == 0 ) && ( header.m_TransformVersion == 0 ) );
+
+    // It decompresses to the PCH
+    {
+        CollectingSink sink;
+        uint32_t size = 0;
+        TEST_ASSERT( StreamDecompressor::DecompressMemory( blob.Begin(), blob.GetSize(), sink, size ) );
+        TEST_ASSERT( size == content.GetSize() );
+        TEST_ASSERT( sink.m_Data.GetSize() == content.GetSize() );
+        TEST_ASSERT( memcmp( sink.m_Data.Begin(), content.Begin(), content.GetSize() ) == 0 );
+    }
+
+    // In pieces of any size
+    const size_t pieceSizes[] = { 1, 5, 11, 12, 13, 4093, ( 1024 * 1024 ), 1000000000 };
+    for ( const size_t pieceSize : pieceSizes )
+    {
+        StreamDecompressor decompressor;
+        CollectingSink sink;
+        size_t done = 0;
+        if ( pieceSize == 1 )
+        {
+            for ( ; done < 200; ++done ) // The start: a byte at a time throughout would be slow
+            {
+                TEST_ASSERT( decompressor.Feed( blob.Begin() + done, 1, sink ) );
+            }
+        }
+        while ( done < blob.GetSize() )
+        {
+            const size_t piece = Math::Min( pieceSize, blob.GetSize() - done );
+            TEST_ASSERT( decompressor.Feed( blob.Begin() + done, piece, sink ) );
+            done += piece;
+        }
+        TEST_ASSERT( decompressor.Finish() );
+        TEST_ASSERT( sink.m_Data.GetSize() == content.GetSize() );
+        TEST_ASSERT( memcmp( sink.m_Data.Begin(), content.Begin(), content.GetSize() ) == 0 );
+    }
+}
+
+// TransformedBlobIsVerifiedAndUnpacked
+//------------------------------------------------------------------------------
+void TestPchBlob::TransformedBlobIsVerifiedAndUnpacked() const
+{
+    // Sizes that are not a multiple of a word, or of a piece
+    const uint32_t sizes[] = { 1000003, ( 1024 * 1024 ) + 1, ( 3 * 1024 * 1024 ) + 7 };
+    for ( const uint32_t size : sizes )
+    {
+        Array<char> content;
+        MakePchLikeBytes( size, size, content );
+        Array<char> blob;
+        bool transformed = false;
+        TEST_ASSERT( MakePchBlob( content, kPchLikeBase, blob, &transformed ) );
+        TEST_ASSERT( transformed );
+        const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
+
+        // It is the PCH of the id and size, and no other
+        TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId, size ) );
+        TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId + 1, size ) == false );
+        TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId, size + 1 ) == false );
+        TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize() - 1, pchId, size ) == false );
+
+        AStackString<> dir;
+        GetTestDir( "TransformedUnpack", dir );
+        AStackString<> stored( dir );
+        stored += "pch.zst";
+        TEST_ASSERT( WriteFile( stored, blob ) );
+        TEST_ASSERT( PchBlob::VerifyFile( stored.Get(), pchId, size, nullptr ) );
+        TEST_ASSERT( PchBlob::VerifyFile( stored.Get(), pchId + 1, size, nullptr ) == false );
+        TEST_ASSERT( PchBlob::VerifyFile( stored.Get(), pchId, size - 1, nullptr ) == false );
+        const Atomic<bool> aborted{ true };
+        TEST_ASSERT( PchBlob::VerifyFile( stored.Get(), pchId, size, &aborted ) == false );
+
+        // Unpacking inverts the transform: the raw file is the PCH
+        AStackString<> temp( dir );
+        temp += "pch.tmp";
+        AStackString<> raw( dir );
+        raw += "pch.pch";
+        uint64_t rawSize = 0;
+        TEST_ASSERT( PchBlob::Unpack( stored, pchId, temp, raw, nullptr, rawSize ) == PchBlob::UNPACK_OK );
+        TEST_ASSERT( rawSize == size );
+        Array<char> unpacked;
+        TEST_ASSERT( ReadFile( raw, unpacked ) );
+        TEST_ASSERT( unpacked.GetSize() == content.GetSize() );
+        TEST_ASSERT( memcmp( unpacked.Begin(), content.Begin(), content.GetSize() ) == 0 );
+        TEST_ASSERT( FileIO::FileExists( stored.Get() ) );
+        TEST_ASSERT( FileIO::FileExists( temp.Get() ) == false );
+
+        // And it is the id that is checked: of the PCH, not of what was stored
+        TEST_ASSERT( FileIO::FileDelete( raw.Get() ) );
+        TEST_ASSERT( PchBlob::Unpack( stored, pchId + 1, temp, raw, nullptr, rawSize ) == PchBlob::UNPACK_CORRUPT );
+        TEST_ASSERT( FileIO::FileExists( raw.Get() ) == false );
+        TEST_ASSERT( FileIO::FileExists( temp.Get() ) == false );
+    }
+}
+
+// RejectsTransformedBlobsThatAreNotValid
+//------------------------------------------------------------------------------
+void TestPchBlob::RejectsTransformedBlobsThatAreNotValid() const
+{
+    Array<char> content;
+    MakePchLikeBytes( 700001, 21, content );
+    Array<char> blob;
+    bool transformed = false;
+    TEST_ASSERT( MakePchBlob( content, kPchLikeBase, blob, &transformed ) );
+    TEST_ASSERT( transformed );
+    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
+    const uint32_t size = (uint32_t)content.GetSize();
+    TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId, size ) );
+
+    auto isRejected = [ & ]( const Array<char> & bad )
+    {
+        CollectingSink sink;
+        uint32_t decompressedSize = 0;
+        return ( PchBlob::Verify( bad.Begin(), bad.GetSize(), pchId, size ) == false ) &&
+               ( StreamDecompressor::DecompressMemory( bad.Begin(), bad.GetSize(), sink, decompressedSize ) == false );
+    };
+
+    // A damaged body: anywhere in it
+    const size_t positions[] = { 13, 100, blob.GetSize() / 3, blob.GetSize() / 2, blob.GetSize() - 5, blob.GetSize() - 1 };
+    for ( const size_t position : positions )
+    {
+        Array<char> bad;
+        bad = blob;
+        bad[ position ] ^= 0x5A;
+        TEST_ASSERT( PchBlob::Verify( bad.Begin(), bad.GetSize(), pchId, size ) == false ); // It may decompress, to what is not the PCH
+
+        // The worker's copy of it is not unpacked
+        AStackString<> dir;
+        GetTestDir( "TransformedCorrupt", dir );
+        AStackString<> stored( dir );
+        stored += "pch.zst";
+        TEST_ASSERT( WriteFile( stored, bad ) );
+        AStackString<> temp( dir );
+        temp += "pch.tmp";
+        AStackString<> raw( dir );
+        raw += "pch.pch";
+        uint64_t rawSize = 0;
+        TEST_ASSERT( PchBlob::Unpack( stored, pchId, temp, raw, nullptr, rawSize ) == PchBlob::UNPACK_CORRUPT );
+        TEST_ASSERT( CountFilesIn( dir ) == 1 );
+    }
+
+    // A header that names a transform that is not known: another id, another version, bits that mean nothing
+    const uint32_t wrongTypes[] = {
+        ( Compressor::eZstd | ( 2u << 8 ) | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) ),                         // Another id
+        ( Compressor::eZstd | ( 255u << 8 ) | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) ),
+        ( Compressor::eZstd | ( (uint32_t)PchTransform::kPtrXfId << 8 ) | ( ( PchTransform::kPtrXfVersion + 1u ) << 16 ) ), // Another version
+        ( Compressor::eZstd | ( (uint32_t)PchTransform::kPtrXfId << 8 ) | ( 255u << 16 ) ),
+        ( Compressor::eZstd | ( (uint32_t)PchTransform::kPtrXfId << 8 ) ),                                              // No version
+        ( Compressor::eZstd | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) ),                                        // A version of no transform
+        ( kTransformedType | ( 1u << 24 ) ),                                                                            // Bits that are not used
+        ( Compressor::eUncompressed | ( (uint32_t)PchTransform::kPtrXfId << 8 ) | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) ), // Of data that is not compressed
+        ( Compressor::eLZ4 | ( (uint32_t)PchTransform::kPtrXfId << 8 ) | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) ),
+        ( 3u | ( (uint32_t)PchTransform::kPtrXfId << 8 ) | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) ),           // A codec that is not known
+    };
+    for ( const uint32_t type : wrongTypes )
+    {
+        Array<char> bad;
+        bad = blob;
+        SetHeaderWord( bad, 0, type );
+        TEST_ASSERT( isRejected( bad ) );
+    }
+
+    // A size that is not that of the PCH
+    const int32_t differences[] = { -1, 1, -8, 8 };
+    for ( const int32_t difference : differences )
+    {
+        Array<char> bad;
+        bad = blob;
+        SetHeaderWord( bad, 1, size + (uint32_t)difference );
+        CollectingSink sink;
+        uint32_t decompressedSize = 0;
+        TEST_ASSERT( StreamDecompressor::DecompressMemory( bad.Begin(), bad.GetSize(), sink, decompressedSize ) == false );
+        TEST_ASSERT( PchBlob::Verify( bad.Begin(), bad.GetSize(), pchId, size + (uint32_t)difference ) == false );
+    }
+
+    // Data cut short, or with more after it
+    {
+        Array<char> bad;
+        bad = blob;
+        bad.SetSize( bad.GetSize() - 1 );
+        TEST_ASSERT( isRejected( bad ) );
+        bad = blob;
+        bad.Append( 'x' );
+        TEST_ASSERT( isRejected( bad ) );
+    }
+}
+
+// TransformFallsBackToThePlainBlob
+//------------------------------------------------------------------------------
+void TestPchBlob::TransformFallsBackToThePlainBlob() const
+{
+    // Data that does not get smaller is written as it is, with the header of data that is not compressed: the
+    // transform makes it no smaller
+    Array<char> content;
+    MakeRandomBytes( 500000, 8, content );
+    Array<char> plain;
+    Array<char> blob;
+    bool transformed = true;
+    TEST_ASSERT( MakePchBlob( content, kPchLikeBase, blob, &transformed ) );
+    TEST_ASSERT( transformed == false );
+    TEST_ASSERT( MakePchBlob( content, 0, plain, nullptr ) );
+    TEST_ASSERT( blob.GetSize() == plain.GetSize() );
+    TEST_ASSERT( memcmp( blob.Begin(), plain.Begin(), blob.GetSize() ) == 0 );
+    TEST_ASSERT( GetHeaderWord( blob, 0 ) == Compressor::eUncompressed );
+    TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), PchId::Calc( content.Begin(), content.GetSize() ), (uint32_t)content.GetSize() ) );
+}
+
+// TransformedFrameIsBounded
+//------------------------------------------------------------------------------
+void TestPchBlob::TransformedFrameIsBounded() const
+{
+    // A frame that makes more than the transform can make of a PCH of the size the header says is not
+    // decompressed to the end, however well it compresses
+    Array<char> stream;
+    for ( uint32_t i = 0; i < 4; ++i )
+    {
+        stream.Append( (char)( kPchLikeBase >> ( 8 * i ) ) );
+    }
+    const uint32_t numZeroWords = 5000;
+    for ( uint32_t i = 0; i < ( numZeroWords * 8 ); ++i )
+    {
+        stream.Append( 0 );
+    }
+    Array<char> blob;
+    Compress( stream, blob );
+    TEST_ASSERT( GetHeaderWord( blob, 0 ) == Compressor::eZstd );
+
+    // What it makes is a PCH of numZeroWords words, and is what it is when the header says so
+    {
+        Array<char> good;
+        good = blob;
+        SetHeaderWord( good, 0, kTransformedType );
+        SetHeaderWord( good, 1, numZeroWords * 8 );
+        CollectingSink sink;
+        uint32_t size = 0;
+        TEST_ASSERT( StreamDecompressor::DecompressMemory( good.Begin(), good.GetSize(), sink, size ) );
+        TEST_ASSERT( sink.m_Data.GetSize() == ( numZeroWords * 8 ) );
+    }
+
+    // A header that says it is smaller
+    const uint32_t claims[] = { 1000, 8, 39992, ( ( numZeroWords * 8 ) - 1 ), ( ( numZeroWords * 8 ) + 1 ) };
+    for ( const uint32_t claim : claims )
+    {
+        Array<char> bad;
+        bad = blob;
+        SetHeaderWord( bad, 0, kTransformedType );
+        SetHeaderWord( bad, 1, claim );
+        CollectingSink sink;
+        uint32_t size = 0;
+        const bool isRead = StreamDecompressor::DecompressMemory( bad.Begin(), bad.GetSize(), sink, size );
+        TEST_ASSERT( isRead == false );
+        TEST_ASSERT( sink.m_Data.GetSize() <= claim ); // Nothing more than it said was handed on
+    }
 }
 
 //------------------------------------------------------------------------------

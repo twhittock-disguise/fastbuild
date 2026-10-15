@@ -8,6 +8,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchReceiver.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchTransform.h"
 #include "Tools/FBuild/FBuildCore/Protocol/PrioritySendQueue.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/SendKind.h"
@@ -38,6 +39,9 @@ private:
     void ReceiverKeepsACachedPch() const;
     void ReceiverKeepsAStoredPchWhateverItsSize() const;
     void ReceiverCleansUpWhenItCannotPublish() const;
+    void ReceiverStoresATransformedPchAsItCame() const;
+    void ReceiverRejectsATransformedPchThatIsNotValid() const;
+    void ReceiverAcceptsAPlainPchFromAnOldClient() const;
     void SendQueueSendsBulkDataLast() const;
     void SendQueueDoesNotStarveBulkData() const;
     void BulkSendKinds() const;
@@ -53,6 +57,10 @@ private:
         Array<char> m_Raw;
     };
     static void MakePch( uint32_t compressedSize, uint64_t seed, TestPch & outPch );
+
+    // A PCH as a client makes it, which compresses: with the transform, or as it was before there was one
+    static void MakeCompressiblePch( uint32_t size, uint64_t seed, bool transform, TestPch & outPch );
+    static void SendChunks( PchReceiver & receiver, const TestPch & pch, const AString & pchFile, PchReceiver::Result & outLastResult );
 
     // The message of a chunk of the compressed data, and where its data is
     struct TestChunk
@@ -85,6 +93,9 @@ REGISTER_TESTS_BEGIN( TestPchTransfer )
     REGISTER_TEST( ReceiverKeepsACachedPch )
     REGISTER_TEST( ReceiverKeepsAStoredPchWhateverItsSize )
     REGISTER_TEST( ReceiverCleansUpWhenItCannotPublish )
+    REGISTER_TEST( ReceiverStoresATransformedPchAsItCame )
+    REGISTER_TEST( ReceiverRejectsATransformedPchThatIsNotValid )
+    REGISTER_TEST( ReceiverAcceptsAPlainPchFromAnOldClient )
     REGISTER_TEST( SendQueueSendsBulkDataLast )
     REGISTER_TEST( SendQueueDoesNotStarveBulkData )
     REGISTER_TEST( BulkSendKinds )
@@ -106,6 +117,32 @@ REGISTER_TESTS_END
     TEST_ASSERT( c.GetResultSize() == compressedSize );
     outPch.m_Compressed.SetSize( c.GetResultSize() );
     memcpy( outPch.m_Compressed.Begin(), c.GetResult(), c.GetResultSize() );
+}
+
+// MakeCompressiblePch
+//------------------------------------------------------------------------------
+/*static*/ void TestPchTransfer::MakeCompressiblePch( uint32_t size, uint64_t seed, bool transform, TestPch & outPch )
+{
+    MakePchLikeBytes( size, seed, outPch.m_Raw );
+    outPch.m_UncompressedSize = size;
+    outPch.m_Id = PchId::Calc( outPch.m_Raw.Begin(), outPch.m_Raw.GetSize() );
+    bool transformed = false;
+    TEST_ASSERT( MakePchBlob( outPch.m_Raw, transform ? kPchLikeBase : 0, outPch.m_Compressed, &transformed ) );
+    TEST_ASSERT( transformed == transform );
+}
+
+// SendChunks
+//------------------------------------------------------------------------------
+// Every chunk, and the result of the last. The others have to continue.
+/*static*/ void TestPchTransfer::SendChunks( PchReceiver & receiver, const TestPch & pch, const AString & pchFile, PchReceiver::Result & outLastResult )
+{
+    const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)pch.m_Compressed.GetSize(), kChunkSize );
+    for ( uint32_t i = 0; i < numChunks; ++i )
+    {
+        bool alreadyCached = false;
+        outLastResult = Feed( receiver, TestChunk( pch, kChunkSize, i ), pchFile, alreadyCached );
+        TEST_ASSERT( ( ( i + 1 ) == numChunks ) || ( outLastResult == PchReceiver::CONTINUE ) );
+    }
 }
 
 // TestChunk
@@ -628,6 +665,103 @@ void TestPchTransfer::BulkSendKinds() const
     TEST_ASSERT( IsBulkSendKind( SendKind::Job ) == false );
     TEST_ASSERT( IsBulkSendKind( SendKind::Toolchain ) == false );
     TEST_ASSERT( IsBulkSendKind( SendKind::Control ) == false );
+}
+
+//------------------------------------------------------------------------------
+// ReceiverStoresATransformedPchAsItCame
+//------------------------------------------------------------------------------
+void TestPchTransfer::ReceiverStoresATransformedPchAsItCame() const
+{
+    // What is kept is what was sent, so the store is as small as the wire was
+    TestPch plain;
+    MakeCompressiblePch( ( 2 * 1024 * 1024 ) + 3, 5, false, plain );
+    TestPch pch;
+    MakeCompressiblePch( ( 2 * 1024 * 1024 ) + 3, 5, true, pch );
+    TEST_ASSERT( pch.m_Id == plain.m_Id );
+    TEST_ASSERT( pch.m_Compressed.GetSize() < plain.m_Compressed.GetSize() );
+
+    AStackString<> file;
+    GetCleanPchFile( "TransformedStored", pch.m_Id, file );
+    AStackString<> dir;
+    GetDirOf( file, dir );
+    PchReceiver receiver;
+    PchReceiver::Result result = PchReceiver::CONTINUE;
+    SendChunks( receiver, pch, file, result );
+    TEST_ASSERT( result == PchReceiver::COMPLETE );
+
+    Array<char> content;
+    TEST_ASSERT( ReadFile( file, content ) );
+    TEST_ASSERT( content.GetSize() == pch.m_Compressed.GetSize() );
+    TEST_ASSERT( memcmp( content.Begin(), pch.m_Compressed.Begin(), content.GetSize() ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 1 );
+}
+
+// ReceiverRejectsATransformedPchThatIsNotValid
+//------------------------------------------------------------------------------
+void TestPchTransfer::ReceiverRejectsATransformedPchThatIsNotValid() const
+{
+    TestPch good;
+    MakeCompressiblePch( ( 1024 * 1024 ) + 5, 6, true, good );
+
+    enum Fault { BODY, TRANSFORM_VERSION, TRANSFORM_ID, WRONG_ID, WRONG_SIZE };
+    for ( uint32_t fault = BODY; fault <= WRONG_SIZE; ++fault )
+    {
+        TestPch pch;
+        pch.m_Compressed = good.m_Compressed;
+        pch.m_UncompressedSize = good.m_UncompressedSize;
+        pch.m_Id = good.m_Id;
+        uint32_t type;
+        memcpy( &type, pch.m_Compressed.Begin(), sizeof( type ) );
+        switch ( fault )
+        {
+            case BODY:              pch.m_Compressed[ pch.m_Compressed.GetSize() / 2 ] ^= 0x33; break;
+            case TRANSFORM_VERSION: type += ( 1u << 16 ); break;
+            case TRANSFORM_ID:      type += ( 1u << 8 ); break;
+            case WRONG_ID:          pch.m_Id++; break;
+            case WRONG_SIZE:        pch.m_UncompressedSize += 8; break;
+        }
+        memcpy( pch.m_Compressed.Begin(), &type, sizeof( type ) );
+
+        AStackString<> file;
+        GetCleanPchFile( "TransformedRejected", pch.m_Id, file );
+        AStackString<> dir;
+        GetDirOf( file, dir );
+        PchReceiver receiver;
+        PchReceiver::Result result = PchReceiver::CONTINUE;
+        const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)pch.m_Compressed.GetSize(), kChunkSize );
+        for ( uint32_t i = 0; ( i < numChunks ) && ( result != PchReceiver::FAILED ); ++i )
+        {
+            bool alreadyCached = false;
+            result = Feed( receiver, TestChunk( pch, kChunkSize, i ), file, alreadyCached );
+        }
+
+        // Rejected like any PCH that is not what it says, and nothing of it is kept
+        TEST_ASSERT( result == PchReceiver::FAILED );
+        TEST_ASSERT( CountFilesIn( dir ) == 0 );
+    }
+}
+
+// ReceiverAcceptsAPlainPchFromAnOldClient
+//------------------------------------------------------------------------------
+void TestPchTransfer::ReceiverAcceptsAPlainPchFromAnOldClient() const
+{
+    // A client that has no transform sends the PCH compressed, which is what is stored
+    TestPch pch;
+    MakeCompressiblePch( ( 1024 * 1024 ) + 5, 7, false, pch );
+    uint32_t type;
+    memcpy( &type, pch.m_Compressed.Begin(), sizeof( type ) );
+    TEST_ASSERT( type == Compressor::eZstd );
+
+    AStackString<> file;
+    GetCleanPchFile( "PlainFromOldClient", pch.m_Id, file );
+    PchReceiver receiver;
+    PchReceiver::Result result = PchReceiver::CONTINUE;
+    SendChunks( receiver, pch, file, result );
+    TEST_ASSERT( result == PchReceiver::COMPLETE );
+    Array<char> content;
+    TEST_ASSERT( ReadFile( file, content ) );
+    TEST_ASSERT( content.GetSize() == pch.m_Compressed.GetSize() );
+    TEST_ASSERT( memcmp( content.Begin(), pch.m_Compressed.Begin(), content.GetSize() ) == 0 );
 }
 
 //------------------------------------------------------------------------------

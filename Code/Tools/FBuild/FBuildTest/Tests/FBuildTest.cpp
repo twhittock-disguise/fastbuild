@@ -10,13 +10,18 @@
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/FLog.h"
 #include "Tools/FBuild/FBuildCore/Helpers/BuildProfiler.h"
+#include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchTransform.h"
 
 // Core
 #include "Core/FileIO/FileIO.h"
+#include "Core/FileIO/FileStream.h"
 #include "Core/FileIO/PathUtils.h"
 #include "Core/Process/Process.h"
 #include "Core/Strings/AStackString.h"
 #include "Core/Tracing/Tracing.h"
+
+#include <string.h>
 
 // Static Data
 //------------------------------------------------------------------------------
@@ -260,6 +265,130 @@ void FBuildTest::CheckStatsTotal( size_t numSeen, size_t numBuilt ) const
         x ^= ( x << 17 );
         c = (char)( x >> 24 );
     }
+}
+
+// MakePchLikeBytes
+//------------------------------------------------------------------------------
+/*static*/ void FBuildTest::MakePchLikeBytes( uint32_t size, uint64_t seed, Array<char> & outBytes )
+{
+    outBytes.SetSize( size );
+    uint64_t x = ( seed | 1 );
+    auto next = [ &x ]()
+    {
+        x ^= ( x << 13 );
+        x ^= ( x >> 7 );
+        x ^= ( x << 17 );
+        return x;
+    };
+    auto geometric = [ &next ]( uint32_t limit ) // 0 half of the time, 1 a quarter...
+    {
+        uint32_t k = 0;
+        while ( ( k + 1 ) < limit && ( ( next() & 1 ) == 0 ) )
+        {
+            ++k;
+        }
+        return k;
+    };
+
+    // Records of words: a number, or a pointer to an object allocated now, a recent one, a hot one, or one near a recent one
+    struct Slot { bool m_IsPointer; uint32_t m_Value; };
+    static const Slot template0[] = { { false, 1 }, { true, 0 }, { false, 8 }, { true, 1 }, { true, 2 }, { false, 0 }, { false, 24 }, { true, 0 } };
+    static const Slot template1[] = { { false, 3 }, { true, 2 }, { true, 1 }, { false, 0 } };
+    static const Slot template2[] = { { false, 16 }, { true, 3 }, { false, 1 }, { true, 0 }, { false, 0 }, { false, 2 } };
+    static const Slot * const templates[] = { template0, template1, template2 };
+    static const uint32_t templateSizes[] = { 8, 4, 6 };
+
+    uint32_t hot[ 8 ];
+    uint32_t recent[ 16 ];
+    for ( uint32_t i = 0; i < 8; ++i )
+    {
+        hot[ i ] = ( 0x10000 + ( 0x100 * i ) );
+    }
+    for ( uint32_t i = 0; i < 16; ++i )
+    {
+        recent[ i ] = ( 0x20000 + ( 8 * i ) );
+    }
+    uint32_t cursor = 0x100000;
+
+    uint32_t numWords = ( size / 8 );
+    uint32_t word = 0;
+    while ( word < numWords )
+    {
+        const uint32_t t = geometric( 3 );
+        for ( uint32_t s = 0; ( s < templateSizes[ t ] ) && ( word < numWords ); ++s, ++word )
+        {
+            const Slot & slot = templates[ t ][ s ];
+            uint64_t value = slot.m_Value;
+            if ( slot.m_IsPointer )
+            {
+                uint32_t offset;
+                switch ( slot.m_Value )
+                {
+                    case 0:     cursor += ( 8 * ( 1 + (uint32_t)( next() % 8 ) ) ); offset = cursor; break;
+                    case 1:     offset = recent[ geometric( 16 ) ]; break;
+                    case 2:     offset = hot[ next() % 8 ]; break;
+                    default:    offset = ( recent[ geometric( 16 ) ] + ( 8 * (uint32_t)( next() % 16 ) ) ); break;
+                }
+                memmove( recent + 1, recent, 15 * sizeof( uint32_t ) );
+                recent[ 0 ] = offset;
+                value = ( ( (uint64_t)kPchLikeBase << 32 ) | offset );
+            }
+            for ( uint32_t b = 0; b < 8; ++b )
+            {
+                outBytes[ ( word * 8 ) + b ] = (char)( value >> ( 8 * b ) );
+            }
+        }
+    }
+    for ( uint32_t i = ( numWords * 8 ); i < size; ++i )
+    {
+        outBytes[ i ] = (char)next();
+    }
+}
+
+// MakePchBlob
+//------------------------------------------------------------------------------
+/*static*/ bool FBuildTest::MakePchBlob( const Array<char> & pch, uint32_t transformBase, Array<char> & outBlob, bool * outTransformed )
+{
+    static uint32_t s_Count = 0;
+    AStackString<> source;
+    source.Format( "../tmp/Test/PchBlobs/pch-%u.bin", ++s_Count );
+    AStackString<> blob( source );
+    blob += ".zst";
+    {
+        FileStream f;
+        if ( ( FileIO::EnsurePathExistsForFile( source ) == false ) ||
+             ( f.Open( source.Get(), FileStream::WRITE_ONLY ) == false ) ||
+             ( f.Write( pch.Begin(), pch.GetSize() ) != pch.GetSize() ) )
+        {
+            return false;
+        }
+    }
+
+    struct NoObserver : public Compressor::FileObserver
+    {
+        virtual void OnPass() override {}
+        virtual void OnPiece( const void *, size_t ) override {}
+    } observer;
+    uint64_t blobSize = 0;
+    bool transformed = false;
+    PchTransform::Encoder encoder( transformBase );
+    bool ok = Compressor::CompressZstdFile( source.Get(), pch.GetSize(), blob.Get(), Compressor::kZstdTransferLevel, nullptr, observer, blobSize,
+                                            ( transformBase != 0 ) ? &encoder : nullptr, &transformed );
+    FileStream f;
+    ok = ok && f.Open( blob.Get(), FileStream::READ_ONLY ) && ( f.GetFileSize() == blobSize );
+    if ( ok )
+    {
+        outBlob.SetSize( (size_t)blobSize );
+        ok = ( f.Read( outBlob.Begin(), outBlob.GetSize() ) == outBlob.GetSize() );
+    }
+    f.Close();
+    FileIO::FileDelete( source.Get() );
+    FileIO::FileDelete( blob.Get() );
+    if ( outTransformed )
+    {
+        *outTransformed = transformed;
+    }
+    return ok;
 }
 
 // GetIdOfNoProcess

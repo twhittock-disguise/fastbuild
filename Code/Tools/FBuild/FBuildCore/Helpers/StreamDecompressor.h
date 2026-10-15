@@ -5,6 +5,7 @@
 // Includes
 //------------------------------------------------------------------------------
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchTransform.h"
 
 #include "Core/Env/Types.h"
 
@@ -17,6 +18,8 @@ template <class T> class Atomic;
 // Reads data in the format of Compressor (a header, then one zstd frame, or the data itself when it
 // did not compress) without holding the result: it goes to a Sink as it is produced. The input may
 // be fed in pieces of any size. LZ4 is not read: it is a failure, as is any format but zstd or uncompressed.
+// A frame of a PCH that was transformed (see PchTransform) is made what it was before the transform, which is
+// what the sink is given and what the size in the header is that of. A transform that is not known is a failure.
 class StreamDecompressor
 {
 public:
@@ -48,7 +51,9 @@ public:
     [[nodiscard]] static bool DecompressFile( const char * path, const Atomic<bool> * abort, Sink & sink, uint32_t & outUncompressedSize );
 
 private:
+    class RawSink;
     bool FeedPayload( const char * data, size_t size, Sink & sink );
+    bool OnFrameData( const void * data, size_t size, Sink & sink ); // Of the frame, before any inverse transform
 
     char        m_Header[ Compressor::kHeaderSize ];
     uint32_t    m_HeaderSize = 0;       // Bytes of the header received
@@ -58,9 +63,10 @@ private:
     uint32_t    m_UncompressedSize = 0;
     uint32_t    m_CompressedSize = 0;
     uint64_t    m_PayloadFed = 0;
-    uint64_t    m_Produced = 0;
+    uint64_t    m_Produced = 0;         // What the sink was given
     void *      m_Context = nullptr;    // ZSTD_DCtx
     char *      m_Output = nullptr;
+    PchTransform::Decoder * m_Decoder = nullptr; // If the data was transformed
 };
 
 //------------------------------------------------------------------------------

@@ -42,7 +42,7 @@ Compressor::~Compressor()
 
 // ParseHeader
 //------------------------------------------------------------------------------
-/*static*/ bool Compressor::ParseHeader( const void * data, size_t dataSize, HeaderInfo & outHeader )
+/*static*/ bool Compressor::ParseHeader( const void * data, size_t dataSize, HeaderInfo & outHeader, bool allowTransform )
 {
     ASSERT( data );
     if ( dataSize < kHeaderSize )
@@ -50,14 +50,22 @@ Compressor::~Compressor()
         return false;
     }
     const Header * header = (const Header *)data;
-    if ( ( header->m_CompressionType > eZstd ) ||
+    const uint32_t codec = ( header->m_CompressionType & 0xFF );
+    const uint8_t transformId = (uint8_t)( ( header->m_CompressionType >> 8 ) & 0xFF );
+    const uint8_t transformVersion = (uint8_t)( ( header->m_CompressionType >> 16 ) & 0xFF );
+    const bool hasTransform = ( ( transformId | transformVersion ) != 0 );
+    if ( ( codec > eZstd ) ||
+         ( ( header->m_CompressionType >> 24 ) != 0 ) ||
+         ( hasTransform && ( ( allowTransform == false ) || ( codec != eZstd ) || ( transformId == 0 ) ) ) ||
          ( header->m_CompressedSize > header->m_UncompressedSize ) )
     {
         return false;
     }
-    outHeader.m_Type = static_cast<CompressionType>( header->m_CompressionType );
+    outHeader.m_Type = static_cast<CompressionType>( codec );
     outHeader.m_UncompressedSize = header->m_UncompressedSize;
     outHeader.m_CompressedSize = header->m_CompressedSize;
+    outHeader.m_TransformId = transformId;
+    outHeader.m_TransformVersion = transformVersion;
     return true;
 }
 
@@ -72,11 +80,16 @@ Compressor::~Compressor()
 
 // WriteHeader
 //------------------------------------------------------------------------------
-/*static*/ void Compressor::WriteHeader( void * dest, bool zstd, uint32_t uncompressedSize, uint32_t compressedSize )
+/*static*/ void Compressor::WriteHeader( void * dest, bool zstd, uint32_t uncompressedSize, uint32_t compressedSize, bool transformed )
 {
     static_assert( kHeaderSize == sizeof( Header ), "Header size" );
+    ASSERT( zstd || ( transformed == false ) );
     Header * header = static_cast<Header *>( dest );
     header->m_CompressionType = zstd ? eZstd : eUncompressed;
+    if ( transformed )
+    {
+        header->m_CompressionType |= ( ( (uint32_t)PchTransform::kPtrXfId << 8 ) | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) );
+    }
     header->m_UncompressedSize = uncompressedSize;
     header->m_CompressedSize = zstd ? compressedSize : uncompressedSize;
 }
@@ -89,8 +102,14 @@ Compressor::~Compressor()
                                               int32_t compressionLevel,
                                               const Atomic<bool> * abort,
                                               FileObserver & observer,
-                                              uint64_t & outSize )
+                                              uint64_t & outSize,
+                                              PchTransform::Encoder * transform,
+                                              bool * outTransformed )
 {
+    if ( outTransformed )
+    {
+        *outTransformed = false;
+    }
     if ( ( sourceSize == 0 ) || ( sourceSize > kMaxFileSize ) )
     {
         return false;
@@ -116,34 +135,56 @@ Compressor::~Compressor()
     } zstd;
     if ( ( zstd.m_Context == nullptr ) ||
          ZSTD_isError( ZSTD_CCtx_setParameter( zstd.m_Context, ZSTD_c_compressionLevel, compressionLevel ) ) ||
-         ZSTD_isError( ZSTD_CCtx_setPledgedSrcSize( zstd.m_Context, sourceSize ) ) )
+         ( ( transform == nullptr ) && ZSTD_isError( ZSTD_CCtx_setPledgedSrcSize( zstd.m_Context, sourceSize ) ) ) ) // A transform makes data of another size
     {
         return false;
     }
 
     const size_t outputSize = ZSTD_CStreamOutSize();
     UniquePtr<char, FreeDeletor> output( static_cast<char *>( ALLOC( outputSize ) ) );
-    uint64_t consumed = 0;
     uint64_t frameSize = 0;
+    auto compress = [ & ]( const void * data, size_t size, ZSTD_EndDirective directive )
+    {
+        ZSTD_inBuffer in = { data, size, 0 };
+        size_t remaining;
+        do
+        {
+            ZSTD_outBuffer produced = { output.Get(), outputSize, 0 };
+            remaining = ZSTD_compressStream2( zstd.m_Context, &produced, &in, directive );
+            if ( ZSTD_isError( remaining ) || ( dest.Write( output.Get(), static_cast<uint32_t>( produced.pos ) ) != produced.pos ) )
+            {
+                return false;
+            }
+            frameSize += produced.pos;
+        } while ( ( directive == ZSTD_e_end ) ? ( remaining != 0 ) : ( in.pos < in.size ) );
+        return true;
+    };
+
+    // What the transform makes goes to the frame
+    class FrameSink : public PchTransform::Sink
+    {
+    public:
+        explicit FrameSink( const decltype( compress ) & compressFunc ) : m_Compress( compressFunc ) {}
+        explicit FrameSink( const FrameSink & other ) = delete;
+        FrameSink & operator=( const FrameSink & other ) = delete;
+        virtual bool OnPiece( const void * data, size_t size ) override { return m_Compress( data, size, ZSTD_e_continue ); }
+    private:
+        const decltype( compress ) & m_Compress;
+    } frameSink( compress );
+
+    uint64_t consumed = 0;
     observer.OnPass();
     if ( FileChunks::ForEachPiece( source, sourceSize, abort, [ & ]( const void * data, uint32_t size )
     {
         observer.OnPiece( data, size );
         consumed += size;
         const bool last = ( consumed == sourceSize );
-        ZSTD_inBuffer in = { data, size, 0 };
-        size_t remaining;
-        do
+        if ( transform )
         {
-            ZSTD_outBuffer produced = { output.Get(), outputSize, 0 };
-            remaining = ZSTD_compressStream2( zstd.m_Context, &produced, &in, last ? ZSTD_e_end : ZSTD_e_continue );
-            if ( ZSTD_isError( remaining ) || ( dest.Write( output.Get(), static_cast<uint32_t>( produced.pos ) ) != produced.pos ) )
-            {
-                return false;
-            }
-            frameSize += produced.pos;
-        } while ( last ? ( remaining != 0 ) : ( in.pos < in.size ) );
-        return true;
+            return ( transform->Feed( data, size, frameSink ) &&
+                     ( ( last == false ) || ( transform->Finish( frameSink ) && compress( nullptr, 0, ZSTD_e_end ) ) ) );
+        }
+        return compress( data, size, last ? ZSTD_e_end : ZSTD_e_continue );
     } ) == false )
     {
         return false;
@@ -151,12 +192,16 @@ Compressor::~Compressor()
 
     if ( frameSize < sourceSize )
     {
-        WriteHeader( header, true, static_cast<uint32_t>( sourceSize ), static_cast<uint32_t>( frameSize ) );
+        WriteHeader( header, true, static_cast<uint32_t>( sourceSize ), static_cast<uint32_t>( frameSize ), ( transform != nullptr ) );
         if ( ( dest.Seek( 0 ) == false ) || ( dest.Write( header, sizeof( header ) ) != sizeof( header ) ) )
         {
             return false;
         }
         outSize = ( sizeof( header ) + frameSize );
+        if ( outTransformed )
+        {
+            *outTransformed = ( transform != nullptr );
+        }
         return true;
     }
 
@@ -264,6 +309,12 @@ bool Compressor::Decompress( const void * data )
     ASSERT( m_Result == nullptr );
 
     const Header * header = (const Header *)data;
+
+    // Not a codec read here (the type of data a transform was applied to is not)
+    if ( header->m_CompressionType > eZstd )
+    {
+        return false;
+    }
 
     // handle uncompressed case
     if ( header->m_CompressionType == eUncompressed )

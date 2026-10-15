@@ -14,8 +14,9 @@ class FileStream;
 
 // PchBlob
 //------------------------------------------------------------------------------
-// The compressed form is the data that came over the wire (see Compressor), kept as it is. The
-// extension names the codec, so another way of storing a PCH can be told from this one by its file.
+// The compressed form is the data that came over the wire (see Compressor), kept as it is: compressed, and
+// transformed first (see PchTransform) if the client did that. The extension names the codec, so another way
+// of storing a PCH can be told from this one by its file.
 class PchBlob
 {
 public:
@@ -23,8 +24,12 @@ public:
     inline static const char * const kStoredFileName = "pch.zst";   // Compressed: what the cache holds
     inline static const char * const kRawFileName = "pch.pch";      // A working copy for the compiler
 
-    // Is the blob (data in the format of Compressor) the PCH with this id and size?
+    // Is the blob (data in the format of Compressor) the PCH with this id and size? That is, is it what the
+    // PCH is once its decompression, and the inverse of the transform if it has one, is done.
     [[nodiscard]] static bool Verify( const void * blob, size_t blobSize, uint64_t pchId, uint32_t uncompressedSize );
+
+    // The same for a blob in a file, read in pieces
+    [[nodiscard]] static bool VerifyFile( const char * blobFile, uint64_t pchId, uint32_t uncompressedSize, const Atomic<bool> * abort );
 
     enum UnpackResult
     {
