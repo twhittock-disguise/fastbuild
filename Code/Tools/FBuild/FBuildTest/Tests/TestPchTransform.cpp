@@ -720,12 +720,20 @@ void TestPchTransform::CacheOrdersByUse() const
     TEST_ASSERT( cache.Find( 10000 ) == -1 );                           // The oldest ones left
     TEST_ASSERT( cache.Find( 10000 + ( 5 * 100000 ) ) == (int32_t)( PchTransform::kCacheSize - 1 ) );
 
-    // Moved to the front
-    const uint32_t offset = cache.Get( 7 );
+    // Moved to the front, the others keep their order
+    uint32_t before[ PchTransform::kCacheSize ];
+    for ( uint32_t i = 0; i < PchTransform::kCacheSize; ++i )
+    {
+        before[ i ] = cache.Get( i );
+    }
     cache.MoveToFront( 7 );
-    TEST_ASSERT( cache.Get( 0 ) == offset );
-    TEST_ASSERT( cache.Find( offset ) == 0 );
+    TEST_ASSERT( cache.Get( 0 ) == before[ 7 ] );
+    TEST_ASSERT( cache.Find( before[ 7 ] ) == 0 );
     TEST_ASSERT( cache.GetCount() == PchTransform::kCacheSize );
+    for ( uint32_t i = 1; i < PchTransform::kCacheSize; ++i )
+    {
+        TEST_ASSERT( cache.Get( i ) == before[ ( i <= 7 ) ? ( i - 1 ) : i ] );
+    }
 
     // The nearest within the range, the first of two that are as nearest, and none beyond it
     PchTransform::PointerCache nearest;
