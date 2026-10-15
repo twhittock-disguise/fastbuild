@@ -231,6 +231,7 @@ private:
     Array<uint64_t> m_SentToolchains; // Protected by m_Mutex
     Array<uint64_t> m_CachedToolchains; // Reported by the worker and not used yet. Protected by m_Mutex
     Atomic<uint32_t> m_NumSkippedToolchains{ 0 }; // Toolchains the worker had, so we did not send them
+    Atomic<uint32_t> m_NumTransformedPchs{ 0 };   // PCHs sent in the form that a transform makes (see PchTransform)
     PchSendState m_PchState;          // Protected by m_Mutex
     Array<uint64_t> m_PendingPchIds;  // Needed by this worker, not yet queued. Protected by m_Mutex
     uint32_t m_ToolchainsGeneration = 0; // Client thread only: the toolchains pushed so far
@@ -1142,7 +1143,8 @@ void ClientToWorkerConnection::SendPendingPchs()
     }
 
     Array<PchDataCache::ReadyPch> ready;
-    bool allOk = PchDataCache::Get().TakeReadyPchs( m_PendingPchIds, m_PchState.GetOnWorker(), ready );
+    const bool allowTransform = ( ( m_WorkerCapabilities.Load() & Protocol::CAP_PCH_TRANSFORM ) != 0 );
+    bool allOk = PchDataCache::Get().TakeReadyPchs( m_PendingPchIds, m_PchState.GetOnWorker(), ready, allowTransform );
     const uint32_t chunkSize = Math::Clamp( FBuild::Get().GetOptions().m_DistributionPchChunkSize,
                                             Protocol::kMinPchChunkSize,
                                             Protocol::kMaxPchChunkSize );
@@ -1171,8 +1173,13 @@ void ClientToWorkerConnection::SendPendingPchs()
                              isLast ? pch.pchId : 0 );
         }
 
-        DIST_INFO( " - Sent PCH 0x%016" PRIx64 " to %s (%zu bytes compressed, %u chunks)\n",
-                   pch.pchId, m_Worker->m_Address.Get(), pch.dataSize, numChunks );
+        if ( pch.transformed )
+        {
+            m_NumTransformedPchs.Increment();
+        }
+        DIST_INFO( " - Sent PCH 0x%016" PRIx64 " to %s (%u bytes, %zu bytes compressed%s, %u chunks)\n",
+                   pch.pchId, m_Worker->m_Address.Get(), pch.uncompressedSize, pch.dataSize,
+                   pch.transformed ? " with the PCH transform" : "", numChunks );
     }
 
     if ( allOk == false )
@@ -1833,6 +1840,7 @@ void ClientToWorkerConnection::WriteStats() const
     stats.m_WorkerAddress = m_Worker->m_Address;
     stats.m_ConnectedTime = m_ConnectionTimer.GetElapsed();
     stats.m_NumSkippedToolchains = m_NumSkippedToolchains.Load();
+    stats.m_NumTransformedPchs = m_NumTransformedPchs.Load();
     DistributionStats::WriteToTempLog( stats );
 }
 

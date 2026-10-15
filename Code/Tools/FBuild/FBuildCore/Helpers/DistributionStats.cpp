@@ -7,6 +7,7 @@
 
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/FBuild.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchTransform.h"
 
 // Core
 #include "Core/FileIO/FileIO.h"
@@ -73,6 +74,10 @@ namespace
         outText.AppendFormat( "  toolchain: %u cached on the worker, not sent\n", stats.m_NumSkippedToolchains );
     }
     AppendBulkLine( outText, "pch:", stats.m_Pch );
+    if ( stats.m_NumTransformedPchs > 0 )
+    {
+        outText.AppendFormat( "  pch-transform: %u sent after the transform (ptrxf v%u)\n", stats.m_NumTransformedPchs, (uint32_t)PchTransform::kPtrXfVersion );
+    }
     AppendBulkLine( outText, "jobs:", stats.m_Jobs );
     outText.AppendFormat( "  results:   %u received, ", stats.m_ResultsReceived );
     AppendSize( outText, stats.m_ResultRawBytes );

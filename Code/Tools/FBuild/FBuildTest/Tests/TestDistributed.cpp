@@ -16,6 +16,8 @@
 #include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchDataCache.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchTransform.h"
+#include "Tools/FBuild/FBuildCore/Helpers/StreamDecompressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/TempFiles.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
@@ -163,6 +165,19 @@ private:
     void ClientRejectsAnAckWithAPayload() const;
     void ClientDoesNotWaitForInventoriesTheWorkerLacks() const;
     void ClientIgnoresCapabilitiesItDidNotAdvertise() const;
+    void PchTransformCapabilityIsNegotiated() const;
+    void PchIsCompressedInTheFormsWorkersRead() const;
+    void PchTransformThatDoesNotInvertIsNotSent() const;
+    void WorkerStoresATransformedPch() const;
+    void WorkerAcceptsAPlainPchFromAnOldClient() const;
+    void WorkerRejectsATransformedPchThatIsNotValid() const;
+    void StoredTransformedPchThatCannotBeInvertedIsDropped() const;
+#if defined( __WINDOWS__ )
+    void ClientSendsTheTransformedPchOnlyToWorkersThatReadIt() const;
+    void WorkersOfBothKindsAreSentTheirForms() const;
+    void PchTransformedThroughTheBuild() const;
+    void PchTransformFallsBackThroughTheBuild() const;
+#endif
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
     void RemoteRaceWinRemote();
@@ -296,7 +311,15 @@ private:
         Atomic<bool>    m_ResultDeliveredWhileHeld{ false };
     };
     static uint32_t HoldSendMutexOnFirstJob( void * param );
-    void BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when ) const;
+    void BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when, uint32_t clientCapabilities = Protocol::kCapabilities ) const;
+
+    // PCH transform helpers
+    static bool WritePchLikeFile( const char * path, uint32_t size, uint32_t seed, Array<char> & outContent );
+    static PchDataCache::CompressedState WaitForForm( PchDataCache & cache, const PchDataCache::Entry & entry, bool allowTransform, AString & outFilePath, uint64_t & outSize, bool & outTransformed );
+    static bool BlobDecodesTo( const Array<char> & blob, const Array<char> & content ); // As a worker decodes a PCH: the transform is undone
+    static uint32_t GetBlobType( const Array<char> & blob ); // The first word of its header
+    static uint32_t CountInStatsLog( const char * text );
+    static void ClearWorkerPchStore();
 
     // Totals over the lines starting with linePrefix in the client's stats log, for lines like
     // "  jobs:      12 msgs, 1.1 MB raw, 40.2 KB sent, ..." (first is raw, second is sent or received)
@@ -405,6 +428,19 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ClientRejectsAnAckWithAPayload )
     REGISTER_TEST( ClientDoesNotWaitForInventoriesTheWorkerLacks )
     REGISTER_TEST( ClientIgnoresCapabilitiesItDidNotAdvertise )
+    REGISTER_TEST( PchTransformCapabilityIsNegotiated )
+    REGISTER_TEST( PchIsCompressedInTheFormsWorkersRead )
+    REGISTER_TEST( PchTransformThatDoesNotInvertIsNotSent )
+    REGISTER_TEST( WorkerStoresATransformedPch )
+    REGISTER_TEST( WorkerAcceptsAPlainPchFromAnOldClient )
+    REGISTER_TEST( WorkerRejectsATransformedPchThatIsNotValid )
+    REGISTER_TEST( StoredTransformedPchThatCannotBeInvertedIsDropped )
+#if defined( __WINDOWS__ )
+    REGISTER_TEST( ClientSendsTheTransformedPchOnlyToWorkersThatReadIt )
+    REGISTER_TEST( WorkersOfBothKindsAreSentTheirForms )
+    REGISTER_TEST( PchTransformedThroughTheBuild )
+    REGISTER_TEST( PchTransformFallsBackThroughTheBuild )
+#endif
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
     REGISTER_TEST( RemoteRaceWinRemote )
@@ -3015,6 +3051,10 @@ namespace
             : FakeWorker( kNoCapacity, toolchainInventory )
         {
         }
+        explicit NoCapacityWorker( uint32_t capabilities )
+            : FakeWorker( kNoCapacity, Array<uint64_t>(), capabilities )
+        {
+        }
         explicit NoCapacityWorker( const NoCapacityWorker & other ) = delete;
         NoCapacityWorker & operator=( const NoCapacityWorker & other ) = delete;
 
@@ -3024,8 +3064,13 @@ namespace
         uint32_t GetNumJobs() const { return m_NumJobs.Load(); }
         uint64_t GetLastToolId() const { return m_LastToolId.Load(); }
 
+        // What the first chunk of the last PCH came with: the type in the header of the data, and the sizes
+        uint32_t GetPchType() const { return m_PchType.Load(); }
+        uint32_t GetPchCompressedSize() const { return m_PchCompressedSize.Load(); }
+        uint32_t GetPchUncompressedSize() const { return m_PchUncompressedSize.Load(); }
+
     private:
-        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage & message, void *, uint32_t ) override
+        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage & message, void * payload, uint32_t payloadSize ) override
         {
             switch ( message.GetType() )
             {
@@ -3034,12 +3079,28 @@ namespace
                     m_NumManifests.Increment();
                     break;
                 case Protocol::MSG_FILE: m_NumFiles.Increment(); break;
-                case Protocol::MSG_PCH_FILE: m_NumPchFiles.Increment(); break;
+                case Protocol::MSG_PCH_FILE:
+                {
+                    const Protocol::MsgPchFile & pchFile = static_cast<const Protocol::MsgPchFile &>( message );
+                    if ( ( pchFile.GetChunkIndex() == 0 ) && ( payloadSize >= Compressor::kHeaderSize ) )
+                    {
+                        uint32_t type;
+                        memcpy( &type, payload, sizeof( type ) );
+                        m_PchType.Store( type );
+                        m_PchCompressedSize.Store( pchFile.GetCompressedSize() );
+                        m_PchUncompressedSize.Store( pchFile.GetUncompressedSize() );
+                    }
+                    m_NumPchFiles.Increment();
+                    break;
+                }
                 case Protocol::MSG_JOB: m_NumJobs.Increment(); break;
                 default: break;
             }
         }
 
+        Atomic<uint32_t> m_PchType{ 0xFFFFFFFF };
+        Atomic<uint32_t> m_PchCompressedSize{ 0 };
+        Atomic<uint32_t> m_PchUncompressedSize{ 0 };
         Atomic<uint32_t> m_NumManifests{ 0 };
         Atomic<uint32_t> m_NumFiles{ 0 };
         Atomic<uint32_t> m_NumPchFiles{ 0 };
@@ -3059,9 +3120,10 @@ namespace
 }
 
 // Builds the library with a PCH against a worker that never gets a job, until the build is stopped
-void TestDistributed::BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when ) const
+void TestDistributed::BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when, uint32_t clientCapabilities ) const
 {
     FBuildTestOptions options;
+    options.m_DistributionCapabilities = clientCapabilities;
     options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
     options.m_AllowDistributed = true;
     options.m_NumWorkerThreads = 1;
@@ -5982,7 +6044,9 @@ void TestDistributed::PchStoreIsUsedThroughTheBuild() const
         TEST_ASSERT( storedFile.EndsWith( PchBlob::kStoredFileName ) );
         TEST_ASSERT( LoadFile( AStackString<>( "../tmp/Test/Distributed/PrecompiledHeader.pch" ), client_pch ) );
         TEST_ASSERT( PchId::Calc( client_pch.Begin(), client_pch.GetSize() ) == pchId );
-        TEST_ASSERT( DecodesToFile( storedFile, client_pch ) );
+        Array<char> stored;
+        TEST_ASSERT( LoadFile( storedFile, stored ) );
+        TEST_ASSERT( BlobDecodesTo( stored, client_pch ) ); // The client may have sent it transformed
 
         // What the compiler was given is the PCH of the client, byte for byte
         AStackString<> rawFile;
@@ -6535,5 +6599,978 @@ void TestDistributed::CleanMessageToPreventMSBuildFailure() const
         TEST_ASSERT( out == in );
     }
 }
+
+// PCH transform helpers
+//------------------------------------------------------------------------------
+namespace
+{
+    // The type in the header of a blob of a PCH that the PCH transform was applied to
+    constexpr uint32_t kTransformedBlobType = ( Compressor::eZstd | ( (uint32_t)PchTransform::kPtrXfId << 8 ) | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) );
+
+    // Collects what a blob decodes to
+    class BlobCollector : public StreamDecompressor::Sink
+    {
+    public:
+        virtual bool OnPiece( const void * data, size_t size ) override
+        {
+            const size_t oldSize = m_Data.GetSize();
+            if ( ( oldSize + size ) > m_Data.GetCapacity() )
+            {
+                m_Data.SetCapacity( Math::Max( ( oldSize + size ), ( m_Data.GetCapacity() * 2 ) ) );
+            }
+            m_Data.SetSize( oldSize + size );
+            memcpy( m_Data.Begin() + oldSize, data, size );
+            return true;
+        }
+        Array<char> m_Data;
+    };
+
+    // Makes what a PCH transform makes damaged for a while, as one that did not invert would
+    class DamagedTransform
+    {
+    public:
+        DamagedTransform() { PchDataCache::Get().SetDamageTransform( true ); }
+        ~DamagedTransform() { PchDataCache::Get().SetDamageTransform( false ); }
+        explicit DamagedTransform( const DamagedTransform & other ) = delete;
+        DamagedTransform & operator=( const DamagedTransform & other ) = delete;
+    };
+}
+
+/*static*/ bool TestDistributed::WritePchLikeFile( const char * path, uint32_t size, uint32_t seed, Array<char> & outContent )
+{
+    MakePchLikeBytes( size, seed, outContent );
+    if ( FileIO::EnsurePathExistsForFile( AStackString<>( path ) ) == false )
+    {
+        return false;
+    }
+    FileStream f;
+    return f.Open( path, FileStream::WRITE_ONLY ) && ( f.Write( outContent.Begin(), size ) == size );
+}
+
+/*static*/ PchDataCache::CompressedState TestDistributed::WaitForForm( PchDataCache & cache,
+                                                                        const PchDataCache::Entry & entry,
+                                                                        bool allowTransform,
+                                                                        AString & outFilePath,
+                                                                        uint64_t & outSize,
+                                                                        bool & outTransformed )
+{
+    PchDataCache::CompressedState state = PchDataCache::COMPRESSING;
+    WaitUntil( [ & ]()
+    {
+        state = cache.GetCompressed( entry, outFilePath, outSize, allowTransform, &outTransformed );
+        return ( state != PchDataCache::COMPRESSING );
+    } );
+    return state;
+}
+
+/*static*/ bool TestDistributed::BlobDecodesTo( const Array<char> & blob, const Array<char> & content )
+{
+    BlobCollector sink;
+    uint32_t size = 0;
+    return StreamDecompressor::DecompressMemory( blob.Begin(), blob.GetSize(), sink, size ) &&
+           ( size == content.GetSize() ) &&
+           ( sink.m_Data.GetSize() == content.GetSize() ) &&
+           ( memcmp( sink.m_Data.Begin(), content.Begin(), content.GetSize() ) == 0 );
+}
+
+/*static*/ uint32_t TestDistributed::GetBlobType( const Array<char> & blob )
+{
+    uint32_t type = 0xFFFFFFFF;
+    if ( blob.GetSize() >= sizeof( type ) )
+    {
+        memcpy( &type, blob.Begin(), sizeof( type ) );
+    }
+    return type;
+}
+
+/*static*/ uint32_t TestDistributed::CountInStatsLog( const char * text )
+{
+    AStackString<> logPath;
+    VERIFY( FBuild::GetTempDir( logPath ) );
+    logPath += "FBuild-distribution-stats.log";
+    Array<char> log;
+    if ( LoadFile( logPath, log ) == false )
+    {
+        return 0;
+    }
+    log.Append( 0 );
+    uint32_t count = 0;
+    for ( const char * found = strstr( log.Begin(), text ); found; found = strstr( found + 1, text ) )
+    {
+        ++count;
+    }
+    return count;
+}
+
+/*static*/ void TestDistributed::ClearWorkerPchStore()
+{
+    AStackString<> cacheDir;
+    VERIFY( FBuild::GetWorkerCacheDir( cacheDir ) );
+    Array<AString> files;
+    FileIO::GetFiles( cacheDir, AStackString( "*" ), true, &files );
+    for ( const AString & file : files )
+    {
+        if ( file.EndsWith( PchBlob::kStoredFileName ) || file.EndsWith( PchBlob::kRawFileName ) )
+        {
+            FileIO::FileDelete( file.Get() );
+        }
+    }
+}
+
+// PchTransformCapabilityIsNegotiated
+//------------------------------------------------------------------------------
+void TestDistributed::PchTransformCapabilityIsNegotiated() const
+{
+    // A capability is used on a connection only if both sides have it
+    const uint32_t bit = Protocol::CAP_PCH_TRANSFORM;
+    TEST_ASSERT( ( Protocol::kCapabilities & bit ) != 0 );
+    TEST_ASSERT( ( Protocol::Negotiate( Protocol::kCapabilities, Protocol::kCapabilities ) & bit ) != 0 );
+    TEST_ASSERT( ( Protocol::Negotiate( Protocol::kCapabilities & ~bit, Protocol::kCapabilities ) & bit ) == 0 );
+    TEST_ASSERT( ( Protocol::Negotiate( Protocol::kCapabilities, Protocol::kCapabilities & ~bit ) & bit ) == 0 );
+    TEST_ASSERT( Protocol::Negotiate( Protocol::kCapabilities & ~bit, Protocol::kCapabilities ) == ( Protocol::kCapabilities & ~bit ) ); // The others are as they were
+
+    // The worker tells a client that has it that it can be used, and one that does not that it cannot
+    struct Case { uint32_t m_Client; uint32_t m_Ack; };
+    const Case cases[] = {
+        { bit | Protocol::CAP_PCH_REQUEST, bit | Protocol::CAP_PCH_REQUEST },
+        { Protocol::CAP_PCH_REQUEST, Protocol::CAP_PCH_REQUEST },
+        { 0, 0 },
+        { bit | ( 1u << 31 ), bit },
+    };
+    for ( const Case & c : cases )
+    {
+        Server s( 1 );
+        TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+        HandshakeProbe probe;
+        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+        TEST_ASSERT( ci );
+        HandshakeBytes handshake( c.m_Client );
+        TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
+        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 1 ); } ) );
+        TEST_ASSERT( probe.GetAckCapabilities() == c.m_Ack );
+        probe.ShutdownAllConnections();
+    }
+
+    // The client says it has it
+    NoCapacityWorker worker;
+    TEST_ASSERT( BuildPchLocal( worker ).m_Built );
+    TEST_ASSERT( ( worker.GetClientCapabilities() & bit ) != 0 );
+}
+
+// PchIsCompressedInTheFormsWorkersRead
+//------------------------------------------------------------------------------
+void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
+{
+    PchDataCache cache;
+    Array<char> content;
+    const AStackString<> path( "../tmp/Test/Distributed/PchTransformForms/pchlike.pch" );
+    const uint32_t fileSize = ( 3 * MEGABYTE ) + 5;
+    TEST_ASSERT( WritePchLikeFile( path.Get(), fileSize, 1, content ) );
+    PchDataCache::Entry entry;
+    entry.pchId = PchId::Calc( content.Begin(), fileSize );
+    entry.uncompressedSize = fileSize;
+    entry.filePath = path;
+    cache.Store( entry );
+
+    // A worker that reads the transform is given the PCH after it
+    AStackString<> transformedPath;
+    uint64_t transformedSize = 0;
+    bool isTransformed = false;
+    TEST_ASSERT( WaitForForm( cache, entry, true, transformedPath, transformedSize, isTransformed ) == PchDataCache::READY );
+    TEST_ASSERT( isTransformed );
+    Array<char> transformedBlob;
+    TEST_ASSERT( LoadFile( transformedPath, transformedBlob ) );
+    TEST_ASSERT( transformedBlob.GetSize() == transformedSize );
+    TEST_ASSERT( GetBlobType( transformedBlob ) == kTransformedBlobType );
+    TEST_ASSERT( BlobDecodesTo( transformedBlob, content ) );
+    TEST_ASSERT( cache.GetNumCompressions() == 1 );
+
+    // One that does not is given what 24.0 sends: it is made when it is asked for
+    AStackString<> plainPath;
+    uint64_t plainSize = 0;
+    bool plainIsTransformed = true;
+    TEST_ASSERT( WaitForForm( cache, entry, false, plainPath, plainSize, plainIsTransformed ) == PchDataCache::READY );
+    TEST_ASSERT( plainIsTransformed == false );
+    TEST_ASSERT( plainPath != transformedPath );
+    TEST_ASSERT( cache.GetNumCompressions() == 2 );
+    Array<char> plainBlob;
+    TEST_ASSERT( LoadFile( plainPath, plainBlob ) );
+    TEST_ASSERT( GetBlobType( plainBlob ) == Compressor::eZstd );
+    TEST_ASSERT( DecodesToFile( plainPath, content ) ); // As a worker of 24.0 decodes it
+    OUTPUT( "PchIsCompressedInTheFormsWorkersRead: %" PRIu64 " bytes, %" PRIu64 " with the transform (%.1f%%)\n", plainSize, transformedSize, ( 100.0 * (double)transformedSize ) / (double)plainSize );
+    TEST_ASSERT( ( transformedSize * 100 ) < ( plainSize * 90 ) );
+
+    // Each is made once, however often it is asked for
+    {
+        AStackString<> again;
+        uint64_t againSize = 0;
+        bool againTransformed = false;
+        TEST_ASSERT( cache.GetCompressed( entry, again, againSize, true, &againTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( ( again == transformedPath ) && ( againSize == transformedSize ) && againTransformed );
+        TEST_ASSERT( cache.GetCompressed( entry, again, againSize, false, &againTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( ( again == plainPath ) && ( againSize == plainSize ) && ( againTransformed == false ) );
+        TEST_ASSERT( cache.GetNumCompressions() == 2 );
+    }
+
+    // What a connection takes is the form its worker reads
+    for ( uint32_t allow = 0; allow < 2; ++allow )
+    {
+        Array<uint64_t> pending;
+        pending.Append( entry.pchId );
+        Array<uint64_t> onWorker;
+        Array<PchDataCache::ReadyPch> ready;
+        TEST_ASSERT( cache.TakeReadyPchs( pending, onWorker, ready, ( allow != 0 ) ) );
+        TEST_ASSERT( pending.IsEmpty() );
+        TEST_ASSERT( ready.GetSize() == 1 );
+        TEST_ASSERT( ready[ 0 ].transformed == ( allow != 0 ) );
+        TEST_ASSERT( ready[ 0 ].filePath == ( allow ? transformedPath : plainPath ) );
+        TEST_ASSERT( ready[ 0 ].dataSize == ( allow ? transformedSize : plainSize ) );
+        TEST_ASSERT( ready[ 0 ].uncompressedSize == fileSize );
+    }
+
+    // A PCH the transform does not help is sent as it is to a worker that reads the transform, and is made once
+    {
+        Array<char> random;
+        MakeRandomBytes( ( 2 * MEGABYTE ) + 3, 9, random );
+        const AStackString<> randomPath( "../tmp/Test/Distributed/PchTransformForms/random.pch" );
+        {
+            FileStream f;
+            TEST_ASSERT( FileIO::EnsurePathExistsForFile( randomPath ) );
+            TEST_ASSERT( f.Open( randomPath.Get(), FileStream::WRITE_ONLY ) );
+            TEST_ASSERT( f.Write( random.Begin(), random.GetSize() ) == random.GetSize() );
+        }
+        PchDataCache::Entry randomEntry;
+        randomEntry.pchId = PchId::Calc( random.Begin(), random.GetSize() );
+        randomEntry.uncompressedSize = (uint32_t)random.GetSize();
+        randomEntry.filePath = randomPath;
+        cache.Store( randomEntry );
+
+        AStackString<> asked;
+        uint64_t askedSize = 0;
+        bool askedTransformed = true;
+        TEST_ASSERT( WaitForForm( cache, randomEntry, true, asked, askedSize, askedTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( askedTransformed == false );
+        Array<char> askedBlob;
+        TEST_ASSERT( LoadFile( asked, askedBlob ) );
+        TEST_ASSERT( ( GetBlobType( askedBlob ) & ~0xFFu ) == 0 ); // Not of a transform
+        TEST_ASSERT( DecodesToFile( asked, random ) );
+        TEST_ASSERT( cache.GetNumCompressions() == 3 );
+
+        AStackString<> other;
+        uint64_t otherSize = 0;
+        bool otherTransformed = true;
+        TEST_ASSERT( cache.GetCompressed( randomEntry, other, otherSize, false, &otherTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( ( other == asked ) && ( otherSize == askedSize ) && ( otherTransformed == false ) );
+        TEST_ASSERT( cache.GetNumCompressions() == 3 );
+    }
+}
+
+// PchTransformThatDoesNotInvertIsNotSent
+//------------------------------------------------------------------------------
+void TestDistributed::PchTransformThatDoesNotInvertIsNotSent() const
+{
+    Array<char> content;
+    const AStackString<> path( "../tmp/Test/Distributed/PchTransformDamaged/pchlike.pch" );
+    const uint32_t fileSize = ( 2 * MEGABYTE ) + 1;
+    TEST_ASSERT( WritePchLikeFile( path.Get(), fileSize, 2, content ) );
+    PchDataCache::Entry entry;
+    entry.pchId = PchId::Calc( content.Begin(), fileSize );
+    entry.uncompressedSize = fileSize;
+    entry.filePath = path;
+
+    // Nothing is wrong with the PCH: the transform is
+    {
+        PchDataCache cache;
+        cache.SetDamageTransform( true );
+        cache.Store( entry );
+        AStackString<> filePath;
+        uint64_t size = 0;
+        bool isTransformed = true;
+        TEST_ASSERT( WaitForForm( cache, entry, true, filePath, size, isTransformed ) == PchDataCache::READY );
+
+        // What is sent is the PCH compressed as it was before there was a transform, and nothing of the other is left
+        TEST_ASSERT( isTransformed == false );
+        Array<char> blob;
+        TEST_ASSERT( LoadFile( filePath, blob ) );
+        TEST_ASSERT( GetBlobType( blob ) == Compressor::eZstd );
+        TEST_ASSERT( DecodesToFile( filePath, content ) );
+        TEST_ASSERT( cache.HasCompressionFailed( entry.pchId ) == false );
+        TEST_ASSERT( cache.GetFailedAttempts( entry.pchId ) == 0 );
+        TEST_ASSERT( cache.GetNumCompressions() == 1 );
+        AStackString<> sendDir;
+        TEST_ASSERT( cache.GetSendDirectory( sendDir ) );
+        Array<AString> files;
+        FileIO::GetFiles( sendDir, AStackString( "*" ), true, &files );
+        TEST_ASSERT( files.GetSize() == 1 );
+    }
+
+    // The same PCH is sent after the transform when it inverts
+    {
+        PchDataCache cache;
+        cache.Store( entry );
+        AStackString<> filePath;
+        uint64_t size = 0;
+        bool isTransformed = false;
+        TEST_ASSERT( WaitForForm( cache, entry, true, filePath, size, isTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( isTransformed );
+    }
+}
+
+// WorkerStoresATransformedPch
+//------------------------------------------------------------------------------
+void TestDistributed::WorkerStoresATransformedPch() const
+{
+    Array<char> content;
+    MakePchLikeBytes( ( 3 * MEGABYTE ) + 5, 3, content );
+    Array<char> blob;
+    Array<char> plainBlob;
+    bool transformed = false;
+    TEST_ASSERT( MakePchBlob( content, kPchLikeBase, blob, &transformed ) );
+    TEST_ASSERT( transformed );
+    TEST_ASSERT( MakePchBlob( content, 0, plainBlob ) );
+    TEST_ASSERT( blob.GetSize() < plainBlob.GetSize() );
+    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
+    ClearWorkerPchStore();
+
+    Server worker( 1 );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+    PchSender sender;
+    TEST_ASSERT( sender.ConnectToWorker() );
+    const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)blob.GetSize(), Protocol::kPchChunkSize );
+    TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), blob.Begin(), (uint32_t)blob.GetSize(), Protocol::kPchChunkSize, 0, numChunks ) );
+    AStackString<> storedFile;
+    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, storedFile ); } ) );
+
+    // What is kept is what was sent: the store is as small as the wire was
+    Array<char> onDisk;
+    TEST_ASSERT( LoadFile( storedFile, onDisk ) );
+    TEST_ASSERT( onDisk.GetSize() == blob.GetSize() );
+    TEST_ASSERT( memcmp( onDisk.Begin(), blob.Begin(), blob.GetSize() ) == 0 );
+    TEST_ASSERT( GetBlobType( onDisk ) == kTransformedBlobType );
+    {
+        MutexHolder mh( worker.m_PchCacheMutex );
+        TEST_ASSERT( worker.m_PchCache.GetSize() == 1 );
+        TEST_ASSERT( worker.m_PchCache[ 0 ].size == blob.GetSize() );
+    }
+
+    // A job is given the PCH, with the transform undone
+    Job * job = MakePchJob( worker, pchId );
+    TEST_ASSERT( WaitUntil( [ & ]() { return worker.TryResolvePch( *job ); } ) );
+    Array<char> raw;
+    TEST_ASSERT( LoadFile( job->GetPchCachePath(), raw ) );
+    TEST_ASSERT( raw.GetSize() == content.GetSize() );
+    TEST_ASSERT( memcmp( raw.Begin(), content.Begin(), raw.GetSize() ) == 0 );
+    TEST_ASSERT( worker.m_NumPchsUnpacked.Load() == 1 );
+    TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) ); // The store is what it was
+    FDELETE job;
+}
+
+// WorkerAcceptsAPlainPchFromAnOldClient
+//------------------------------------------------------------------------------
+void TestDistributed::WorkerAcceptsAPlainPchFromAnOldClient() const
+{
+    // A client of 24.0 sends the PCH compressed, and the worker keeps and unpacks it as before
+    Array<char> content;
+    MakePchLikeBytes( ( 3 * MEGABYTE ) + 5, 4, content );
+    Array<char> blob;
+    bool transformed = true;
+    TEST_ASSERT( MakePchBlob( content, 0, blob, &transformed ) );
+    TEST_ASSERT( transformed == false );
+    TEST_ASSERT( GetBlobType( blob ) == Compressor::eZstd );
+    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
+    ClearWorkerPchStore();
+
+    Server worker( 1 );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+    PchSender sender;
+    TEST_ASSERT( sender.ConnectToWorker() );
+    const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)blob.GetSize(), Protocol::kPchChunkSize );
+    TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), blob.Begin(), (uint32_t)blob.GetSize(), Protocol::kPchChunkSize, 0, numChunks ) );
+    AStackString<> storedFile;
+    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, storedFile ); } ) );
+
+    Array<char> onDisk;
+    TEST_ASSERT( LoadFile( storedFile, onDisk ) );
+    TEST_ASSERT( onDisk.GetSize() == blob.GetSize() );
+    TEST_ASSERT( memcmp( onDisk.Begin(), blob.Begin(), blob.GetSize() ) == 0 );
+    TEST_ASSERT( DecodesToFile( storedFile, content ) );
+
+    Job * job = MakePchJob( worker, pchId );
+    TEST_ASSERT( WaitUntil( [ & ]() { return worker.TryResolvePch( *job ); } ) );
+    Array<char> raw;
+    TEST_ASSERT( LoadFile( job->GetPchCachePath(), raw ) );
+    TEST_ASSERT( raw.GetSize() == content.GetSize() );
+    TEST_ASSERT( memcmp( raw.Begin(), content.Begin(), raw.GetSize() ) == 0 );
+    FDELETE job;
+}
+
+// WorkerRejectsATransformedPchThatIsNotValid
+//------------------------------------------------------------------------------
+void TestDistributed::WorkerRejectsATransformedPchThatIsNotValid() const
+{
+    enum Fault { NONE, BODY, TRANSFORM_VERSION, TRANSFORM_ID, WRONG_ID, WRONG_SIZE, NUM_FAULTS };
+    for ( uint32_t fault = NONE; fault < NUM_FAULTS; ++fault )
+    {
+        Array<char> content;
+        MakePchLikeBytes( ( 2 * MEGABYTE ) + 3, 10 + fault, content );
+        Array<char> blob;
+        bool transformed = false;
+        TEST_ASSERT( MakePchBlob( content, kPchLikeBase, blob, &transformed ) );
+        TEST_ASSERT( transformed );
+        uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
+        uint32_t size = (uint32_t)content.GetSize();
+        uint32_t type = GetBlobType( blob );
+        switch ( fault )
+        {
+            case BODY:              blob[ blob.GetSize() / 2 ] ^= 0x33; break;
+            case TRANSFORM_VERSION: type += ( 1u << 16 ); break;
+            case TRANSFORM_ID:      type += ( 1u << 8 ); break;
+            case WRONG_ID:          pchId++; break;
+            case WRONG_SIZE:        size += 8; break;
+            default:                break;
+        }
+        memcpy( blob.Begin(), &type, sizeof( type ) );
+        ClearWorkerPchStore();
+
+        Server worker( 1 );
+        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+        auto numClients = [ &worker ]()
+        {
+            MutexHolder mh( worker.m_ClientListMutex );
+            return worker.m_ClientList.GetSize();
+        };
+        PchSender sender;
+        TEST_ASSERT( sender.ConnectToWorker() );
+        TEST_ASSERT( WaitUntil( [ & ]() { return numClients() == 1; } ) );
+        const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)blob.GetSize(), Protocol::kPchChunkSize );
+        TEST_ASSERT( sender.SendChunks( pchId, size, blob.Begin(), (uint32_t)blob.GetSize(), Protocol::kPchChunkSize, 0, numChunks ) );
+
+        AStackString<> storedFile;
+        if ( fault == NONE )
+        {
+            TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, storedFile ); } ) );
+            TEST_ASSERT( numClients() == 1 );
+            continue;
+        }
+
+        // A PCH that is not valid is rejected as one that is corrupt: the connection is dropped, and nothing is kept
+        TEST_ASSERT( WaitUntil( [ & ]() { return numClients() == 0; } ) );
+        TEST_ASSERT( worker.FindCachedPch( pchId, storedFile ) == false );
+        AStackString<> dir;
+        GetWorkerPchDir( pchId, dir );
+        Array<AString> files;
+        FileIO::GetFiles( dir, AStackString( "*" ), true, &files );
+        TEST_ASSERT( files.IsEmpty() );
+    }
+}
+
+// StoredTransformedPchThatCannotBeInvertedIsDropped
+//------------------------------------------------------------------------------
+void TestDistributed::StoredTransformedPchThatCannotBeInvertedIsDropped() const
+{
+    Array<char> content;
+    MakePchLikeBytes( ( 2 * MEGABYTE ) + 3, 21, content );
+    Array<char> good;
+    bool transformed = false;
+    TEST_ASSERT( MakePchBlob( content, kPchLikeBase, good, &transformed ) );
+    TEST_ASSERT( transformed );
+    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
+
+    enum Case { GOOD, DAMAGED_BODY, UNKNOWN_VERSION, UNKNOWN_ID, NUM_CASES };
+    for ( uint32_t which = GOOD; which < NUM_CASES; ++which )
+    {
+        Array<char> blob;
+        blob = good;
+        uint32_t type = GetBlobType( blob );
+        if ( which == DAMAGED_BODY )
+        {
+            for ( size_t i = ( Compressor::kHeaderSize + 100 ); i < blob.GetSize(); i += ( blob.GetSize() / 9 ) )
+            {
+                blob[ i ] = (char)( blob[ i ] ^ 0x5A );
+            }
+        }
+        else if ( which == UNKNOWN_VERSION )
+        {
+            type += ( 1u << 16 );
+        }
+        else if ( which == UNKNOWN_ID )
+        {
+            type += ( 1u << 8 );
+        }
+        memcpy( blob.Begin(), &type, sizeof( type ) );
+        ClearWorkerPchStore(); // What an earlier case left would be found by the worker
+
+        Server s( 1 );
+        AStackString<> storedFile;
+        AddStoredBlob( s, pchId, blob.Begin(), blob.GetSize(), true, storedFile );
+        AStackString<> rawFile;
+        TEST_ASSERT( Server::GetRawPchPath( storedFile, rawFile ) );
+        AStackString<> dir( storedFile.Get(), storedFile.FindLast( NATIVE_SLASH ) + 1 );
+
+        Job * job = MakePchJob( s, pchId );
+        if ( which == GOOD )
+        {
+            TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
+            Array<char> raw;
+            TEST_ASSERT( LoadFile( rawFile, raw ) );
+            TEST_ASSERT( raw.GetSize() == content.GetSize() );
+            TEST_ASSERT( memcmp( raw.Begin(), content.Begin(), raw.GetSize() ) == 0 );
+        }
+        else
+        {
+            // As a PCH that is damaged: the job waits, the PCH is not unpacked again, and is not kept, so it can be sent again
+            TEST_ASSERT( s.TryResolvePch( *job ) == false );
+            TEST_ASSERTM( WaitUntil( [ & ]() { return ( s.IsPchCached( pchId ) == false ); } ), "case %u", which );
+            TEST_ASSERT( WaitUntil( [ & ]() { return ( s.m_PchUnpackQueue.IsEmpty() && ( IsPchBeingUnpacked( s, pchId ) == false ) ); } ) );
+            TEST_ASSERT( job->GetPchCachePath().IsEmpty() );
+            TEST_ASSERT( s.m_NumPchsUnpacked.Load() == 0 );
+            TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 1 );
+            TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) == false );
+            TEST_ASSERT( FileIO::FileExists( rawFile.Get() ) == false );
+            TEST_ASSERT( FileIO::DirectoryExists( dir ) == false );
+        }
+        FDELETE job;
+    }
+}
+
+#if defined( __WINDOWS__ )
+
+// ClientSendsTheTransformedPchOnlyToWorkersThatReadIt
+//------------------------------------------------------------------------------
+void TestDistributed::ClientSendsTheTransformedPchOnlyToWorkersThatReadIt() const
+{
+    const uint32_t withoutTransform = ( Protocol::kCapabilities & ~Protocol::CAP_PCH_TRANSFORM );
+    const uint32_t numLoggedBefore = CountInStatsLog( "pch-transform:" );
+
+    // A worker of this version, and a client of it: the PCH is sent after the transform
+    uint32_t transformedSize = 0;
+    uint32_t uncompressedSize = 0;
+    {
+        NoCapacityWorker worker( Protocol::kCapabilities );
+        BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES );
+        TEST_ASSERT( worker.GetPchType() == kTransformedBlobType );
+        transformedSize = worker.GetPchCompressedSize();
+        uncompressedSize = worker.GetPchUncompressedSize();
+    }
+    TEST_ASSERT( CountInStatsLog( "pch-transform:" ) == ( numLoggedBefore + 1 ) ); // The connection says so in its stats
+
+    // A worker of 24.0, which does not advertise the capability: it is sent what it reads
+    uint32_t plainSize = 0;
+    {
+        NoCapacityWorker worker( withoutTransform );
+        BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES );
+        TEST_ASSERT( worker.GetPchType() == Compressor::eZstd );
+        TEST_ASSERT( worker.GetPchUncompressedSize() == uncompressedSize );
+        plainSize = worker.GetPchCompressedSize();
+    }
+    OUTPUT( "ClientSendsTheTransformedPchOnlyToWorkersThatReadIt: PCH of %u bytes, %u sent, %u with the transform (%.1f%%)\n",
+            uncompressedSize, plainSize, transformedSize, ( 100.0 * transformedSize ) / plainSize );
+    TEST_ASSERT( ( (uint64_t)transformedSize * 100 ) < ( (uint64_t)plainSize * 95 ) );
+
+    // A client that does not advertise it is not sent it by a worker that has it
+    {
+        NoCapacityWorker worker( Protocol::kCapabilities );
+        BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES, withoutTransform );
+        TEST_ASSERT( worker.GetClientCapabilities() == withoutTransform );
+        TEST_ASSERT( worker.GetPchType() == Compressor::eZstd );
+    }
+    TEST_ASSERT( CountInStatsLog( "pch-transform:" ) == ( numLoggedBefore + 1 ) ); // Only the first
+}
+
+// Workers of two kinds
+//------------------------------------------------------------------------------
+namespace
+{
+    // A worker that is of two kinds, as a fleet is while it is updated: the first connection it is given has
+    // the PCH transform, and the next has not. It takes no job, and notes what each connection is sent for a PCH.
+    // It tells the connections apart, as FakeWorker, which reads one at a time, does not.
+    class TwoKindsOfWorker : public TCPConnectionPool
+    {
+    public:
+        struct Received
+        {
+            uint32_t m_Capabilities; // Of the connection it came on
+            uint32_t m_Type;         // In the header of the data
+            uint32_t m_CompressedSize;
+            uint32_t m_UncompressedSize;
+        };
+
+        TwoKindsOfWorker() = default;
+        virtual ~TwoKindsOfWorker() override { ShutdownAllConnections(); }
+        explicit TwoKindsOfWorker( const TwoKindsOfWorker & other ) = delete;
+        TwoKindsOfWorker & operator=( const TwoKindsOfWorker & other ) = delete;
+
+        size_t GetNumConnections() const
+        {
+            MutexHolder mh( m_Mutex );
+            return m_Connections.GetSize();
+        }
+        size_t GetNumReceived() const
+        {
+            MutexHolder mh( m_Mutex );
+            return m_Received.GetSize();
+        }
+        Received GetReceived( size_t index ) const
+        {
+            MutexHolder mh( m_Mutex );
+            return m_Received[ index ];
+        }
+
+    private:
+        struct Connection
+        {
+            const ConnectionInfo *      m_Info;
+            uint32_t                    m_Capabilities;
+            const Protocol::IMessage *  m_Message;  // Its header, until its payload arrives
+        };
+
+        virtual void OnReceive( const ConnectionInfo * connection, void * data, uint32_t size, bool & keepMemory ) override
+        {
+            keepMemory = true; // freed below
+
+            const Protocol::IMessage * message = nullptr;
+            void * payload = nullptr;
+            uint32_t capabilities = 0;
+            {
+                MutexHolder mh( m_Mutex );
+                Connection * state = nullptr;
+                for ( Connection & c : m_Connections )
+                {
+                    if ( c.m_Info == connection )
+                    {
+                        state = &c;
+                    }
+                }
+                if ( state == nullptr )
+                {
+                    Connection added;
+                    added.m_Info = connection;
+                    added.m_Capabilities = ( m_Connections.GetSize() == 0 ) ? Protocol::kCapabilities : ( Protocol::kCapabilities & ~Protocol::CAP_PCH_TRANSFORM );
+                    added.m_Message = nullptr;
+                    m_Connections.Append( added );
+                    state = &m_Connections[ m_Connections.GetSize() - 1 ];
+                }
+                capabilities = state->m_Capabilities;
+                if ( state->m_Message == nullptr )
+                {
+                    state->m_Message = static_cast<const Protocol::IMessage *>( data );
+                    if ( state->m_Message->HasPayload() )
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    payload = data;
+                }
+                message = state->m_Message;
+                state->m_Message = nullptr;
+            }
+
+            if ( message->GetType() == Protocol::MSG_CONNECTION )
+            {
+                const Protocol::MsgConnectionAck ack( 0, capabilities );
+                ack.Send( connection );
+                const Protocol::MsgPchInventory pchInventory( 0 );
+                pchInventory.Send( connection );
+                const Protocol::MsgToolchainInventory toolchainInventory( 0 );
+                toolchainInventory.Send( connection );
+            }
+            else if ( message->GetType() == Protocol::MSG_PCH_FILE )
+            {
+                const Protocol::MsgPchFile & pchFile = static_cast<const Protocol::MsgPchFile &>( *message );
+                if ( ( pchFile.GetChunkIndex() == 0 ) && ( size >= Compressor::kHeaderSize ) )
+                {
+                    Received received;
+                    memcpy( &received.m_Type, payload, sizeof( received.m_Type ) );
+                    received.m_Capabilities = capabilities;
+                    received.m_CompressedSize = pchFile.GetCompressedSize();
+                    received.m_UncompressedSize = pchFile.GetUncompressedSize();
+                    MutexHolder mh( m_Mutex );
+                    m_Received.Append( received );
+                }
+            }
+            (void)size;
+            FREE( (void *)message );
+            FREE( payload );
+        }
+
+        mutable Mutex m_Mutex;
+        Array<Connection> m_Connections;
+        Array<Received> m_Received;
+    };
+}
+
+// WorkersOfBothKindsAreSentTheirForms
+//------------------------------------------------------------------------------
+void TestDistributed::WorkersOfBothKindsAreSentTheirForms() const
+{
+    // One build with two workers, one that reads the transform and one that does not. The PCH is made in both forms.
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestPchTransform/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true;
+    options.m_AllowLocalRace = false;
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    TwoKindsOfWorker worker;
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+    auto bothReceived = [ &worker ]() { return ( worker.GetNumReceived() >= 2 ); };
+    BuildAborter aborter( bothReceived, kWaitTimeoutSeconds );
+    const bool built = fBuild.Build( "../tmp/Test/PchTransform/TwoWorkers/twoworkers.lib" );
+    worker.ShutdownAllConnections();
+    TEST_ASSERT( built == false ); // Aborted
+    TEST_ASSERT( aborter.HasReached() );
+    TEST_ASSERT( worker.GetNumConnections() == 2 );
+
+    // The one that has the transform is sent the PCH after it, and the other is sent what it reads
+    uint32_t transformedSize = 0;
+    uint32_t plainSize = 0;
+    for ( size_t i = 0; i < 2; ++i )
+    {
+        const TwoKindsOfWorker::Received received = worker.GetReceived( i );
+        if ( received.m_Capabilities & Protocol::CAP_PCH_TRANSFORM )
+        {
+            TEST_ASSERT( received.m_Type == kTransformedBlobType );
+            transformedSize = received.m_CompressedSize;
+        }
+        else
+        {
+            TEST_ASSERT( received.m_Type == Compressor::eZstd );
+            plainSize = received.m_CompressedSize;
+        }
+        TEST_ASSERT( received.m_UncompressedSize == worker.GetReceived( 0 ).m_UncompressedSize );
+    }
+    TEST_ASSERT( transformedSize != 0 );
+    TEST_ASSERT( plainSize != 0 );
+    TEST_ASSERT( ( (uint64_t)transformedSize * 100 ) < ( (uint64_t)plainSize * 95 ) );
+}
+
+// PchTransformedThroughTheBuild
+//------------------------------------------------------------------------------
+void TestDistributed::PchTransformedThroughTheBuild() const
+{
+    const char * target( "../tmp/Test/Distributed/distpch.lib" );
+    const AStackString<> dbFile( "../tmp/Test/PchTransform/Build.db" );
+    FileIO::FileDelete( dbFile.Get() );
+    TEST_ASSERT( FileIO::EnsurePathExistsForFile( dbFile ) );
+    const char * objects[] = { "a_pch", "b_pch", "c_pch" };
+
+    auto cleanOutput = []()
+    {
+        Array<AString> files;
+        FileIO::GetFiles( AStackString( "../tmp/Test/Distributed" ), AStackString( "*.*" ), true, &files );
+        for ( const AString & file : files )
+        {
+            FileIO::FileDelete( file.Get() );
+        }
+    };
+    // An object file is the same but for the time it was made, which is in its header
+    auto IsSameObject = []( const Array<char> & a, const Array<char> & b )
+    {
+        if ( a.GetSize() != b.GetSize() )
+        {
+            return false;
+        }
+        for ( size_t i = 0; i < a.GetSize(); ++i )
+        {
+            const bool isTimeStamp = ( ( i >= 4 ) && ( i < 8 ) );
+            if ( ( a[ i ] != b[ i ] ) && ( isTimeStamp == false ) )
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+    auto readObject = [ & ]( const char * name, Array<char> & outBytes )
+    {
+        AStackString<> path;
+        path.Format( "../tmp/Test/Distributed/%s.obj", name );
+        TEST_ASSERT( LoadFile( path, outBytes ) );
+    };
+    auto deleteObjects = [ & ]()
+    {
+        for ( const char * object : objects )
+        {
+            AStackString<> path;
+            path.Format( "../tmp/Test/Distributed/%s.obj", object );
+            TEST_ASSERT( FileIO::FileDelete( path.Get() ) );
+        }
+        FileIO::FileDelete( target );
+    };
+    auto storedFileOf = []( Server & worker, AString & outStoredFile, uint64_t & outPchId )
+    {
+        MutexHolder mh( worker.m_PchCacheMutex );
+        TEST_ASSERT( worker.m_PchCache.GetSize() >= 1 );
+        outStoredFile = worker.m_PchCache[ worker.m_PchCache.GetSize() - 1 ].filePath;
+        outPchId = worker.m_PchCache[ worker.m_PchCache.GetSize() - 1 ].pchId;
+    };
+    ClearWorkerPchStore();
+
+    // A client and a worker of this version: the PCH goes over, and is kept, after the transform
+    Array<char> first[ 3 ];
+    Array<char> clientPch;
+    AStackString<> storedFile;
+    uint64_t pchId = 0;
+    uint64_t transformedStoredSize = 0;
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_NoLocalConsumptionOfRemoteJobs = true; // The jobs need the PCH on the worker
+        options.m_AllowLocalRace = false; // So that every object is built on the worker
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+        cleanOutput();
+
+        Server worker( 1 );
+        SetPchCacheLimits( worker, ( 1ull << 30 ), 0, ( 1ull << 30 ) );
+        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( fBuild.Build( target ) );
+        TEST_ASSERT( fBuild.SaveDependencyGraph( dbFile.Get() ) );
+        TEST_ASSERT( worker.m_NumPchChunksReceived.Load() >= 1 );
+        for ( uint32_t i = 0; i < 3; ++i )
+        {
+            readObject( objects[ i ], first[ i ] );
+            TEST_ASSERT( first[ i ].GetSize() > 0 );
+        }
+
+        storedFileOf( worker, storedFile, pchId );
+        TEST_ASSERT( LoadFile( AStackString<>( "../tmp/Test/Distributed/PrecompiledHeader.pch" ), clientPch ) );
+        TEST_ASSERT( PchId::Calc( clientPch.Begin(), clientPch.GetSize() ) == pchId );
+
+        // What the worker keeps is the transformed blob, which is smaller, and is the PCH of the client when the transform is undone
+        Array<char> stored;
+        TEST_ASSERT( LoadFile( storedFile, stored ) );
+        TEST_ASSERT( GetBlobType( stored ) == kTransformedBlobType );
+        TEST_ASSERT( BlobDecodesTo( stored, clientPch ) );
+        transformedStoredSize = stored.GetSize();
+
+        // What the compiler was given is the PCH of the client, byte for byte
+        AStackString<> rawFile;
+        TEST_ASSERT( Server::GetRawPchPath( storedFile, rawFile ) );
+        Array<char> raw;
+        TEST_ASSERT( LoadFile( rawFile, raw ) );
+        TEST_ASSERT( raw.GetSize() == clientPch.GetSize() );
+        TEST_ASSERT( memcmp( raw.Begin(), clientPch.Begin(), raw.GetSize() ) == 0 );
+    }
+
+    // A worker that starts later finds it in the store, and is not sent the PCH again. The objects are the same.
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_NoLocalConsumptionOfRemoteJobs = true;
+        options.m_AllowLocalRace = false;
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize( dbFile.Get() ) );
+        deleteObjects();
+
+        Server worker( 1 );
+        SetPchCacheLimits( worker, ( 1ull << 30 ), 0, ( 1ull << 30 ) );
+        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( worker.IsPchCached( pchId ) );
+        TEST_ASSERT( fBuild.Build( target ) );
+        TEST_ASSERT( worker.m_NumPchChunksReceived.Load() == 0 );
+        TEST_ASSERT( worker.m_NumPchsUnpacked.Load() >= 1 ); // Made from the transformed store, for the jobs
+        for ( uint32_t i = 0; i < 3; ++i )
+        {
+            Array<char> built;
+            readObject( objects[ i ], built );
+            TEST_ASSERT( IsSameObject( built, first[ i ] ) );
+        }
+    }
+
+    // A client that does not advertise the capability sends the PCH as 24.0 does, which is kept as it came and is bigger. The objects are the same.
+    ClearWorkerPchStore();
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_NoLocalConsumptionOfRemoteJobs = true;
+        options.m_AllowLocalRace = false;
+        options.m_DistributionCapabilities = ( Protocol::kCapabilities & ~Protocol::CAP_PCH_TRANSFORM );
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize( dbFile.Get() ) );
+        deleteObjects();
+
+        Server worker( 1 );
+        SetPchCacheLimits( worker, ( 1ull << 30 ), 0, ( 1ull << 30 ) );
+        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( worker.IsPchCached( pchId ) == false );
+        TEST_ASSERT( fBuild.Build( target ) );
+        TEST_ASSERT( worker.m_NumPchChunksReceived.Load() >= 1 );
+        AStackString<> plainStoredFile;
+        uint64_t plainPchId = 0;
+        storedFileOf( worker, plainStoredFile, plainPchId );
+        TEST_ASSERT( plainPchId == pchId );
+        Array<char> stored;
+        TEST_ASSERT( LoadFile( plainStoredFile, stored ) );
+        TEST_ASSERT( GetBlobType( stored ) == Compressor::eZstd );
+        TEST_ASSERT( DecodesToFile( plainStoredFile, clientPch ) );
+        OUTPUT( "PchTransformedThroughTheBuild: stored %zu bytes, %" PRIu64 " with the transform (%.1f%%)\n", stored.GetSize(), transformedStoredSize, ( 100.0 * (double)transformedStoredSize ) / (double)stored.GetSize() );
+        TEST_ASSERT( ( transformedStoredSize * 100 ) < ( stored.GetSize() * 95 ) );
+        for ( uint32_t i = 0; i < 3; ++i )
+        {
+            Array<char> built;
+            readObject( objects[ i ], built );
+            TEST_ASSERT( IsSameObject( built, first[ i ] ) );
+        }
+    }
+}
+
+// PchTransformFallsBackThroughTheBuild
+//------------------------------------------------------------------------------
+void TestDistributed::PchTransformFallsBackThroughTheBuild() const
+{
+    const char * target( "../tmp/Test/Distributed/distpch.lib" );
+    Array<AString> files;
+    FileIO::GetFiles( AStackString( "../tmp/Test/Distributed" ), AStackString( "*.*" ), true, &files );
+    for ( const AString & file : files )
+    {
+        FileIO::FileDelete( file.Get() );
+    }
+    ClearWorkerPchStore();
+
+    // The transform makes what does not give the PCH back, so what is sent is the PCH as it is: the build is not at fault
+    DamagedTransform damaged;
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true;
+    options.m_AllowLocalRace = false;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    Server worker( 1 );
+    SetPchCacheLimits( worker, ( 1ull << 30 ), 0, ( 1ull << 30 ) );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( fBuild.Build( target ) );
+    TEST_ASSERT( FileIO::FileExists( target ) );
+    TEST_ASSERT( worker.m_NumPchChunksReceived.Load() >= 1 );
+    TEST_ASSERT( worker.m_NumPchsUnpacked.Load() >= 1 );
+
+    AStackString<> storedFile;
+    {
+        MutexHolder mh( worker.m_PchCacheMutex );
+        TEST_ASSERT( worker.m_PchCache.GetSize() >= 1 );
+        storedFile = worker.m_PchCache[ worker.m_PchCache.GetSize() - 1 ].filePath;
+    }
+    Array<char> clientPch;
+    TEST_ASSERT( LoadFile( AStackString<>( "../tmp/Test/Distributed/PrecompiledHeader.pch" ), clientPch ) );
+    Array<char> stored;
+    TEST_ASSERT( LoadFile( storedFile, stored ) );
+    TEST_ASSERT( GetBlobType( stored ) == Compressor::eZstd );
+    TEST_ASSERT( DecodesToFile( storedFile, clientPch ) );
+}
+
+#endif // __WINDOWS__
 
 //------------------------------------------------------------------------------

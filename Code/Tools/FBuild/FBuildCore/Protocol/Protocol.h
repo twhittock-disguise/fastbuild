@@ -37,6 +37,8 @@ namespace Protocol
     // Capabilities: optional features negotiated for each connection. One is used only if both sides
     //   advertise its bit, and a bit is added together with the feature (and the fallback) it stands for.
     // A receiver ignores the trailing bytes of a message it knows and the capability bits it does not.
+    // 24.1 has not been released (24.0 is the last that was), so what it adds, capabilities included, is
+    //   part of 24.1: a capability added before it is released does not raise the minor again.
     inline static const uint32_t kVersionMajor = 24;
     inline static const uint8_t kVersionMinor = 1;
 
@@ -45,8 +47,9 @@ namespace Protocol
         CAP_PCH_INVENTORY = ( 1u << 0 ),        // The worker sends MSG_PCH_INVENTORY after the ack
         CAP_TOOLCHAIN_INVENTORY = ( 1u << 1 ),  // The worker sends MSG_TOOLCHAIN_INVENTORY after the PCH inventory
         CAP_PCH_REQUEST = ( 1u << 2 ),          // The worker sends MSG_PCH_NEEDED for a PCH a job needs and it does not have
+        CAP_PCH_TRANSFORM = ( 1u << 3 ),        // The worker reads a PCH sent with a transform applied (the type of its blob header, see Compressor)
     };
-    inline static const uint32_t kCapabilities = ( CAP_PCH_INVENTORY | CAP_TOOLCHAIN_INVENTORY | CAP_PCH_REQUEST );
+    inline static const uint32_t kCapabilities = ( CAP_PCH_INVENTORY | CAP_TOOLCHAIN_INVENTORY | CAP_PCH_REQUEST | CAP_PCH_TRANSFORM );
 
     // The capabilities in use when one side advertises ours and the other theirs
     inline uint32_t Negotiate( uint32_t ours, uint32_t theirs ) { return ( ours & theirs & kCapabilities ); }

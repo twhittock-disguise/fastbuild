@@ -1,0 +1,23 @@
+#include "..\testcommon.bff"
+Using( .StandardEnvironment )
+Settings
+{
+    .Workers        = { "127.0.0.1", "127.0.0.2" } // The same machine, twice: two workers that the test makes of two kinds
+}
+
+// The PCH library of TestDistributed
+#if __WINDOWS__
+Library( "TwoWorkersPCH" )
+{
+    .PCHInputFile               = "Tools/FBuild/FBuildTest/Data/TestDistributed/PrecompiledHeader.cpp"
+    .PCHOutputFile              = "$Out$/Test/PchTransform/TwoWorkers/PrecompiledHeader.pch"
+
+    .LibrarianOutput            = "$Out$\Test\PchTransform\TwoWorkers\twoworkers.lib"
+    .CompilerInputPath          = "Tools/FBuild/FBuildTest/Data/TestDistributed/"
+    .CompilerInputPattern       = "*_pch.cpp"
+    .CompilerOutputPath         = "$Out$\Test\PchTransform\TwoWorkers\"
+    .CompilerOptions            + ' /Yu"PrecompiledHeader.h" /Fp"$PCHOutputFile$"'
+                                + ' /I"."'
+    .PCHOptions                 + ' /I"."'
+}
+#endif

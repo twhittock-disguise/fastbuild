@@ -9,12 +9,15 @@
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/FLog.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchTransform.h"
 #include "Tools/FBuild/FBuildCore/Helpers/TempFiles.h"
 
 // Core
 #include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/PathUtils.h"
+#include "Core/Math/Conversions.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Process/Atomic.h"
 #include "Core/Process/Mutex.h"
@@ -50,9 +53,10 @@ namespace
 class PchDataCache::CompressedPch
 {
 public:
-    CompressedPch( const Entry & entry, PchDataCache & owner )
+    CompressedPch( const Entry & entry, PchDataCache & owner, bool wantTransform )
         : m_Entry( entry )
         , m_Owner( owner )
+        , m_WantTransform( wantTransform )
     {
         // A dedicated thread: build worker threads are busy compiling, and a small
         // stack is enough as the file is read and compressed in pieces
@@ -75,6 +79,8 @@ public:
     void RequestCancel() { m_Cancel.Store( true ); }
 
     uint64_t GetPchId() const { return m_Entry.pchId; }
+    bool WantsTransform() const { return m_WantTransform; }
+    bool IsTransformed() const { return m_Transformed; } // Known when READY
     CompressedState GetState() const { return static_cast<CompressedState>( m_State.Load() ); }
     uint32_t GetFailedAttempts() const { return m_FailedAttempts.Load(); }
     const AString & GetFilePath() const { return m_FilePath; }
@@ -140,12 +146,48 @@ private:
         AStackString<> tempPath;
         TempFiles::MakeName( dir, kTempFilePrefix, kTempFileExtension, tempPath );
 
-        // The file is read in pieces and must hash to the id it was recorded with: a worker rejects
-        // data that does not, and would be disconnected and sent the same data again
-        HashObserver observer;
+        // The transformed form if it is wanted and is worth it. It is checked to give the PCH back before it is used.
         uint64_t compressedFileSize = 0;
+        bool transformed = false;
+        if ( m_WantTransform )
+        {
+            uint32_t base = 0;
+            if ( PchTransform::Choose( m_Entry.filePath.Get(), m_Entry.uncompressedSize, Compressor::kZstdTransferLevel, &m_Cancel, base ) )
+            {
+                PchTransform::Encoder encoder( base );
+                if ( m_Owner.m_DamageTransform.Load() )
+                {
+                    encoder.DamageOutput();
+                }
+                if ( WriteBlob( tempPath, &encoder, compressedFileSize, transformed ) == false )
+                {
+                    return false;
+                }
+                if ( transformed && ( PchBlob::VerifyFile( tempPath.Get(), m_Entry.pchId, m_Entry.uncompressedSize, &m_Cancel ) == false ) )
+                {
+                    FLOG_WARN( "PCH distribution: the transformed '%s' is not the PCH, so it is sent as it is\n", m_Entry.filePath.Get() );
+                    FileIO::FileDelete( tempPath.Get() );
+                    transformed = false;
+                }
+            }
+        }
+        if ( ( transformed == false ) && ( WriteBlob( tempPath, nullptr, compressedFileSize, transformed ) == false ) )
+        {
+            return false;
+        }
+        m_FilePath = tempPath;
+        m_FileSize = compressedFileSize;
+        m_Transformed = transformed;
+        return true;
+    }
+
+    // The file is read in pieces and must hash to the id it was recorded with: a worker rejects
+    // data that does not, and would be disconnected and sent the same data again
+    bool WriteBlob( const AString & tempPath, PchTransform::Encoder * transform, uint64_t & outSize, bool & outTransformed )
+    {
+        HashObserver observer;
         if ( Compressor::CompressZstdFile( m_Entry.filePath.Get(), m_Entry.uncompressedSize, tempPath.Get(),
-                                           Compressor::kZstdTransferLevel, &m_Cancel, observer, compressedFileSize ) == false )
+                                           Compressor::kZstdTransferLevel, &m_Cancel, observer, outSize, transform, &outTransformed ) == false )
         {
             FLOG_WARN( "PCH distribution: failed to read and compress '%s' to '%s'\n", m_Entry.filePath.Get(), tempPath.Get() );
             FileIO::FileDelete( tempPath.Get() );
@@ -157,19 +199,19 @@ private:
             FileIO::FileDelete( tempPath.Get() );
             return false;
         }
-        m_FilePath = tempPath;
-        m_FileSize = compressedFileSize;
         return true;
     }
 
     Entry m_Entry;
     PchDataCache & m_Owner;
+    const bool m_WantTransform;
     Thread m_Thread;
     Atomic<uint32_t> m_State{ COMPRESSING };
     Atomic<uint32_t> m_FailedAttempts{ 0 };
     Atomic<bool> m_Cancel{ false };
     AString m_FilePath;     // Set before the state is READY
     uint64_t m_FileSize = 0;
+    bool m_Transformed = false; // Set before the state is READY
 };
 
 // CONSTRUCTOR
@@ -287,25 +329,35 @@ bool PchDataCache::Record( const AString & filePath, Entry & outEntry )
 //------------------------------------------------------------------------------
 PchDataCache::CompressedState PchDataCache::GetCompressed( const Entry & entry,
                                                            AString & outFilePath,
-                                                           uint64_t & outFileSize )
+                                                           uint64_t & outFileSize,
+                                                           bool allowTransform,
+                                                           bool * outTransformed )
 {
     MutexHolder mh( m_Mutex );
 
     for ( const CompressedPch * c : m_Compressed )
     {
-        if ( c->GetPchId() == entry.pchId )
+        // The form that was asked for, or what was made when the other was asked for and was not worth it
+        const bool isWanted = ( c->GetPchId() == entry.pchId ) &&
+                              ( ( c->WantsTransform() == allowTransform ) ||
+                                ( ( allowTransform == false ) && ( c->GetState() == READY ) && ( c->IsTransformed() == false ) ) );
+        if ( isWanted )
         {
             const CompressedState state = c->GetState();
             if ( state == READY )
             {
                 outFilePath = c->GetFilePath();
                 outFileSize = c->GetFileSize();
+                if ( outTransformed )
+                {
+                    *outTransformed = c->IsTransformed();
+                }
             }
             return state;
         }
     }
 
-    m_Compressed.Append( FNEW( CompressedPch( entry, *this ) ) );
+    m_Compressed.Append( FNEW( CompressedPch( entry, *this, allowTransform ) ) );
     return COMPRESSING;
 }
 
@@ -315,14 +367,15 @@ uint32_t PchDataCache::GetFailedAttempts( uint64_t pchId ) const
 {
     MutexHolder mh( m_Mutex );
 
+    uint32_t numFailed = 0;
     for ( const CompressedPch * c : m_Compressed )
     {
         if ( c->GetPchId() == pchId )
         {
-            return c->GetFailedAttempts();
+            numFailed = Math::Max( numFailed, c->GetFailedAttempts() );
         }
     }
-    return 0;
+    return numFailed;
 }
 
 // HasCompressionFailed
@@ -333,9 +386,9 @@ bool PchDataCache::HasCompressionFailed( uint64_t pchId ) const
 
     for ( const CompressedPch * c : m_Compressed )
     {
-        if ( c->GetPchId() == pchId )
+        if ( ( c->GetPchId() == pchId ) && ( c->GetState() == FAILED ) )
         {
-            return ( c->GetState() == FAILED );
+            return true;
         }
     }
     return false;
@@ -353,7 +406,8 @@ size_t PchDataCache::GetNumCompressions() const
 //------------------------------------------------------------------------------
 bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
                                   const Array<uint64_t> & onWorker,
-                                  Array<ReadyPch> & outReady )
+                                  Array<ReadyPch> & outReady,
+                                  bool allowTransform )
 {
     bool allOk = true;
 
@@ -368,7 +422,8 @@ bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
         {
             AStackString<> filePath;
             uint64_t fileSize = 0;
-            switch ( GetCompressed( entry, filePath, fileSize ) )
+            bool transformed = false;
+            switch ( GetCompressed( entry, filePath, fileSize, allowTransform, &transformed ) )
             {
                 case COMPRESSING:
                     stillPending.Append( pchId );
@@ -380,6 +435,7 @@ bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
                     ready.uncompressedSize = entry.uncompressedSize;
                     ready.filePath = filePath;
                     ready.dataSize = fileSize;
+                    ready.transformed = transformed;
                     outReady.Append( Move( ready ) );
                     break;
                 }

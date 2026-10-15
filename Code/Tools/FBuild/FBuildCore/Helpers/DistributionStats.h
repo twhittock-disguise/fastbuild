@@ -29,6 +29,7 @@ struct DistributionConnectionStats
     DistributionSendStats   m_Toolchain;
     uint32_t                m_NumSkippedToolchains = 0; // Already cached on the worker, so not sent
     DistributionSendStats   m_Pch;
+    uint32_t                m_NumTransformedPchs = 0; // Of the PCHs in m_Pch, those sent in the form a PCH transform makes
     DistributionSendStats   m_Jobs;
     uint32_t                m_ResultsReceived = 0;
     uint64_t                m_ResultBytesReceived = 0;

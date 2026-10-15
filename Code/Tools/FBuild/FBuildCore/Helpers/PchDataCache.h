@@ -56,7 +56,13 @@ public:
     // Compressed copy of a PCH for sending to workers, kept in a temporary file. The first request
     // starts compression on a background thread, however many connections ask. Reading or compressing
     // is retried after a short delay when it fails. When READY, the file stays until Clear().
-    CompressedState GetCompressed( const Entry & entry, AString & outFilePath, uint64_t & outFileSize );
+    //
+    // There are two forms of the copy: the PCH compressed as it is, and compressed after it was transformed
+    // (see PchTransform), which is smaller. Only a worker that reads the second (allowTransform) is given it,
+    // and it is only made when one asks, if it is worth it, and if it gives the PCH back. When it is not
+    // made, the copy is the first form, and outTransformed says which one it is. A form made for one worker
+    // is used for every one that wants it.
+    CompressedState GetCompressed( const Entry & entry, AString & outFilePath, uint64_t & outFileSize, bool allowTransform = false, bool * outTransformed = nullptr );
     uint32_t GetFailedAttempts( uint64_t pchId ) const;
     bool HasCompressionFailed( uint64_t pchId ) const;
     size_t GetNumCompressions() const; // PCHs for which compression was started
@@ -67,15 +73,18 @@ public:
         uint32_t        uncompressedSize;
         AString         filePath;   // The compressed data, in the format of Compressor
         uint64_t        dataSize;   // Size of that file
+        bool            transformed = false; // Its data is of the PCH after a transform (see PchTransform)
     };
 
     // Resolves the PCH ids a connection needs to send. Ids the worker already has, and ids
     // with no entry, are dropped from pending. READY ones are dropped and returned in outReady,
     // in the order they were pending. Ones still compressing are skipped and stay pending, so a
     // slow one does not hold up the rest. Returns false if any failed for good (those are dropped).
+    // allowTransform is whether the worker reads a PCH that was transformed (see GetCompressed).
     bool TakeReadyPchs( Array<uint64_t> & pending,
                         const Array<uint64_t> & onWorker,
-                        Array<ReadyPch> & outReady );
+                        Array<ReadyPch> & outReady,
+                        bool allowTransform = false );
 
     // Clear all cached entries and delete their compressed files (call at build end)
     void Clear();
@@ -89,6 +98,7 @@ public:
     void SetTempDir( const AString & dir );
     typedef void ( *HashHook )( void * userData );
     void SetHashHook( HashHook hook, void * userData );
+    void SetDamageTransform( bool damage ) { m_DamageTransform.Store( damage ); } // What a transform makes is damaged, as if it did not invert
     uint32_t GetNumFilesHashed() const { return m_NumFilesHashed.Load(); }
 
     static const uint32_t kMaxCompressAttempts = 3;
@@ -118,6 +128,7 @@ private:
     HashHook m_HashHook = nullptr;
     void * m_HashHookData = nullptr;
     Atomic<uint32_t> m_NumFilesHashed{ 0 };
+    Atomic<bool> m_DamageTransform{ false };
 };
 
 //------------------------------------------------------------------------------
