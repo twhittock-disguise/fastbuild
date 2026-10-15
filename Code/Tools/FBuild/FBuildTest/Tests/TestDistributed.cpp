@@ -26,6 +26,7 @@
 #include "Core/Mem/Mem.h"
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
+#include "Core/Process/Process.h"
 #include "Core/Process/Thread.h"
 #include "Core/Strings/AStackString.h"
 #include "Core/Time/Time.h"
@@ -64,6 +65,8 @@ private:
     void PchCompressedCache() const;
     void PchCompressRetry() const;
     void PchTakeReadyPchs() const;
+    void PchChangedAfterItWasRecorded() const;
+    void PchStartupScanRemovesStaleTempFiles() const;
     void DistributionStatsLog() const;
     void PayloadsAcceptedByWorker() const;
     void PchChunksReachTheWorker() const;
@@ -135,7 +138,8 @@ private:
         const void *                    m_Data = nullptr;
         size_t                          m_Size = 0;
     };
-    static bool WriteTestFile( const char * path, uint32_t size, Array<char> & outContent );
+    static void MakeTestContent( uint32_t size, uint32_t seed, Array<char> & outContent );
+    static bool WriteTestFile( const char * path, uint32_t size, Array<char> & outContent, uint32_t seed = 0 );
     static PchDataCache::CompressedState WaitForCompression( PchDataCache & cache,
                                                              const PchDataCache::Entry & entry,
                                                              const void *& outData,
@@ -172,7 +176,7 @@ private:
 
     // Totals over the lines starting with linePrefix in the client's stats log, for lines like
     // "  jobs:      12 msgs, 1.1 MB raw, 40.2 KB sent, ..." (first is raw, second is sent or received)
-    static void ReadStats( const AString & logPath, const char * linePrefix, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outOtherBytes );
+    static void ReadStats( const AString & logPath, const char * linePrefix, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outOtherBytes, uint32_t * outNumMessages = nullptr );
 
     mutable SyntheticToolchain::ScratchWorkerCache m_WorkerCache;
 };
@@ -190,6 +194,8 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchCompressedCache )
     REGISTER_TEST( PchCompressRetry )
     REGISTER_TEST( PchTakeReadyPchs )
+    REGISTER_TEST( PchChangedAfterItWasRecorded )
+    REGISTER_TEST( PchStartupScanRemovesStaleTempFiles )
     REGISTER_TEST( DistributionStatsLog )
     REGISTER_TEST( PayloadsAcceptedByWorker )
     REGISTER_TEST( PchChunksReachTheWorker )
@@ -380,14 +386,19 @@ void TestDistributed::PchCacheEvictionPolicy() const
 
 // PchDataCache helpers
 //------------------------------------------------------------------------------
-/*static*/ bool TestDistributed::WriteTestFile( const char * path, uint32_t size, Array<char> & outContent )
+/*static*/ void TestDistributed::MakeTestContent( uint32_t size, uint32_t seed, Array<char> & outContent )
 {
     // Compressible, with some variation
     outContent.SetSize( size );
     for ( uint32_t i = 0; i < size; ++i )
     {
-        outContent[ i ] = (char)( ( i % 251 ) ^ ( ( i / 4096 ) & 0xFF ) );
+        outContent[ i ] = (char)( ( i % 251 ) ^ ( ( i / 4096 ) & 0xFF ) ^ seed );
     }
+}
+
+/*static*/ bool TestDistributed::WriteTestFile( const char * path, uint32_t size, Array<char> & outContent, uint32_t seed )
+{
+    MakeTestContent( size, seed, outContent );
 
     if ( FileIO::EnsurePathExistsForFile( AStackString<>( path ) ) == false )
     {
@@ -445,7 +456,7 @@ void TestDistributed::PchCompressedCache() const
     TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
 
     PchDataCache::Entry entry;
-    entry.pchId = 0x1234;
+    entry.pchId = xxHash::Calc64( content.Begin(), fileSize ); // The id is the hash of the file
     entry.uncompressedSize = fileSize;
     entry.filePath = path;
     cache.Store( entry );
@@ -494,9 +505,10 @@ void TestDistributed::PchCompressRetry() const
         const AStackString<> path( "../tmp/Test/Distributed/PchCompressRetry/appears.pch" );
         const uint32_t fileSize = ( 1 * MEGABYTE );
         FileIO::FileDelete( path.Get() );
+        MakeTestContent( fileSize, 0, content );
 
         PchDataCache::Entry entry;
-        entry.pchId = 0x1;
+        entry.pchId = xxHash::Calc64( content.Begin(), fileSize );
         entry.uncompressedSize = fileSize;
         entry.filePath = path;
         cache.Store( entry );
@@ -549,23 +561,28 @@ void TestDistributed::PchTakeReadyPchs() const
 
     Array<char> content;
     const AStackString<> goodPath( "../tmp/Test/Distributed/PchTakeReadyPchs/good.pch" );
+    const AStackString<> goodTooPath( "../tmp/Test/Distributed/PchTakeReadyPchs/goodtoo.pch" );
     const AStackString<> shortPath( "../tmp/Test/Distributed/PchTakeReadyPchs/short.pch" );
     const uint32_t fileSize = ( 1 * MEGABYTE );
     TEST_ASSERT( WriteTestFile( goodPath.Get(), fileSize, content ) );
+    Array<char> goodTooContent;
+    TEST_ASSERT( WriteTestFile( goodTooPath.Get(), fileSize, goodTooContent, 1 ) );
     Array<char> shortContent;
     TEST_ASSERT( WriteTestFile( shortPath.Get(), 100, shortContent ) );
 
-    const uint64_t kGood = 1;
+    // The id of a PCH is the hash of the file
+    const uint64_t kGood = xxHash::Calc64( content.Begin(), fileSize );
+    const uint64_t kGoodToo = xxHash::Calc64( goodTooContent.Begin(), fileSize );
     const uint64_t kUnreadable = 2;
     const uint64_t kUnknown = 3;
     const uint64_t kWorkerHasIt = 4;
-    const uint64_t kGoodToo = 5;
     PchDataCache::Entry entry;
     entry.pchId = kGood;
     entry.uncompressedSize = fileSize;
     entry.filePath = goodPath;
     cache.Store( entry );
     entry.pchId = kGoodToo;
+    entry.filePath = goodTooPath;
     cache.Store( entry );
     entry.pchId = kUnreadable;
     entry.uncompressedSize = 1024; // The file is shorter
@@ -621,6 +638,105 @@ void TestDistributed::PchTakeReadyPchs() const
     TEST_ASSERT( ready.GetSize() == 2 );
 }
 
+// PchChangedAfterItWasRecorded
+//------------------------------------------------------------------------------
+void TestDistributed::PchChangedAfterItWasRecorded() const
+{
+    // The id of a PCH is the hash of its file. A file rewritten since it was recorded does not hash
+    // to it, so it is not sent: a worker would refuse it, and would be sent the same data again.
+    PchDataCache cache( 2, 10 );
+    Array<char> content;
+    const AStackString<> path( "../tmp/Test/Distributed/PchChangedAfterItWasRecorded/test.pch" );
+    const uint32_t fileSize = ( 1 * MEGABYTE );
+    TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
+
+    PchDataCache::Entry entry;
+    entry.pchId = xxHash::Calc64( content.Begin(), fileSize );
+    entry.uncompressedSize = fileSize;
+    entry.filePath = path;
+    cache.Store( entry );
+
+    // Rewritten to the same size
+    Array<char> other;
+    TEST_ASSERT( WriteTestFile( path.Get(), fileSize, other, 1 ) );
+
+    const void * data = nullptr;
+    size_t size = 0;
+    TEST_ASSERT( WaitForCompression( cache, entry, data, size ) == PchDataCache::FAILED );
+    TEST_ASSERT( cache.HasCompressionFailed( entry.pchId ) );
+}
+
+// PchStartupScanRemovesStaleTempFiles
+//------------------------------------------------------------------------------
+void TestDistributed::PchStartupScanRemovesStaleTempFiles() const
+{
+    // What a crashed worker left in a PCH directory next to the PCH it had
+    const uint64_t kPchId = 0x7001;
+    AStackString<> pchFile;
+    VERIFY( FBuild::GetWorkerCacheDir( pchFile ) );
+    pchFile.AppendFormat( "pch.%016" PRIx64 "%cpch.pch", kPchId, (char)NATIVE_SLASH );
+    AStackString<> dir;
+    dir.Assign( pchFile.Get(), pchFile.FindLast( NATIVE_SLASH ) + 1 );
+    Array<AString> old;
+    FileIO::GetFiles( dir, AStackString( "*" ), true, &old );
+    for ( const AString & file : old )
+    {
+        FileIO::FileDelete( file.Get() );
+    }
+
+    const uint32_t thisProcess = Process::GetCurrentId();
+    const uint32_t otherProcess = ( thisProcess + 1 );
+    auto makeFile = [ & ]( const char * name, AString & outFile )
+    {
+        outFile = dir;
+        outFile += name;
+        FileStream f;
+        TEST_ASSERT( FileIO::EnsurePathExistsForFile( outFile ) );
+        TEST_ASSERT( f.Open( outFile.Get(), FileStream::WRITE_ONLY ) );
+        const char data[] = "data";
+        TEST_ASSERT( f.Write( data, sizeof( data ) ) == sizeof( data ) );
+    };
+    AStackString<> staleName;
+    staleName.Format( "incoming.%u.1.pch", otherProcess );
+    AStackString<> freshName;
+    freshName.Format( "incoming.%u.2.pch", otherProcess );
+    AStackString<> ownName;
+    ownName.Format( "incoming.%u.3.pch", thisProcess );
+    AStackString<> pch;
+    AStackString<> stale;
+    AStackString<> fresh;
+    AStackString<> own;
+    AStackString<> unrelated;
+    makeFile( "pch.pch", pch );
+    makeFile( staleName.Get(), stale );
+    makeFile( freshName.Get(), fresh );
+    makeFile( ownName.Get(), own );
+    makeFile( "notes.txt", unrelated );
+
+    // Old enough to be left by a process that is gone: the other process's, and our own as well
+#if defined( __WINDOWS__ )
+    const uint64_t kDay = ( 24ULL * 3600ULL * 10000000ULL );
+#else
+    const uint64_t kDay = ( 24ULL * 3600ULL * 1000000000ULL );
+#endif
+    const uint64_t longAgo = ( Time::GetCurrentFileTime() - kDay );
+    TEST_ASSERT( FileIO::SetFileLastWriteTime( stale, longAgo ) );
+    TEST_ASSERT( FileIO::SetFileLastWriteTime( own, longAgo ) );
+    TEST_ASSERT( FileIO::SetFileLastWriteTime( unrelated, longAgo ) );
+
+    Server s( 1 );
+
+    // The PCH is registered, a leftover of another process is removed, and so is nothing that
+    // another process may still be writing, that is being written by this one, or that is not ours
+    AStackString<> cachedPath;
+    TEST_ASSERT( s.FindCachedPch( kPchId, cachedPath ) );
+    TEST_ASSERT( FileIO::FileExists( pch.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( stale.Get() ) == false );
+    TEST_ASSERT( FileIO::FileExists( fresh.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( own.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( unrelated.Get() ) );
+}
+
 // DistributionStatsLog
 //------------------------------------------------------------------------------
 void TestDistributed::DistributionStatsLog() const
@@ -653,7 +769,7 @@ void TestDistributed::DistributionStatsLog() const
         TEST_ASSERT( text.Find( "[2026-01-02 03:04:05] worker 10.0.0.7, connected 12.5s" ) );
         TEST_ASSERT( text.Find( "toolchain: 18 msgs, 40.0 MB raw, 2.0 MB sent" ) );
         TEST_ASSERT( text.Find( "jobs:      3 msgs, 24.0 MB raw, 3.0 MB sent, send time 0.5s, encode time 0.4s, max wait 0.2s, done at" ) );
-        TEST_ASSERT( text.Find( "pch:       1 msgs, 0.0 KB raw, 1.0 MB sent, send time 0.5s, done at" ) ); // No wait is shown for bulk data
+        TEST_ASSERT( text.Find( "pch:       1 msgs, 0.0 KB raw, 1.0 MB sent, send time 0.5s, done at" ) );
         TEST_ASSERT( text.Find( "toolchain: 2 cached on the worker, not sent" ) );
         TEST_ASSERT( text.Find( "results:   3 received, 4.0 MB raw, 1.0 MB received" ) );
         TEST_ASSERT( text.Find( "upload:    6.0 MB in 2.0s of send time = 3.00 MB/s (24.0 Mbit/s)" ) );
@@ -760,7 +876,7 @@ namespace
             {
                 const Protocol::MsgPchFile msg( pchId, uncompressedSize, compressedSize, chunkSize, i );
                 const ConstMemoryStream payload( static_cast<const char *>( compressedData ) + ( (size_t)i * chunkSize ),
-                                                 Protocol::MsgPchFile::GetChunkSize( compressedSize, chunkSize, i ) );
+                                                 Protocol::MsgPchFile::GetChunkLength( compressedSize, chunkSize, i ) );
                 if ( msg.Send( m_Connection, payload ) == false )
                 {
                     return false;
@@ -778,20 +894,6 @@ namespace
     {
         VERIFY( FBuild::GetWorkerCacheDir( outDir ) );
         outDir.AppendFormat( "pch.%016" PRIx64 "%c", pchId, (char)NATIVE_SLASH );
-    }
-
-    // Data that does not compress
-    void MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes )
-    {
-        outBytes.SetSize( size );
-        uint64_t x = ( seed | 1 );
-        for ( char & c : outBytes )
-        {
-            x ^= ( x << 13 );
-            x ^= ( x >> 7 );
-            x ^= ( x << 17 );
-            c = (char)( x >> 24 );
-        }
     }
 }
 
@@ -915,15 +1017,18 @@ void TestDistributed::PchLeftHalfSentIsDropped() const
         TEST_ASSERT( WaitUntil( [ & ]() { return numClients() == 1; } ) );
         TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, 2 ) );
 
-        // What has been sent is being kept on disk
-        Array<AString> files;
-        TEST_ASSERT( WaitUntil( [ & ]() { files.Clear(); FileIO::GetFiles( pchDir, AStackString( "*" ), true, &files ); return ( files.GetSize() == 1 ); } ) );
+        // Both chunks have been taken in by the worker
+        TEST_ASSERT( WaitUntil( [ & ]()
+        {
+            MutexHolder mh( worker.m_ClientListMutex );
+            return ( worker.m_ClientList.GetSize() == 1 ) && ( worker.m_ClientList[ 0 ]->m_PchReceiver.GetNumChunksReceived() >= 2 );
+        } ) );
 
         sender.DisconnectFromWorker();
         TEST_ASSERT( WaitUntil( [ & ]() { return numClients() == 0; } ) );
     }
 
-    // Nothing is left of it, and the worker does not have the PCH
+    // Nothing is on disk, and the worker does not have the PCH
     Array<AString> files;
     FileIO::GetFiles( pchDir, AStackString( "*" ), true, &files );
     TEST_ASSERT( files.IsEmpty() );
@@ -970,13 +1075,13 @@ void TestDistributed::PchInChunksThroughTheBuild() const
     AStackString<> logPath;
     TEST_ASSERT( FBuild::GetTempDir( logPath ) );
     logPath += "FBuild-distribution-stats.log";
-    FileStream log;
-    TEST_ASSERT( log.Open( logPath.Get(), FileStream::READ_ONLY ) );
-    AStackString<> text;
-    TEST_ASSERT( log.ReadIntoString( text ) );
-    const char * pchLine = text.Find( "  pch:       " );
-    TEST_ASSERT( pchLine );
-    TEST_ASSERT( atoi( pchLine + 13 ) >= 3 );
+    uint32_t numConnections = 0;
+    uint32_t numMessages = 0;
+    uint64_t rawBytes = 0;
+    uint64_t sentBytes = 0;
+    ReadStats( logPath, "  pch: ", numConnections, rawBytes, sentBytes, &numMessages );
+    TEST_ASSERT( numConnections == 1 );
+    TEST_ASSERT( numMessages >= 3 );
 
     // Nothing is left of the pieces on the worker
     AStackString<> cacheDir;
@@ -1297,11 +1402,15 @@ void TestDistributed::ToolchainCorruptedFileIsResent() const
 
 // ReadStats
 //------------------------------------------------------------------------------
-/*static*/ void TestDistributed::ReadStats( const AString & logPath, const char * linePrefix, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outOtherBytes )
+/*static*/ void TestDistributed::ReadStats( const AString & logPath, const char * linePrefix, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outOtherBytes, uint32_t * outNumMessages )
 {
     outNumBlocks = 0;
     outRawBytes = 0;
     outOtherBytes = 0;
+    if ( outNumMessages )
+    {
+        *outNumMessages = 0;
+    }
 
     FileStream f;
     if ( f.Open( logPath.Get(), FileStream::READ_ONLY ) == false )
@@ -1327,7 +1436,7 @@ void TestDistributed::ToolchainCorruptedFileIsResent() const
     while ( ( line = strstr( line, linePrefix ) ) != nullptr )
     {
         char * p = nullptr;
-        (void)strtoul( line + strlen( linePrefix ), &p, 10 );
+        const uint32_t numMessages = (uint32_t)strtoul( line + strlen( linePrefix ), &p, 10 );
         p = strstr( p, ", " );
         if ( p == nullptr )
         {
@@ -1346,6 +1455,10 @@ void TestDistributed::ToolchainCorruptedFileIsResent() const
         ++outNumBlocks;
         outRawBytes += raw;
         outOtherBytes += other;
+        if ( outNumMessages )
+        {
+            *outNumMessages += numMessages;
+        }
         line = p;
     }
 }
@@ -1680,21 +1793,24 @@ void TestDistributed::CorruptResultIsRejected() const
 {
     SendHold * hold = static_cast<SendHold *>( param );
 
-    // Wait for a job to arrive. Building it takes long enough to get the lock first.
+    // The client sends its toolchain once the worker has sent everything of the handshake, and
+    // sends the job after it: taking the mutex when the toolchain arrives is before any result,
+    // and cannot hold up the handshake. The connection stays up, as the build waits for the result.
     Server::ClientState * cs = nullptr;
     while ( ( cs == nullptr ) && ( hold->m_Stop.Load() == false ) )
     {
+        if ( hold->m_Server->m_NumManifestsReceived.Load() > 0 )
         {
             MutexHolder mh( hold->m_Server->m_ClientListMutex );
-            for ( Server::ClientState * client : hold->m_Server->m_ClientList )
+            if ( hold->m_Server->m_ClientList.GetSize() == 1 )
             {
-                if ( client->m_NumJobsActive.Load() > 0 )
-                {
-                    cs = client;
-                }
+                cs = hold->m_Server->m_ClientList[ 0 ];
             }
         }
-        Thread::Sleep( 1 );
+        else
+        {
+            Thread::Sleep( 1 );
+        }
     }
     if ( cs == nullptr )
     {
@@ -1703,16 +1819,21 @@ void TestDistributed::CorruptResultIsRejected() const
 
     cs->m_SendMutex.Lock();
 
-    // The worker finishes the job, but has to wait to send the result
-    hold->m_ReachedSend.Store( WaitUntil( [ cs ]() { return ( cs->m_NumJobsActive.Load() == 0 ); } ) );
+    // The job arrives and is built, but its result has to wait to be sent
+    const bool jobArrived = WaitUntil( [ cs ]() { return ( cs->m_NumJobsActive.Load() > 0 ); } );
+    hold->m_ReachedSend.Store( jobArrived && WaitUntil( [ cs ]() { return ( cs->m_NumJobsActive.Load() == 0 ); } ) );
     if ( hold->m_ReachedSend.Load() )
     {
-        // Jobs can still be received meanwhile
-        if ( cs->m_Mutex.TryLock() )
+        // What guards the connection's jobs is another lock: jobs can still be received meanwhile
+        hold->m_StateMutexFree.Store( WaitUntil( [ cs ]()
         {
-            hold->m_StateMutexFree.Store( true );
-            cs->m_Mutex.Unlock();
-        }
+            if ( cs->m_Mutex.TryLock() )
+            {
+                cs->m_Mutex.Unlock();
+                return true;
+            }
+            return false;
+        }, 1.0f ) );
         Thread::Sleep( 200 );
         hold->m_ResultDeliveredWhileHeld.Store( hold->m_BuildDone.Load() );
     }

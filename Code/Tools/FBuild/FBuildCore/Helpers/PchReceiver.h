@@ -4,16 +4,19 @@
 
 // Includes
 //------------------------------------------------------------------------------
+#include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
+
+#include "Core/Containers/Array.h"
 #include "Core/Env/Types.h"
-#include "Core/FileIO/FileStream.h"
+#include "Core/Process/Atomic.h"
 #include "Core/Strings/AString.h"
 
 // PchReceiver
 //------------------------------------------------------------------------------
-// One per coordinator connection. The chunks of a PCH are written to a temporary file as they
-// arrive. The last one decompresses it, checks the size and the id (the xxHash64 of the file)
-// and moves the result into place, so a PCH file is only ever seen complete. The chunks of one
-// PCH arrive in order and without another PCH in between.
+// One per coordinator connection. The chunks of a PCH are kept in memory as they arrive. The last
+// one decompresses them, checks the size and the id (the xxHash64 of the file) and moves the
+// result into place, so a PCH file is only ever seen complete. The chunks of one PCH arrive in
+// order and without another PCH in between.
 class PchReceiver
 {
 public:
@@ -24,17 +27,6 @@ public:
     explicit PchReceiver( const PchReceiver & other ) = delete;
     PchReceiver & operator=( const PchReceiver & other ) = delete;
 
-    struct Chunk
-    {
-        uint64_t        m_PchId = 0;
-        uint32_t        m_UncompressedSize = 0;
-        uint32_t        m_CompressedSize = 0;
-        uint32_t        m_ChunkSize = 0;
-        uint32_t        m_Index = 0;
-        const void *    m_Data = nullptr;
-        size_t          m_Size = 0;
-    };
-
     enum Result
     {
         CONTINUE,   // More chunks are expected
@@ -42,32 +34,41 @@ public:
         FAILED,     // Not valid, and nothing is left on disk. The sender should be disconnected.
     };
 
-    // pchDir is the directory the PCH is kept in, ending in a slash
-    Result OnChunk( const Chunk & chunk,
-                    const AString & pchDir,
-                    AString & outPchFile,
+    // pchFile is the path the PCH is kept at
+    Result OnChunk( const Protocol::MsgPchFile & msg,
+                    const void * data,
+                    size_t size,
+                    const AString & pchFile,
                     bool & outAlreadyCached );
 
     // Drops a PCH that was only partly received
     void Abort();
 
-    // The most a compressed PCH can be larger than the PCH, so a sender cannot make us store more
-    static uint64_t GetMaxCompressedSize( uint32_t uncompressedSize );
+    uint32_t GetNumChunksReceived() const { return m_NumChunksReceived.Load(); }
+
+    // The temporary file a PCH is written to before it is moved into place, next to pchFile. It is
+    // named incoming.<process id>.<number>.pch: no two are the same, and what a crashed worker
+    // left can be recognised.
+    static void MakeTempFileName( const AString & pchFile, AString & outFile );
+    static bool IsTempFileName( const char * fileName, uint32_t & outProcessId );
+
+    // The largest PCH a sender may announce
+    inline static const uint32_t kMaxUncompressedSize = ( 2u * 1024 * 1024 * 1024 );
 
 private:
-    Result Fail( const char * reason );
-    Result Finish( const AString & pchDir, AString & outPchFile, bool & outAlreadyCached );
+    Result Fail( uint64_t pchId, const char * reason );
+    Result Finish( const AString & pchFile, bool & outAlreadyCached );
 
-    bool        m_Active = false;
-    bool        m_AlreadyCached = false; // The PCH was already on disk: the chunks are read and dropped
-    uint64_t    m_PchId = 0;
-    uint32_t    m_UncompressedSize = 0;
-    uint32_t    m_CompressedSize = 0;
-    uint32_t    m_ChunkSize = 0;
-    uint32_t    m_NextIndex = 0;
-    AString     m_ReceivingFile; // Compressed data, as received
-    AString     m_DecodedFile;   // Decompressed data, until it is moved into place
-    FileStream  m_File;
+    bool            m_Active = false;
+    bool            m_AlreadyCached = false; // The PCH was already on disk: the chunks are dropped
+    uint64_t        m_PchId = 0;
+    uint32_t        m_UncompressedSize = 0;
+    uint32_t        m_CompressedSize = 0;
+    uint32_t        m_ChunkSize = 0;
+    uint32_t        m_NextIndex = 0;
+    Array<char>     m_Compressed;   // As received, so far
+    AString         m_TempFile;     // The decompressed PCH, until it is moved into place
+    Atomic<uint32_t> m_NumChunksReceived{ 0 };
 };
 
 //------------------------------------------------------------------------------

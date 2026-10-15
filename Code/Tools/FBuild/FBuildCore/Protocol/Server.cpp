@@ -22,6 +22,7 @@
 #include "Core/FileIO/MemoryStream.h"
 #include "Core/FileIO/PathUtils.h"
 #include "Core/Process/Atomic.h"
+#include "Core/Process/Process.h"
 #include "Core/Profile/Profile.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Strings/AStackString.h"
@@ -42,6 +43,12 @@
 namespace
 {
     constexpr uint32_t kMaxCachedPchEntries = 20;
+
+    const char * const kPchFileName = "pch.pch";
+
+    // A temporary PCH file another process left is only removed once it has not been written to
+    // for this long, as that process may be receiving a PCH
+    constexpr uint64_t kStaleTempPchFileSeconds = ( 60 * 60 );
 
     // Picks entries to evict, least recently used first, until at most maxEntries remain.
     // Protected entries are never picked, so more than maxEntries may remain.
@@ -90,14 +97,11 @@ namespace
     // Persistent on-disk cache layout (toolchains and PCHs), under FBuild::GetWorkerCacheDir:
     //   toolchain.<toolId hex>/...
     //   pch.<pchId hex>/pch.pch
-    bool BuildPchCacheDir( uint64_t pchId, AStackString<> & outDir )
+    //   pch.<pchId hex>/incoming.<process id>.<number>.pch (while a PCH is being received)
+    bool BuildPchFilePath( uint64_t pchId, AStackString<> & outFile )
     {
-        if ( FBuild::GetWorkerCacheDir( outDir ) == false ) { return false; }
-    #if defined( __WINDOWS__ )
-        outDir.AppendFormat( "pch.%016" PRIx64 "\\", pchId );
-    #else
-        outDir.AppendFormat( "pch.%016" PRIx64 "/", pchId );
-    #endif
+        if ( FBuild::GetWorkerCacheDir( outFile ) == false ) { return false; }
+        outFile.AppendFormat( "pch.%016" PRIx64 "%c%s", pchId, (char)NATIVE_SLASH, kPchFileName );
         return true;
     }
 
@@ -753,26 +757,16 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
 
     const uint64_t pchId = msg->GetPchId();
 
-    AStackString pchDir;
-    if ( BuildPchCacheDir( pchId, pchDir ) == false )
+    AStackString pchFilePath;
+    if ( BuildPchFilePath( pchId, pchFilePath ) == false )
     {
         FLOG_WARN( "Failed to get temp dir for PCH cache\n" );
         Disconnect( connection );
         return;
     }
 
-    PchReceiver::Chunk chunk;
-    chunk.m_PchId = pchId;
-    chunk.m_UncompressedSize = msg->GetUncompressedSize();
-    chunk.m_CompressedSize = msg->GetCompressedSize();
-    chunk.m_ChunkSize = msg->GetChunkSize();
-    chunk.m_Index = msg->GetChunkIndex();
-    chunk.m_Data = payload;
-    chunk.m_Size = payloadSize;
-
-    AStackString pchFilePath;
     bool alreadyCached = false;
-    const PchReceiver::Result result = cs->m_PchReceiver.OnChunk( chunk, pchDir, pchFilePath, alreadyCached );
+    const PchReceiver::Result result = cs->m_PchReceiver.OnChunk( *msg, payload, payloadSize, pchFilePath, alreadyCached );
     if ( result == PchReceiver::FAILED )
     {
         Disconnect( connection );
@@ -856,7 +850,7 @@ void Server::ScanPchCache()
     // Scan for pch.pch files under pch.<hex> subdirs.
     // Parse pchId from the directory name rather than reading/hashing each file.
     Array<FileIO::FileInfo> pchFiles;
-    AStackString pchWildcard( "pch.pch" );
+    AStackString pchWildcard( kPchFileName );
     Array<AString> pchPatterns;
     pchPatterns.Append( pchWildcard );
     if ( FileIO::GetFilesEx( basePath, &pchPatterns, true /*recurse*/, &pchFiles ) )
@@ -888,6 +882,8 @@ void Server::ScanPchCache()
         }
     }
 
+    RemoveStaleTempPchFiles( basePath );
+
     if ( scannedEntries.IsEmpty() )
     {
         return;
@@ -907,6 +903,37 @@ void Server::ScanPchCache()
 
     FLOG_OUTPUT( "PCH inventory: %u entries scanned from disk cache\n",
                  (uint32_t)m_PchCache.GetSize() );
+}
+
+// RemoveStaleTempPchFiles
+//------------------------------------------------------------------------------
+/*static*/ void Server::RemoveStaleTempPchFiles( const AString & basePath )
+{
+    Array<FileIO::FileInfo> files;
+    Array<AString> patterns;
+    patterns.Append( AStackString<>( "incoming.*" ) );
+    if ( FileIO::GetFilesEx( basePath, &patterns, true /*recurse*/, &files ) == false )
+    {
+        return;
+    }
+
+    // Those of this process are being written to, and those of another may be as well
+    const uint64_t now = Time::FileTimeToSeconds( Time::GetCurrentFileTime() );
+    const uint32_t thisProcess = Process::GetCurrentId();
+    for ( const FileIO::FileInfo & file : files )
+    {
+        uint32_t processId = 0;
+        if ( ( PchReceiver::IsTempFileName( file.m_Name.Get(), processId ) == false ) ||
+             ( processId == thisProcess ) )
+        {
+            continue;
+        }
+        const uint64_t lastWritten = Time::FileTimeToSeconds( file.m_LastWriteTime );
+        if ( ( now > lastWritten ) && ( ( now - lastWritten ) >= kStaleTempPchFileSeconds ) )
+        {
+            FileIO::FileDelete( file.m_Name.Get() );
+        }
+    }
 }
 
 // CollectPchIdsInUse

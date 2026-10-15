@@ -216,7 +216,7 @@ Protocol::MsgPchFile::MsgPchFile( uint64_t pchId, uint32_t uncompressedSize, uin
 }
 
 //------------------------------------------------------------------------------
-/*static*/ uint32_t Protocol::MsgPchFile::GetChunkSize( uint32_t compressedSize, uint32_t chunkSize, uint32_t chunkIndex )
+/*static*/ uint32_t Protocol::MsgPchFile::GetChunkLength( uint32_t compressedSize, uint32_t chunkSize, uint32_t chunkIndex )
 {
     const uint64_t offset = ( (uint64_t)chunkIndex * chunkSize );
     if ( offset >= compressedSize )

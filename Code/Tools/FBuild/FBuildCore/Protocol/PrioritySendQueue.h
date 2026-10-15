@@ -6,43 +6,45 @@
 //------------------------------------------------------------------------------
 #include "Core/Containers/Array.h"
 #include "Core/Containers/Move.h"
+#include "Core/Env/Assert.h"
 
 // PrioritySendQueue
 //------------------------------------------------------------------------------
-// Bulk data goes out in pieces. A piece is only sent when nothing else is waiting, so what
-// is queued after a large transfer has started waits for one piece of it at most.
+// Bulk data goes out in pieces, one behind each batch of the other messages, so what is queued
+// after a large transfer has started waits for one piece of it at most, and a steady stream of
+// messages cannot hold the transfer up for good. ITEM::IsBulk() says which kind an item is.
 // Not thread safe.
 template <class ITEM>
 class PrioritySendQueue
 {
 public:
-    void Push( ITEM && item, bool isBulk )
+    void Push( ITEM && item )
     {
-        ( isBulk ? m_Bulk : m_Normal ).EmplaceBack( Move( item ) );
+        ( item.IsBulk() ? m_Bulk : m_Normal ).EmplaceBack( Move( item ) );
     }
 
-    // Takes everything that is not bulk data, or if there is none the next piece of bulk data,
-    // in the order they were pushed. Returns false if nothing is queued.
-    bool Take( Array<ITEM> & outItems )
+    // Takes everything that is not bulk data, in the order it was pushed, then the next piece of
+    // bulk data if there is any. Takes nothing if nothing is queued.
+    void Take( Array<ITEM> & outItems )
     {
         ASSERT( outItems.IsEmpty() );
-        if ( m_Normal.IsEmpty() == false )
+        m_Normal.Swap( outItems );
+        if ( m_BulkNext < m_Bulk.GetSize() )
         {
-            m_Normal.Swap( outItems );
-            return true;
+            outItems.EmplaceBack( Move( m_Bulk[ m_BulkNext ] ) );
+            ++m_BulkNext;
+            if ( m_BulkNext == m_Bulk.GetSize() )
+            {
+                m_Bulk.Clear();
+                m_BulkNext = 0;
+            }
         }
-        if ( m_Bulk.IsEmpty() == false )
-        {
-            outItems.EmplaceBack( Move( m_Bulk[ 0 ] ) );
-            m_Bulk.EraseIndex( 0 );
-            return true;
-        }
-        return false;
     }
 
 private:
     Array<ITEM> m_Normal;
     Array<ITEM> m_Bulk;
+    size_t      m_BulkNext = 0; // The next piece of m_Bulk to send
 };
 
 //------------------------------------------------------------------------------

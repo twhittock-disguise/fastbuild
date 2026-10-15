@@ -132,6 +132,7 @@ private:
         uint64_t    lastWriteTime;
     };
     void ScanPchCache();
+    static void RemoveStaleTempPchFiles( const AString & basePath ); // Left by a crashed worker
     bool FindCachedPch( uint64_t pchId, AString & outPath ); // refreshes LRU recency
 
     // PCH ids referenced by jobs that are waiting, pending or in flight

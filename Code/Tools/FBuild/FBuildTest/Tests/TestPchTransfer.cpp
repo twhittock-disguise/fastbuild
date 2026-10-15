@@ -9,13 +9,16 @@
 #include "Tools/FBuild/FBuildCore/Helpers/PchReceiver.h"
 #include "Tools/FBuild/FBuildCore/Protocol/PrioritySendQueue.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
+#include "Tools/FBuild/FBuildCore/Protocol/SendKind.h"
 
 // Core
 #include "Core/Containers/Array.h"
 #include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/FileStream.h"
 #include "Core/Math/xxHash.h"
+#include "Core/Process/Process.h"
 #include "Core/Strings/AStackString.h"
+#include "Core/Time/Time.h"
 
 // TestPchTransfer
 //------------------------------------------------------------------------------
@@ -27,10 +30,16 @@ private:
     void ReceiverReassemblesChunks() const;
     void ReceiverRejectsAWrongId() const;
     void ReceiverRejectsMalformedChunks() const;
+    void ReceiverAcceptsTheLimits() const;
     void ReceiverDropsAPartialPch() const;
+    void ReceiverNamesItsTemporaryFiles() const;
     void ReceiversOfTheSamePchDoNotMeet() const;
     void ReceiverKeepsACachedPch() const;
+    void ReceiverReplacesAPchOfTheWrongSize() const;
+    void ReceiverCleansUpWhenItCannotPublish() const;
     void SendQueueSendsBulkDataLast() const;
+    void SendQueueDoesNotStarveBulkData() const;
+    void BulkSendKinds() const;
 
     static constexpr uint32_t kChunkSize = Protocol::kMinPchChunkSize; // Small, so a PCH has many chunks
 
@@ -44,11 +53,21 @@ private:
     };
     static void MakePch( uint32_t compressedSize, uint64_t seed, TestPch & outPch );
 
-    // Cuts one chunk out of the compressed data
-    static PchReceiver::Chunk GetChunk( const TestPch & pch, uint32_t chunkSize, uint32_t index );
+    // The message of a chunk of the compressed data, and where its data is
+    struct TestChunk
+    {
+        TestChunk( const TestPch & pch, uint32_t chunkSize, uint32_t index );
 
-    // The directory a test keeps a PCH in, emptied of what an earlier run left
-    static void GetCleanDir( const char * testName, uint64_t pchId, AString & outDir );
+        Protocol::MsgPchFile    m_Msg;
+        const void *            m_Data;
+        size_t                  m_Size;
+    };
+    static PchReceiver::Result Feed( PchReceiver & receiver, const TestChunk & chunk, const AString & pchFile, bool & outAlreadyCached );
+    static PchReceiver::Result FeedAll( PchReceiver & receiver, const TestPch & pch, const AString & pchFile, bool & outAlreadyCached );
+
+    // Where a test keeps a PCH, with what an earlier run left removed
+    static void GetCleanPchFile( const char * testName, uint64_t pchId, AString & outPchFile );
+    static void GetDirOf( const AString & file, AString & outDir );
     static uint32_t CountFiles( const AString & dir );
     static bool ReadFile( const AString & file, Array<char> & outContent );
 };
@@ -59,10 +78,16 @@ REGISTER_TESTS_BEGIN( TestPchTransfer )
     REGISTER_TEST( ReceiverReassemblesChunks )
     REGISTER_TEST( ReceiverRejectsAWrongId )
     REGISTER_TEST( ReceiverRejectsMalformedChunks )
+    REGISTER_TEST( ReceiverAcceptsTheLimits )
     REGISTER_TEST( ReceiverDropsAPartialPch )
+    REGISTER_TEST( ReceiverNamesItsTemporaryFiles )
     REGISTER_TEST( ReceiversOfTheSamePchDoNotMeet )
     REGISTER_TEST( ReceiverKeepsACachedPch )
+    REGISTER_TEST( ReceiverReplacesAPchOfTheWrongSize )
+    REGISTER_TEST( ReceiverCleansUpWhenItCannotPublish )
     REGISTER_TEST( SendQueueSendsBulkDataLast )
+    REGISTER_TEST( SendQueueDoesNotStarveBulkData )
+    REGISTER_TEST( BulkSendKinds )
 REGISTER_TESTS_END
 
 // MakePch
@@ -73,15 +98,7 @@ REGISTER_TESTS_END
     const uint32_t headerSize = 12;
     TEST_ASSERT( compressedSize > headerSize );
     outPch.m_UncompressedSize = ( compressedSize - headerSize );
-    outPch.m_Raw.SetSize( outPch.m_UncompressedSize );
-    uint64_t x = ( seed | 1 );
-    for ( char & c : outPch.m_Raw )
-    {
-        x ^= ( x << 13 );
-        x ^= ( x >> 7 );
-        x ^= ( x << 17 );
-        c = (char)( x >> 24 );
-    }
+    MakeRandomBytes( outPch.m_UncompressedSize, seed, outPch.m_Raw );
     outPch.m_Id = xxHash::Calc64( outPch.m_Raw.Begin(), outPch.m_Raw.GetSize() );
 
     Compressor c;
@@ -91,33 +108,65 @@ REGISTER_TESTS_END
     memcpy( outPch.m_Compressed.Begin(), c.GetResult(), c.GetResultSize() );
 }
 
-// GetChunk
+// TestChunk
 //------------------------------------------------------------------------------
-/*static*/ PchReceiver::Chunk TestPchTransfer::GetChunk( const TestPch & pch, uint32_t chunkSize, uint32_t index )
+TestPchTransfer::TestChunk::TestChunk( const TestPch & pch, uint32_t chunkSize, uint32_t index )
+    : m_Msg( pch.m_Id, pch.m_UncompressedSize, (uint32_t)pch.m_Compressed.GetSize(), chunkSize, index )
+    , m_Data( pch.m_Compressed.Begin() + ( (size_t)index * chunkSize ) )
+    , m_Size( Protocol::MsgPchFile::GetChunkLength( (uint32_t)pch.m_Compressed.GetSize(), chunkSize, index ) )
 {
-    const uint32_t compressedSize = (uint32_t)pch.m_Compressed.GetSize();
-    PchReceiver::Chunk chunk;
-    chunk.m_PchId = pch.m_Id;
-    chunk.m_UncompressedSize = pch.m_UncompressedSize;
-    chunk.m_CompressedSize = compressedSize;
-    chunk.m_ChunkSize = chunkSize;
-    chunk.m_Index = index;
-    chunk.m_Data = pch.m_Compressed.Begin() + ( (size_t)index * chunkSize );
-    chunk.m_Size = Protocol::MsgPchFile::GetChunkSize( compressedSize, chunkSize, index );
-    return chunk;
 }
 
-// GetCleanDir
+// Feed
 //------------------------------------------------------------------------------
-/*static*/ void TestPchTransfer::GetCleanDir( const char * testName, uint64_t pchId, AString & outDir )
+/*static*/ PchReceiver::Result TestPchTransfer::Feed( PchReceiver & receiver,
+                                                       const TestChunk & chunk,
+                                                       const AString & pchFile,
+                                                       bool & outAlreadyCached )
 {
-    outDir.Format( "../tmp/Test/PchTransfer/%s/pch.%016" PRIx64 "%c", testName, pchId, (char)NATIVE_SLASH );
+    return receiver.OnChunk( chunk.m_Msg, chunk.m_Data, chunk.m_Size, pchFile, outAlreadyCached );
+}
+
+// FeedAll
+//------------------------------------------------------------------------------
+/*static*/ PchReceiver::Result TestPchTransfer::FeedAll( PchReceiver & receiver,
+                                                         const TestPch & pch,
+                                                         const AString & pchFile,
+                                                         bool & outAlreadyCached )
+{
+    const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)pch.m_Compressed.GetSize(), kChunkSize );
+    PchReceiver::Result result = PchReceiver::CONTINUE;
+    for ( uint32_t i = 0; i < numChunks; ++i )
+    {
+        result = Feed( receiver, TestChunk( pch, kChunkSize, i ), pchFile, outAlreadyCached );
+        TEST_ASSERT( result == ( ( i + 1 ) == numChunks ? PchReceiver::COMPLETE : PchReceiver::CONTINUE ) );
+    }
+    return result;
+}
+
+// GetCleanPchFile
+//------------------------------------------------------------------------------
+/*static*/ void TestPchTransfer::GetCleanPchFile( const char * testName, uint64_t pchId, AString & outPchFile )
+{
+    AStackString<> dir;
+    dir.Format( "../tmp/Test/PchTransfer/%s/pch.%016" PRIx64 "%c", testName, pchId, (char)NATIVE_SLASH );
     Array<AString> old;
-    FileIO::GetFiles( outDir, AStackString( "*" ), true, &old );
+    FileIO::GetFiles( dir, AStackString( "*" ), true, &old );
     for ( const AString & file : old )
     {
         FileIO::FileDelete( file.Get() );
     }
+    outPchFile = dir;
+    outPchFile += "pch.pch";
+}
+
+// GetDirOf
+//------------------------------------------------------------------------------
+/*static*/ void TestPchTransfer::GetDirOf( const AString & file, AString & outDir )
+{
+    const char * lastSlash = file.FindLast( NATIVE_SLASH );
+    TEST_ASSERT( lastSlash );
+    outDir.Assign( file.Get(), lastSlash + 1 );
 }
 
 // CountFiles
@@ -160,26 +209,21 @@ void TestPchTransfer::ReceiverReassemblesChunks() const
         TestPch pch;
         MakePch( size, ++seed, pch );
 
+        AStackString<> file;
+        GetCleanPchFile( "Reassembles", pch.m_Id, file );
         AStackString<> dir;
-        GetCleanDir( "Reassembles", pch.m_Id, dir );
+        GetDirOf( file, dir );
 
         PchReceiver receiver;
-        const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( size, kChunkSize );
-        for ( uint32_t i = 0; i < numChunks; ++i )
-        {
-            AStackString<> file;
-            bool alreadyCached = false;
-            const PchReceiver::Result result = receiver.OnChunk( GetChunk( pch, kChunkSize, i ), dir, file, alreadyCached );
-            TEST_ASSERT( result == ( ( i + 1 ) == numChunks ? PchReceiver::COMPLETE : PchReceiver::CONTINUE ) );
-            if ( result == PchReceiver::COMPLETE )
-            {
-                TEST_ASSERT( alreadyCached == false );
-                Array<char> content;
-                TEST_ASSERT( ReadFile( file, content ) );
-                TEST_ASSERT( content.GetSize() == pch.m_Raw.GetSize() );
-                TEST_ASSERT( memcmp( content.Begin(), pch.m_Raw.Begin(), content.GetSize() ) == 0 );
-            }
-        }
+        bool alreadyCached = false;
+        TEST_ASSERT( FeedAll( receiver, pch, file, alreadyCached ) == PchReceiver::COMPLETE );
+        TEST_ASSERT( alreadyCached == false );
+        TEST_ASSERT( receiver.GetNumChunksReceived() == Protocol::MsgPchFile::GetNumChunks( size, kChunkSize ) );
+
+        Array<char> content;
+        TEST_ASSERT( ReadFile( file, content ) );
+        TEST_ASSERT( content.GetSize() == pch.m_Raw.GetSize() );
+        TEST_ASSERT( memcmp( content.Begin(), pch.m_Raw.Begin(), content.GetSize() ) == 0 );
 
         // Only the PCH is left
         TEST_ASSERT( CountFiles( dir ) == 1 );
@@ -195,15 +239,16 @@ void TestPchTransfer::ReceiverRejectsAWrongId() const
     MakePch( ( 3 * kChunkSize ) + 7, 100, pch );
     pch.m_Id++;
 
+    AStackString<> file;
+    GetCleanPchFile( "WrongId", pch.m_Id, file );
     AStackString<> dir;
-    GetCleanDir( "WrongId", pch.m_Id, dir );
+    GetDirOf( file, dir );
     PchReceiver receiver;
     const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)pch.m_Compressed.GetSize(), kChunkSize );
     for ( uint32_t i = 0; i < numChunks; ++i )
     {
-        AStackString<> file;
         bool alreadyCached = false;
-        const PchReceiver::Result result = receiver.OnChunk( GetChunk( pch, kChunkSize, i ), dir, file, alreadyCached );
+        const PchReceiver::Result result = Feed( receiver, TestChunk( pch, kChunkSize, i ), file, alreadyCached );
         TEST_ASSERT( result == ( ( i + 1 ) == numChunks ? PchReceiver::FAILED : PchReceiver::CONTINUE ) );
     }
     TEST_ASSERT( CountFiles( dir ) == 0 );
@@ -217,80 +262,98 @@ void TestPchTransfer::ReceiverRejectsMalformedChunks() const
     MakePch( ( 4 * kChunkSize ) + 5, 200, pch );
     TestPch other;
     MakePch( ( 2 * kChunkSize ) + 5, 300, other );
-    AStackString<> dir;
-    GetCleanDir( "Malformed", pch.m_Id, dir );
-    AStackString<> otherDir;
-    GetCleanDir( "Malformed", other.m_Id, otherDir );
-
     AStackString<> file;
+    GetCleanPchFile( "Malformed", pch.m_Id, file );
+    AStackString<> dir;
+    GetDirOf( file, dir );
+    AStackString<> otherFile;
+    GetCleanPchFile( "Malformed", other.m_Id, otherFile );
+
+    const uint32_t compressedSize = (uint32_t)pch.m_Compressed.GetSize();
     bool alreadyCached = false;
 
     // The first chunk is not the first
     {
         PchReceiver receiver;
-        TEST_ASSERT( receiver.OnChunk( GetChunk( pch, kChunkSize, 1 ), dir, file, alreadyCached ) == PchReceiver::FAILED );
-        TEST_ASSERT( CountFiles( dir ) == 0 );
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 1 ), file, alreadyCached ) == PchReceiver::FAILED );
+    }
+
+    // The first chunk twice
+    {
+        PchReceiver receiver;
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 0 ), file, alreadyCached ) == PchReceiver::CONTINUE );
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 0 ), file, alreadyCached ) == PchReceiver::FAILED );
     }
 
     // A chunk is missing
     {
         PchReceiver receiver;
-        TEST_ASSERT( receiver.OnChunk( GetChunk( pch, kChunkSize, 0 ), dir, file, alreadyCached ) == PchReceiver::CONTINUE );
-        TEST_ASSERT( receiver.OnChunk( GetChunk( pch, kChunkSize, 2 ), dir, file, alreadyCached ) == PchReceiver::FAILED );
-        TEST_ASSERT( CountFiles( dir ) == 0 ); // What was received is dropped
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 0 ), file, alreadyCached ) == PchReceiver::CONTINUE );
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 2 ), file, alreadyCached ) == PchReceiver::FAILED );
     }
 
     // A chunk of the wrong size
     {
         PchReceiver receiver;
-        TEST_ASSERT( receiver.OnChunk( GetChunk( pch, kChunkSize, 0 ), dir, file, alreadyCached ) == PchReceiver::CONTINUE );
-        PchReceiver::Chunk chunk = GetChunk( pch, kChunkSize, 1 );
-        chunk.m_Size--;
-        TEST_ASSERT( receiver.OnChunk( chunk, dir, file, alreadyCached ) == PchReceiver::FAILED );
-        TEST_ASSERT( CountFiles( dir ) == 0 );
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 0 ), file, alreadyCached ) == PchReceiver::CONTINUE );
+        const TestChunk chunk( pch, kChunkSize, 1 );
+        TEST_ASSERT( receiver.OnChunk( chunk.m_Msg, chunk.m_Data, chunk.m_Size - 1, file, alreadyCached ) == PchReceiver::FAILED );
     }
 
     // A chunk that says the PCH has other sizes than the first did
     {
         PchReceiver receiver;
-        TEST_ASSERT( receiver.OnChunk( GetChunk( pch, kChunkSize, 0 ), dir, file, alreadyCached ) == PchReceiver::CONTINUE );
-        PchReceiver::Chunk chunk = GetChunk( pch, kChunkSize, 1 );
-        chunk.m_CompressedSize++;
-        TEST_ASSERT( receiver.OnChunk( chunk, dir, file, alreadyCached ) == PchReceiver::FAILED );
-        TEST_ASSERT( CountFiles( dir ) == 0 );
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 0 ), file, alreadyCached ) == PchReceiver::CONTINUE );
+        const Protocol::MsgPchFile msg( pch.m_Id, pch.m_UncompressedSize, compressedSize + 1, kChunkSize, 1 );
+        const TestChunk chunk( pch, kChunkSize, 1 );
+        TEST_ASSERT( receiver.OnChunk( msg, chunk.m_Data, chunk.m_Size, file, alreadyCached ) == PchReceiver::FAILED );
     }
 
     // A PCH starts before the one before it is complete
     {
         PchReceiver receiver;
-        TEST_ASSERT( receiver.OnChunk( GetChunk( pch, kChunkSize, 0 ), dir, file, alreadyCached ) == PchReceiver::CONTINUE );
-        TEST_ASSERT( receiver.OnChunk( GetChunk( other, kChunkSize, 0 ), otherDir, file, alreadyCached ) == PchReceiver::FAILED );
-        TEST_ASSERT( CountFiles( dir ) == 0 );
-        TEST_ASSERT( CountFiles( otherDir ) == 0 );
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 0 ), file, alreadyCached ) == PchReceiver::CONTINUE );
+        TEST_ASSERT( Feed( receiver, TestChunk( other, kChunkSize, 0 ), otherFile, alreadyCached ) == PchReceiver::FAILED );
     }
 
     // Sizes that no sender should ask for
     {
-        PchReceiver receiver;
-        PchReceiver::Chunk chunk = GetChunk( pch, kChunkSize, 0 );
-        chunk.m_CompressedSize = ( PchReceiver::GetMaxCompressedSize( chunk.m_UncompressedSize ) < 0xFFFFFFFFULL )
-                                     ? (uint32_t)( PchReceiver::GetMaxCompressedSize( chunk.m_UncompressedSize ) + 1 )
-                                     : 0xFFFFFFFFu;
-        TEST_ASSERT( receiver.OnChunk( chunk, dir, file, alreadyCached ) == PchReceiver::FAILED );
-
-        chunk = GetChunk( pch, kChunkSize, 0 );
-        chunk.m_ChunkSize = ( Protocol::kMinPchChunkSize - 1 );
-        TEST_ASSERT( receiver.OnChunk( chunk, dir, file, alreadyCached ) == PchReceiver::FAILED );
-
-        chunk = GetChunk( pch, kChunkSize, 0 );
-        chunk.m_ChunkSize = ( Protocol::kMaxPchChunkSize + 1 );
-        TEST_ASSERT( receiver.OnChunk( chunk, dir, file, alreadyCached ) == PchReceiver::FAILED );
-
-        chunk = GetChunk( pch, kChunkSize, 0 );
-        chunk.m_UncompressedSize = 0;
-        TEST_ASSERT( receiver.OnChunk( chunk, dir, file, alreadyCached ) == PchReceiver::FAILED );
-        TEST_ASSERT( CountFiles( dir ) == 0 );
+        const TestChunk chunk( pch, kChunkSize, 0 );
+        const Protocol::MsgPchFile tooBig( pch.m_Id, pch.m_UncompressedSize, ( 2 * pch.m_UncompressedSize ) + ( 128 * 1024 ), kChunkSize, 0 );
+        const Protocol::MsgPchFile noData( pch.m_Id, pch.m_UncompressedSize, 0, kChunkSize, 0 );
+        const Protocol::MsgPchFile noPch( pch.m_Id, 0, compressedSize, kChunkSize, 0 );
+        const Protocol::MsgPchFile hugePch( pch.m_Id, PchReceiver::kMaxUncompressedSize + 1, compressedSize, kChunkSize, 0 );
+        const Protocol::MsgPchFile tinyChunks( pch.m_Id, pch.m_UncompressedSize, compressedSize, Protocol::kMinPchChunkSize - 1, 0 );
+        const Protocol::MsgPchFile hugeChunks( pch.m_Id, pch.m_UncompressedSize, compressedSize, Protocol::kMaxPchChunkSize + 1, 0 );
+        const Protocol::MsgPchFile * const msgs[] = { &tooBig, &noData, &noPch, &hugePch, &tinyChunks, &hugeChunks };
+        for ( const Protocol::MsgPchFile * msg : msgs )
+        {
+            PchReceiver receiver;
+            TEST_ASSERT( receiver.OnChunk( *msg, chunk.m_Data, chunk.m_Size, file, alreadyCached ) == PchReceiver::FAILED );
+        }
     }
+
+    // Nothing was written by any of it
+    TEST_ASSERT( CountFiles( dir ) == 0 );
+}
+
+// ReceiverAcceptsTheLimits
+//------------------------------------------------------------------------------
+void TestPchTransfer::ReceiverAcceptsTheLimits() const
+{
+    // The largest chunk size a sender may ask for: a PCH of one chunk
+    TestPch pch;
+    MakePch( ( 2 * kChunkSize ) + 9, 700, pch );
+    AStackString<> file;
+    GetCleanPchFile( "Limits", pch.m_Id, file );
+
+    PchReceiver receiver;
+    bool alreadyCached = false;
+    const Protocol::MsgPchFile msg( pch.m_Id, pch.m_UncompressedSize, (uint32_t)pch.m_Compressed.GetSize(), Protocol::kMaxPchChunkSize, 0 );
+    TEST_ASSERT( receiver.OnChunk( msg, pch.m_Compressed.Begin(), pch.m_Compressed.GetSize(), file, alreadyCached ) == PchReceiver::COMPLETE );
+
+    // The smallest is what the other tests use (kChunkSize)
+    TEST_ASSERT( kChunkSize == Protocol::kMinPchChunkSize );
 }
 
 // ReceiverDropsAPartialPch
@@ -299,40 +362,58 @@ void TestPchTransfer::ReceiverDropsAPartialPch() const
 {
     TestPch pch;
     MakePch( ( 4 * kChunkSize ) + 5, 400, pch );
-    AStackString<> dir;
-    GetCleanDir( "Partial", pch.m_Id, dir );
     AStackString<> file;
+    GetCleanPchFile( "Partial", pch.m_Id, file );
+    AStackString<> dir;
+    GetDirOf( file, dir );
     bool alreadyCached = false;
 
-    // The connection ends with the PCH half received
+    // The connection ends with the PCH half received: nothing is written yet, and nothing registered
     {
         PchReceiver receiver;
-        TEST_ASSERT( receiver.OnChunk( GetChunk( pch, kChunkSize, 0 ), dir, file, alreadyCached ) == PchReceiver::CONTINUE );
-        TEST_ASSERT( receiver.OnChunk( GetChunk( pch, kChunkSize, 1 ), dir, file, alreadyCached ) == PchReceiver::CONTINUE );
-        TEST_ASSERT( CountFiles( dir ) == 1 ); // What has arrived is kept somewhere
-    } // Destroyed, as the connection's state is
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 0 ), file, alreadyCached ) == PchReceiver::CONTINUE );
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 1 ), file, alreadyCached ) == PchReceiver::CONTINUE );
+    }
     TEST_ASSERT( CountFiles( dir ) == 0 );
 
-    // The same by asking
+    // A receiver that is told to drop it can take the PCH from the start
     {
         PchReceiver receiver;
-        TEST_ASSERT( receiver.OnChunk( GetChunk( pch, kChunkSize, 0 ), dir, file, alreadyCached ) == PchReceiver::CONTINUE );
+        TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 0 ), file, alreadyCached ) == PchReceiver::CONTINUE );
         receiver.Abort();
-        TEST_ASSERT( CountFiles( dir ) == 0 );
-    }
-
-    // It can be sent again from the start
-    {
-        PchReceiver receiver;
-        const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)pch.m_Compressed.GetSize(), kChunkSize );
-        PchReceiver::Result result = PchReceiver::CONTINUE;
-        for ( uint32_t i = 0; i < numChunks; ++i )
-        {
-            result = receiver.OnChunk( GetChunk( pch, kChunkSize, i ), dir, file, alreadyCached );
-        }
-        TEST_ASSERT( result == PchReceiver::COMPLETE );
+        TEST_ASSERT( FeedAll( receiver, pch, file, alreadyCached ) == PchReceiver::COMPLETE );
         TEST_ASSERT( CountFiles( dir ) == 1 );
     }
+}
+
+// ReceiverNamesItsTemporaryFiles
+//------------------------------------------------------------------------------
+void TestPchTransfer::ReceiverNamesItsTemporaryFiles() const
+{
+    AStackString<> pchFile;
+    pchFile.Format( "../tmp/Test/PchTransfer/Names/pch.0000000000000001%cpch.pch", (char)NATIVE_SLASH );
+    AStackString<> a;
+    AStackString<> b;
+    PchReceiver::MakeTempFileName( pchFile, a );
+    PchReceiver::MakeTempFileName( pchFile, b );
+
+    // Never the same, next to the PCH, and the process that wrote them can be told
+    TEST_ASSERT( a != b );
+    AStackString<> dir;
+    GetDirOf( pchFile, dir );
+    TEST_ASSERT( a.BeginsWith( dir ) );
+    uint32_t processId = 0;
+    TEST_ASSERT( PchReceiver::IsTempFileName( a.Get(), processId ) );
+    TEST_ASSERT( processId == Process::GetCurrentId() );
+    TEST_ASSERT( PchReceiver::IsTempFileName( "incoming.1234.5.pch", processId ) );
+    TEST_ASSERT( processId == 1234 );
+
+    // Other files are not
+    TEST_ASSERT( PchReceiver::IsTempFileName( pchFile.Get(), processId ) == false );
+    TEST_ASSERT( PchReceiver::IsTempFileName( "incoming.pch", processId ) == false );
+    TEST_ASSERT( PchReceiver::IsTempFileName( "incoming.12.pch", processId ) == false );
+    TEST_ASSERT( PchReceiver::IsTempFileName( "incoming.12.3.pch.zst", processId ) == false );
+    TEST_ASSERT( PchReceiver::IsTempFileName( "xincoming.12.3.pch", processId ) == false );
 }
 
 // ReceiversOfTheSamePchDoNotMeet
@@ -342,13 +423,13 @@ void TestPchTransfer::ReceiversOfTheSamePchDoNotMeet() const
     // Two coordinators send the same PCH to a worker, and their chunks arrive alternately
     TestPch pch;
     MakePch( ( 5 * kChunkSize ) + 3, 500, pch );
+    AStackString<> file;
+    GetCleanPchFile( "SamePch", pch.m_Id, file );
     AStackString<> dir;
-    GetCleanDir( "SamePch", pch.m_Id, dir );
+    GetDirOf( file, dir );
 
     PchReceiver a;
     PchReceiver b;
-    AStackString<> fileA;
-    AStackString<> fileB;
     bool cachedA = false;
     bool cachedB = false;
     const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)pch.m_Compressed.GetSize(), kChunkSize );
@@ -356,22 +437,17 @@ void TestPchTransfer::ReceiversOfTheSamePchDoNotMeet() const
     PchReceiver::Result resultB = PchReceiver::CONTINUE;
     for ( uint32_t i = 0; i < numChunks; ++i )
     {
-        resultA = a.OnChunk( GetChunk( pch, kChunkSize, i ), dir, fileA, cachedA );
-        if ( i == 1 )
-        {
-            TEST_ASSERT( CountFiles( dir ) == 2 ); // Each has its own
-        }
-        resultB = b.OnChunk( GetChunk( pch, kChunkSize, i ), dir, fileB, cachedB );
+        resultA = Feed( a, TestChunk( pch, kChunkSize, i ), file, cachedA );
+        resultB = Feed( b, TestChunk( pch, kChunkSize, i ), file, cachedB );
     }
 
     TEST_ASSERT( resultA == PchReceiver::COMPLETE );
     TEST_ASSERT( resultB == PchReceiver::COMPLETE );
     TEST_ASSERT( cachedA == false );
     TEST_ASSERT( cachedB ); // The first one had it in place already
-    TEST_ASSERT( fileA == fileB );
 
     Array<char> content;
-    TEST_ASSERT( ReadFile( fileA, content ) );
+    TEST_ASSERT( ReadFile( file, content ) );
     TEST_ASSERT( content.GetSize() == pch.m_Raw.GetSize() );
     TEST_ASSERT( memcmp( content.Begin(), pch.m_Raw.Begin(), content.GetSize() ) == 0 );
     TEST_ASSERT( CountFiles( dir ) == 1 ); // No temporary file is left
@@ -383,76 +459,183 @@ void TestPchTransfer::ReceiverKeepsACachedPch() const
 {
     TestPch pch;
     MakePch( ( 3 * kChunkSize ) + 1, 600, pch );
-    AStackString<> dir;
-    GetCleanDir( "Cached", pch.m_Id, dir );
-
-    const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)pch.m_Compressed.GetSize(), kChunkSize );
     AStackString<> file;
+    GetCleanPchFile( "Cached", pch.m_Id, file );
+    AStackString<> dir;
+    GetDirOf( file, dir );
+
     bool alreadyCached = false;
     {
         PchReceiver receiver;
-        for ( uint32_t i = 0; i < numChunks; ++i )
-        {
-            receiver.OnChunk( GetChunk( pch, kChunkSize, i ), dir, file, alreadyCached );
-        }
+        TEST_ASSERT( FeedAll( receiver, pch, file, alreadyCached ) == PchReceiver::COMPLETE );
     }
     TEST_ASSERT( CountFiles( dir ) == 1 );
 
-    // Sent again, it is read and dropped, and nothing is written
+    // Give it a time that nothing writing the file now would give it
+#if defined( __WINDOWS__ )
+    const uint64_t kHour = ( 3600ULL * 10000000ULL );
+#else
+    const uint64_t kHour = ( 3600ULL * 1000000000ULL );
+#endif
+    const uint64_t oldTime = ( Time::GetCurrentFileTime() - kHour );
+    TEST_ASSERT( FileIO::SetFileLastWriteTime( file, oldTime ) );
+    const uint64_t timeBefore = FileIO::GetFileLastWriteTime( file );
+    Array<char> contentBefore;
+    TEST_ASSERT( ReadFile( file, contentBefore ) );
+
+    // Sent again, it is dropped as it arrives, and the file is not touched
     PchReceiver receiver;
+    TEST_ASSERT( FeedAll( receiver, pch, file, alreadyCached ) == PchReceiver::COMPLETE );
+    TEST_ASSERT( alreadyCached );
+    TEST_ASSERT( CountFiles( dir ) == 1 );
+    TEST_ASSERT( FileIO::GetFileLastWriteTime( file ) == timeBefore );
+    Array<char> contentAfter;
+    TEST_ASSERT( ReadFile( file, contentAfter ) );
+    TEST_ASSERT( contentAfter.GetSize() == contentBefore.GetSize() );
+    TEST_ASSERT( memcmp( contentAfter.Begin(), contentBefore.Begin(), contentAfter.GetSize() ) == 0 );
+}
+
+// ReceiverReplacesAPchOfTheWrongSize
+//------------------------------------------------------------------------------
+void TestPchTransfer::ReceiverReplacesAPchOfTheWrongSize() const
+{
+    // What an interrupted write left is not the PCH
+    TestPch pch;
+    MakePch( ( 3 * kChunkSize ) + 5, 800, pch );
+    AStackString<> file;
+    GetCleanPchFile( "WrongSize", pch.m_Id, file );
+    TEST_ASSERT( FileIO::EnsurePathExistsForFile( file ) );
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( file.Get(), FileStream::WRITE_ONLY ) );
+        const char partial[] = "not the whole PCH";
+        TEST_ASSERT( f.Write( partial, sizeof( partial ) ) == sizeof( partial ) );
+    }
+
+    PchReceiver receiver;
+    bool alreadyCached = false;
+    TEST_ASSERT( FeedAll( receiver, pch, file, alreadyCached ) == PchReceiver::COMPLETE );
+    TEST_ASSERT( alreadyCached == false );
+    Array<char> content;
+    TEST_ASSERT( ReadFile( file, content ) );
+    TEST_ASSERT( content.GetSize() == pch.m_Raw.GetSize() );
+    TEST_ASSERT( memcmp( content.Begin(), pch.m_Raw.Begin(), content.GetSize() ) == 0 );
+}
+
+// ReceiverCleansUpWhenItCannotPublish
+//------------------------------------------------------------------------------
+void TestPchTransfer::ReceiverCleansUpWhenItCannotPublish() const
+{
+    // The PCH is written in full before it is moved into place. When that fails the file has to be
+    // removed, which needs it closed first: an open file cannot be deleted on Windows.
+    TestPch pch;
+    MakePch( ( 3 * kChunkSize ) + 5, 900, pch );
+    AStackString<> file;
+    GetCleanPchFile( "CannotPublish", pch.m_Id, file );
+    AStackString<> dir;
+    GetDirOf( file, dir );
+    TEST_ASSERT( FileIO::EnsurePathExists( file ) ); // A directory where the PCH goes
+
+    PchReceiver receiver;
+    bool alreadyCached = false;
+    const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)pch.m_Compressed.GetSize(), kChunkSize );
+    PchReceiver::Result result = PchReceiver::CONTINUE;
     for ( uint32_t i = 0; i < numChunks; ++i )
     {
-        const PchReceiver::Result result = receiver.OnChunk( GetChunk( pch, kChunkSize, i ), dir, file, alreadyCached );
-        TEST_ASSERT( result == ( ( i + 1 ) == numChunks ? PchReceiver::COMPLETE : PchReceiver::CONTINUE ) );
-        TEST_ASSERT( CountFiles( dir ) == 1 );
+        result = Feed( receiver, TestChunk( pch, kChunkSize, i ), file, alreadyCached );
     }
-    TEST_ASSERT( alreadyCached );
+    TEST_ASSERT( result == PchReceiver::FAILED );
+
+    Array<AString> left;
+    FileIO::GetFiles( dir, AStackString( "incoming.*" ), true, &left );
+    TEST_ASSERT( left.IsEmpty() );
 }
 
 // SendQueueSendsBulkDataLast
 //------------------------------------------------------------------------------
+namespace
+{
+    struct QueueItem
+    {
+        bool IsBulk() const { return m_Bulk; }
+
+        uint32_t    m_Id;
+        bool        m_Bulk;
+    };
+}
+
 void TestPchTransfer::SendQueueSendsBulkDataLast() const
 {
-    struct Item
-    {
-        uint32_t m_Id;
-    };
-    PrioritySendQueue<Item> queue;
-    Array<Item> items;
+    PrioritySendQueue<QueueItem> queue;
+    Array<QueueItem> items;
 
-    TEST_ASSERT( queue.Take( items ) == false );
+    queue.Take( items );
+    TEST_ASSERT( items.IsEmpty() );
 
-    queue.Push( Item{ 1 }, false );
-    queue.Push( Item{ 2 }, true );
-    queue.Push( Item{ 3 }, true );
-    queue.Push( Item{ 4 }, false );
+    queue.Push( QueueItem{ 1, false } );
+    queue.Push( QueueItem{ 2, true } );
+    queue.Push( QueueItem{ 3, true } );
+    queue.Push( QueueItem{ 4, false } );
 
-    // What is not bulk data goes first, in order
-    TEST_ASSERT( queue.Take( items ) );
-    TEST_ASSERT( items.GetSize() == 2 );
+    // What is not bulk data goes first, in order, followed by one piece of bulk data
+    queue.Take( items );
+    TEST_ASSERT( items.GetSize() == 3 );
     TEST_ASSERT( items[ 0 ].m_Id == 1 );
     TEST_ASSERT( items[ 1 ].m_Id == 4 );
-
-    // Then one piece of bulk data at a time
-    items.Clear();
-    TEST_ASSERT( queue.Take( items ) );
-    TEST_ASSERT( items.GetSize() == 1 );
-    TEST_ASSERT( items[ 0 ].m_Id == 2 );
+    TEST_ASSERT( items[ 2 ].m_Id == 2 );
 
     // A message queued while a transfer is under way goes before the rest of it
-    queue.Push( Item{ 5 }, false );
+    queue.Push( QueueItem{ 5, false } );
     items.Clear();
-    TEST_ASSERT( queue.Take( items ) );
-    TEST_ASSERT( items.GetSize() == 1 );
+    queue.Take( items );
+    TEST_ASSERT( items.GetSize() == 2 );
     TEST_ASSERT( items[ 0 ].m_Id == 5 );
+    TEST_ASSERT( items[ 1 ].m_Id == 3 );
 
     items.Clear();
-    TEST_ASSERT( queue.Take( items ) );
-    TEST_ASSERT( items.GetSize() == 1 );
-    TEST_ASSERT( items[ 0 ].m_Id == 3 );
+    queue.Take( items );
+    TEST_ASSERT( items.IsEmpty() );
+}
 
-    items.Clear();
-    TEST_ASSERT( queue.Take( items ) == false );
+// SendQueueDoesNotStarveBulkData
+//------------------------------------------------------------------------------
+void TestPchTransfer::SendQueueDoesNotStarveBulkData() const
+{
+    // Messages keep coming, as jobs do while a PCH is queued: the PCH still goes, a piece at a time
+    PrioritySendQueue<QueueItem> queue;
+    const uint32_t kPieces = 5;
+    for ( uint32_t i = 0; i < kPieces; ++i )
+    {
+        queue.Push( QueueItem{ 100 + i, true } );
+    }
+
+    uint32_t nextPiece = 100;
+    for ( uint32_t round = 0; round < kPieces; ++round )
+    {
+        queue.Push( QueueItem{ round, false } );
+        Array<QueueItem> items;
+        queue.Take( items );
+        TEST_ASSERT( items.GetSize() == 2 );
+        TEST_ASSERT( items[ 0 ].m_Id == round );
+        TEST_ASSERT( items[ 1 ].m_Id == nextPiece++ );
+    }
+
+    // All of it went, in order
+    TEST_ASSERT( nextPiece == ( 100 + kPieces ) );
+    Array<QueueItem> items;
+    queue.Take( items );
+    TEST_ASSERT( items.IsEmpty() );
+}
+
+// BulkSendKinds
+//------------------------------------------------------------------------------
+void TestPchTransfer::BulkSendKinds() const
+{
+    // Only a PCH waits behind jobs. Jobs, and the messages the worker needs to run them, do not.
+    TEST_ASSERT( IsBulkSendKind( SendKind::Pch ) );
+    TEST_ASSERT( IsBulkSendKind( SendKind::Job ) == false );
+    TEST_ASSERT( IsBulkSendKind( SendKind::Toolchain ) == false );
+    TEST_ASSERT( IsBulkSendKind( SendKind::Control ) == false );
 }
 
 //------------------------------------------------------------------------------

@@ -237,6 +237,21 @@ void FBuildTest::CheckStatsTotal( size_t numSeen, size_t numBuilt ) const
     CheckStatsTotal( stats, numSeen, numBuilt );
 }
 
+// MakeRandomBytes
+//------------------------------------------------------------------------------
+/*static*/ void FBuildTest::MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes )
+{
+    outBytes.SetSize( size );
+    uint64_t x = ( seed | 1 );
+    for ( char & c : outBytes )
+    {
+        x ^= ( x << 13 );
+        x ^= ( x >> 7 );
+        x ^= ( x << 17 );
+        c = (char)( x >> 24 );
+    }
+}
+
 // GetCodeDir
 //------------------------------------------------------------------------------
 /*static*/ void FBuildTest::GetCodeDir( AString & codeDir )

@@ -10,6 +10,7 @@
 #include "Tools/FBuild/FBuildCore/FBuildOptions.h"
 #include "Tools/FBuild/FBuildCore/Graph/Node.h"
 
+#include "Core/Containers/Array.h"
 #include "Core/Process/Mutex.h"
 
 // Forward Declarations
@@ -57,6 +58,9 @@ protected:
 
     // other helpers
     static void GetCodeDir( AString & codeDir );
+
+    // Data that does not compress, the same for the same seed
+    static void MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes );
 
     const AString & GetRecordedOutput() const { return s_RecordedOutput; }
 

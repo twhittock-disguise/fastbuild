@@ -8,33 +8,36 @@
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/FLog.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
-#include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 
 // Core
-#include "Core/Containers/UniquePtr.h"
 #include "Core/FileIO/FileIO.h"
+#include "Core/FileIO/FileStream.h"
+#include "Core/Math/Conversions.h"
 #include "Core/Math/xxHash.h"
-#include "Core/Mem/Mem.h"
 #include "Core/Process/Atomic.h"
+#include "Core/Process/Process.h"
 #include "Core/Strings/AStackString.h"
-#include "Core/Time/Timer.h"
+
+#include <stdlib.h>
 
 // Static
 //------------------------------------------------------------------------------
 namespace
 {
-    // Temporary files are named so that concurrent receivers of the same PCH do not meet
-    void MakeTempFileName( AString & outFile, const AString & dir, const char * extension )
-    {
-        static Atomic<uint32_t> s_Counter{ 0 };
-        outFile = dir;
-        outFile.AppendFormat( "pch.%08x.%08x.%s", s_Counter.Increment(), (uint32_t)Timer::GetNow(), extension );
-    }
+    const char * const kTempFilePrefix = "incoming.";
+    const char * const kTempFileExtension = ".pch";
 
     bool IsFileOfSize( const AString & file, uint32_t size )
     {
         FileStream f;
         return ( f.Open( file.Get() ) && ( f.GetFileSize() == size ) );
+    }
+
+    // The most a compressed PCH can be larger than the PCH, so a sender cannot make us store more
+    uint64_t GetMaxCompressedSize( uint32_t uncompressedSize )
+    {
+        // Data that does not compress is stored with a small header
+        return ( (uint64_t)uncompressedSize + ( uncompressedSize >> 7 ) + ( 64 * 1024 ) );
     }
 }
 
@@ -45,103 +48,147 @@ PchReceiver::~PchReceiver()
     Abort();
 }
 
-// GetMaxCompressedSize
+// MakeTempFileName
 //------------------------------------------------------------------------------
-/*static*/ uint64_t PchReceiver::GetMaxCompressedSize( uint32_t uncompressedSize )
+/*static*/ void PchReceiver::MakeTempFileName( const AString & pchFile, AString & outFile )
 {
-    // Data that does not compress is stored with a small header
-    return ( (uint64_t)uncompressedSize + ( uncompressedSize >> 7 ) + ( 64 * 1024 ) );
+    static Atomic<uint32_t> s_Counter{ 0 };
+    const char * lastSlash = pchFile.FindLast( NATIVE_SLASH );
+    if ( lastSlash )
+    {
+        outFile.Assign( pchFile.Get(), lastSlash + 1 );
+    }
+    else
+    {
+        outFile.Clear();
+    }
+    outFile.AppendFormat( "%s%u.%u%s", kTempFilePrefix, Process::GetCurrentId(), s_Counter.Increment(), kTempFileExtension );
+}
+
+// IsTempFileName
+//------------------------------------------------------------------------------
+/*static*/ bool PchReceiver::IsTempFileName( const char * fileName, uint32_t & outProcessId )
+{
+    const AStackString<> path( fileName );
+    const char * lastSlash = path.FindLast( NATIVE_SLASH );
+    if ( lastSlash == nullptr )
+    {
+        lastSlash = path.FindLast( '/' );
+    }
+    const char * name = lastSlash ? ( lastSlash + 1 ) : path.Get();
+
+    const size_t prefixLength = strlen( kTempFilePrefix );
+    if ( strncmp( name, kTempFilePrefix, prefixLength ) != 0 )
+    {
+        return false;
+    }
+
+    // <process id>.<number>.pch
+    const char * p = ( name + prefixLength );
+    char * end = nullptr;
+    const unsigned long processId = strtoul( p, &end, 10 );
+    if ( ( end == p ) || ( *end != '.' ) )
+    {
+        return false;
+    }
+    p = ( end + 1 );
+    strtoul( p, &end, 10 );
+    if ( ( end == p ) || ( strcmp( end, kTempFileExtension ) != 0 ) )
+    {
+        return false;
+    }
+    outProcessId = (uint32_t)processId;
+    return true;
 }
 
 // OnChunk
 //------------------------------------------------------------------------------
-PchReceiver::Result PchReceiver::OnChunk( const Chunk & chunk,
-                                          const AString & pchDir,
-                                          AString & outPchFile,
+PchReceiver::Result PchReceiver::OnChunk( const Protocol::MsgPchFile & msg,
+                                          const void * data,
+                                          size_t size,
+                                          const AString & pchFile,
                                           bool & outAlreadyCached )
 {
     outAlreadyCached = false;
 
-    if ( chunk.m_Index == 0 )
+    const uint64_t pchId = msg.GetPchId();
+    const uint32_t index = msg.GetChunkIndex();
+
+    if ( index == 0 )
     {
         if ( m_Active )
         {
-            return Fail( "a PCH started before the one before it was complete" );
+            return Fail( pchId, "a PCH started before the one before it was complete" );
         }
-        if ( ( chunk.m_UncompressedSize == 0 ) ||
-             ( chunk.m_CompressedSize == 0 ) ||
-             ( chunk.m_CompressedSize > GetMaxCompressedSize( chunk.m_UncompressedSize ) ) ||
-             ( chunk.m_ChunkSize < Protocol::kMinPchChunkSize ) ||
-             ( chunk.m_ChunkSize > Protocol::kMaxPchChunkSize ) )
+        if ( ( msg.GetUncompressedSize() == 0 ) ||
+             ( msg.GetUncompressedSize() > kMaxUncompressedSize ) ||
+             ( msg.GetCompressedSize() == 0 ) ||
+             ( msg.GetCompressedSize() > GetMaxCompressedSize( msg.GetUncompressedSize() ) ) ||
+             ( msg.GetChunkSize() < Protocol::kMinPchChunkSize ) ||
+             ( msg.GetChunkSize() > Protocol::kMaxPchChunkSize ) )
         {
-            return Fail( "its sizes are not possible" );
+            return Fail( pchId, "its sizes are not possible" );
         }
 
         m_Active = true;
-        m_PchId = chunk.m_PchId;
-        m_UncompressedSize = chunk.m_UncompressedSize;
-        m_CompressedSize = chunk.m_CompressedSize;
-        m_ChunkSize = chunk.m_ChunkSize;
+        m_PchId = pchId;
+        m_UncompressedSize = msg.GetUncompressedSize();
+        m_CompressedSize = msg.GetCompressedSize();
+        m_ChunkSize = msg.GetChunkSize();
         m_NextIndex = 0;
 
         // The id identifies the content, so a file of the right size is the PCH
-        AStackString<> pchFile( pchDir );
-        pchFile += "pch.pch";
         m_AlreadyCached = IsFileOfSize( pchFile, m_UncompressedSize );
-        if ( m_AlreadyCached == false )
-        {
-            MakeTempFileName( m_ReceivingFile, pchDir, "zst" );
-            if ( ( FileIO::EnsurePathExists( pchDir ) == false ) ||
-                 ( m_File.Open( m_ReceivingFile.Get(), FileStream::WRITE_ONLY ) == false ) )
-            {
-                m_ReceivingFile.Clear();
-                return Fail( "the cache directory cannot be written" );
-            }
-        }
     }
     else if ( ( m_Active == false ) ||
-              ( chunk.m_PchId != m_PchId ) ||
-              ( chunk.m_UncompressedSize != m_UncompressedSize ) ||
-              ( chunk.m_CompressedSize != m_CompressedSize ) ||
-              ( chunk.m_ChunkSize != m_ChunkSize ) ||
-              ( chunk.m_Index != m_NextIndex ) )
+              ( pchId != m_PchId ) ||
+              ( msg.GetUncompressedSize() != m_UncompressedSize ) ||
+              ( msg.GetCompressedSize() != m_CompressedSize ) ||
+              ( msg.GetChunkSize() != m_ChunkSize ) ||
+              ( index != m_NextIndex ) )
     {
-        return Fail( "a chunk is not the next one" );
+        return Fail( pchId, "a chunk is not the next one" );
     }
 
-    if ( chunk.m_Size != Protocol::MsgPchFile::GetChunkSize( m_CompressedSize, m_ChunkSize, chunk.m_Index ) )
+    if ( size != Protocol::MsgPchFile::GetChunkLength( m_CompressedSize, m_ChunkSize, index ) )
     {
-        return Fail( "a chunk has the wrong size" );
+        return Fail( pchId, "a chunk has the wrong size" );
     }
 
-    if ( ( m_AlreadyCached == false ) &&
-         ( m_File.Write( chunk.m_Data, chunk.m_Size ) != chunk.m_Size ) )
+    if ( m_AlreadyCached == false )
     {
-        return Fail( "a chunk cannot be written" );
+        // The buffer grows with what has arrived, never to what the sender says is coming
+        const size_t oldSize = m_Compressed.GetSize();
+        const size_t newSize = ( oldSize + size );
+        if ( newSize > m_Compressed.GetCapacity() )
+        {
+            m_Compressed.SetCapacity( Math::Min<size_t>( Math::Max( newSize, m_Compressed.GetCapacity() * 2 ), m_CompressedSize ) );
+        }
+        m_Compressed.SetSize( newSize );
+        memcpy( m_Compressed.Begin() + oldSize, data, size );
     }
 
+    m_NumChunksReceived.Increment();
     ++m_NextIndex;
     if ( m_NextIndex < Protocol::MsgPchFile::GetNumChunks( m_CompressedSize, m_ChunkSize ) )
     {
         return CONTINUE;
     }
-    return Finish( pchDir, outPchFile, outAlreadyCached );
+    return Finish( pchFile, outAlreadyCached );
 }
 
 // Abort
 //------------------------------------------------------------------------------
 void PchReceiver::Abort()
 {
-    m_File.Close();
-    if ( m_ReceivingFile.IsEmpty() == false )
+    Array<char> empty;
+    m_Compressed.Swap( empty );
+
+    // The file is never open here: it is closed before anything can fail
+    if ( m_TempFile.IsEmpty() == false )
     {
-        FileIO::FileDelete( m_ReceivingFile.Get() );
-        m_ReceivingFile.Clear();
-    }
-    if ( m_DecodedFile.IsEmpty() == false )
-    {
-        FileIO::FileDelete( m_DecodedFile.Get() );
-        m_DecodedFile.Clear();
+        FileIO::FileDelete( m_TempFile.Get() );
+        m_TempFile.Clear();
     }
     m_Active = false;
     m_AlreadyCached = false;
@@ -149,23 +196,17 @@ void PchReceiver::Abort()
 
 // Fail
 //------------------------------------------------------------------------------
-PchReceiver::Result PchReceiver::Fail( const char * reason )
+PchReceiver::Result PchReceiver::Fail( uint64_t pchId, const char * reason )
 {
-    FLOG_WARN( "Rejected the PCH 0x%016" PRIx64 ": %s\n", m_PchId, reason );
+    FLOG_WARN( "Rejected the PCH 0x%016" PRIx64 ": %s\n", pchId, reason );
     Abort();
     return FAILED;
 }
 
 // Finish
 //------------------------------------------------------------------------------
-PchReceiver::Result PchReceiver::Finish( const AString & pchDir, AString & outPchFile, bool & outAlreadyCached )
+PchReceiver::Result PchReceiver::Finish( const AString & pchFile, bool & outAlreadyCached )
 {
-    m_File.Close();
-
-    AStackString<> pchFile( pchDir );
-    pchFile += "pch.pch";
-    outPchFile = pchFile;
-
     if ( m_AlreadyCached )
     {
         outAlreadyCached = true;
@@ -174,43 +215,38 @@ PchReceiver::Result PchReceiver::Finish( const AString & pchDir, AString & outPc
     }
 
     Compressor decompressor;
+    if ( ( Compressor::IsValidData( m_Compressed.Begin(), m_Compressed.GetSize() ) == false ) ||
+         ( decompressor.Decompress( m_Compressed.Begin() ) == false ) )
     {
-        UniquePtr<char, FreeDeletor> compressed( (char *)ALLOC( m_CompressedSize ) );
-        FileStream f;
-        if ( ( f.Open( m_ReceivingFile.Get() ) == false ) ||
-             ( f.GetFileSize() != m_CompressedSize ) ||
-             ( f.Read( compressed.Get(), m_CompressedSize ) != m_CompressedSize ) )
-        {
-            return Fail( "the data received cannot be read back" );
-        }
-        f.Close();
-        FileIO::FileDelete( m_ReceivingFile.Get() );
-        m_ReceivingFile.Clear();
-
-        if ( ( Compressor::IsValidData( compressed.Get(), m_CompressedSize ) == false ) ||
-             ( decompressor.Decompress( compressed.Get() ) == false ) )
-        {
-            return Fail( "its data cannot be decompressed" );
-        }
+        return Fail( m_PchId, "its data cannot be decompressed" );
+    }
+    {
+        Array<char> empty;
+        m_Compressed.Swap( empty );
     }
 
     if ( decompressor.GetResultSize() != m_UncompressedSize )
     {
-        return Fail( "its size is not the one announced" );
+        return Fail( m_PchId, "its size is not the one announced" );
     }
     if ( xxHash::Calc64( decompressor.GetResult(), decompressor.GetResultSize() ) != m_PchId )
     {
-        return Fail( "its content does not match its id" );
+        return Fail( m_PchId, "its content does not match its id" );
     }
 
-    MakeTempFileName( m_DecodedFile, pchDir, "pch" );
+    // Write it next to where it goes, and close it before anything can fail: a file that is open
+    // cannot be deleted on Windows
+    MakeTempFileName( pchFile, m_TempFile );
+    bool written = false;
+    if ( FileIO::EnsurePathExistsForFile( pchFile ) )
     {
         FileStream f;
-        if ( ( f.Open( m_DecodedFile.Get(), FileStream::WRITE_ONLY ) == false ) ||
-             ( f.Write( decompressor.GetResult(), decompressor.GetResultSize() ) != decompressor.GetResultSize() ) )
-        {
-            return Fail( "it cannot be written" );
-        }
+        written = ( f.Open( m_TempFile.Get(), FileStream::WRITE_ONLY ) &&
+                    ( f.Write( decompressor.GetResult(), decompressor.GetResultSize() ) == decompressor.GetResultSize() ) );
+    }
+    if ( written == false )
+    {
+        return Fail( m_PchId, "it cannot be written" );
     }
 
     // Another connection may have finished the same PCH first, and a compile may be using it
@@ -218,11 +254,11 @@ PchReceiver::Result PchReceiver::Finish( const AString & pchDir, AString & outPc
     {
         outAlreadyCached = true;
     }
-    else if ( FileIO::FileMove( m_DecodedFile, pchFile ) == false )
+    else if ( FileIO::FileMove( m_TempFile, pchFile ) == false )
     {
         if ( IsFileOfSize( pchFile, m_UncompressedSize ) == false )
         {
-            return Fail( "it cannot be moved into place" );
+            return Fail( m_PchId, "it cannot be moved into place" );
         }
         outAlreadyCached = true;
     }

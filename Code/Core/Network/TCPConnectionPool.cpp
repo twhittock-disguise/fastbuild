@@ -292,11 +292,7 @@ const ConnectionInfo * TCPConnectionPool::Connect( uint32_t hostIP, uint16_t por
     DisableSigPipe( sockfd );       // Prevent socket inheritence by child processes
     DisableNagle( sockfd );         // Disable Nagle's algorithm
     EnableKeepAlive( sockfd );      // Keep idle connections alive
-    SetLargeBufferSizes( sockfd );  // Set large send/recv buffer sizes
-    if ( m_ConnectSendBufferSize != 0 )
-    {
-        SetSendBufferSize( sockfd, m_ConnectSendBufferSize );
-    }
+    SetLargeBufferSizes( sockfd, m_ConnectSendBufferSize ); // Set large send/recv buffer sizes
     SetNonBlocking( sockfd );       // Set non-blocking
 
     // setup destination address
@@ -1269,7 +1265,7 @@ void TCPConnectionPool::DisableSigPipe( TCPSocket socket ) const
 
 // SetLargeBufferSizes
 //------------------------------------------------------------------------------
-void TCPConnectionPool::SetLargeBufferSizes( TCPSocket socket ) const
+void TCPConnectionPool::SetLargeBufferSizes( TCPSocket socket, uint32_t sendBufferSize ) const
 {
 #if defined( __APPLE__ )
     const uint32_t bufferSize = ( 5 * 1024 * 1024 ); // larger values fail on OS X
@@ -1288,22 +1284,12 @@ void TCPConnectionPool::SetLargeBufferSizes( TCPSocket socket ) const
 
     // Send Buffer
     {
-        const int ret = setsockopt( socket, SOL_SOCKET, SO_SNDBUF, (const char *)&bufferSize, sizeof( bufferSize ) );
+        const uint32_t sendSize = ( sendBufferSize != 0 ) ? sendBufferSize : bufferSize;
+        const int ret = setsockopt( socket, SOL_SOCKET, SO_SNDBUF, (const char *)&sendSize, sizeof( sendSize ) );
         if ( ret != 0 )
         {
             TCPDEBUG( "setsockopt(SO_SNDBUF) failed. Error: %s\n", LAST_NETWORK_ERROR_STR );
         }
-    }
-}
-
-// SetSendBufferSize
-//------------------------------------------------------------------------------
-void TCPConnectionPool::SetSendBufferSize( TCPSocket socket, uint32_t bytes ) const
-{
-    const int ret = setsockopt( socket, SOL_SOCKET, SO_SNDBUF, (const char *)&bytes, sizeof( bytes ) );
-    if ( ret != 0 )
-    {
-        TCPDEBUG( "setsockopt(SO_SNDBUF) failed. Error: %s\n", LAST_NETWORK_ERROR_STR );
     }
 }
 

@@ -162,8 +162,7 @@ private:
     void DisableSigPipe( TCPSocket socket ) const;
     void EnableKeepAlive( TCPSocket socket ) const;
     static void WaitForSocket( TCPSocket socket, bool forWrite );
-    void SetLargeBufferSizes( TCPSocket socket ) const;
-    void SetSendBufferSize( TCPSocket socket, uint32_t bytes ) const;
+    void SetLargeBufferSizes( TCPSocket socket, uint32_t sendBufferSize = 0 ) const; // 0 for the default send size
     void SetNonBlocking( TCPSocket socket ) const;
 
     uint32_t m_ConnectSendBufferSize = 0; // 0 for the default

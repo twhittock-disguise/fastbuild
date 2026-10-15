@@ -36,10 +36,8 @@ namespace Protocol
 
     inline static const uint16_t kTestPort = kPort + 1; // Different port for use by tests
 
-    // Send buffer of a client's connection to a worker. What is in it goes out ahead of a job sent
-    // after it. Over a 30 Mbit/s link with 22 ms a message sent behind bulk data waited 3.0 s with
-    // 10 MiB, 0.7 s with 2 MiB and 0.4 s with 1 MiB. Two is enough for 300 Mbit/s at 50 ms, and the
-    // links we know need under 300 KB (100 Mbit/s with 22 ms, 1 Gbit/s with 2 ms).
+    // Send buffer of a client's connection to a worker: sized to cover 300 Mbit/s at 50 ms. What
+    // is in it goes out ahead of a message sent later. (Linux doubles the value and clamps it to wmem_max.)
     inline static const uint32_t kClientSendBufferSize = ( 2 * 1024 * 1024 );
 
     // Identifiers for all unique messages
@@ -264,7 +262,7 @@ namespace Protocol
         uint32_t GetChunkIndex() const { return m_ChunkIndex; }
 
         static uint32_t GetNumChunks( uint32_t compressedSize, uint32_t chunkSize );
-        static uint32_t GetChunkSize( uint32_t compressedSize, uint32_t chunkSize, uint32_t chunkIndex ); // 0 if past the end
+        static uint32_t GetChunkLength( uint32_t compressedSize, uint32_t chunkSize, uint32_t chunkIndex ); // 0 if past the end
 
     private:
         uint64_t m_PchId;

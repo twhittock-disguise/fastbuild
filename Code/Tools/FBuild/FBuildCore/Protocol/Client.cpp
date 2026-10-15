@@ -19,6 +19,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchDataCache.h"
 #include "Tools/FBuild/FBuildCore/Protocol/PrioritySendQueue.h"
+#include "Tools/FBuild/FBuildCore/Protocol/SendKind.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
@@ -62,16 +63,6 @@ public:
 };
 
 //------------------------------------------------------------------------------
-enum class SendKind : uint8_t
-{
-    Control,
-    Toolchain,
-    Pch,
-    Job,
-    NumKinds
-};
-
-//------------------------------------------------------------------------------
 class ClientSendQueueItem
 {
 public:
@@ -106,6 +97,8 @@ public:
     // movable
     explicit ClientSendQueueItem( ClientSendQueueItem && other ) = default;
     ClientSendQueueItem & operator=( ClientSendQueueItem && other ) = default;
+
+    bool IsBulk() const { return IsBulkSendKind( m_Kind ); }
 
     MemoryStream m_Message;
     bool m_HasPayload = false;
@@ -755,6 +748,7 @@ bool ClientToWorkerConnection::QueueToolchain( const ToolManifest & manifest )
             const void * data = manifest.GetFileData( i, dataSize );
             if ( data )
             {
+                // Not chunked: a large file holds up the jobs queued after it
                 EnqueueSend( Protocol::MsgFile( toolId, i ),
                              Move( ConstMemoryStream( data, dataSize ) ),
                              SendKind::Toolchain,
@@ -970,7 +964,9 @@ void ClientToWorkerConnection::SendPendingPchs()
 
     Array<PchDataCache::ReadyPch> ready;
     const bool allOk = PchDataCache::Get().TakeReadyPchs( m_PendingPchIds, m_PchState.GetOnWorker(), ready );
-    const uint32_t chunkSize = FBuild::Get().GetOptions().m_DistributionPchChunkSize;
+    const uint32_t chunkSize = Math::Clamp( FBuild::Get().GetOptions().m_DistributionPchChunkSize,
+                                            Protocol::kMinPchChunkSize,
+                                            Protocol::kMaxPchChunkSize );
     for ( const PchDataCache::ReadyPch & pch : ready )
     {
         // One message per chunk, so that jobs can go out between them. The PCH counts as sent
@@ -981,7 +977,7 @@ void ClientToWorkerConnection::SendPendingPchs()
         for ( uint32_t i = 0; i < numChunks; ++i )
         {
             const char * chunkData = ( static_cast<const char *>( pch.data ) + ( (size_t)i * chunkSize ) );
-            const uint32_t thisChunkSize = Protocol::MsgPchFile::GetChunkSize( compressedSize, chunkSize, i );
+            const uint32_t thisChunkSize = Protocol::MsgPchFile::GetChunkLength( compressedSize, chunkSize, i );
             const bool isLast = ( ( i + 1 ) == numChunks );
             EnqueueSend( Protocol::MsgPchFile( pch.pchId, pch.uncompressedSize, compressedSize, chunkSize, i ),
                          Move( ConstMemoryStream( chunkData, thisChunkSize ) ),
@@ -1513,7 +1509,7 @@ void ClientToWorkerConnection::EnqueueSend( const T & msg )
     ClientSendQueueItem item( msg );
     {
         MutexHolder lock( m_SendQueueMutex );
-        m_SendQueue.Push( Move( item ), false );
+        m_SendQueue.Push( Move( item ) );
     }
     m_SendThreadWakeSemaphore.Signal();
 }
@@ -1529,7 +1525,7 @@ void ClientToWorkerConnection::EnqueueSend( const T & msg,
     ClientSendQueueItem item( msg, Move( payload ), kind, rawBytes, false, pchId );
     {
         MutexHolder lock( m_SendQueueMutex );
-        m_SendQueue.Push( Move( item ), ( kind == SendKind::Pch ) );
+        m_SendQueue.Push( Move( item ) );
     }
     m_SendThreadWakeSemaphore.Signal();
 }
@@ -1542,7 +1538,7 @@ void ClientToWorkerConnection::EnqueueJob( const Protocol::MsgJob & msg, ConstMe
     ClientSendQueueItem item( msg, Move( payload ), SendKind::Job, rawBytes, true );
     {
         MutexHolder lock( m_SendQueueMutex );
-        m_SendQueue.Push( Move( item ), false );
+        m_SendQueue.Push( Move( item ) );
     }
     m_SendThreadWakeSemaphore.Signal();
 }

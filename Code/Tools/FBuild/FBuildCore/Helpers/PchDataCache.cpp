@@ -12,6 +12,7 @@
 // Core
 #include "Core/Containers/UniquePtr.h"
 #include "Core/FileIO/FileStream.h"
+#include "Core/Math/xxHash.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Process/Atomic.h"
 #include "Core/Process/Mutex.h"
@@ -120,6 +121,14 @@ private:
             return false;
         }
         file.Close();
+
+        // The id is the hash of the file as it was recorded. A worker rejects data that does not
+        // match it, and would be disconnected and sent the same data again.
+        if ( xxHash::Calc64( data.Get(), fileSize ) != m_Entry.pchId )
+        {
+            FLOG_WARN( "PCH distribution: '%s' changed since it was recorded\n", m_Entry.filePath.Get() );
+            return false;
+        }
 
         // The result is valid whether or not compression helped
         (void)m_Compressor.CompressZstd( data.Get(), fileSize, Compressor::kZstdTransferLevel );
