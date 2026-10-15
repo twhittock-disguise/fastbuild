@@ -283,10 +283,10 @@ bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
 {
     bool allOk = true;
 
-    for ( size_t i = pending.GetSize(); i > 0; --i )
+    // In the order they were asked for, which is the order they are sent
+    Array<uint64_t> stillPending;
+    for ( const uint64_t pchId : pending )
     {
-        const uint64_t pchId = pending[ i - 1 ];
-
         // The worker may have reported it since it was queued
         const bool alreadySent = ( sent.Find( pchId ) != nullptr );
 
@@ -298,7 +298,8 @@ bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
             switch ( GetCompressed( entry, data, dataSize ) )
             {
                 case COMPRESSING:
-                    continue;
+                    stillPending.Append( pchId );
+                    break;
                 case READY:
                     sent.Append( pchId );
                     outReady.Append( ReadyPch{ pchId, entry.uncompressedSize, data, dataSize } );
@@ -308,8 +309,8 @@ bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
                     break;
             }
         }
-        pending.EraseIndex( i - 1 );
     }
+    pending.Swap( stillPending );
     return allOk;
 }
 

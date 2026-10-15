@@ -6,6 +6,7 @@
 //------------------------------------------------------------------------------
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/Graph/Node.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/PchDispatch.h"
 
 // Core
 #include "Core/Containers/Array.h"
@@ -88,7 +89,7 @@ private:
 
     // client side of protocol consumes jobs via this interface
     friend class ClientToWorkerConnection;
-    Job * GetDistributableJobToProcess( bool remote, uint8_t workerMinorProtocolVersion );
+    Job * GetDistributableJobToProcess( bool remote, uint8_t workerMinorProtocolVersion, const PchWorkerState * pchState = nullptr );
     Job * OnReturnRemoteJob( uint32_t jobId,
                              bool systemError,
                              bool & outRaceLost,

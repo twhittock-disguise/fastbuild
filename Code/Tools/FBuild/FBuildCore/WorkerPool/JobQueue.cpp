@@ -435,7 +435,7 @@ void JobQueue::QueueDistributableJob( Job * job )
 
 // GetDistributableJobToProcess
 //------------------------------------------------------------------------------
-Job * JobQueue::GetDistributableJobToProcess( bool remote, uint8_t workerMinorProtocolVersion )
+Job * JobQueue::GetDistributableJobToProcess( bool remote, uint8_t workerMinorProtocolVersion, const PchWorkerState * pchState )
 {
     MutexHolder m( m_DistributedJobsMutex );
 
@@ -454,8 +454,19 @@ Job * JobQueue::GetDistributableJobToProcess( bool remote, uint8_t workerMinorPr
 
         // Jobs are sorted from least to most expensive, so we consume
         // from the end of the list.
-        job = m_DistributableJobs_Available.Top();
-        m_DistributableJobs_Available.Pop();
+        int32_t index = static_cast<int32_t>( m_DistributableJobs_Available.GetSize() ) - 1;
+        if ( pchState )
+        {
+            index = PchDispatch::SelectJob( m_DistributableJobs_Available.GetSize(),
+                                            [ this ]( size_t i ) { return m_DistributableJobs_Available[ i ]->GetPchId(); },
+                                            *pchState );
+            if ( index < 0 )
+            {
+                return nullptr;
+            }
+        }
+        job = m_DistributableJobs_Available[ static_cast<size_t>( index ) ];
+        m_DistributableJobs_Available.EraseIndex( static_cast<size_t>( index ) );
     }
     else
     {
