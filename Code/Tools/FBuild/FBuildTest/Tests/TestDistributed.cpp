@@ -91,6 +91,7 @@ private:
     void CorruptPchIsAskedForAgain() const;
     void CorruptPchIsReturnedToAClientThatCannotAsk() const;
     void PchUnpackIsSingleFlight() const;
+    void UnpackSkipsAPchNoJobNeeds() const;
     void UnpackedCopyLivesWithItsJobs() const;
     void UnusedCopiesAreKeptToABudget() const;
     void UnusedCopiesGoWhenIdle() const;
@@ -325,6 +326,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchThatCannotBeUnpackedIsDropped )
     REGISTER_TEST( PchThatCannotBeWrittenIsKept )
     REGISTER_TEST( PchUnpackIsSingleFlight )
+    REGISTER_TEST( UnpackSkipsAPchNoJobNeeds )
     REGISTER_TEST( UnpackedCopyLivesWithItsJobs )
     REGISTER_TEST( UnusedCopiesAreKeptToABudget )
     REGISTER_TEST( UnusedCopiesGoWhenIdle )
@@ -5442,6 +5444,29 @@ void TestDistributed::PchUnpackIsSingleFlight() const
         }
     }
     TEST_ASSERT( NumLeases( s, pch.m_Id ) == 0 );
+}
+
+// UnpackSkipsAPchNoJobNeeds
+//------------------------------------------------------------------------------
+void TestDistributed::UnpackSkipsAPchNoJobNeeds() const
+{
+    Server s( 1 );
+    StoredPch pch;
+    AddStoredPch( s, ( 1 * MEGABYTE ), 19, pch );
+
+    // Queued to be unpacked for a job that was gone by the time its turn came
+    {
+        MutexHolder mh( s.m_PchCacheMutex );
+        Server::PchRawEntry raw;
+        raw.pchId = pch.m_Id;
+        raw.state = Server::PchRawEntry::UNPACKING;
+        s.m_PchRaw.Append( raw );
+    }
+    s.UnpackPch( pch.m_Id );
+    TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 0 );
+    TEST_ASSERT( HasRawEntry( s, pch.m_Id ) == false );
+    TEST_ASSERT( FileIO::FileExists( pch.m_RawFile.Get() ) == false );
+    TEST_ASSERT( s.IsPchCached( pch.m_Id ) );
 }
 
 // UnpackedCopyLivesWithItsJobs
