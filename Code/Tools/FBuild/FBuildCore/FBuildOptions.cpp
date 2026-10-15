@@ -740,9 +740,12 @@ void FBuildOptions::DisplayVersion() const
 #else
     #define VERSION_CONFIG ""
 #endif
-    OUTPUT( "FASTBuild %s " VERSION_CONFIG "- "
+    AStackString protocol;
+    Protocol::GetVersionDescription( protocol );
+    OUTPUT( "FASTBuild %s (%s) " VERSION_CONFIG "- "
             "Copyright 2012-2026 Franta Fulin - https://www.fastbuild.org\n",
-            GetVersionString() );
+            GetVersionString(),
+            protocol.Get() );
 #undef VERSION_CONFIG
 }
 

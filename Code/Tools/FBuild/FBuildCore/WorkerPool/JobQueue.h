@@ -89,7 +89,7 @@ private:
 
     // client side of protocol consumes jobs via this interface
     friend class ClientToWorkerConnection;
-    Job * GetDistributableJobToProcess( bool remote, uint8_t workerMinorProtocolVersion, const PchWorkerState * pchState = nullptr );
+    Job * GetDistributableJobToProcess( bool remote, const PchWorkerState * pchState = nullptr );
     void CountDistributableJobsByPch( Array<uint64_t> & outPchIds, Array<uint32_t> & outNumJobs );
     Job * OnReturnRemoteJob( uint32_t jobId,
                              bool systemError,

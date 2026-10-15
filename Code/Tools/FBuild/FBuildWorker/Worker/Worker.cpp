@@ -154,7 +154,9 @@ uint32_t Worker::WorkThread()
     PROFILE_FUNCTION;
 
     // Initial status message
-    StatusMessage( "FBuildWorker %s", GetVersionString() );
+    AStackString protocol;
+    Protocol::GetVersionDescription( protocol );
+    StatusMessage( "FBuildWorker %s (%s)", GetVersionString(), protocol.Get() );
 
     // start listening
     StatusMessage( "Listening on port %u\n", Protocol::kPort );

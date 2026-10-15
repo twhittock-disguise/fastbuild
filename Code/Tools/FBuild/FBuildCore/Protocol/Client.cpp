@@ -56,6 +56,7 @@ public:
     Timer m_ConnectionDelayTimer; // Throttle for reconnection attempts
     bool m_InUse = false; // Connecting, connected or awaiting cleanup
     bool m_DenyListed = false; // Misbehaving workers are disabled for the rest of the build
+    bool m_ReportedHandshakeFailure = false; // The user is told once per worker that its handshake failed
     uint32_t m_UniqueId = 0; // Index for profiling purposes
 
     // Static Data
@@ -124,6 +125,7 @@ public:
     ClientToWorkerConnection & operator=( const ClientToWorkerConnection & other ) = delete;
 
     [[nodiscard]] bool IsComplete() { return m_Complete.Load(); }
+    void PrepareForShutdown() { m_ShuttingDown.Store( true ); } // Closing before the handshake is then not a failure
 
     ClientWorkerInfo * GetWorker() const { return m_Worker; }
 
@@ -150,11 +152,14 @@ private:
     void Process( const Protocol::MsgJobResultCompressed * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgRequestManifest * msg );
     void Process( const ConnectionInfo * connection, const Protocol::MsgRequestFile * msg );
-    void Process( const Protocol::MsgConnectionAck * msg );
+    void Process( const ConnectionInfo * connection, const Protocol::MsgConnectionAck * msg, uint32_t size );
+    void Process( const ConnectionInfo * connection, const Protocol::MsgRefused * msg );
     void Process( const Protocol::MsgPchInventory * msg, const void * payload, size_t payloadSize );
     void Process( const Protocol::MsgToolchainInventory * msg, const void * payload, size_t payloadSize );
 
     void ProcessJobResultCommon( bool isCompressed, const void * payload, size_t payloadSize );
+    void Refuse( const ConnectionInfo * connection, uint32_t workerMajor, uint32_t workerMinor );
+    void OnInventoriesComplete();
 
     bool QueueToolchain( const ToolManifest & manifest );
     const ToolManifest * FindManifest( uint64_t toolId ) const;
@@ -185,11 +190,14 @@ private:
     // Info returned by worker
     Atomic<uint16_t> m_WorkerVersion;
     Atomic<uint8_t> m_ProtocolVersionMinor;
+    Atomic<uint32_t> m_WorkerCapabilities{ 0 }; // What the worker and this client both have
+    Atomic<bool> m_HandshakeDone{ false };
+    Atomic<bool> m_ShuttingDown{ false };
 
     // Push-based job tracking
     Atomic<uint32_t> m_WorkerCapacity{ 0 };
     Atomic<uint32_t> m_JobsInFlight{ 0 };
-    Atomic<bool> m_AwaitingInventory{ true }; // Jobs wait for the worker's inventories, so they are not sent what it already has. Our worker always sends them.
+    Atomic<bool> m_AwaitingInventory{ true }; // Jobs wait for the inventories the worker advertises, so they are not sent what it already has
     Array<uint64_t> m_SentToolchains; // Protected by m_Mutex
     Array<uint64_t> m_CachedToolchains; // Reported by the worker and not used yet. Protected by m_Mutex
     Atomic<uint32_t> m_NumSkippedToolchains{ 0 }; // Toolchains the worker had, so we did not send them
@@ -262,10 +270,28 @@ uint32_t Client::GetNumConnections() const
 }
 
 //------------------------------------------------------------------------------
+uint32_t Client::GetNumDenyListedWorkers() const
+{
+    uint32_t count = 0;
+    for ( const UniquePtr<ClientWorkerInfo> & worker : m_WorkerPool )
+    {
+        count += ( worker->m_DenyListed ? 1 : 0 );
+    }
+    return count;
+}
+
+//------------------------------------------------------------------------------
 /*virtual*/ void ClientToWorkerConnection::OnDisconnected( const ConnectionInfo * /*connection*/ )
 {
     MutexHolder mh( m_Mutex );
     DIST_INFO( "Disconnected: %s\n", m_Worker->m_Address.Get() );
+    if ( ( m_HandshakeDone.Load() == false ) && ( m_ShuttingDown.Load() == false ) && ( m_Worker->m_ReportedHandshakeFailure == false ) && ( m_Worker->m_DenyListed == false ) )
+    {
+        // A worker of another major can only drop the connection if it is older than the refusal message
+        m_Worker->m_ReportedHandshakeFailure = true;
+        FLOG_OUTPUT( "Distributed Compilation : worker %s closed the connection during the handshake: it may run another protocol than v%u.%u (update FBuild and FBuildWorker together)\n",
+                     m_Worker->m_Address.Get(), Protocol::kVersionMajor, (uint32_t)Protocol::kVersionMinor );
+    }
     if ( m_Jobs.IsEmpty() == false )
     {
         for ( Job * job : m_Jobs )
@@ -346,6 +372,7 @@ void Client::ThreadFunc()
     // cleanup
     for ( UniquePtr<ClientToWorkerConnection> & serverState : m_ActiveConnections )
     {
+        serverState->PrepareForShutdown();
         serverState->ShutdownAllConnections();
     }
     m_ActiveConnections.Clear();
@@ -529,6 +556,13 @@ void Client::CommunicateJobAvailability()
     if ( m_CurrentMessage == nullptr )
     {
         // message
+        if ( Protocol::IsFrameLongEnough( data, size ) == false )
+        {
+            DIST_INFO( "Protocol Error: %s sent a message that is too short (%u bytes)\n", m_Worker->m_Address.Get(), size );
+            FREE( data );
+            Disconnect( connection );
+            return;
+        }
         m_CurrentMessage = static_cast<const Protocol::IMessage *>( data );
         if ( m_CurrentMessage->HasPayload() )
         {
@@ -578,7 +612,13 @@ void Client::CommunicateJobAvailability()
         case Protocol::MSG_CONNECTION_ACK:
         {
             const Protocol::MsgConnectionAck * msg = static_cast<const Protocol::MsgConnectionAck *>( imsg );
-            Process( msg );
+            Process( connection, msg, size );
+            break;
+        }
+        case Protocol::MSG_REFUSED:
+        {
+            const Protocol::MsgRefused * msg = static_cast<const Protocol::MsgRefused *>( imsg );
+            Process( connection, msg );
             break;
         }
         case Protocol::MSG_PCH_INVENTORY:
@@ -597,7 +637,7 @@ void Client::CommunicateJobAvailability()
         {
             // unknown message type
             ASSERT( false ); // this indicates a protocol bug
-            DIST_INFO( "Protocol Error: %s\n", m_Worker->m_Address.Get() );
+            DIST_INFO( "Protocol Error: %s sent an unknown message (type %u)\n", m_Worker->m_Address.Get(), (uint32_t)messageType );
             Disconnect( connection );
             break;
         }
@@ -633,18 +673,30 @@ void ClientToWorkerConnection::Process( const Protocol::MsgJobResultCompressed *
 
 // Process( MsgConnectionAck )
 //------------------------------------------------------------------------------
-void ClientToWorkerConnection::Process( const Protocol::MsgConnectionAck * msg )
+void ClientToWorkerConnection::Process( const ConnectionInfo * connection, const Protocol::MsgConnectionAck * msg, uint32_t size )
 {
     PROFILE_SECTION( "MsgConnectionAck" );
 
-    // The connection would be dropped and we would not get an ack if the major
-    // protocol version is mismatched.
-    ASSERT( msg->GetProtocolVersionMajor() == Protocol::kVersionMajor );
+    // Only the version fields are the same in every major version
+    if ( msg->GetProtocolVersionMajor() != Protocol::kVersionMajor )
+    {
+        Refuse( connection, msg->GetProtocolVersionMajor(), msg->GetProtocolVersionMinor() );
+        return;
+    }
+    if ( size < sizeof( Protocol::MsgConnectionAck ) )
+    {
+        DIST_INFO( "Protocol Error: %s sent a handshake that is too short (%u bytes)\n", m_Worker->m_Address.Get(), size );
+        Disconnect( connection );
+        return;
+    }
 
     // Take note of additional server info
+    const uint32_t capabilities = ( msg->GetCapabilities() & Protocol::kCapabilities ); // What both sides have
     m_WorkerVersion.Store( msg->GetWorkerVersion() );
     m_ProtocolVersionMinor.Store( msg->GetProtocolVersionMinor() );
+    m_WorkerCapabilities.Store( capabilities );
     m_WorkerCapacity.Store( msg->GetWorkerCapacity() );
+    m_HandshakeDone.Store( true );
     DIST_INFO( " - Worker %s is v%u.%u (protocol v%u.%u) capacity=%u\n",
                m_Worker->m_Address.Get(),
                ( m_WorkerVersion.Load() / 100U ),
@@ -653,7 +705,43 @@ void ClientToWorkerConnection::Process( const Protocol::MsgConnectionAck * msg )
                m_ProtocolVersionMinor.Load(),
                msg->GetWorkerCapacity() );
 
-    // The initial batch of jobs is pushed once the toolchain inventory arrives, right behind the ack
+    // The initial batch of jobs waits for the last inventory the worker sends. It follows the ack,
+    // so without one there is nothing to wait for.
+    if ( ( capabilities & ( Protocol::CAP_PCH_INVENTORY | Protocol::CAP_TOOLCHAIN_INVENTORY ) ) == 0 )
+    {
+        OnInventoriesComplete();
+    }
+}
+
+// Process( MsgRefused )
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::Process( const ConnectionInfo * connection, const Protocol::MsgRefused * msg )
+{
+    PROFILE_SECTION( "MsgRefused" );
+    Refuse( connection, msg->GetProtocolVersionMajor(), msg->GetProtocolVersionMinor() );
+}
+
+// Refuse
+//------------------------------------------------------------------------------
+// The worker is another version: tell the user once, and leave it alone for the rest of the build
+void ClientToWorkerConnection::Refuse( const ConnectionInfo * connection, uint32_t workerMajor, uint32_t workerMinor )
+{
+    if ( m_Worker->m_ReportedHandshakeFailure == false )
+    {
+        m_Worker->m_ReportedHandshakeFailure = true;
+        FLOG_OUTPUT( "Distributed Compilation : worker %s runs protocol v%u.%u, this FBuild is v%u.%u: update FBuild and FBuildWorker together\n",
+                     m_Worker->m_Address.Get(), workerMajor, workerMinor, Protocol::kVersionMajor, (uint32_t)Protocol::kVersionMinor );
+    }
+    m_Worker->m_DenyListed = true;
+    Disconnect( connection );
+}
+
+// OnInventoriesComplete
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::OnInventoriesComplete()
+{
+    m_AwaitingInventory.Store( false );
+    PushJobsToWorker();
 }
 
 // Process( MsgPchInventory )
@@ -665,27 +753,27 @@ void ClientToWorkerConnection::Process( const Protocol::MsgPchInventory * msg,
     PROFILE_SECTION( "MsgPchInventory" );
 
     const uint32_t numEntries = msg->GetNumEntries();
-    if ( numEntries == 0 )
-    {
-        return;
-    }
-
-    // Validate payload size
     const size_t expectedSize = (size_t)numEntries * sizeof( uint64_t );
     if ( payloadSize < expectedSize )
     {
         DIST_INFO( " - Worker %s sent truncated PCH inventory (%zu < %zu)\n",
                    m_Worker->m_Address.Get(), payloadSize, expectedSize );
-        return;
     }
-
+    else if ( numEntries > 0 )
     {
-        MutexHolder mh( m_Mutex );
-        m_PchState.OnInventory( static_cast<const uint64_t *>( payload ), numEntries );
+        {
+            MutexHolder mh( m_Mutex );
+            m_PchState.OnInventory( static_cast<const uint64_t *>( payload ), numEntries );
+        }
+        DIST_INFO( " - Worker %s has %u cached PCH entries\n",
+                   m_Worker->m_Address.Get(), numEntries );
     }
 
-    DIST_INFO( " - Worker %s has %u cached PCH entries\n",
-               m_Worker->m_Address.Get(), numEntries );
+    // The toolchain inventory follows this one when the worker has it
+    if ( ( m_WorkerCapabilities.Load() & Protocol::CAP_TOOLCHAIN_INVENTORY ) == 0 )
+    {
+        OnInventoriesComplete();
+    }
 }
 
 // Process( MsgToolchainInventory )
@@ -718,8 +806,7 @@ void ClientToWorkerConnection::Process( const Protocol::MsgToolchainInventory * 
     }
 
     // Both inventories have now been processed
-    m_AwaitingInventory.Store( false );
-    PushJobsToWorker();
+    OnInventoriesComplete();
 }
 
 // QueueToolchain
@@ -853,7 +940,6 @@ void ClientToWorkerConnection::PushJobsToWorker()
         return;
     }
 
-    const uint8_t workerMinorProtocolVersion = m_ProtocolVersionMinor.Load();
     uint32_t toSend = capacity - inFlight;
 
     // The jobs already on the worker that wait for their PCH, and the PCHs on the worker or on
@@ -883,7 +969,7 @@ void ClientToWorkerConnection::PushJobsToWorker()
             break;
         }
 
-        Job * job = JobQueue::Get().GetDistributableJobToProcess( true, workerMinorProtocolVersion, &pchState );
+        Job * job = JobQueue::Get().GetDistributableJobToProcess( true, &pchState );
         if ( job == nullptr )
         {
             break;
@@ -1589,6 +1675,12 @@ void ClientToWorkerConnection::SendQueueThreadFunc()
         SendQueueMainLoop( ci );
     }
     WriteStats();
+
+    // A worker that drops the connection before the handshake is not tried again straight away
+    if ( m_HandshakeDone.Load() == false )
+    {
+        m_Worker->m_ConnectionDelayTimer.Restart();
+    }
 
     // Note terminated connection
     ASSERT( ClientWorkerInfo::s_NumConnections.Load() > 0 );

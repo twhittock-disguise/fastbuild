@@ -13,6 +13,7 @@
 #include "Core/FileIO/ConstMemoryStream.h"
 #include "Core/FileIO/MemoryStream.h"
 #include "Core/Network/TCPConnectionPool.h"
+#include "Core/Strings/AString.h"
 
 // system
 #include <memory.h> // for memset
@@ -42,6 +43,7 @@ const char * GetProtocolMessageDebugName( Protocol::MessageType msgType )
         "RequestManifest",
         "RequestFile",
         "ToolchainInventory",
+        "Refused",
     };
     // clang-format on
     static_assert( ( sizeof( msgNames ) / sizeof( const char * ) ) == Protocol::NUM_MESSAGES, "msgNames item count doesn't match NUM_MESSAGES" );
@@ -112,6 +114,7 @@ Protocol::MsgConnection::MsgConnection()
     , m_ProtocolVersion( kVersionMajor )
     , m_Platform( Env::GetPlatform() )
     , m_ProtocolVersionMinor( kVersionMinor )
+    , m_Capabilities( kCapabilities )
 {
     memset( m_Padding2, 0, sizeof( m_Padding2 ) );
     memset( m_HostName, 0, sizeof( m_HostName ) );
@@ -123,14 +126,25 @@ Protocol::MsgConnection::MsgConnection()
 
 // MsgConnectionAck
 //------------------------------------------------------------------------------
-Protocol::MsgConnectionAck::MsgConnectionAck( uint8_t capacity )
+Protocol::MsgConnectionAck::MsgConnectionAck( uint8_t capacity, uint32_t capabilities )
     : Protocol::IMessage( Protocol::MSG_CONNECTION_ACK, sizeof( MsgConnectionAck ), false )
     , m_WorkerVersion( static_cast<uint16_t>( GetVersionIdentifier() ) )
     , m_ProtocolVersionMajor( kVersionMajor )
     , m_ProtocolVersionMinor( kVersionMinor )
     , m_WorkerCapacity( capacity )
+    , m_Capabilities( capabilities )
 {
     memset( m_Padding2, 0, sizeof( m_Padding2 ) );
+}
+
+// MsgRefused
+//------------------------------------------------------------------------------
+Protocol::MsgRefused::MsgRefused()
+    : Protocol::IMessage( Protocol::MSG_REFUSED, sizeof( MsgRefused ), false )
+    , m_WorkerVersion( static_cast<uint16_t>( GetVersionIdentifier() ) )
+    , m_ProtocolVersionMajor( kVersionMajor )
+    , m_ProtocolVersionMinor( kVersionMinor )
+{
 }
 
 // MsgJob
@@ -240,6 +254,48 @@ Protocol::MsgToolchainInventory::MsgToolchainInventory( uint32_t numEntries )
     : Protocol::IMessage( Protocol::MSG_TOOLCHAIN_INVENTORY, sizeof( MsgToolchainInventory ), numEntries > 0 )
     , m_NumEntries( numEntries )
 {
+}
+
+// GetMinMessageSize
+//------------------------------------------------------------------------------
+uint32_t Protocol::GetMinMessageSize( MessageType type )
+{
+    switch ( type )
+    {
+        case MSG_CONNECTION:            return kHandshakePrefixSize;
+        case MSG_CONNECTION_ACK:        return kHandshakePrefixSize;
+        case MSG_REFUSED:               return sizeof( MsgRefused );
+        case MSG_JOB:                   return sizeof( MsgJob );
+        case MSG_JOB_RESULT:            return sizeof( MsgJobResult );
+        case MSG_JOB_RESULT_COMPRESSED: return sizeof( MsgJobResultCompressed );
+        case MSG_MANIFEST:              return sizeof( MsgManifest );
+        case MSG_FILE:                  return sizeof( MsgFile );
+        case MSG_PCH_FILE:              return sizeof( MsgPchFile );
+        case MSG_PCH_INVENTORY:         return sizeof( MsgPchInventory );
+        case MSG_REQUEST_MANIFEST:      return sizeof( MsgRequestManifest );
+        case MSG_REQUEST_FILE:          return sizeof( MsgRequestFile );
+        case MSG_TOOLCHAIN_INVENTORY:   return sizeof( MsgToolchainInventory );
+        case NUM_MESSAGES:              break;
+    }
+    return 0;
+}
+
+// IsFrameLongEnough
+//------------------------------------------------------------------------------
+bool Protocol::IsFrameLongEnough( const void * frame, uint32_t size )
+{
+    if ( size < sizeof( IMessage ) )
+    {
+        return false; // Not even the type can be read
+    }
+    return ( size >= GetMinMessageSize( static_cast<const IMessage *>( frame )->GetType() ) );
+}
+
+// GetVersionDescription
+//------------------------------------------------------------------------------
+void Protocol::GetVersionDescription( AString & outText )
+{
+    outText.Format( "protocol v%u.%u", kVersionMajor, (uint32_t)kVersionMinor );
 }
 
 //------------------------------------------------------------------------------

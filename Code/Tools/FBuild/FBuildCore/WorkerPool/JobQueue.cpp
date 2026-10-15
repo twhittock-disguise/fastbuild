@@ -436,7 +436,7 @@ void JobQueue::QueueDistributableJob( Job * job )
 
 // GetDistributableJobToProcess
 //------------------------------------------------------------------------------
-Job * JobQueue::GetDistributableJobToProcess( bool remote, uint8_t workerMinorProtocolVersion, const PchWorkerState * pchState )
+Job * JobQueue::GetDistributableJobToProcess( bool remote, const PchWorkerState * pchState )
 {
     MutexHolder m( m_DistributedJobsMutex );
 
@@ -445,62 +445,20 @@ Job * JobQueue::GetDistributableJobToProcess( bool remote, uint8_t workerMinorPr
         return nullptr;
     }
 
-    Job * job = nullptr;
-
-    // Compare capabilities of the worker to our local requirements
-    if ( workerMinorProtocolVersion >= Protocol::kVersionMinor )
+    // Jobs are sorted from least to most expensive, so we consume from the end of the list
+    int32_t index = static_cast<int32_t>( m_DistributableJobs_Available.GetSize() ) - 1;
+    if ( pchState )
     {
-        // Worker is equal or newer and minor protocol changes are backwards
-        // compatible so worker can take any job.
-
-        // Jobs are sorted from least to most expensive, so we consume
-        // from the end of the list.
-        int32_t index = static_cast<int32_t>( m_DistributableJobs_Available.GetSize() ) - 1;
-        if ( pchState )
-        {
-            index = PchDispatch::SelectJob( m_DistributableJobs_Available.GetSize(),
-                                            [ this ]( size_t i ) { return m_DistributableJobs_Available[ i ]->GetPchId(); },
-                                            *pchState );
-            if ( index < 0 )
-            {
-                return nullptr;
-            }
-        }
-        job = m_DistributableJobs_Available[ static_cast<size_t>( index ) ];
-        m_DistributableJobs_Available.EraseIndex( static_cast<size_t>( index ) );
-    }
-    else
-    {
-        // Worker is old so we need to check if it can process a specific job
-        // Search backwards to obtain most expensive job
-        const int32_t numJobs = static_cast<int32_t>( m_DistributableJobs_Available.GetSize() );
-        for ( int32_t i = ( numJobs - 1 ); i >= 0; --i )
-        {
-            Job * potentialJob = m_DistributableJobs_Available[ static_cast<size_t>( i ) ];
-
-            // Check if the node is using a feature that needs a particular version
-            // TODO:B: Migrate this logic to the CompilerDriver
-
-            // MSVC /dynamicdeopt require minor protocol 5 or later
-            const ObjectNode * on = potentialJob->GetNode()->CastTo<ObjectNode>();
-            if ( on->IsMSVC() &&
-                 on->IsUsingDynamicDeopt() &&
-                 ( workerMinorProtocolVersion < 5 ) )
-            {
-                continue;
-            }
-
-            job = potentialJob;
-            m_DistributableJobs_Available.EraseIndex( static_cast<size_t>( i ) );
-            break;
-        }
-
-        // It's possible there are no compatible jobs
-        if ( job == nullptr )
+        index = PchDispatch::SelectJob( m_DistributableJobs_Available.GetSize(),
+                                        [ this ]( size_t i ) { return m_DistributableJobs_Available[ i ]->GetPchId(); },
+                                        *pchState );
+        if ( index < 0 )
         {
             return nullptr;
         }
     }
+    Job * job = m_DistributableJobs_Available[ static_cast<size_t>( index ) ];
+    m_DistributableJobs_Available.EraseIndex( static_cast<size_t>( index ) );
 
     ASSERT( job->GetDistributionState() == Job::DIST_AVAILABLE );
 

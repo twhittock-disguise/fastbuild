@@ -344,6 +344,15 @@ bool Server::IsSynchingTool( AString & statusStr ) const
     if ( cs->m_CurrentMessage == nullptr )
     {
         // message
+        if ( Protocol::IsFrameLongEnough( data, size ) == false )
+        {
+            AStackString remoteAddr;
+            TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
+            FLOG_WARN( "Disconnecting '%s' as it sent a message that is too short (%u bytes)\n", remoteAddr.Get(), size );
+            FREE( data );
+            Disconnect( connection );
+            return;
+        }
         cs->m_CurrentMessage = static_cast<const Protocol::IMessage *>( data );
         if ( cs->m_CurrentMessage->HasPayload() )
         {
@@ -369,7 +378,7 @@ bool Server::IsSynchingTool( AString & statusStr ) const
         case Protocol::MSG_CONNECTION:
         {
             const Protocol::MsgConnection * msg = static_cast<const Protocol::MsgConnection *>( imsg );
-            Process( connection, msg );
+            Process( connection, msg, size );
             break;
         }
         case Protocol::MSG_JOB:
@@ -400,6 +409,9 @@ bool Server::IsSynchingTool( AString & statusStr ) const
         {
             // unknown message type
             ASSERT( false ); // this indicates a protocol bug
+            AStackString remoteAddr;
+            TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
+            FLOG_WARN( "Disconnecting '%s' as it sent an unknown message (type %u)\n", remoteAddr.Get(), (uint32_t)messageType );
             Disconnect( connection );
             break;
         }
@@ -449,35 +461,57 @@ template <class MSG>
 
 // Process( MsgConnection )
 //------------------------------------------------------------------------------
-void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConnection * msg )
+void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConnection * msg, uint32_t size )
 {
-    // check for valid/supported protocol version
+    ClientState * cs = (ClientState *)connection->GetUserData();
+    AStackString remoteAddr;
+    TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
+
+    // A client of another major version is told which version this worker runs. Only the version
+    // fields can be relied on in its message, and only as far as it is long.
     if ( msg->GetProtocolVersion() != Protocol::kVersionMajor )
     {
-        AStackString remoteAddr;
-        TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-        FLOG_WARN( "Disconnecting '%s' due to bad protocol version (client v%u, worker v%u)\n",
-                   remoteAddr.Get(), msg->GetProtocolVersion(), Protocol::kVersionMajor );
+        char clientName[ 65 ] = "";
+        if ( size >= ( sizeof( Protocol::MsgConnection ) - sizeof( uint32_t ) ) )
+        {
+            memcpy( clientName, msg->GetHostName(), 64 ); // Where this major keeps it, if the message reaches that far
+        }
+        FLOG_WARN( "Refusing '%s' (%s): it runs protocol v%u, this worker runs v%u.%u. FBuild and FBuildWorker must be updated together.\n",
+                   remoteAddr.Get(), clientName, msg->GetProtocolVersion(), Protocol::kVersionMajor, (uint32_t)Protocol::kVersionMinor );
+        const Protocol::MsgRefused refused;
+        SendTo( *cs, refused );
+        Disconnect( connection );
+        return;
+    }
+    if ( size < sizeof( Protocol::MsgConnection ) )
+    {
+        FLOG_WARN( "Disconnecting '%s' as its handshake is too short (%u bytes)\n", remoteAddr.Get(), size );
         Disconnect( connection );
         return;
     }
 
+    char hostName[ 65 ];
+    memcpy( hostName, msg->GetHostName(), 64 );
+    hostName[ 64 ] = 0; // A client does not have to terminate it
+
     // Check for matching platform
     if ( msg->GetPlatform() != Env::GetPlatform() )
     {
-        AStackString remoteAddr;
-        TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-        FLOG_WARN( "Disconnecting '%s' (%s) due to mismatched platform\n", remoteAddr.Get(), msg->GetHostName() );
+        FLOG_WARN( "Disconnecting '%s' (%s) due to mismatched platform\n", remoteAddr.Get(), hostName );
         Disconnect( connection );
         return;
     }
 
     // take note of initial status of client
-    ClientState * cs = (ClientState *)connection->GetUserData();
+    uint32_t peerCapabilities = 0;
     {
         MutexHolder mh( cs->m_Mutex );
-        cs->m_HostName = msg->GetHostName();
+        cs->m_HostName = hostName;
+        cs->m_PeerMinor = msg->GetProtocolVersionMinor();
+        cs->m_PeerCapabilities = msg->GetCapabilities();
+        peerCapabilities = cs->m_PeerCapabilities;
     }
+    const uint32_t capabilities = ( peerCapabilities & Protocol::kCapabilities ); // What both sides have
 
     // Recalculate capacity across all connected coordinators
     // (takes m_ClientListMutex, so cs->m_Mutex must not be held)
@@ -488,19 +522,25 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     SendTo( *cs, ack );
 
     // Send PCH inventory so coordinator knows what's already cached
-    Array<uint64_t> pchIds;
+    if ( capabilities & Protocol::CAP_PCH_INVENTORY )
     {
-        MutexHolder mh( m_PchCacheMutex );
-        for ( const PchCacheEntry & e : m_PchCache )
+        Array<uint64_t> pchIds;
         {
-            pchIds.Append( e.pchId );
+            MutexHolder mh( m_PchCacheMutex );
+            for ( const PchCacheEntry & e : m_PchCache )
+            {
+                pchIds.Append( e.pchId );
+            }
         }
+        SendIdInventory<Protocol::MsgPchInventory>( *cs, pchIds );
     }
-    SendIdInventory<Protocol::MsgPchInventory>( *cs, pchIds );
 
     // Send toolchain inventory so coordinator can skip sending toolchains we already have.
     // It follows the PCH inventory, so the coordinator knows both have arrived.
-    SendToolchainInventory( *cs );
+    if ( capabilities & Protocol::CAP_TOOLCHAIN_INVENTORY )
+    {
+        SendToolchainInventory( *cs );
+    }
 }
 
 // Process( MsgJob )

@@ -119,6 +119,7 @@ public:
     bool CacheTrim() const;
 
     uint32_t GetNumWorkerConnections() const;
+    uint32_t GetNumDenyListedWorkers() const;
 
     // The build is about to need this toolchain on workers
     void OnDistributableCompiler( const ToolManifest & manifest );

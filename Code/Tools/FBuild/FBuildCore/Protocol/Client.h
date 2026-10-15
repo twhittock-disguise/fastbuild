@@ -49,6 +49,7 @@ public:
     uint16_t GetPort() const { return m_Port; }
 
     uint32_t GetNumConnections() const;
+    uint32_t GetNumDenyListedWorkers() const; // Workers that refused this client or misbehaved
 
     // Toolchains the build is about to need on workers
     void AddToolchain( const ToolManifest * manifest );

@@ -180,7 +180,7 @@ void WorkerThread::WaitForStop()
     // no local job, see if we can do one from the remote queue
     if ( FBuild::Get().GetOptions().m_NoLocalConsumptionOfRemoteJobs == false )
     {
-        job = JobQueue::IsValid() ? JobQueue::Get().GetDistributableJobToProcess( false, Protocol::kVersionMinor )
+        job = JobQueue::IsValid() ? JobQueue::Get().GetDistributableJobToProcess( false )
                                   : nullptr;
         if ( job != nullptr )
         {

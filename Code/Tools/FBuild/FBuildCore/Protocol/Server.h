@@ -47,7 +47,7 @@ private:
     virtual void OnReceive( const ConnectionInfo * connection, void * data, uint32_t size, bool & keepMemory ) override;
 
     // helpers to handle messages
-    void Process( const ConnectionInfo * connection, const Protocol::MsgConnection * msg );
+    void Process( const ConnectionInfo * connection, const Protocol::MsgConnection * msg, uint32_t size );
     void Process( const ConnectionInfo * connection, const Protocol::MsgJob * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgManifest * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgFile * msg, const void * payload, size_t payloadSize );
@@ -84,6 +84,8 @@ private:
         uint32_t m_AllocatedCapacity = 0;
 
         AString m_HostName;
+        uint8_t m_PeerMinor = 0;        // What the client reported in its handshake. Protected by m_Mutex.
+        uint32_t m_PeerCapabilities = 0;
 
         Array<Job *> m_WaitingJobs; // jobs waiting for manifests/toolchains
 

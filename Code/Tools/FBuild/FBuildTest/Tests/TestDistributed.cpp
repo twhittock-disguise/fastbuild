@@ -89,6 +89,16 @@ private:
     void CachedToolchainIsNotSent() const;
     void ToolchainIsNotSentWhenNothingIsDistributed() const;
     void MismatchedProtocolVersionIsRefused() const;
+    void HandshakeLayoutIsFrozen() const;
+    void VersionDescriptionNamesTheProtocol() const;
+    void ShortMessagesAreRejected() const;
+    void LongerMessagesAreAccepted() const;
+    void CapabilitiesAreExchanged() const;
+    void ServerSendsOnlyWhatTheClientAdvertises() const;
+    void ClientRefusesAWorkerThatRefusesIt() const;
+    void ClientRefusesAnAckOfAnotherMajor() const;
+    void ClientRejectsAShortAck() const;
+    void ClientDoesNotWaitForInventoriesTheWorkerLacks() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
     void RemoteRaceWinRemote();
@@ -222,6 +232,16 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ToolchainIsNotSentWhenNothingIsDistributed )
 #endif
     REGISTER_TEST( MismatchedProtocolVersionIsRefused )
+    REGISTER_TEST( HandshakeLayoutIsFrozen )
+    REGISTER_TEST( VersionDescriptionNamesTheProtocol )
+    REGISTER_TEST( ShortMessagesAreRejected )
+    REGISTER_TEST( LongerMessagesAreAccepted )
+    REGISTER_TEST( CapabilitiesAreExchanged )
+    REGISTER_TEST( ServerSendsOnlyWhatTheClientAdvertises )
+    REGISTER_TEST( ClientRefusesAWorkerThatRefusesIt )
+    REGISTER_TEST( ClientRefusesAnAckOfAnotherMajor )
+    REGISTER_TEST( ClientRejectsAShortAck )
+    REGISTER_TEST( ClientDoesNotWaitForInventoriesTheWorkerLacks )
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
     REGISTER_TEST( RemoteRaceWinRemote )
@@ -1697,17 +1717,50 @@ namespace
     class FakeWorker : public TCPConnectionPool
     {
     public:
-        explicit FakeWorker( uint8_t capacity, const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
+        explicit FakeWorker( uint8_t capacity,
+                             const Array<uint64_t> & toolchainInventory = Array<uint64_t>(),
+                             uint32_t capabilities = Protocol::kCapabilities )
             : m_Capacity( capacity )
             , m_ToolchainInventory( toolchainInventory )
+            , m_Capabilities( capabilities )
         {
         }
         explicit FakeWorker( const FakeWorker & other ) = delete;
         FakeWorker & operator=( const FakeWorker & other ) = delete;
 
         uint32_t GetNumConnections() const { return m_NumConnections.Load(); }
+        uint32_t GetClientCapabilities() const { return m_ClientCapabilities.Load(); }
 
     protected:
+        // The reply to the client's handshake: the ack, then the inventories the capabilities have
+        virtual void Handshake( const ConnectionInfo * connection )
+        {
+            const Protocol::MsgConnectionAck ack( m_Capacity, m_Capabilities );
+            ack.Send( connection );
+            if ( m_Capabilities & Protocol::CAP_PCH_INVENTORY )
+            {
+                const Protocol::MsgPchInventory pchInventory( 0 );
+                pchInventory.Send( connection );
+            }
+            if ( m_Capabilities & Protocol::CAP_TOOLCHAIN_INVENTORY )
+            {
+                const Protocol::MsgToolchainInventory toolchainInventory( (uint32_t)m_ToolchainInventory.GetSize() );
+                if ( m_ToolchainInventory.IsEmpty() )
+                {
+                    toolchainInventory.Send( connection );
+                }
+                else
+                {
+                    MemoryStream ids;
+                    for ( const uint64_t toolId : m_ToolchainInventory )
+                    {
+                        ids.Write( toolId );
+                    }
+                    toolchainInventory.Send( connection, ids );
+                }
+            }
+        }
+
         // Every message after the handshake. The payload is null for a message that has none.
         virtual void OnMessage( const ConnectionInfo * connection,
                                 const Protocol::IMessage & message,
@@ -1736,24 +1789,8 @@ namespace
             if ( m_CurrentMessage->GetType() == Protocol::MSG_CONNECTION )
             {
                 m_NumConnections.Increment();
-                const Protocol::MsgConnectionAck ack( m_Capacity );
-                const Protocol::MsgPchInventory pchInventory( 0 );
-                const Protocol::MsgToolchainInventory toolchainInventory( (uint32_t)m_ToolchainInventory.GetSize() );
-                ack.Send( connection );
-                pchInventory.Send( connection );
-                if ( m_ToolchainInventory.IsEmpty() )
-                {
-                    toolchainInventory.Send( connection );
-                }
-                else
-                {
-                    MemoryStream ids;
-                    for ( const uint64_t toolId : m_ToolchainInventory )
-                    {
-                        ids.Write( toolId );
-                    }
-                    toolchainInventory.Send( connection, ids );
-                }
+                m_ClientCapabilities.Store( static_cast<const Protocol::MsgConnection *>( m_CurrentMessage )->GetCapabilities() );
+                Handshake( connection );
             }
             else
             {
@@ -1767,15 +1804,17 @@ namespace
 
         const uint8_t m_Capacity;
         const Array<uint64_t> m_ToolchainInventory;
+        const uint32_t m_Capabilities;
         const Protocol::IMessage * m_CurrentMessage = nullptr;
         Atomic<uint32_t> m_NumConnections{ 0 };
+        Atomic<uint32_t> m_ClientCapabilities{ 0 };
     };
 
     // A worker that answers every job with a result that is not valid compressed data
     class CorruptResultWorker : public FakeWorker
     {
     public:
-        CorruptResultWorker() : FakeWorker( 4 ) {}
+        explicit CorruptResultWorker( uint32_t capabilities = Protocol::kCapabilities ) : FakeWorker( 4, Array<uint64_t>(), capabilities ) {}
         explicit CorruptResultWorker( const CorruptResultWorker & other ) = delete;
         CorruptResultWorker & operator=( const CorruptResultWorker & other ) = delete;
 
@@ -2170,6 +2209,9 @@ namespace
             return m_MessageTypes[ index ];
         }
         bool IsDisconnected() const { return m_Disconnected.Load(); }
+        uint32_t GetRefusedMajor() const { return m_RefusedMajor.Load(); }
+        uint32_t GetRefusedMinor() const { return m_RefusedMinor.Load(); }
+        uint32_t GetAckCapabilities() const { return m_AckCapabilities.Load(); }
         void GetToolchainIds( Array<uint64_t> & outToolIds ) const
         {
             MutexHolder mh( m_Mutex );
@@ -2198,6 +2240,16 @@ namespace
             {
                 MutexHolder mh( m_Mutex );
                 m_MessageTypes.Append( (uint8_t)m_CurrentMessage->GetType() );
+                if ( m_CurrentMessage->GetType() == Protocol::MSG_REFUSED )
+                {
+                    const Protocol::MsgRefused * refused = static_cast<const Protocol::MsgRefused *>( m_CurrentMessage );
+                    m_RefusedMajor.Store( refused->GetProtocolVersionMajor() );
+                    m_RefusedMinor.Store( refused->GetProtocolVersionMinor() );
+                }
+                if ( m_CurrentMessage->GetType() == Protocol::MSG_CONNECTION_ACK )
+                {
+                    m_AckCapabilities.Store( static_cast<const Protocol::MsgConnectionAck *>( m_CurrentMessage )->GetCapabilities() );
+                }
                 if ( ( m_CurrentMessage->GetType() == Protocol::MSG_TOOLCHAIN_INVENTORY ) && payload )
                 {
                     const uint64_t * toolIds = static_cast<const uint64_t *>( payload );
@@ -2218,8 +2270,151 @@ namespace
         Array<uint8_t> m_MessageTypes;
         Array<uint64_t> m_ToolchainIds;
         Atomic<bool> m_Disconnected{ false };
+        Atomic<uint32_t> m_RefusedMajor{ 0 };
+        Atomic<uint32_t> m_RefusedMinor{ 0 };
+        Atomic<uint32_t> m_AckCapabilities{ 0 };
         const Protocol::IMessage * m_CurrentMessage = nullptr;
     };
+
+    // The handshake of a client of this version, as bytes a test can change
+    struct HandshakeBytes
+    {
+        HandshakeBytes()
+        {
+            const Protocol::MsgConnection msg;
+            static_assert( sizeof( bytes ) == sizeof( msg ), "Size of the handshake" );
+            memcpy( bytes, &msg, sizeof( msg ) );
+        }
+        void SetCapabilities( uint32_t capabilities ) { memcpy( bytes + sizeof( bytes ) - sizeof( capabilities ), &capabilities, sizeof( capabilities ) ); }
+        uint8_t bytes[ sizeof( Protocol::MsgConnection ) ];
+    };
+
+    // A worker that answers the handshake in a way that is not valid for this version
+    class OddHandshakeWorker : public FakeWorker
+    {
+    public:
+        enum Reply
+        {
+            REFUSE_AS_NEWER_MAJOR,  // MSG_REFUSED from a worker of the next major
+            ACK_OF_OLDER_MAJOR,     // An ack of the previous major
+            ACK_TOO_SHORT,          // An ack of this major that stops after the version fields
+        };
+        explicit OddHandshakeWorker( Reply reply ) : FakeWorker( 4 ), m_Reply( reply ) {}
+        explicit OddHandshakeWorker( const OddHandshakeWorker & other ) = delete;
+        OddHandshakeWorker & operator=( const OddHandshakeWorker & other ) = delete;
+
+    private:
+        virtual void Handshake( const ConnectionInfo * connection ) override
+        {
+            uint8_t bytes[ sizeof( Protocol::MsgConnectionAck ) ];
+            size_t size = sizeof( bytes );
+            switch ( m_Reply )
+            {
+                case REFUSE_AS_NEWER_MAJOR:
+                {
+                    const Protocol::MsgRefused refused;
+                    size = sizeof( refused );
+                    memcpy( bytes, &refused, size );
+                    bytes[ Protocol::kAckProtocolMajorOffset ] = (uint8_t)( Protocol::kVersionMajor + 1 );
+                    break;
+                }
+                case ACK_OF_OLDER_MAJOR:
+                {
+                    const Protocol::MsgConnectionAck ack( 4 );
+                    memcpy( bytes, &ack, size );
+                    bytes[ Protocol::kAckProtocolMajorOffset ] = (uint8_t)( Protocol::kVersionMajor - 1 );
+                    break;
+                }
+                case ACK_TOO_SHORT:
+                {
+                    const Protocol::MsgConnectionAck ack( 4 );
+                    memcpy( bytes, &ack, size );
+                    size = ( Protocol::kHandshakePrefixSize + 2 ); // The version fields and a little more
+                    break;
+                }
+            }
+            Send( connection, bytes, (uint32_t)size );
+        }
+        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage &, void *, uint32_t ) override {}
+
+        const Reply m_Reply;
+    };
+
+    // Ends a build that waits for something that never happens, so the test can fail instead of hang
+    class BuildWatchdog
+    {
+    public:
+        explicit BuildWatchdog( float seconds ) : m_Seconds( seconds ) { m_Thread.Start( ThreadFunc, "Watchdog", this ); }
+        ~BuildWatchdog() { m_Stop.Store( true ); m_Thread.Join(); }
+        explicit BuildWatchdog( const BuildWatchdog & other ) = delete;
+        BuildWatchdog & operator=( const BuildWatchdog & other ) = delete;
+        bool HasFired() const { return m_Fired.Load(); }
+
+    private:
+        static uint32_t ThreadFunc( void * param )
+        {
+            BuildWatchdog * w = static_cast<BuildWatchdog *>( param );
+            const Timer timer;
+            while ( w->m_Stop.Load() == false )
+            {
+                if ( timer.GetElapsed() > w->m_Seconds )
+                {
+                    w->m_Fired.Store( true );
+                    FBuild::AbortBuild();
+                    break;
+                }
+                Thread::Sleep( 1 );
+            }
+            return 0;
+        }
+        const float m_Seconds;
+        Thread m_Thread;
+        Atomic<bool> m_Stop{ false };
+        Atomic<bool> m_Fired{ false };
+    };
+
+    // Watches the workers a build gives up on, which it does while the build runs
+    class DenyListPoller
+    {
+    public:
+        explicit DenyListPoller( const FBuild & build ) : m_Build( build ) { m_Thread.Start( ThreadFunc, "DenyListPoller", this ); }
+        ~DenyListPoller() { m_Stop.Store( true ); m_Thread.Join(); }
+        explicit DenyListPoller( const DenyListPoller & other ) = delete;
+        DenyListPoller & operator=( const DenyListPoller & other ) = delete;
+        uint32_t GetMax() const { return m_Max.Load(); }
+
+    private:
+        static uint32_t ThreadFunc( void * param )
+        {
+            DenyListPoller * p = static_cast<DenyListPoller *>( param );
+            while ( p->m_Stop.Load() == false )
+            {
+                const uint32_t n = p->m_Build.GetNumDenyListedWorkers();
+                if ( n > p->m_Max.Load() )
+                {
+                    p->m_Max.Store( n );
+                }
+                Thread::Sleep( 1 );
+            }
+            return 0;
+        }
+        const FBuild & m_Build;
+        Thread m_Thread;
+        Atomic<bool> m_Stop{ false };
+        Atomic<uint32_t> m_Max{ 0 };
+    };
+
+    uint32_t CountOccurrences( const AString & text, const char * what )
+    {
+        uint32_t count = 0;
+        const char * pos = text.Find( what );
+        while ( pos != nullptr )
+        {
+            ++count;
+            pos = text.Find( what, pos + AString::StrLen( what ) );
+        }
+        return count;
+    }
 }
 
 // ToolchainInventoryFollowsAck
@@ -2325,19 +2520,336 @@ void TestDistributed::MismatchedProtocolVersionIsRefused() const
     TEST_ASSERT( ci );
 
     // Handshake from a client with the previous protocol version
-    const Protocol::MsgConnection msg;
-    uint8_t bytes[ sizeof( msg ) ];
-    memcpy( bytes, &msg, sizeof( msg ) );
-    const size_t versionOffset = sizeof( Protocol::IMessage );
-    TEST_ASSERT( bytes[ versionOffset ] == Protocol::kVersionMajor ); // Found the right byte
-    bytes[ versionOffset ] = (uint8_t)( Protocol::kVersionMajor - 1 );
-    TEST_ASSERT( probe.Send( ci, bytes, sizeof( bytes ) ) );
+    HandshakeBytes handshake;
+    TEST_ASSERT( handshake.bytes[ Protocol::kConnectionVersionOffset ] == Protocol::kVersionMajor ); // Found the right byte
+    handshake.bytes[ Protocol::kConnectionVersionOffset ] = (uint8_t)( Protocol::kVersionMajor - 1 );
+    TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
 
-    // The worker drops the connection without acknowledging it
+    // The worker says which version it is, and drops the connection without acknowledging it
     TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
-    TEST_ASSERT( probe.GetNumMessages() == 0 );
+    TEST_ASSERT( probe.GetNumMessages() == 1 );
+    TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_REFUSED );
+    TEST_ASSERT( probe.GetRefusedMajor() == Protocol::kVersionMajor );
+    TEST_ASSERT( probe.GetRefusedMinor() == Protocol::kVersionMinor );
 
     probe.ShutdownAllConnections();
+}
+
+// HandshakeLayoutIsFrozen
+//------------------------------------------------------------------------------
+void TestDistributed::HandshakeLayoutIsFrozen() const
+{
+    // A worker of another major can only be told apart by these bytes, so they stay where they are
+    const Protocol::MsgConnection connection;
+    uint8_t bytes[ sizeof( connection ) ];
+    memcpy( bytes, &connection, sizeof( connection ) );
+    TEST_ASSERT( bytes[ 0 ] == Protocol::MSG_CONNECTION );
+    TEST_ASSERT( bytes[ 1 ] == sizeof( connection ) );
+    TEST_ASSERT( bytes[ Protocol::kConnectionVersionOffset ] == Protocol::kVersionMajor );
+
+    const Protocol::MsgConnectionAck ack( 4 );
+    uint8_t ackBytes[ sizeof( ack ) ];
+    memcpy( ackBytes, &ack, sizeof( ack ) );
+    TEST_ASSERT( ackBytes[ 0 ] == Protocol::MSG_CONNECTION_ACK );
+    TEST_ASSERT( ackBytes[ Protocol::kAckProtocolMajorOffset ] == Protocol::kVersionMajor );
+    TEST_ASSERT( ackBytes[ Protocol::kAckProtocolMinorOffset ] == Protocol::kVersionMinor );
+    uint16_t workerVersion = 0;
+    memcpy( &workerVersion, ackBytes + Protocol::kAckWorkerVersionOffset, sizeof( workerVersion ) );
+    TEST_ASSERT( workerVersion == ack.GetWorkerVersion() );
+
+    const Protocol::MsgRefused refused;
+    uint8_t refusedBytes[ sizeof( refused ) ];
+    memcpy( refusedBytes, &refused, sizeof( refused ) );
+    TEST_ASSERT( refusedBytes[ 0 ] == Protocol::MSG_REFUSED );
+    TEST_ASSERT( refusedBytes[ Protocol::kAckProtocolMajorOffset ] == Protocol::kVersionMajor );
+    TEST_ASSERT( refusedBytes[ Protocol::kAckProtocolMinorOffset ] == Protocol::kVersionMinor );
+
+    // and the frames of a message that only carries them are exactly as long as what is read
+    TEST_ASSERT( sizeof( refused ) == Protocol::kHandshakePrefixSize );
+    TEST_ASSERT( Protocol::GetMinMessageSize( Protocol::MSG_CONNECTION ) == Protocol::kHandshakePrefixSize );
+    TEST_ASSERT( Protocol::GetMinMessageSize( Protocol::MSG_CONNECTION_ACK ) == Protocol::kHandshakePrefixSize );
+}
+
+// VersionDescriptionNamesTheProtocol
+//------------------------------------------------------------------------------
+void TestDistributed::VersionDescriptionNamesTheProtocol() const
+{
+    AStackString description;
+    Protocol::GetVersionDescription( description );
+    AStackString expected;
+    expected.Format( "protocol v%u.%u", Protocol::kVersionMajor, (uint32_t)Protocol::kVersionMinor );
+    TEST_ASSERT( description == expected );
+}
+
+// ShortMessagesAreRejected
+//------------------------------------------------------------------------------
+void TestDistributed::ShortMessagesAreRejected() const
+{
+    // Every message needs its whole size, apart from the handshakes, which need their version fields
+    TEST_ASSERT( Protocol::IsFrameLongEnough( nullptr, 0 ) == false );
+    for ( uint32_t type = 1; type < Protocol::NUM_MESSAGES; ++type )
+    {
+        const uint32_t minSize = Protocol::GetMinMessageSize( (Protocol::MessageType)type );
+        TEST_ASSERT( minSize >= sizeof( Protocol::IMessage ) );
+        uint8_t frame[ 256 ];
+        memset( frame, 0, sizeof( frame ) );
+        frame[ 0 ] = (uint8_t)type;
+        TEST_ASSERT( Protocol::IsFrameLongEnough( frame, minSize - 1 ) == false );
+        TEST_ASSERT( Protocol::IsFrameLongEnough( frame, minSize ) );
+        TEST_ASSERT( Protocol::IsFrameLongEnough( frame, minSize + 8 ) );
+    }
+    const uint8_t tooShortForAType[ 3 ] = { Protocol::MSG_JOB, 0, 0 };
+    TEST_ASSERT( Protocol::IsFrameLongEnough( tooShortForAType, sizeof( tooShortForAType ) ) == false );
+
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    // The worker closes the connection to a client that sends one, without answering
+    HandshakeBytes handshake;
+    const Protocol::MsgJob job( 1, 0 );
+    struct Frame { const void * data; uint32_t size; };
+    const Frame frames[] = {
+        { handshake.bytes, 3 },                                    // Not even a header
+        { handshake.bytes, Protocol::kHandshakePrefixSize - 1 },   // A handshake that stops before the version
+        { &job, (uint32_t)sizeof( job ) - 1 },                     // A job without its last byte
+    };
+    for ( const Frame & frame : frames )
+    {
+        HandshakeProbe probe;
+        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+        TEST_ASSERT( ci );
+        TEST_ASSERT( probe.Send( ci, frame.data, frame.size ) );
+        TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+        TEST_ASSERT( probe.GetNumMessages() == 0 );
+        probe.ShutdownAllConnections();
+    }
+
+    // A handshake of this version that is too short for it is not read past its end
+    {
+        HandshakeProbe probe;
+        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+        TEST_ASSERT( ci );
+        TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) - 1 ) );
+        TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+        TEST_ASSERT( probe.GetNumMessages() == 0 );
+        probe.ShutdownAllConnections();
+    }
+}
+
+// LongerMessagesAreAccepted
+//------------------------------------------------------------------------------
+void TestDistributed::LongerMessagesAreAccepted() const
+{
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    // A later minor version may add to a message, and only the part that is known is read
+    HandshakeBytes handshake;
+    uint8_t longer[ sizeof( handshake.bytes ) + 8 ];
+    memset( longer, 0xAB, sizeof( longer ) );
+    memcpy( longer, handshake.bytes, sizeof( handshake.bytes ) );
+    longer[ 1 ] = (uint8_t)sizeof( longer ); // Its own size
+
+    HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    TEST_ASSERT( ci );
+    TEST_ASSERT( probe.Send( ci, longer, sizeof( longer ) ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
+    TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
+    TEST_ASSERT( probe.IsDisconnected() == false );
+    probe.ShutdownAllConnections();
+}
+
+// CapabilitiesAreExchanged
+//------------------------------------------------------------------------------
+void TestDistributed::CapabilitiesAreExchanged() const
+{
+    // The worker keeps what the client says it has, and tells the client what it has
+    {
+        Server s( 1 );
+        TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+        HandshakeProbe probe;
+        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+        TEST_ASSERT( ci );
+        HandshakeBytes handshake;
+        handshake.SetCapabilities( Protocol::CAP_PCH_CHUNKS | Protocol::CAP_JOB_STREAM );
+        TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
+        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 1 ); } ) );
+        TEST_ASSERT( probe.GetAckCapabilities() == Protocol::kCapabilities );
+
+        auto peerState = [ &s ]( uint8_t & outMinor, uint32_t & outCapabilities )
+        {
+            MutexHolder mh( s.m_ClientListMutex );
+            if ( s.m_ClientList.GetSize() != 1 )
+            {
+                return false;
+            }
+            MutexHolder mh2( s.m_ClientList[ 0 ]->m_Mutex );
+            outMinor = s.m_ClientList[ 0 ]->m_PeerMinor;
+            outCapabilities = s.m_ClientList[ 0 ]->m_PeerCapabilities;
+            return true;
+        };
+        uint8_t minor = 0xFF;
+        uint32_t capabilities = 0;
+        TEST_ASSERT( peerState( minor, capabilities ) );
+        TEST_ASSERT( minor == Protocol::kVersionMinor );
+        TEST_ASSERT( capabilities == ( Protocol::CAP_PCH_CHUNKS | Protocol::CAP_JOB_STREAM ) );
+        probe.ShutdownAllConnections();
+    }
+
+    // The worker has to be told by the client: it does not assume anything
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_ForceCleanBuild = true;
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+        NoCapacityWorker worker;
+        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( fBuild.Build( "../tmp/Test/Distributed/Local/distpchlocal.lib" ) );
+        worker.ShutdownAllConnections();
+        TEST_ASSERT( worker.GetNumConnections() >= 1 );
+        TEST_ASSERT( worker.GetClientCapabilities() == Protocol::kCapabilities );
+    }
+}
+
+// ServerSendsOnlyWhatTheClientAdvertises
+//------------------------------------------------------------------------------
+void TestDistributed::ServerSendsOnlyWhatTheClientAdvertises() const
+{
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    struct Case { uint32_t capabilities; size_t numMessages; };
+    const Case cases[] = {
+        { 0, 1 },                                                                           // The ack alone
+        { Protocol::CAP_PCH_INVENTORY, 2 },                                                 // and the PCH inventory
+        { Protocol::CAP_PCH_INVENTORY | Protocol::CAP_TOOLCHAIN_INVENTORY, 3 },             // and the toolchain inventory
+        { Protocol::CAP_TOOLCHAIN_INVENTORY | ( 1u << 31 ), 2 },                            // A bit nobody knows is ignored
+    };
+    for ( const Case & c : cases )
+    {
+        HandshakeProbe probe;
+        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+        TEST_ASSERT( ci );
+        HandshakeBytes handshake;
+        handshake.SetCapabilities( c.capabilities );
+        TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
+        TEST_ASSERT( WaitUntil( [ & ]() { return ( probe.GetNumMessages() >= c.numMessages ); } ) );
+        Thread::Sleep( 200 ); // Anything more would have come by now
+        TEST_ASSERT( probe.GetNumMessages() == c.numMessages );
+        TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
+        probe.ShutdownAllConnections();
+    }
+}
+
+// ClientRefusesAWorkerThatRefusesIt, ClientRefusesAnAckOfAnotherMajor, ClientRejectsAShortAck
+//------------------------------------------------------------------------------
+namespace
+{
+    // A build that compiles here while a worker answers the client's handshake in a way it can not accept.
+    // Returns how many workers the build gave up on.
+    uint32_t BuildAgainstOddWorker( OddHandshakeWorker::Reply reply, bool & outBuilt, uint32_t & outConnections )
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_ForceCleanBuild = true;
+        FBuildForTest fBuild( options );
+        if ( fBuild.Initialize() == false )
+        {
+            outBuilt = false;
+            return 0;
+        }
+        OddHandshakeWorker worker( reply );
+        if ( worker.Listen( Protocol::kTestPort ) == false )
+        {
+            outBuilt = false;
+            return 0;
+        }
+        DenyListPoller poller( fBuild );
+        outBuilt = fBuild.Build( "../tmp/Test/Distributed/Local/distpchlocal.lib" );
+        worker.ShutdownAllConnections();
+        outConnections = worker.GetNumConnections();
+        return poller.GetMax();
+    }
+}
+
+void TestDistributed::ClientRefusesAWorkerThatRefusesIt() const
+{
+    bool built = false;
+    uint32_t connections = 0;
+    const uint32_t denyListed = BuildAgainstOddWorker( OddHandshakeWorker::REFUSE_AS_NEWER_MAJOR, built, connections );
+    TEST_ASSERT( built );
+    TEST_ASSERT( connections == 1 );
+
+    // The user is told once, with both versions, and the worker is left alone
+    const AString & output = GetRecordedOutput();
+    AStackString expected;
+    expected.Format( "worker 127.0.0.1 runs protocol v%u.%u, this FBuild is v%u.%u: update FBuild and FBuildWorker together",
+                     Protocol::kVersionMajor + 1, (uint32_t)Protocol::kVersionMinor, Protocol::kVersionMajor, (uint32_t)Protocol::kVersionMinor );
+    TEST_ASSERT( CountOccurrences( output, expected.Get() ) == 1 );
+    TEST_ASSERT( denyListed == 1 );
+}
+
+void TestDistributed::ClientRefusesAnAckOfAnotherMajor() const
+{
+    bool built = false;
+    uint32_t connections = 0;
+    const uint32_t denyListed = BuildAgainstOddWorker( OddHandshakeWorker::ACK_OF_OLDER_MAJOR, built, connections );
+    TEST_ASSERT( built );
+    TEST_ASSERT( connections == 1 );
+
+    AStackString expected;
+    expected.Format( "worker 127.0.0.1 runs protocol v%u.%u, this FBuild is v%u.%u: update FBuild and FBuildWorker together",
+                     Protocol::kVersionMajor - 1, (uint32_t)Protocol::kVersionMinor, Protocol::kVersionMajor, (uint32_t)Protocol::kVersionMinor );
+    TEST_ASSERT( CountOccurrences( GetRecordedOutput(), expected.Get() ) == 1 );
+    TEST_ASSERT( denyListed == 1 );
+}
+
+void TestDistributed::ClientRejectsAShortAck() const
+{
+    bool built = false;
+    uint32_t connections = 0;
+    const uint32_t denyListed = BuildAgainstOddWorker( OddHandshakeWorker::ACK_TOO_SHORT, built, connections );
+    TEST_ASSERT( built );
+    TEST_ASSERT( connections == 1 );
+
+    // An ack of this version that stops short is a broken worker, not another version. It is dropped,
+    // and the user is told once that the handshake did not complete.
+    const AString & output = GetRecordedOutput();
+    TEST_ASSERT( CountOccurrences( output, "closed the connection during the handshake" ) == 1 );
+    TEST_ASSERT( CountOccurrences( output, " runs protocol v" ) == 0 );
+    TEST_ASSERT( denyListed == 0 );
+}
+
+// ClientDoesNotWaitForInventoriesTheWorkerLacks
+//------------------------------------------------------------------------------
+void TestDistributed::ClientDoesNotWaitForInventoriesTheWorkerLacks() const
+{
+    // A worker that does not have the inventories does not send them, so jobs must not wait for them
+    const uint32_t capabilities = ( Protocol::kCapabilities & ~( Protocol::CAP_PCH_INVENTORY | Protocol::CAP_TOOLCHAIN_INVENTORY ) );
+
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    CorruptResultWorker worker( capabilities );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    BuildWatchdog watchdog( 20.0f );
+    fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
+    worker.ShutdownAllConnections();
+
+    TEST_ASSERT( watchdog.HasFired() == false );
+    TEST_ASSERT( worker.GetNumResultsSent() >= 1 ); // A job reached the worker
 }
 
 // RegressionTest_RemoteCrashOnErrorFormatting

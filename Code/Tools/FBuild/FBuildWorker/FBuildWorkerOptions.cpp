@@ -7,6 +7,7 @@
 
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/FBuildVersion.h"
+#include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 
 // Core
 #include "Core/Containers/Array.h"
@@ -158,7 +159,9 @@ bool FBuildWorkerOptions::ProcessCommandLine( const AString & commandLine )
 void FBuildWorkerOptions::ShowUsageError()
 {
     AStackString msg;
-    msg.Format( "FBuildWorker.exe - %s\n", GetVersionString() );
+    AStackString protocol;
+    Protocol::GetVersionDescription( protocol );
+    msg.Format( "FBuildWorker.exe - %s (%s)\n", GetVersionString(), protocol.Get() );
     msg.Append( "Copyright 2012-2026 Franta Fulin - https://www.fastbuild.org\n"
                 "\n"
                 "Command Line Options:\n"

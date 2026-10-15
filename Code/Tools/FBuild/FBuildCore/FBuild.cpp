@@ -976,6 +976,14 @@ uint32_t FBuild::GetNumWorkerConnections() const
     return (uint32_t)( m_Client ? m_Client->GetNumConnections() : 0 );
 }
 
+// GetNumDenyListedWorkers
+//------------------------------------------------------------------------------
+uint32_t FBuild::GetNumDenyListedWorkers() const
+{
+    MutexHolder mh( m_ClientLifetimeMutex );
+    return ( m_Client ? m_Client->GetNumDenyListedWorkers() : 0 );
+}
+
 // OnDistributableCompiler
 //------------------------------------------------------------------------------
 void FBuild::OnDistributableCompiler( const ToolManifest & manifest )
