@@ -123,6 +123,10 @@ public:
     static bool IsCompilerArg_MSVC( const AString & token, const char * arg );
     static bool IsStartOfCompilerArg_MSVC( const AString & token, const char * arg );
 
+    // Whether the output of a failed remote MSVC compile shows a problem of the worker (full disk,
+    // out of memory, broken installation) rather than of the code, so another worker should be tried
+    static bool IsMSVCSystemFailure( const AString & stdOut );
+
     bool IsCacheable() const { return m_CompilerFlags.IsCacheable(); }
     bool IsDistributable() const { return m_CompilerFlags.IsDistributable(); }
     bool IsUsingPCH() const { return m_CompilerFlags.IsUsingPCH(); }

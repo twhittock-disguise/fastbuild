@@ -2549,6 +2549,84 @@ Node::BuildResult ObjectNode::CompileHelper::SpawnCompiler( Job * job,
     return BuildResult::eOk;
 }
 
+// IsMSVCSystemFailure
+//------------------------------------------------------------------------------
+/*static*/ bool ObjectNode::IsMSVCSystemFailure( const AString & stdOut )
+{
+    // But we need to determine if it's actually an out of space
+    // (rather than some compile error with missing file(s))
+    // These error codes have been observed in the wild
+    if ( stdOut.Find( "C1082" ) ||
+         stdOut.Find( "C1085" ) ||
+         stdOut.Find( "C1088" ) )
+    {
+        return true;
+    }
+
+    // If the compiler can fail with C1083 on the remote host for at least the following
+    // reasons:
+    //     a) Failed to create a temp file (C1083: Cannot open compiler intermediate file)
+    //          - This was seen when the tmp dir was full (tmp file creation failed)
+    //     b) Failed to write an extra output file (C1083: Cannot open compiler generated file)
+    //          - This was seen when using /sourceDependencies and the output folder didn't exist
+    if ( stdOut.Find( "C1083" ) )
+    {
+        return true;
+    }
+
+    // The compiler could not load mspdbcore.dll, seen right after the toolchain was written on the worker
+    // (C1356: unable to find mspdbcore.dll)
+    if ( stdOut.Find( "C1356" ) )
+    {
+        return true;
+    }
+
+    // The program database manager (mspdb*.dll) is not the version the compiler expects, which is a
+    // broken or half-written toolchain on the worker (C1902: Program database manager mismatch)
+    if ( stdOut.Find( "C1902" ) )
+    {
+        return true;
+    }
+
+    // The MSVC compiler can fail with "compiler is out of heap space" even if
+    // using the 64bit toolchain. This failure can be intermittent and not
+    // repeatable with the same code on a different machine, so we don't want it
+    // to fail the build.
+    if ( stdOut.Find( "C1060" ) )
+    {
+        // If either of these are present
+        //  - C1076 : compiler limit : internal heap limit reached; use /Zm to specify a higher limit
+        //  - C3859 : virtual memory range for PCH exceeded; please recompile with a command line option of '-Zmvalue' or greater
+        // then the issue is related to compiler settings.
+        // If they are not present, it's a system error, possibly caused by system resource
+        // exhaustion on the remote machine
+        if ( ( stdOut.Find( "C1076" ) == nullptr ) &&
+             ( stdOut.Find( "C3859" ) == nullptr ) )
+        {
+            return true;
+        }
+    }
+
+    // If the compiler crashed (Internal Compiler Error), treat this
+    // as a system error so it will be retried, since it can also be
+    // the result of faulty hardware.
+    if ( stdOut.Find( "C1001" ) )
+    {
+        return true;
+    }
+
+    // Error messages above also contains this text
+    // (We check for this message additionally to handle other error codes
+    //  that may not have been observed yet)
+    // TODO:C Should we check for localized msg?
+    if ( stdOut.Find( "No space left on device" ) )
+    {
+        return true;
+    }
+
+    return false;
+}
+
 // HandleSystemFailures
 //------------------------------------------------------------------------------
 /*static*/ void ObjectNode::HandleSystemFailures( Job * job, int result, const AString & stdOut, const AString & stdErr )
@@ -2625,69 +2703,10 @@ Node::BuildResult ObjectNode::CompileHelper::SpawnCompiler( Job * job,
 
 #if defined( __WINDOWS__ )
     // MSVC errors
-    if ( objectNode->IsMSVC() )
+    if ( objectNode->IsMSVC() && IsMSVCSystemFailure( stdOut ) )
     {
-        // But we need to determine if it's actually an out of space
-        // (rather than some compile error with missing file(s))
-        // These error codes have been observed in the wild
-        if ( stdOut.Find( "C1082" ) ||
-             stdOut.Find( "C1085" ) ||
-             stdOut.Find( "C1088" ) )
-        {
-            job->OnSystemError();
-            return;
-        }
-
-        // If the compiler can fail with C1083 on the remote host for at least the following
-        // reasons:
-        //     a) Failed to create a temp file (C1083: Cannot open compiler intermediate file)
-        //          - This was seen when the tmp dir was full (tmp file creation failed)
-        //     b) Failed to write an extra output file (C1083: Cannot open compiler generated file)
-        //          - This was seen when using /sourceDependencies and the output folder didn't exist
-        if ( stdOut.Find( "C1083" ) )
-        {
-            job->OnSystemError();
-            return;
-        }
-
-        // The MSVC compiler can fail with "compiler is out of heap space" even if
-        // using the 64bit toolchain. This failure can be intermittent and not
-        // repeatable with the same code on a different machine, so we don't want it
-        // to fail the build.
-        if ( stdOut.Find( "C1060" ) )
-        {
-            // If either of these are present
-            //  - C1076 : compiler limit : internal heap limit reached; use /Zm to specify a higher limit
-            //  - C3859 : virtual memory range for PCH exceeded; please recompile with a command line option of '-Zmvalue' or greater
-            // then the issue is related to compiler settings.
-            // If they are not present, it's a system error, possibly caused by system resource
-            // exhaustion on the remote machine
-            if ( ( stdOut.Find( "C1076" ) == nullptr ) &&
-                 ( stdOut.Find( "C3859" ) == nullptr ) )
-            {
-                job->OnSystemError();
-                return;
-            }
-        }
-
-        // If the compiler crashed (Internal Compiler Error), treat this
-        // as a system error so it will be retried, since it can also be
-        // the result of faulty hardware.
-        if ( stdOut.Find( "C1001" ) )
-        {
-            job->OnSystemError();
-            return;
-        }
-
-        // Error messages above also contains this text
-        // (We check for this message additionally to handle other error codes
-        //  that may not have been observed yet)
-        // TODO:C Should we check for localized msg?
-        if ( stdOut.Find( "No space left on device" ) )
-        {
-            job->OnSystemError();
-            return;
-        }
+        job->OnSystemError(); // task will be retried on another worker
+        return;
     }
 #endif
 

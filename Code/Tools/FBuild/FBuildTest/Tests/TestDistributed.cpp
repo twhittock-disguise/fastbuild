@@ -109,6 +109,7 @@ private:
     void HostNameIsBoundedByTheFrame() const;
 #endif
     void CapabilitiesAreExchanged() const;
+    void MSVCWorkerFailuresAreRetriedElsewhere() const;
     void ServerSendsOnlyWhatTheClientAdvertises() const;
     void ClientRefusesAWorkerThatRefusesIt() const;
     void ClientRefusesAnAckOfAnotherMajor() const;
@@ -267,6 +268,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( HostNameIsBoundedByTheFrame )
 #endif
     REGISTER_TEST( CapabilitiesAreExchanged )
+    REGISTER_TEST( MSVCWorkerFailuresAreRetriedElsewhere )
     REGISTER_TEST( ServerSendsOnlyWhatTheClientAdvertises )
     REGISTER_TEST( ClientRefusesAWorkerThatRefusesIt )
     REGISTER_TEST( ClientRefusesAnAckOfAnotherMajor )
@@ -3553,6 +3555,44 @@ void TestDistributed::ClientIgnoresCapabilitiesItDidNotAdvertise() const
     TEST_ASSERT( aborter.HasTimedOut() == false );
     TEST_ASSERT( worker.GetClientCapabilities() == Protocol::CAP_PCH_INVENTORY );
     TEST_ASSERT( worker.GetNumResultsSent() >= 1 );
+}
+
+// MSVCWorkerFailuresAreRetriedElsewhere
+//------------------------------------------------------------------------------
+void TestDistributed::MSVCWorkerFailuresAreRetriedElsewhere() const
+{
+    // What the compiler prints when the worker is at fault, not the code: the job is tried on another worker
+    const char * const workerFailures[] =
+    {
+        "c1xx : fatal error C1356: unable to find mspdbcore.dll",
+        "fatal error C1902: Program database manager mismatch; please check your installation",
+        "fatal error C1082: Cannot access program database",
+        "fatal error C1085: Cannot write compiler generated file",
+        "fatal error C1088: Cannot flush compiler generated file",
+        "fatal error C1083: Cannot open compiler intermediate file",
+        "fatal error C1060: compiler is out of heap space",
+        "fatal error C1001: Internal compiler error",
+        "fatal error: No space left on device",
+        "a.cpp(1): error C2065: 'x': undeclared identifier\nc1xx : fatal error C1356: unable to find mspdbcore.dll", // Among other output
+    };
+    for ( const char * text : workerFailures )
+    {
+        TEST_ASSERT( ObjectNode::IsMSVCSystemFailure( AStackString<>( text ) ) );
+    }
+
+    // Problems of the code are left to the user, as are settings that make the compiler run out of memory
+    const char * const codeFailures[] =
+    {
+        "",
+        "a.cpp(1): error C2065: 'x': undeclared identifier",
+        "a.cpp(3): fatal error C1189: #error:  not supported",
+        "fatal error C1060: compiler is out of heap space\nfatal error C1076: compiler limit : internal heap limit reached; use /Zm to specify a higher limit",
+        "fatal error C1060: compiler is out of heap space\nerror C3859: virtual memory range for PCH exceeded; please recompile with a command line option of '-Zmvalue' or greater",
+    };
+    for ( const char * text : codeFailures )
+    {
+        TEST_ASSERT( ObjectNode::IsMSVCSystemFailure( AStackString<>( text ) ) == false );
+    }
 }
 
 // RegressionTest_RemoteCrashOnErrorFormatting
