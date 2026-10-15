@@ -11,6 +11,7 @@
 #include "Core/Containers/Array.h"
 #include "Core/Containers/UniquePtr.h"
 #include "Core/Process/Atomic.h"
+#include "Core/Process/Mutex.h"
 #include "Core/Process/Thread.h"
 #include "Core/Strings/AString.h"
 #include "Core/Time/Timer.h"
@@ -49,6 +50,10 @@ public:
 
     uint32_t GetNumConnections() const;
 
+    // Compilers the build uses with distribution. Their toolchains are sent to workers as they connect.
+    void AddToolchain( const ToolManifest * manifest );
+    void GetToolchains( Array<const ToolManifest *> & outManifests ) const;
+
 private:
     Client & operator=( const Client & other ) = delete;
 
@@ -77,6 +82,9 @@ private:
 
     // Workers we are connected to (or establishing/cleaning up a connection to)
     Array<UniquePtr<ClientToWorkerConnection>> m_ActiveConnections;
+
+    mutable Mutex m_ToolchainsMutex;
+    Array<const ToolManifest *> m_Toolchains;
 
     // State that remains constant throughout the build
     const bool m_DetailedLogging;

@@ -70,6 +70,7 @@ private:
     void ResultsAreCompressed() const;
     void CorruptResultIsRejected() const;
     void SendMutexHoldsBackResults() const;
+    void ToolchainIsSentBeforeAnyJob() const;
     void MismatchedProtocolVersionIsRefused() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
@@ -154,6 +155,7 @@ private:
         Atomic<bool>    m_ResultDeliveredWhileHeld{ false };
     };
     static uint32_t HoldSendMutexOnFirstJob( void * param );
+    static uint32_t AbortOnceToolchainArrives( void * param );
 
     // Totals over the lines starting with linePrefix in the client's stats log, for lines like
     // "  jobs:      12 msgs, 1.1 MB raw, 40.2 KB sent, ..." (first is raw, second is sent or received)
@@ -187,6 +189,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ResultsAreCompressed )
     REGISTER_TEST( CorruptResultIsRejected )
     REGISTER_TEST( SendMutexHoldsBackResults )
+    REGISTER_TEST( ToolchainIsSentBeforeAnyJob )
     REGISTER_TEST( MismatchedProtocolVersionIsRefused )
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
@@ -1459,6 +1462,116 @@ void TestDistributed::SendMutexHoldsBackResults() const
     TEST_ASSERT( hold.m_ResultDeliveredWhileHeld.Load() == false );
     TEST_ASSERT( hold.m_StateMutexFree.Load() );
     TEST_ASSERT( built );
+}
+
+// ToolchainIsSentBeforeAnyJob
+//------------------------------------------------------------------------------
+namespace
+{
+    // A worker that completes the handshake but has no capacity, so no job is ever sent to it
+    class NoCapacityWorker : public TCPConnectionPool
+    {
+    public:
+        NoCapacityWorker() = default;
+        explicit NoCapacityWorker( const NoCapacityWorker & other ) = delete;
+        NoCapacityWorker & operator=( const NoCapacityWorker & other ) = delete;
+
+        uint32_t GetNumManifests() const { return m_NumManifests.Load(); }
+        uint32_t GetNumFiles() const { return m_NumFiles.Load(); }
+        uint32_t GetNumJobs() const { return m_NumJobs.Load(); }
+
+    private:
+        virtual void OnReceive( const ConnectionInfo * connection, void * data, uint32_t, bool & keepMemory ) override
+        {
+            keepMemory = true; // freed below
+
+            void * payload = nullptr;
+            if ( m_CurrentMessage == nullptr )
+            {
+                m_CurrentMessage = static_cast<const Protocol::IMessage *>( data );
+                if ( m_CurrentMessage->HasPayload() )
+                {
+                    return;
+                }
+            }
+            else
+            {
+                payload = data;
+            }
+
+            switch ( m_CurrentMessage->GetType() )
+            {
+                case Protocol::MSG_CONNECTION:
+                {
+                    const Protocol::MsgConnectionAck ack( 0 );
+                    const Protocol::MsgPchInventory pchInventory( 0 );
+                    const Protocol::MsgToolchainInventory toolchainInventory( 0 );
+                    ack.Send( connection );
+                    pchInventory.Send( connection );
+                    toolchainInventory.Send( connection );
+                    break;
+                }
+                case Protocol::MSG_MANIFEST: m_NumManifests.Increment(); break;
+                case Protocol::MSG_FILE: m_NumFiles.Increment(); break;
+                case Protocol::MSG_JOB: m_NumJobs.Increment(); break;
+                default: break;
+            }
+
+            FREE( (void *)m_CurrentMessage );
+            FREE( payload );
+            m_CurrentMessage = nullptr;
+        }
+
+        const Protocol::IMessage * m_CurrentMessage = nullptr;
+        Atomic<uint32_t> m_NumManifests{ 0 };
+        Atomic<uint32_t> m_NumFiles{ 0 };
+        Atomic<uint32_t> m_NumJobs{ 0 };
+    };
+
+    struct ToolchainWatch
+    {
+        const NoCapacityWorker * m_Worker = nullptr;
+        Atomic<bool> m_ToolchainArrived{ false };
+    };
+}
+
+/*static*/ uint32_t TestDistributed::AbortOnceToolchainArrives( void * param )
+{
+    ToolchainWatch * watch = static_cast<ToolchainWatch *>( param );
+    watch->m_ToolchainArrived.Store( WaitUntil( [ watch ]() { return ( watch->m_Worker->GetNumManifests() >= 1 ) &&
+                                                                       ( watch->m_Worker->GetNumFiles() >= 1 ); } ) );
+    FBuild::AbortBuild();
+    return 0;
+}
+
+void TestDistributed::ToolchainIsSentBeforeAnyJob() const
+{
+    // The worker has no capacity, so the build never sends it a job. It is sent the toolchain
+    // regardless, as soon as the compiler is known, so the upload does not wait for the first job.
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true; // jobs stay queued for the remote worker
+    options.m_AllowLocalRace = false;
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    NoCapacityWorker worker;
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    ToolchainWatch watch;
+    watch.m_Worker = &worker;
+    Thread watcher;
+    watcher.Start( AbortOnceToolchainArrives, "ToolchainWatch", &watch );
+    const bool built = fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
+    watcher.Join();
+    worker.ShutdownAllConnections();
+
+    TEST_ASSERT( built == false ); // Aborted
+    TEST_ASSERT( watch.m_ToolchainArrived.Load() );
+    TEST_ASSERT( worker.GetNumJobs() == 0 );
 }
 
 // Handshake tests

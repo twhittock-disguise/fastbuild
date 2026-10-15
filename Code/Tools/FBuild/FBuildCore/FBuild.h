@@ -20,6 +20,7 @@
 // Forward Declarations
 //------------------------------------------------------------------------------
 class Client;
+class CompilerNode;
 class Dependencies;
 class FileStream;
 class ICache;
@@ -118,6 +119,10 @@ public:
     bool CacheTrim() const;
 
     uint32_t GetNumWorkerConnections() const;
+
+    // A compiler used by distributable objects has been found. Workers are sent its toolchain
+    // as soon as they connect, rather than once the first job is ready.
+    void OnDistributableCompiler( const CompilerNode & compiler );
 
 protected:
     bool GetTargets( const Array<AString> & targets, Dependencies & outDeps ) const;

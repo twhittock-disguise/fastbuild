@@ -561,6 +561,11 @@ ObjectListNode::~ObjectListNode() = default;
 //------------------------------------------------------------------------------
 /*virtual*/ bool ObjectListNode::DoDynamicDependencies( NodeGraph & nodeGraph )
 {
+    if ( m_AllowDistribution && m_CompilerNode->CanBeDistributed() && FBuild::Get().GetOptions().m_AllowDistributed )
+    {
+        FBuild::Get().OnDistributableCompiler( *m_CompilerNode );
+    }
+
     if ( GatherDynamicDependencies( nodeGraph ) == false )
     {
         return false; // GatherDynamicDependencies will have emitted error

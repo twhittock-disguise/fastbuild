@@ -84,13 +84,15 @@ public:
                                   ConstMemoryStream && payload,
                                   SendKind kind,
                                   uint64_t rawBytes,
-                                  bool streamCompress )
+                                  bool streamCompress,
+                                  uint64_t pchId = 0 )
         : m_Message( msg.GetSize() ) // Prealloc exact size needed
         , m_HasPayload( true )
         , m_Payload( Move( payload ) )
         , m_Kind( kind )
         , m_RawBytes( rawBytes )
         , m_StreamCompress( streamCompress )
+        , m_PchId( pchId )
     {
         VERIFY( m_Message.WriteBuffer( &msg, msg.GetSize() ) == msg.GetSize() );
     }
@@ -109,6 +111,7 @@ public:
     SendKind m_Kind = SendKind::Control;
     uint64_t m_RawBytes = 0; // Size before compression, for stats
     bool m_StreamCompress = false; // Payload is compressed by the send thread, against the jobs sent before it
+    uint64_t m_PchId = 0; // The PCH the payload holds, if it is one
 };
 
 //------------------------------------------------------------------------------
@@ -128,6 +131,7 @@ public:
 
     ClientWorkerInfo * GetWorker() const { return m_Worker; }
 
+    void PushToolchainsToWorker();
     void PushJobsToWorker();
     void SendPendingPchs();
 
@@ -137,7 +141,8 @@ public:
     void EnqueueSend( const T & msg,
                       ConstMemoryStream && payload,
                       SendKind kind = SendKind::Control,
-                      uint64_t rawBytes = 0 );
+                      uint64_t rawBytes = 0,
+                      uint64_t pchId = 0 );
     void EnqueueJob( const Protocol::MsgJob & msg, ConstMemoryStream && payload );
 
 private:
@@ -154,6 +159,8 @@ private:
 
     void ProcessJobResultCommon( bool isCompressed, const void * payload, size_t payloadSize );
 
+    void QueueToolchain( const ToolManifest & manifest );
+    void GetPchState( Array<uint64_t> & outOnWorker, Array<uint64_t> & outSending, uint32_t & outNumHeld ) const;
     const ToolManifest * FindManifest( uint64_t toolId ) const;
     bool WriteFileToDisk( const AString & fileName, const MultiBuffer & multiBuffer, size_t index ) const;
 
@@ -190,6 +197,7 @@ private:
     Array<uint64_t> m_CachedToolchains; // Reported by the worker and not used yet. Protected by m_Mutex
     Atomic<uint32_t> m_NumSkippedToolchains{ 0 }; // Toolchains the worker had, so we did not send them
     Array<uint64_t> m_SentPchIds;     // Protected by m_Mutex
+    Array<uint64_t> m_DeliveredPchIds; // Reported by the worker, or fully sent to it. Protected by m_Mutex
     Array<uint64_t> m_PendingPchIds;  // Needed by this worker, not yet queued. Protected by m_Mutex
     Atomic<uint32_t> m_UnsentJobs{ 0 }; // Queued for the send thread, not yet sent
     JobStreamEncoder m_JobEncoder; // Send thread only. A new connection starts a new stream.
@@ -230,6 +238,23 @@ Client::~Client()
 
     m_ShouldExit.Store( true );
     m_Thread.Join();
+}
+
+//------------------------------------------------------------------------------
+void Client::AddToolchain( const ToolManifest * manifest )
+{
+    MutexHolder mh( m_ToolchainsMutex );
+    if ( m_Toolchains.Find( manifest ) == nullptr )
+    {
+        m_Toolchains.Append( manifest );
+    }
+}
+
+//------------------------------------------------------------------------------
+void Client::GetToolchains( Array<const ToolManifest *> & outManifests ) const
+{
+    MutexHolder mh( m_ToolchainsMutex );
+    outManifests = m_Toolchains;
 }
 
 //------------------------------------------------------------------------------
@@ -470,10 +495,11 @@ void Client::CommunicateJobAvailability()
 {
     PROFILE_FUNCTION;
 
-    // PCHs finish compressing independently of job availability
-    // (this call comes before the early-out so they are still sent once the queue drains)
+    // Toolchains and PCHs are sent independently of job availability
+    // (this comes before the early-out so they are still sent once the queue drains)
     for ( UniquePtr<ClientToWorkerConnection> & ss : m_ActiveConnections )
     {
+        ss->PushToolchainsToWorker();
         ss->SendPendingPchs();
     }
 
@@ -665,6 +691,10 @@ void ClientToWorkerConnection::Process( const Protocol::MsgPchInventory * msg,
             {
                 m_SentPchIds.Append( pchIds[ i ] );
             }
+            if ( m_DeliveredPchIds.Find( pchIds[ i ] ) == nullptr )
+            {
+                m_DeliveredPchIds.Append( pchIds[ i ] );
+            }
         }
     }
 
@@ -706,6 +736,103 @@ void ClientToWorkerConnection::Process( const Protocol::MsgToolchainInventory * 
     PushJobsToWorker();
 }
 
+// QueueToolchain
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::QueueToolchain( const ToolManifest & manifest )
+{
+    const uint64_t toolId = manifest.GetToolId();
+    if ( toolId == 0 )
+    {
+        return;
+    }
+
+    MutexHolder mh( m_Mutex );
+    if ( m_SentToolchains.Find( toolId ) == nullptr )
+    {
+        MemoryStream ms;
+        manifest.SerializeForRemote( ms );
+        EnqueueSend( Protocol::MsgManifest( toolId ),
+                     Move( ConstMemoryStream( Move( ms ) ) ),
+                     SendKind::Toolchain );
+
+        const Array<ToolManifestFile> & files = manifest.GetFiles();
+        for ( uint32_t i = 0; i < files.GetSize(); ++i )
+        {
+            size_t dataSize = 0;
+            const void * data = manifest.GetFileData( i, dataSize );
+            if ( data )
+            {
+                EnqueueSend( Protocol::MsgFile( toolId, i ),
+                             Move( ConstMemoryStream( data, dataSize ) ),
+                             SendKind::Toolchain,
+                             files[ i ].GetUncompressedContentSize() );
+            }
+        }
+        m_SentToolchains.Append( toolId );
+    }
+    else if ( m_CachedToolchains.FindAndErase( toolId ) )
+    {
+        m_NumSkippedToolchains.Increment();
+        DIST_INFO( " - Toolchain 0x%016" PRIx64 " is cached on %s\n", toolId, m_Worker->m_Address.Get() );
+    }
+}
+
+// PushToolchainsToWorker
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::PushToolchainsToWorker()
+{
+    // The compilers of the build are sent as soon as they are known, rather than when the first job
+    // is ready, so the upload overlaps the PCH builds and preprocessing that come first
+    if ( m_AwaitingInventory.Load() || m_Worker->m_DenyListed || m_SendThreadQuit.Load() )
+    {
+        return;
+    }
+
+    Array<const ToolManifest *> manifests;
+    m_Client->GetToolchains( manifests );
+    for ( const ToolManifest * manifest : manifests )
+    {
+        QueueToolchain( *manifest );
+    }
+}
+
+// GetPchState
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::GetPchState( Array<uint64_t> & outOnWorker,
+                                            Array<uint64_t> & outSending,
+                                            uint32_t & outNumHeld ) const
+{
+    MutexHolder mh( m_Mutex );
+
+    outOnWorker = m_DeliveredPchIds;
+
+    // Queued for sending, in the order they go out
+    for ( const uint64_t pchId : m_SentPchIds )
+    {
+        if ( outOnWorker.Find( pchId ) == nullptr )
+        {
+            outSending.Append( pchId );
+        }
+    }
+    for ( const uint64_t pchId : m_PendingPchIds )
+    {
+        if ( ( outOnWorker.Find( pchId ) == nullptr ) && ( outSending.Find( pchId ) == nullptr ) )
+        {
+            outSending.Append( pchId );
+        }
+    }
+
+    outNumHeld = 0;
+    for ( const Job * job : m_Jobs )
+    {
+        const uint64_t pchId = job->GetPchId();
+        if ( ( pchId != 0 ) && ( outOnWorker.Find( pchId ) == nullptr ) )
+        {
+            ++outNumHeld;
+        }
+    }
+}
+
 // PushJobsToWorker
 //------------------------------------------------------------------------------
 void ClientToWorkerConnection::PushJobsToWorker()
@@ -722,6 +849,9 @@ void ClientToWorkerConnection::PushJobsToWorker()
     const uint8_t workerMinorProtocolVersion = m_ProtocolVersionMinor.Load();
     uint32_t toSend = capacity - inFlight;
 
+    // At most half the slots hold jobs waiting for a PCH, so jobs that can run are never shut out
+    const uint32_t maxHeld = Math::Max( 1u, capacity / 2u );
+
     while ( toSend > 0 )
     {
         // Jobs are compressed as they are sent. Take no more than the send thread can use,
@@ -731,7 +861,15 @@ void ClientToWorkerConnection::PushJobsToWorker()
             break;
         }
 
-        Job * job = JobQueue::Get().GetDistributableJobToProcess( true, workerMinorProtocolVersion );
+        Array<uint64_t> onWorker;
+        Array<uint64_t> sending;
+        PchWorkerState pchState;
+        GetPchState( onWorker, sending, pchState.m_NumHeld );
+        pchState.m_OnWorker = &onWorker;
+        pchState.m_Sending = &sending;
+        pchState.m_MaxHeld = maxHeld;
+
+        Job * job = JobQueue::Get().GetDistributableJobToProcess( true, workerMinorProtocolVersion, &pchState );
         if ( job == nullptr )
         {
             break;
@@ -742,38 +880,7 @@ void ClientToWorkerConnection::PushJobsToWorker()
         const ToolManifest & manifest = n->CastTo<CompilerNode>()->GetManifest();
         const uint64_t toolId = manifest.GetToolId();
 
-        // Push toolchain if not yet sent to this worker
-        {
-            MutexHolder mh( m_Mutex );
-            if ( m_SentToolchains.Find( toolId ) == nullptr )
-            {
-                MemoryStream ms;
-                manifest.SerializeForRemote( ms );
-                EnqueueSend( Protocol::MsgManifest( toolId ),
-                             Move( ConstMemoryStream( Move( ms ) ) ),
-                             SendKind::Toolchain );
-
-                const Array<ToolManifestFile> & files = manifest.GetFiles();
-                for ( uint32_t i = 0; i < files.GetSize(); ++i )
-                {
-                    size_t dataSize = 0;
-                    const void * data = manifest.GetFileData( i, dataSize );
-                    if ( data )
-                    {
-                        EnqueueSend( Protocol::MsgFile( toolId, i ),
-                                     Move( ConstMemoryStream( data, dataSize ) ),
-                                     SendKind::Toolchain,
-                                     files[ i ].GetUncompressedContentSize() );
-                    }
-                }
-                m_SentToolchains.Append( toolId );
-            }
-            else if ( m_CachedToolchains.FindAndErase( toolId ) )
-            {
-                m_NumSkippedToolchains.Increment();
-                DIST_INFO( " - Toolchain 0x%016" PRIx64 " is cached on %s\n", toolId, m_Worker->m_Address.Get() );
-            }
-        }
+        QueueToolchain( manifest );
 
         // Queue PCH data if not yet sent to this worker
         const uint64_t pchId = job->GetPchId();
@@ -853,7 +960,8 @@ void ClientToWorkerConnection::SendPendingPchs()
         EnqueueSend( Protocol::MsgPchFile( pch.pchId, pch.uncompressedSize ),
                      Move( ConstMemoryStream( pch.data, pch.dataSize ) ),
                      SendKind::Pch,
-                     pch.uncompressedSize );
+                     pch.uncompressedSize,
+                     pch.pchId );
 
         DIST_INFO( " - Sent PCH 0x%016" PRIx64 " to %s (%zu bytes compressed)\n",
                    pch.pchId, m_Worker->m_Address.Get(), pch.dataSize );
@@ -1386,11 +1494,12 @@ template <class T>
 void ClientToWorkerConnection::EnqueueSend( const T & msg,
                                             ConstMemoryStream && payload,
                                             SendKind kind,
-                                            uint64_t rawBytes )
+                                            uint64_t rawBytes,
+                                            uint64_t pchId )
 {
     {
         MutexHolder lock( m_SendQueueMutex );
-        m_SendQueue.EmplaceBack( msg, Move( payload ), kind, rawBytes, false );
+        m_SendQueue.EmplaceBack( msg, Move( payload ), kind, rawBytes, false, pchId );
     }
     m_SendThreadWakeSemaphore.Signal();
 }
@@ -1559,6 +1668,12 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
                 stats.m_SendTime += sendTimer.GetElapsed();
                 stats.m_EncodeTime += encodeTime;
                 stats.m_LastSentAt = m_ConnectionTimer.GetElapsed();
+
+                if ( item.m_PchId != 0 )
+                {
+                    MutexHolder mh( m_Mutex );
+                    m_DeliveredPchIds.Append( item.m_PchId );
+                }
             }
 
             // If signaled to exit for any reason, don't process additional items
