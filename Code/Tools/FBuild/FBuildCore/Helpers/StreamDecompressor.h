@@ -4,6 +4,8 @@
 
 // Includes
 //------------------------------------------------------------------------------
+#include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+
 #include "Core/Env/Types.h"
 
 // Forward Declarations
@@ -14,7 +16,7 @@ template <class T> class Atomic;
 //------------------------------------------------------------------------------
 // Reads data in the format of Compressor (a header, then one zstd frame, or the data itself when it
 // did not compress) without holding the result: it goes to a Sink as it is produced. The input may
-// be fed in pieces of any size. LZ4 is not read.
+// be fed in pieces of any size. LZ4 is not read: it is a failure, as is any format but zstd or uncompressed.
 class StreamDecompressor
 {
 public:
@@ -39,19 +41,16 @@ public:
     [[nodiscard]] bool Finish() const;
 
     // Known once the header has been fed
-    bool HasHeader() const { return m_HeaderSize == kHeaderSize; }
     uint32_t GetUncompressedSize() const { return m_UncompressedSize; }
 
-    // The input in one go, or the file at path (which must be fileSize bytes)
+    // The input in one go, or the file at path
     [[nodiscard]] static bool DecompressMemory( const void * data, size_t size, Sink & sink, uint32_t & outUncompressedSize );
     [[nodiscard]] static bool DecompressFile( const char * path, const Atomic<bool> * abort, Sink & sink, uint32_t & outUncompressedSize );
 
 private:
-    static constexpr uint32_t kHeaderSize = 12;
-
     bool FeedPayload( const char * data, size_t size, Sink & sink );
 
-    char        m_Header[ kHeaderSize ];
+    char        m_Header[ Compressor::kHeaderSize ];
     uint32_t    m_HeaderSize = 0;       // Bytes of the header received
     bool        m_Zstd = false;
     bool        m_Failed = false;

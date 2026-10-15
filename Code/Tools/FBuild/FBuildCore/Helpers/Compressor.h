@@ -18,6 +18,24 @@ public:
     explicit Compressor();
     ~Compressor();
 
+    // The wire format: a header, then the payload
+    enum CompressionType : uint32_t
+    {
+        eUncompressed = 0,
+        eLZ4 = 1,
+        eZstd = 2,
+    };
+    static constexpr size_t kHeaderSize = 12;
+    struct HeaderInfo
+    {
+        CompressionType m_Type;
+        uint32_t m_UncompressedSize;
+        uint32_t m_CompressedSize;  // The payload bytes that follow the header
+    };
+    // Reads the header at the start of data, if it is a valid one: a known type and a payload no
+    // larger than what it makes. dataSize must be at least kHeaderSize.
+    static bool ParseHeader( const void * data, size_t dataSize, HeaderInfo & outHeader );
+
     static bool IsValidData( const void * data, size_t dataSize );
     static uint32_t GetUncompressedSize( const void * data, size_t dataSize );
 
@@ -50,7 +68,6 @@ public:
     // not smaller. The file is read once, and twice when it does not compress; the observer sees every
     // pass. The source must be sourceSize bytes: the size is part of the format, and of at most
     // kMaxFileSize. outSize is the size of the file written.
-    static constexpr size_t kHeaderSize = 12;
     static constexpr uint64_t kMaxFileSize = ( 0xFFFFFFFFull - kHeaderSize );
     [[nodiscard]] static bool CompressZstdFile( const char * sourcePath,
                                                 uint64_t sourceSize,
@@ -72,12 +89,6 @@ public:
     }
 
 private:
-    enum CompressionType : uint32_t
-    {
-        eUncompressed = 0,
-        eLZ4 = 1,
-        eZstd = 2,
-    };
     struct Header
     {
         uint32_t m_CompressionType;

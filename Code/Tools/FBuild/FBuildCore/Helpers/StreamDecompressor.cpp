@@ -6,6 +6,7 @@
 #include "StreamDecompressor.h"
 
 // FBuildCore
+#include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/FileChunks.h"
 
 // Core
@@ -23,10 +24,6 @@
 //------------------------------------------------------------------------------
 namespace
 {
-    // As Compressor writes them
-    constexpr uint32_t kTypeUncompressed = 0;
-    constexpr uint32_t kTypeZstd = 2;
-
     // What is decompressed is handed on in pieces of this size
     constexpr size_t kOutputSize = FileChunks::kChunkSize;
 }
@@ -56,26 +53,24 @@ bool StreamDecompressor::Feed( const void * data, size_t size, Sink & sink )
     }
 
     const char * bytes = static_cast<const char *>( data );
-    if ( m_HeaderSize < kHeaderSize )
+    if ( m_HeaderSize < Compressor::kHeaderSize )
     {
-        const size_t numHeaderBytes = Math::Min<size_t>( size, ( kHeaderSize - m_HeaderSize ) );
+        const size_t numHeaderBytes = Math::Min<size_t>( size, ( Compressor::kHeaderSize - m_HeaderSize ) );
         memcpy( m_Header + m_HeaderSize, bytes, numHeaderBytes );
         m_HeaderSize += static_cast<uint32_t>( numHeaderBytes );
         bytes += numHeaderBytes;
         size -= numHeaderBytes;
 
-        if ( m_HeaderSize == kHeaderSize )
+        if ( m_HeaderSize == Compressor::kHeaderSize )
         {
-            uint32_t fields[ 3 ];
-            memcpy( fields, m_Header, sizeof( fields ) );
-            m_Zstd = ( fields[ 0 ] == kTypeZstd );
-            m_UncompressedSize = fields[ 1 ];
-            m_CompressedSize = fields[ 2 ];
-
-            // What Compressor::IsValidData accepts, of the formats that are read here
-            const bool valid = ( ( m_Zstd || ( fields[ 0 ] == kTypeUncompressed ) ) &&
-                                 ( m_CompressedSize <= m_UncompressedSize ) &&
-                                 ( m_Zstd || ( m_CompressedSize == m_UncompressedSize ) ) );
+            // Of the formats Compressor writes, the ones that are read here
+            Compressor::HeaderInfo header = {};
+            const bool valid = ( Compressor::ParseHeader( m_Header, sizeof( m_Header ), header ) &&
+                                 ( ( header.m_Type == Compressor::eZstd ) ||
+                                   ( ( header.m_Type == Compressor::eUncompressed ) && ( header.m_CompressedSize == header.m_UncompressedSize ) ) ) );
+            m_Zstd = ( header.m_Type == Compressor::eZstd );
+            m_UncompressedSize = header.m_UncompressedSize;
+            m_CompressedSize = header.m_CompressedSize;
             if ( valid && m_Zstd )
             {
                 m_Context = ZSTD_createDCtx();
@@ -105,7 +100,7 @@ bool StreamDecompressor::Feed( const void * data, size_t size, Sink & sink )
 //------------------------------------------------------------------------------
 bool StreamDecompressor::FeedPayload( const char * data, size_t size, Sink & sink )
 {
-    if ( ( m_HeaderSize < kHeaderSize ) || ( size > ( m_CompressedSize - m_PayloadFed ) ) )
+    if ( ( m_HeaderSize < Compressor::kHeaderSize ) || ( size > ( m_CompressedSize - m_PayloadFed ) ) )
     {
         return false; // More than the header says there is
     }
@@ -154,7 +149,7 @@ bool StreamDecompressor::FeedPayload( const char * data, size_t size, Sink & sin
 bool StreamDecompressor::Finish() const
 {
     return ( m_Failed == false ) &&
-           ( m_HeaderSize == kHeaderSize ) &&
+           ( m_HeaderSize == Compressor::kHeaderSize ) &&
            ( m_PayloadFed == m_CompressedSize ) &&
            ( m_Produced == m_UncompressedSize ) &&
            ( ( m_Zstd == false ) || m_FrameDone );

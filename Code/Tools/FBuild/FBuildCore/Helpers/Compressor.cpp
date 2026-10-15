@@ -40,29 +40,34 @@ Compressor::~Compressor()
     FREE( m_Result );
 }
 
-// IsValidData
+// ParseHeader
 //------------------------------------------------------------------------------
-/*static*/ bool Compressor::IsValidData( const void * data, size_t dataSize )
+/*static*/ bool Compressor::ParseHeader( const void * data, size_t dataSize, HeaderInfo & outHeader )
 {
     ASSERT( data );
-    if ( dataSize < sizeof( Header ) )
+    if ( dataSize < kHeaderSize )
     {
         return false;
     }
     const Header * header = (const Header *)data;
-    if ( header->m_CompressionType > eZstd )
+    if ( ( header->m_CompressionType > eZstd ) ||
+         ( header->m_CompressedSize > header->m_UncompressedSize ) )
     {
         return false;
     }
-    if ( ( header->m_CompressedSize + sizeof( Header ) ) != dataSize )
-    {
-        return false;
-    }
-    if ( header->m_CompressedSize > header->m_UncompressedSize )
-    {
-        return false;
-    }
+    outHeader.m_Type = static_cast<CompressionType>( header->m_CompressionType );
+    outHeader.m_UncompressedSize = header->m_UncompressedSize;
+    outHeader.m_CompressedSize = header->m_CompressedSize;
     return true;
+}
+
+// IsValidData
+//------------------------------------------------------------------------------
+/*static*/ bool Compressor::IsValidData( const void * data, size_t dataSize )
+{
+    HeaderInfo header;
+    return ( ParseHeader( data, dataSize, header ) &&
+             ( ( header.m_CompressedSize + kHeaderSize ) == dataSize ) );
 }
 
 // WriteHeader
