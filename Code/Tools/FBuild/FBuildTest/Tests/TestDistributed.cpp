@@ -6723,11 +6723,12 @@ void TestDistributed::PchTransformCapabilityIsNegotiated() const
 {
     // A capability is used on a connection only if both sides have it
     const uint32_t bit = Protocol::CAP_PCH_TRANSFORM;
-    TEST_ASSERT( ( Protocol::kCapabilities & bit ) != 0 );
-    TEST_ASSERT( ( Protocol::Negotiate( Protocol::kCapabilities, Protocol::kCapabilities ) & bit ) != 0 );
-    TEST_ASSERT( ( Protocol::Negotiate( Protocol::kCapabilities & ~bit, Protocol::kCapabilities ) & bit ) == 0 );
-    TEST_ASSERT( ( Protocol::Negotiate( Protocol::kCapabilities, Protocol::kCapabilities & ~bit ) & bit ) == 0 );
-    TEST_ASSERT( Protocol::Negotiate( Protocol::kCapabilities & ~bit, Protocol::kCapabilities ) == ( Protocol::kCapabilities & ~bit ) ); // The others are as they were
+    volatile uint32_t all = Protocol::kCapabilities; // Not a constant, so that what is made of it is checked when it is run
+    TEST_ASSERT( ( all & bit ) != 0 );
+    TEST_ASSERT( ( Protocol::Negotiate( all, all ) & bit ) != 0 );
+    TEST_ASSERT( ( Protocol::Negotiate( all & ~bit, all ) & bit ) == 0 );
+    TEST_ASSERT( ( Protocol::Negotiate( all, all & ~bit ) & bit ) == 0 );
+    TEST_ASSERT( Protocol::Negotiate( all & ~bit, all ) == ( all & ~bit ) ); // The others are as they were
 
     // The worker tells a client that has it that it can be used, and one that does not that it cannot
     struct Case { uint32_t m_Client; uint32_t m_Ack; };
