@@ -92,6 +92,8 @@ private:
         JobStreamDecoder m_JobDecoder;
         PchReceiver m_PchReceiver; // The chunks of the PCH being received, in order
         Array<ToolManifest *> m_KnownTools; // toolchains this client may send jobs for, each holding a use
+        uint32_t m_Capabilities = 0; // What this client and the worker both have (under m_Mutex)
+        Array<uint64_t> m_PchNeededSent; // PCHs asked of this client that have not arrived yet (under m_Mutex)
     };
 
     // Messages for one connection come from the server thread (results), the connection's
@@ -103,6 +105,11 @@ private:
     static void SendIdInventory( ClientState & cs, const Array<uint64_t> & ids );
     void RequestMissingFiles( ClientState & cs, ToolManifest * manifest ) const;
 
+    // A job needs a PCH that is not cached. Asks the client for it, once until it arrives, unless
+    // the client cannot be asked or the PCH is already being received. The caller holds
+    // m_ClientListMutex and cs.m_Mutex.
+    void RequestPchIfMissing( ClientState & cs, uint64_t pchId );
+    bool IsPchBeingReceived( uint64_t pchId ) const; // Caller holds m_ClientListMutex
     bool IsPchCached( uint64_t pchId ) const; // Does not refresh LRU recency
 
     uint32_t m_PrefetchBuffer = 0;
@@ -174,6 +181,7 @@ private:
                            const Array<uint64_t> & pchIdsInUse );
     void EvictPchsToBudget( Array<PchCacheEntry> & entries, const Array<uint64_t> & pchIdsInUse ) const;
 
+    Atomic<uint32_t> m_NumPchRequestsSent; // MSG_PCH_NEEDED sent, over all connections
     mutable Mutex m_PchCacheMutex;
     Array<PchCacheEntry> m_PchCache;
     bool m_PchCacheScanned = false;

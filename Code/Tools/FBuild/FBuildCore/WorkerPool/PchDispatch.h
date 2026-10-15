@@ -35,8 +35,8 @@ public:
     }
 
     // The PCH has reached the worker: it was reported, or was handed to the socket in full.
-    // The worker evicts old PCHs, which the coordinator cannot see, so jobs for an evicted PCH
-    // wait on the worker until the connection ends.
+    // The worker evicts PCHs the coordinator cannot see, so this can stop being true: a worker that
+    // can (CAP_PCH_REQUEST) asks for the PCH again when a job needs it (OnNeeded).
     void OnDelivered( uint64_t pchId )
     {
         m_Sending.FindAndErase( pchId );
@@ -46,6 +46,51 @@ public:
         }
     }
 
+    // A PCH is sent again at most this many times per connection, so a worker that keeps losing it
+    // (or asking for what is on its way) is given up on rather than fed forever
+    static constexpr uint32_t kMaxResends = 8;
+
+    enum NeededResult
+    {
+        NEEDED_ALREADY_QUEUED,  // On its way: nothing to do
+        NEEDED_QUEUED,          // Taken off the worker, to be sent again
+        NEEDED_LIMIT,           // Sent again too many times
+    };
+
+    // The worker says a job waits for the PCH, so it does not have it
+    NeededResult OnNeeded( uint64_t pchId, uint32_t maxResends = kMaxResends )
+    {
+        if ( m_Sending.Find( pchId ) != nullptr )
+        {
+            return NEEDED_ALREADY_QUEUED;
+        }
+
+        Resends * resends = nullptr;
+        for ( Resends & r : m_Resends )
+        {
+            if ( r.m_PchId == pchId )
+            {
+                resends = &r;
+            }
+        }
+        if ( resends == nullptr )
+        {
+            Resends newResends;
+            newResends.m_PchId = pchId;
+            m_Resends.Append( newResends );
+            resends = &m_Resends.Top();
+        }
+        if ( resends->m_Count >= maxResends )
+        {
+            return NEEDED_LIMIT;
+        }
+        ++resends->m_Count;
+
+        m_OnWorker.FindAndErase( pchId );
+        m_Sending.Append( pchId );
+        return NEEDED_QUEUED;
+    }
+
     bool IsOnWorker( uint64_t pchId ) const { return m_OnWorker.Find( pchId ) != nullptr; }
     bool IsRequested( uint64_t pchId ) const { return IsOnWorker( pchId ) || ( m_Sending.Find( pchId ) != nullptr ); }
 
@@ -53,8 +98,15 @@ public:
     const Array<uint64_t> & GetSending() const { return m_Sending; } // In the order requested, which is the order sent
 
 private:
+    struct Resends
+    {
+        uint64_t m_PchId = 0;
+        uint32_t m_Count = 0;
+    };
+
     Array<uint64_t> m_OnWorker;
     Array<uint64_t> m_Sending;
+    Array<Resends> m_Resends;
 };
 
 // PchWorkerState

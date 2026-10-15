@@ -186,6 +186,7 @@ private:
     void Process( const ConnectionInfo * connection, const Protocol::MsgRefused * msg );
     void Process( const Protocol::MsgPchInventory * msg, const void * payload, size_t payloadSize );
     void Process( const Protocol::MsgToolchainInventory * msg, const void * payload, size_t payloadSize );
+    void Process( const Protocol::MsgPchNeeded * msg );
 
     void ProcessJobResultCommon( bool isCompressed, const void * payload, size_t payloadSize );
     void Refuse( const ConnectionInfo * connection, uint32_t workerMajor, uint32_t workerMinor );
@@ -232,6 +233,7 @@ private:
     Atomic<uint32_t> m_NumSkippedToolchains{ 0 }; // Toolchains the worker had, so we did not send them
     PchSendState m_PchState;          // Protected by m_Mutex
     Array<uint64_t> m_PendingPchIds;  // Needed by this worker, not yet queued. Protected by m_Mutex
+    Array<uint64_t> m_UnknownPchIds;  // PCHs the worker asked for that this client has no data for, logged once. Protected by m_Mutex
     uint32_t m_ToolchainsGeneration = 0; // Client thread only: the toolchains pushed so far
     Atomic<uint32_t> m_UnsentJobs{ 0 }; // Queued for the send thread, not yet sent
     JobStreamEncoder m_JobEncoder; // Send thread only. A new connection starts a new stream.
@@ -666,6 +668,12 @@ void Client::CommunicateJobAvailability()
             Process( msg, payload, payloadSize );
             break;
         }
+        case Protocol::MSG_PCH_NEEDED:
+        {
+            const Protocol::MsgPchNeeded * msg = static_cast<const Protocol::MsgPchNeeded *>( imsg );
+            Process( msg );
+            break;
+        }
         default:
         {
             // unknown message type
@@ -846,6 +854,50 @@ void ClientToWorkerConnection::Process( const Protocol::MsgToolchainInventory * 
 
     // Both inventories have now been processed
     OnInventoriesComplete();
+}
+
+// Process( MsgPchNeeded )
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::Process( const Protocol::MsgPchNeeded * msg )
+{
+    PROFILE_SECTION( "MsgPchNeeded" );
+
+    const uint64_t pchId = msg->GetPchId();
+    PchDataCache::Entry entry;
+    const bool known = ( pchId != 0 ) && PchDataCache::Get().Find( pchId, entry );
+
+    MutexHolder mh( m_Mutex );
+    if ( known == false )
+    {
+        if ( m_UnknownPchIds.Find( pchId ) == nullptr )
+        {
+            m_UnknownPchIds.Append( pchId );
+            DIST_INFO( " - Worker %s asked for PCH 0x%016" PRIx64 ", which is not known here\n", m_Worker->m_Address.Get(), pchId );
+        }
+        return;
+    }
+
+    switch ( m_PchState.OnNeeded( pchId ) )
+    {
+        case PchSendState::NEEDED_QUEUED:
+            DIST_INFO( " - Worker %s needs PCH 0x%016" PRIx64 " again\n", m_Worker->m_Address.Get(), pchId );
+            if ( m_PendingPchIds.Find( pchId ) == nullptr )
+            {
+                m_PendingPchIds.Append( pchId );
+            }
+            break;
+        case PchSendState::NEEDED_ALREADY_QUEUED:
+            break;
+        case PchSendState::NEEDED_LIMIT:
+            // Jobs sent to this worker would wait for the PCH for good: close the connection so they
+            // return to the queue, and leave the worker alone for the rest of the build
+            FLOG_WARN( "Distributed Compilation : worker %s lost PCH 0x%016" PRIx64 " %u times: not using it any more\n",
+                       m_Worker->m_Address.Get(), pchId, PchSendState::kMaxResends );
+            m_Client->DenyListWorker( *m_Worker );
+            m_SendThreadQuit.Store( true );
+            m_SendThreadWakeSemaphore.Signal();
+            break;
+    }
 }
 
 // QueueToolchain

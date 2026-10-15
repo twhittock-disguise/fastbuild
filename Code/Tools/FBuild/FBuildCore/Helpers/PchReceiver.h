@@ -46,6 +46,9 @@ public:
 
     uint32_t GetNumChunksReceived() const { return m_NumChunksReceived.Load(); }
 
+    // Whether the chunks of this PCH are arriving. Safe to ask from another connection's thread.
+    bool IsReceiving( uint64_t pchId ) const { return ( m_ReceivingPchId.Load() == pchId ); }
+
     // The temporary file a PCH is written to before it is moved into place, next to pchFile, is named
     // as TempFiles does
     inline static const char * const kTempFilePrefix = "incoming.";
@@ -68,6 +71,7 @@ private:
     Array<char>     m_Compressed;   // As received, so far
     AString         m_TempFile;     // The decompressed PCH, until it is moved into place
     Atomic<uint32_t> m_NumChunksReceived{ 0 };
+    Atomic<uint64_t> m_ReceivingPchId{ 0 }; // The PCH being received, or 0
 };
 
 //------------------------------------------------------------------------------

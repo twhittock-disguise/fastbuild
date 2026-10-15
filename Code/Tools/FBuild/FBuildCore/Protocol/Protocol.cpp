@@ -45,6 +45,7 @@ const char * GetProtocolMessageDebugName( Protocol::MessageType msgType )
         "RequestFile",
         "ToolchainInventory",
         "Refused",
+        "PchNeeded",
     };
     // clang-format on
     static_assert( ( sizeof( msgNames ) / sizeof( const char * ) ) == Protocol::NUM_MESSAGES, "msgNames item count doesn't match NUM_MESSAGES" );
@@ -271,6 +272,15 @@ Protocol::MsgPchInventory::MsgPchInventory( uint32_t numEntries )
 {
 }
 
+// MsgPchNeeded
+//------------------------------------------------------------------------------
+Protocol::MsgPchNeeded::MsgPchNeeded( uint64_t pchId )
+    : Protocol::IMessage( Protocol::MSG_PCH_NEEDED, sizeof( MsgPchNeeded ), false )
+    , m_PchId( pchId )
+{
+    memset( m_Padding2, 0, sizeof( m_Padding2 ) );
+}
+
 // MsgToolchainInventory
 //------------------------------------------------------------------------------
 Protocol::MsgToolchainInventory::MsgToolchainInventory( uint32_t numEntries )
@@ -298,6 +308,7 @@ uint32_t Protocol::GetMinMessageSize( MessageType type )
         case MSG_REQUEST_MANIFEST:      return sizeof( MsgRequestManifest );
         case MSG_REQUEST_FILE:          return sizeof( MsgRequestFile );
         case MSG_TOOLCHAIN_INVENTORY:   return sizeof( MsgToolchainInventory );
+        case MSG_PCH_NEEDED:            return sizeof( MsgPchNeeded );
         case NUM_MESSAGES:              break;
     }
     return 0;
@@ -322,6 +333,7 @@ Protocol::PayloadRule Protocol::GetPayloadRule( MessageType type )
         case MSG_REQUEST_MANIFEST:      return PAYLOAD_NEVER;
         case MSG_REQUEST_FILE:          return PAYLOAD_NEVER;
         case MSG_TOOLCHAIN_INVENTORY:   return PAYLOAD_OPTIONAL;
+        case MSG_PCH_NEEDED:            return PAYLOAD_NEVER;
         case NUM_MESSAGES:              break;
     }
     return PAYLOAD_NEVER;

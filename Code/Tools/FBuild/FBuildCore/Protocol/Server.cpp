@@ -344,6 +344,9 @@ bool Server::IsSynchingTool( AString & statusStr ) const
 
     // Toolchains released above may now be evictable
     EvictToolchains( nullptr );
+
+    // A job that waited for a PCH this client was receiving has to ask for it
+    ReleaseReadyWaitingJobs();
 }
 
 // OnReceive
@@ -515,11 +518,12 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     }
 
     // take note of initial status of client
+    const uint32_t capabilities = Protocol::Negotiate( msg->GetCapabilities(), Protocol::kCapabilities );
     {
         MutexHolder mh( cs->m_Mutex );
         cs->m_HostName = hostName;
+        cs->m_Capabilities = capabilities;
     }
-    const uint32_t capabilities = Protocol::Negotiate( msg->GetCapabilities(), Protocol::kCapabilities );
 
     // Recalculate capacity across all connected coordinators
     // (takes m_ClientListMutex, so cs->m_Mutex must not be held)
@@ -571,71 +575,84 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
     }
     cs->m_NumJobsActive.Increment();
 
-    MutexHolder mh( cs->m_Mutex );
-
-    // deserialize job
-    ConstMemoryStream ms( jobData, jobDataSize );
-    Job * job = FNEW( Job( ms ) );
-    FREE( jobData );
-    job->SetUserData( cs );
-    job->SetResultCompressionLevel( msg->GetResultCompressionLevel(), true /*allowZstdUse*/ );
-
-    // Resolve PCH cache path if job was bundled with PCH distribution data
-    const uint64_t pchId = job->GetPchId();
-    bool pchReady = true;
-    if ( pchId != 0 )
+    // Locks are held in this scope only: asking the client for a PCH takes m_ClientListMutex
+    uint64_t missingPchId = 0;
     {
-        AString pchPath;
-        if ( FindCachedPch( pchId, pchPath ) )
+        MutexHolder mh( cs->m_Mutex );
+
+        // deserialize job
+        ConstMemoryStream ms( jobData, jobDataSize );
+        Job * job = FNEW( Job( ms ) );
+        FREE( jobData );
+        job->SetUserData( cs );
+        job->SetResultCompressionLevel( msg->GetResultCompressionLevel(), true /*allowZstdUse*/ );
+
+        // Resolve PCH cache path if job was bundled with PCH distribution data
+        const uint64_t pchId = job->GetPchId();
+        bool pchReady = true;
+        if ( pchId != 0 )
         {
-            job->SetPchCachePath( pchPath );
-            FLOG_VERBOSE( "MsgJob: PCH resolved pchId=0x%016" PRIx64 " -> '%s' for '%s'\n",
-                          pchId, pchPath.Get(), job->GetRemoteName().Get() );
+            AString pchPath;
+            if ( FindCachedPch( pchId, pchPath ) )
+            {
+                job->SetPchCachePath( pchPath );
+                cs->m_PchNeededSent.FindAndErase( pchId );
+                FLOG_VERBOSE( "MsgJob: PCH resolved pchId=0x%016" PRIx64 " -> '%s' for '%s'\n",
+                              pchId, pchPath.Get(), job->GetRemoteName().Get() );
+            }
+            else
+            {
+                FLOG_VERBOSE( "MsgJob: PCH not yet available pchId=0x%016" PRIx64 " for '%s' — waiting\n",
+                              pchId, job->GetRemoteName().Get() );
+                pchReady = false;
+                missingPchId = pchId;
+            }
+        }
+
+        // Find or create the manifest
+        const uint64_t toolId = msg->GetToolId();
+        ASSERT( toolId );
+
+        MutexHolder manifestMH( m_ToolManifestsMutex );
+
+        ToolManifest ** found = m_Tools.FindDeref( toolId );
+        ToolManifest * manifest = found ? *found : nullptr;
+        if ( manifest )
+        {
+            job->SetToolManifest( manifest );
+
+            // Tool fully synchronized and PCH ready — queue immediately
+            if ( manifest->IsSynchronized() && pchReady )
+            {
+                JobQueueRemote::Get().QueueJob( job );
+                return;
+            }
+
+            // Wait for synchronization to complete
+            if ( manifest->GetUserData() == nullptr )
+            {
+                manifest->SetUserData( (void *)connection );
+            }
         }
         else
         {
-            FLOG_VERBOSE( "MsgJob: PCH not yet available pchId=0x%016" PRIx64 " for '%s' — waiting\n",
-                          pchId, job->GetRemoteName().Get() );
-            pchReady = false;
-        }
-    }
-
-    // Find or create the manifest
-    const uint64_t toolId = msg->GetToolId();
-    ASSERT( toolId );
-
-    MutexHolder manifestMH( m_ToolManifestsMutex );
-
-    ToolManifest ** found = m_Tools.FindDeref( toolId );
-    ToolManifest * manifest = found ? *found : nullptr;
-    if ( manifest )
-    {
-        job->SetToolManifest( manifest );
-
-        // Tool fully synchronized and PCH ready — queue immediately
-        if ( manifest->IsSynchronized() && pchReady )
-        {
-            JobQueueRemote::Get().QueueJob( job );
-            return;
-        }
-
-        // Wait for synchronization to complete
-        if ( manifest->GetUserData() == nullptr )
-        {
+            // First time seeing this tool — coordinator will send MsgManifest + MsgFile
+            manifest = FNEW( ToolManifest( toolId ) );
             manifest->SetUserData( (void *)connection );
+            job->SetToolManifest( manifest );
+            m_Tools.Append( manifest );
         }
-    }
-    else
-    {
-        // First time seeing this tool — coordinator will send MsgManifest + MsgFile
-        manifest = FNEW( ToolManifest( toolId ) );
-        manifest->SetUserData( (void *)connection );
-        job->SetToolManifest( manifest );
-        m_Tools.Append( manifest );
+
+        // Can't start job yet - put it on hold (waiting for toolchain and/or PCH)
+        cs->m_WaitingJobs.Append( job );
     }
 
-    // Can't start job yet - put it on hold (waiting for toolchain and/or PCH)
-    cs->m_WaitingJobs.Append( job );
+    if ( missingPchId != 0 )
+    {
+        MutexHolder mhC( m_ClientListMutex );
+        MutexHolder mh2( cs->m_Mutex );
+        RequestPchIfMissing( *cs, missingPchId );
+    }
 }
 
 // Process( MsgManifest )
@@ -789,24 +806,66 @@ void Server::ReleaseReadyWaitingJobs()
 
             const ToolManifest * manifest = job->GetToolManifest();
             ASSERT( manifest );
-            if ( !manifest->IsSynchronized() ) { continue; }
 
             const uint64_t pchId = job->GetPchId();
+            bool pchReady = true;
             if ( pchId != 0 && job->GetPchCachePath().IsEmpty() )
             {
                 AString pchPath;
-                if ( FindCachedPch( pchId, pchPath ) == false )
+                if ( FindCachedPch( pchId, pchPath ) )
                 {
-                    continue;
+                    job->SetPchCachePath( pchPath );
+                    cs->m_PchNeededSent.FindAndErase( pchId );
                 }
-                job->SetPchCachePath( pchPath );
+                else
+                {
+                    RequestPchIfMissing( *cs, pchId ); // It may have been evicted, or the connection receiving it lost
+                    pchReady = false;
+                }
             }
+            if ( !manifest->IsSynchronized() || !pchReady ) { continue; }
 
             cs->m_WaitingJobs.EraseIndex( (size_t)i );
             JobQueueRemote::Get().QueueJob( job );
             PROTOCOL_DEBUG( "Server: Job %x can now be started\n", job );
         }
     }
+}
+
+// RequestPchIfMissing
+//------------------------------------------------------------------------------
+void Server::RequestPchIfMissing( ClientState & cs, uint64_t pchId )
+{
+    if ( ( cs.m_Capabilities & Protocol::CAP_PCH_REQUEST ) == 0 )
+    {
+        return; // This client would not know the message
+    }
+    if ( cs.m_PchNeededSent.Find( pchId ) || IsPchCached( pchId ) || IsPchBeingReceived( pchId ) )
+    {
+        return;
+    }
+
+    // Once until it arrives: the client sends it again when asked, and the chunks take a while
+    cs.m_PchNeededSent.Append( pchId );
+    FLOG_VERBOSE( "PCH 0x%016" PRIx64 " is needed by a job from '%s' and is not cached: asking for it\n",
+                  pchId, cs.m_HostName.Get() );
+    const Protocol::MsgPchNeeded msg( pchId );
+    SendTo( cs, msg );
+    m_NumPchRequestsSent.Increment();
+}
+
+// IsPchBeingReceived
+//------------------------------------------------------------------------------
+bool Server::IsPchBeingReceived( uint64_t pchId ) const
+{
+    for ( const ClientState * cs : m_ClientList )
+    {
+        if ( cs->m_PchReceiver.IsReceiving( pchId ) )
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 // IsPchCached
@@ -864,6 +923,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
     pchIdsInUse.Append( pchId );
 
     // Add to in-memory cache
+    bool newlyCached = true;
     {
         MutexHolder mh( m_PchCacheMutex );
 
@@ -875,22 +935,39 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
             if ( e.pchId == pchId )
             {
                 e.lastWriteTime = now;
-                return;
+                newlyCached = false;
+                break;
             }
         }
 
-        PchCacheEntry entry;
-        entry.pchId = pchId;
-        entry.filePath = pchFilePath;
-        entry.lastWriteTime = now;
-        entry.size = msg->GetUncompressedSize(); // What the file on disk comes to
-        m_PchCache.Append( Move( entry ) );
+        if ( newlyCached )
+        {
+            PchCacheEntry entry;
+            entry.pchId = pchId;
+            entry.filePath = pchFilePath;
+            entry.lastWriteTime = now;
+            entry.size = msg->GetUncompressedSize(); // What the file on disk comes to
+            m_PchCache.Append( Move( entry ) );
 
-        EvictPchsToBudget( m_PchCache, pchIdsInUse );
+            EvictPchsToBudget( m_PchCache, pchIdsInUse );
+        }
     }
 
-    FLOG_OUTPUT( "PCH cached: 0x%016" PRIx64 " -> %s (cached=%s)\n",
-                 pchId, pchFilePath.Get(), alreadyCached ? "disk" : "new" );
+    // It is here, so no connection needs to ask for it again if it is evicted later
+    {
+        MutexHolder mhC( m_ClientListMutex );
+        for ( ClientState * otherCS : m_ClientList )
+        {
+            MutexHolder mh2( otherCS->m_Mutex );
+            otherCS->m_PchNeededSent.FindAndErase( pchId );
+        }
+    }
+
+    if ( newlyCached )
+    {
+        FLOG_OUTPUT( "PCH cached: 0x%016" PRIx64 " -> %s (cached=%s)\n",
+                     pchId, pchFilePath.Get(), alreadyCached ? "disk" : "new" );
+    }
 
     // Release any jobs that were waiting for this PCH
     ReleaseReadyWaitingJobs();

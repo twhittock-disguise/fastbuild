@@ -75,6 +75,7 @@ PchReceiver::Result PchReceiver::OnChunk( const Protocol::MsgPchFile & msg,
 
         m_Active = true;
         m_PchId = pchId;
+        m_ReceivingPchId.Store( pchId );
         m_UncompressedSize = msg.GetUncompressedSize();
         m_CompressedSize = msg.GetCompressedSize();
         m_ChunkSize = msg.GetChunkSize();
@@ -135,6 +136,7 @@ void PchReceiver::Abort()
     }
     m_Active = false;
     m_AlreadyCached = false;
+    m_ReceivingPchId.Store( 0 );
 }
 
 // Fail

@@ -32,6 +32,7 @@ namespace Protocol
     class MsgRequestManifest;
     class MsgPchInventory;
     class MsgRequestFile;
+    class MsgPchNeeded;
 }
 class ToolManifest;
 

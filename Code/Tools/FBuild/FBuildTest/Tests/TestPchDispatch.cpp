@@ -27,6 +27,7 @@ private:
     void PchsAlreadyRequestedAreNotQueuedAgain() const;
     void EmptyQueue() const;
     void PchSendStateTransitions() const;
+    void PchSendStateWhenTheWorkerNeedsAPch() const;
 
     static constexpr uint32_t kMaxHeld = 4; // Far more than any case here holds
 
@@ -78,6 +79,7 @@ REGISTER_TESTS_BEGIN( TestPchDispatch )
     REGISTER_TEST( PchsAlreadyRequestedAreNotQueuedAgain )
     REGISTER_TEST( EmptyQueue )
     REGISTER_TEST( PchSendStateTransitions )
+    REGISTER_TEST( PchSendStateWhenTheWorkerNeedsAPch )
 REGISTER_TESTS_END
 
 // RunnableJobsGoFirst
@@ -287,6 +289,72 @@ void TestPchDispatch::PchSendStateTransitions() const
     TEST_ASSERT( state.IsOnWorker( 8 ) );
     TEST_ASSERT( state.GetOnWorker().GetSize() == 3 );
     TEST_ASSERT( state.OnRequested( 8 ) == false );
+}
+
+// PchSendStateWhenTheWorkerNeedsAPch
+//------------------------------------------------------------------------------
+void TestPchDispatch::PchSendStateWhenTheWorkerNeedsAPch() const
+{
+    // A PCH the worker reported or was sent is taken back when it says a job needs it, and is queued
+    // to be sent again
+    {
+        PchSendState state;
+        state.OnDelivered( 7 );
+        TEST_ASSERT( state.IsOnWorker( 7 ) );
+        TEST_ASSERT( state.OnNeeded( 7 ) == PchSendState::NEEDED_QUEUED );
+        TEST_ASSERT( state.IsOnWorker( 7 ) == false );
+        TEST_ASSERT( state.GetSending().GetSize() == 1 );
+        TEST_ASSERT( state.GetSending()[ 0 ] == 7 );
+
+        // Asking while it is queued changes nothing, however often
+        TEST_ASSERT( state.OnNeeded( 7 ) == PchSendState::NEEDED_ALREADY_QUEUED );
+        TEST_ASSERT( state.OnNeeded( 7 ) == PchSendState::NEEDED_ALREADY_QUEUED );
+        TEST_ASSERT( state.GetSending().GetSize() == 1 );
+        TEST_ASSERT( state.OnRequested( 7 ) == false ); // and it is still not requested twice
+
+        // Once it has been sent it is on the worker again
+        state.OnDelivered( 7 );
+        TEST_ASSERT( state.IsOnWorker( 7 ) );
+        TEST_ASSERT( state.GetSending().IsEmpty() );
+    }
+
+    // Other PCHs are left as they were, and the order of the queue is the order of the requests
+    {
+        PchSendState state;
+        state.OnDelivered( 1 );
+        state.OnDelivered( 2 );
+        TEST_ASSERT( state.OnRequested( 3 ) );
+        TEST_ASSERT( state.OnNeeded( 1 ) == PchSendState::NEEDED_QUEUED );
+        TEST_ASSERT( state.IsOnWorker( 2 ) );
+        TEST_ASSERT( state.GetSending().GetSize() == 2 );
+        TEST_ASSERT( state.GetSending()[ 0 ] == 3 );
+        TEST_ASSERT( state.GetSending()[ 1 ] == 1 );
+    }
+
+    // A PCH the state knows nothing about is queued as well
+    {
+        PchSendState state;
+        TEST_ASSERT( state.OnNeeded( 9 ) == PchSendState::NEEDED_QUEUED );
+        TEST_ASSERT( state.IsRequested( 9 ) );
+    }
+
+    // A worker that keeps losing a PCH is given up on after a number of sends, for each PCH
+    {
+        PchSendState state;
+        state.OnDelivered( 5 );
+        state.OnDelivered( 6 );
+        const uint32_t kMax = 3;
+        for ( uint32_t i = 0; i < kMax; ++i )
+        {
+            TEST_ASSERT( state.OnNeeded( 5, kMax ) == PchSendState::NEEDED_QUEUED );
+            state.OnDelivered( 5 );
+        }
+        TEST_ASSERT( state.OnNeeded( 5, kMax ) == PchSendState::NEEDED_LIMIT );
+        TEST_ASSERT( state.IsOnWorker( 5 ) ); // Left as it was
+        TEST_ASSERT( state.GetSending().IsEmpty() );
+        TEST_ASSERT( state.OnNeeded( 6, kMax ) == PchSendState::NEEDED_QUEUED ); // The count is kept for each
+    }
+    TEST_ASSERT( PchSendState::kMaxResends > 0 );
 }
 
 //------------------------------------------------------------------------------

@@ -38,14 +38,15 @@ namespace Protocol
     //   advertise its bit, and a bit is added together with the feature (and the fallback) it stands for.
     // A receiver ignores the trailing bytes of a message it knows and the capability bits it does not.
     inline static const uint32_t kVersionMajor = 24;
-    inline static const uint8_t kVersionMinor = 0;
+    inline static const uint8_t kVersionMinor = 1;
 
     enum Capability : uint32_t
     {
         CAP_PCH_INVENTORY = ( 1u << 0 ),        // The worker sends MSG_PCH_INVENTORY after the ack
         CAP_TOOLCHAIN_INVENTORY = ( 1u << 1 ),  // The worker sends MSG_TOOLCHAIN_INVENTORY after the PCH inventory
+        CAP_PCH_REQUEST = ( 1u << 2 ),          // The worker sends MSG_PCH_NEEDED for a PCH a job needs and it does not have
     };
-    inline static const uint32_t kCapabilities = ( CAP_PCH_INVENTORY | CAP_TOOLCHAIN_INVENTORY );
+    inline static const uint32_t kCapabilities = ( CAP_PCH_INVENTORY | CAP_TOOLCHAIN_INVENTORY | CAP_PCH_REQUEST );
 
     // The capabilities in use when one side advertises ours and the other theirs
     inline uint32_t Negotiate( uint32_t ours, uint32_t theirs ) { return ( ours & theirs & kCapabilities ); }
@@ -73,6 +74,7 @@ namespace Protocol
         MSG_REQUEST_FILE = 11,          // Worker -> Client : Request file (disconnect recovery)
         MSG_TOOLCHAIN_INVENTORY = 12,   // Worker -> Client : Advertise cached toolchain IDs
         MSG_REFUSED = 13,               // Worker -> Client : Handshake refused, with the version of the worker
+        MSG_PCH_NEEDED = 14,            // Worker -> Client : A job needs a PCH the worker does not have (CAP_PCH_REQUEST)
 
         NUM_MESSAGES            // leave last
     };
@@ -198,10 +200,10 @@ namespace Protocol
     // follows is a payload only if the header says so.
     bool IsValidHeader( const void * frame, uint32_t size );
 
-    // "v24.0"
+    // "v24.1"
     void FormatVersion( AString & outText, uint32_t major, uint32_t minor );
 
-    // "v24.0" for this version
+    // "v24.1" for this version
     void GetVersionString( AString & outText );
 
     // MsgJob
@@ -356,6 +358,22 @@ namespace Protocol
         uint32_t m_NumEntries;
     };
     static_assert( sizeof( MsgPchInventory ) == sizeof( IMessage ) + 4, "MsgPchInventory message has incorrect size" );
+
+    // MsgPchNeeded
+    //------------------------------------------------------------------------------
+    // The worker evicts PCHs the client believes it holds, so it asks for the one a job is waiting for
+    class MsgPchNeeded : public IMessage
+    {
+    public:
+        explicit MsgPchNeeded( uint64_t pchId );
+
+        uint64_t GetPchId() const { return m_PchId; }
+
+    private:
+        char m_Padding2[ 4 ];
+        uint64_t m_PchId;
+    };
+    static_assert( sizeof( MsgPchNeeded ) == sizeof( IMessage ) + 4 /*alignment*/ + 8, "MsgPchNeeded message has incorrect size" );
 
     // MsgToolchainInventory
     //------------------------------------------------------------------------------
