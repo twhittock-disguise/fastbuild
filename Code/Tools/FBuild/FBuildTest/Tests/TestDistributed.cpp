@@ -42,6 +42,11 @@
 
 // TestDistributed
 //------------------------------------------------------------------------------
+namespace
+{
+    class NoCapacityWorker;
+}
+
 class TestDistributed : public FBuildTest
 {
 private:
@@ -71,6 +76,9 @@ private:
     void CorruptResultIsRejected() const;
     void SendMutexHoldsBackResults() const;
     void ToolchainIsSentBeforeAnyJob() const;
+    void PchIsSentBeforeAnyJobIsDispatched() const;
+    void CachedToolchainIsNotSent() const;
+    void ToolchainIsNotSentWhenNothingIsDistributed() const;
     void MismatchedProtocolVersionIsRefused() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
@@ -155,7 +163,8 @@ private:
         Atomic<bool>    m_ResultDeliveredWhileHeld{ false };
     };
     static uint32_t HoldSendMutexOnFirstJob( void * param );
-    static uint32_t AbortOnceToolchainArrives( void * param );
+    static uint32_t StopBuild( void * param );
+    void BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when ) const;
 
     // Totals over the lines starting with linePrefix in the client's stats log, for lines like
     // "  jobs:      12 msgs, 1.1 MB raw, 40.2 KB sent, ..." (first is raw, second is sent or received)
@@ -189,7 +198,12 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ResultsAreCompressed )
     REGISTER_TEST( CorruptResultIsRejected )
     REGISTER_TEST( SendMutexHoldsBackResults )
+#if defined( __WINDOWS__ )
     REGISTER_TEST( ToolchainIsSentBeforeAnyJob )
+    REGISTER_TEST( PchIsSentBeforeAnyJobIsDispatched )
+    REGISTER_TEST( CachedToolchainIsNotSent )
+    REGISTER_TEST( ToolchainIsNotSentWhenNothingIsDistributed )
+#endif
     REGISTER_TEST( MismatchedProtocolVersionIsRefused )
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
@@ -538,10 +552,13 @@ void TestDistributed::PchTakeReadyPchs() const
     const uint64_t kUnreadable = 2;
     const uint64_t kUnknown = 3;
     const uint64_t kWorkerHasIt = 4;
+    const uint64_t kGoodToo = 5;
     PchDataCache::Entry entry;
     entry.pchId = kGood;
     entry.uncompressedSize = fileSize;
     entry.filePath = goodPath;
+    cache.Store( entry );
+    entry.pchId = kGoodToo;
     cache.Store( entry );
     entry.pchId = kUnreadable;
     entry.uncompressedSize = 1024; // The file is shorter
@@ -552,45 +569,49 @@ void TestDistributed::PchTakeReadyPchs() const
     entry.filePath = goodPath;
     cache.Store( entry );
 
+    // Have both readable ones compressed, so they are ready together
+    const void * data = nullptr;
+    size_t dataSize = 0;
+    PchDataCache::Entry goodEntry;
+    TEST_ASSERT( cache.Find( kGood, goodEntry ) );
+    TEST_ASSERT( WaitForCompression( cache, goodEntry, data, dataSize ) == PchDataCache::READY );
+    TEST_ASSERT( cache.Find( kGoodToo, goodEntry ) );
+    TEST_ASSERT( WaitForCompression( cache, goodEntry, data, dataSize ) == PchDataCache::READY );
+
+    // One still compressing does not hold up the PCHs after it, and stays pending
     Array<uint64_t> pending;
-    pending.Append( kGood );
     pending.Append( kUnreadable );
+    pending.Append( kGoodToo );
+    pending.Append( kGood );
+    Array<uint64_t> onWorker;
+    Array<PchDataCache::ReadyPch> ready;
+    TEST_ASSERT( cache.TakeReadyPchs( pending, onWorker, ready ) );
+    TEST_ASSERT( pending.GetSize() == 1 );
+    TEST_ASSERT( pending[ 0 ] == kUnreadable );
+
+    // Ready ones come back in the order they were asked for
+    TEST_ASSERT( ready.GetSize() == 2 );
+    TEST_ASSERT( ready[ 0 ].pchId == kGoodToo );
+    TEST_ASSERT( ready[ 1 ].pchId == kGood );
+    TEST_ASSERT( ready[ 1 ].uncompressedSize == fileSize );
+    TEST_ASSERT( DecodesTo( ready[ 1 ].data, ready[ 1 ].dataSize, content ) );
+
+    // The rest: the unreadable one is reported once then dropped, an unknown one and one the
+    // worker has are dropped without being sent
     pending.Append( kUnknown );
     pending.Append( kWorkerHasIt );
-    Array<uint64_t> sent;
-    sent.Append( kWorkerHasIt ); // Reported in the worker's inventory
-
-    Array<PchDataCache::ReadyPch> ready;
+    onWorker.Append( kWorkerHasIt ); // Reported in the worker's inventory
     bool allOk = true;
     TEST_ASSERT( WaitUntil( [ & ]()
     {
-        if ( cache.TakeReadyPchs( pending, sent, ready ) == false )
+        if ( cache.TakeReadyPchs( pending, onWorker, ready ) == false )
         {
             allOk = false;
         }
         return pending.IsEmpty();
     } ) );
-
-    // The unreadable PCH is reported once, then dropped without being marked as sent
     TEST_ASSERT( allOk == false );
-    TEST_ASSERT( sent.Find( kUnreadable ) == nullptr );
-
-    // Unknown ids and ones the worker has are dropped without being sent
-    TEST_ASSERT( sent.Find( kUnknown ) == nullptr );
-    TEST_ASSERT( ready.GetSize() == 1 );
-
-    // The readable one is ready once, with the right payload, and marked as sent
-    TEST_ASSERT( ready[ 0 ].pchId == kGood );
-    TEST_ASSERT( ready[ 0 ].uncompressedSize == fileSize );
-    TEST_ASSERT( DecodesTo( ready[ 0 ].data, ready[ 0 ].dataSize, content ) );
-    TEST_ASSERT( sent.Find( kGood ) != nullptr );
-    TEST_ASSERT( sent.GetSize() == 2 );
-
-    // Needed again by the same connection: not sent twice
-    pending.Append( kGood );
-    TEST_ASSERT( cache.TakeReadyPchs( pending, sent, ready ) );
-    TEST_ASSERT( pending.IsEmpty() );
-    TEST_ASSERT( ready.GetSize() == 1 );
+    TEST_ASSERT( ready.GetSize() == 2 );
 }
 
 // DistributionStatsLog
@@ -1235,19 +1256,30 @@ void TestDistributed::ResultsAreCompressed() const
     TEST_ASSERT( ( receivedBytes * 10 ) < rawBytes );
 }
 
-// Corrupt result
+// Fake workers
 //------------------------------------------------------------------------------
 namespace
 {
-    // A worker that completes the handshake and answers every job with a result that is not valid compressed data
-    class CorruptResultWorker : public TCPConnectionPool
+    // A worker that completes the handshake and leaves the rest to the test
+    class FakeWorker : public TCPConnectionPool
     {
     public:
-        CorruptResultWorker() = default;
-        explicit CorruptResultWorker( const CorruptResultWorker & other ) = delete;
-        CorruptResultWorker & operator=( const CorruptResultWorker & other ) = delete;
+        explicit FakeWorker( uint8_t capacity, const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
+            : m_Capacity( capacity )
+            , m_ToolchainInventory( toolchainInventory )
+        {
+        }
+        explicit FakeWorker( const FakeWorker & other ) = delete;
+        FakeWorker & operator=( const FakeWorker & other ) = delete;
 
-        uint32_t GetNumResultsSent() const { return m_NumResultsSent.Load(); }
+        uint32_t GetNumConnections() const { return m_NumConnections.Load(); }
+
+    protected:
+        // Every message after the handshake. The payload is null for a message that has none.
+        virtual void OnMessage( const ConnectionInfo * connection,
+                                const Protocol::IMessage & message,
+                                void * payload,
+                                uint32_t payloadSize ) = 0;
 
     private:
         virtual void OnReceive( const ConnectionInfo * connection, void * data, uint32_t size, bool & keepMemory ) override
@@ -1270,18 +1302,63 @@ namespace
 
             if ( m_CurrentMessage->GetType() == Protocol::MSG_CONNECTION )
             {
-                const Protocol::MsgConnectionAck ack( 4 );
+                m_NumConnections.Increment();
+                const Protocol::MsgConnectionAck ack( m_Capacity );
                 const Protocol::MsgPchInventory pchInventory( 0 );
-                const Protocol::MsgToolchainInventory toolchainInventory( 0 );
+                const Protocol::MsgToolchainInventory toolchainInventory( (uint32_t)m_ToolchainInventory.GetSize() );
                 ack.Send( connection );
                 pchInventory.Send( connection );
-                toolchainInventory.Send( connection );
+                if ( m_ToolchainInventory.IsEmpty() )
+                {
+                    toolchainInventory.Send( connection );
+                }
+                else
+                {
+                    MemoryStream ids;
+                    for ( const uint64_t toolId : m_ToolchainInventory )
+                    {
+                        ids.Write( toolId );
+                    }
+                    toolchainInventory.Send( connection, ids );
+                }
             }
-            else if ( m_CurrentMessage->GetType() == Protocol::MSG_JOB )
+            else
+            {
+                OnMessage( connection, *m_CurrentMessage, payload, size );
+            }
+
+            FREE( (void *)m_CurrentMessage );
+            FREE( payload );
+            m_CurrentMessage = nullptr;
+        }
+
+        const uint8_t m_Capacity;
+        const Array<uint64_t> m_ToolchainInventory;
+        const Protocol::IMessage * m_CurrentMessage = nullptr;
+        Atomic<uint32_t> m_NumConnections{ 0 };
+    };
+
+    // A worker that answers every job with a result that is not valid compressed data
+    class CorruptResultWorker : public FakeWorker
+    {
+    public:
+        CorruptResultWorker() : FakeWorker( 4 ) {}
+        explicit CorruptResultWorker( const CorruptResultWorker & other ) = delete;
+        CorruptResultWorker & operator=( const CorruptResultWorker & other ) = delete;
+
+        uint32_t GetNumResultsSent() const { return m_NumResultsSent.Load(); }
+
+    private:
+        virtual void OnMessage( const ConnectionInfo * connection,
+                                const Protocol::IMessage & message,
+                                void * payload,
+                                uint32_t payloadSize ) override
+        {
+            if ( message.GetType() == Protocol::MSG_JOB )
             {
                 void * job = nullptr;
                 size_t jobSize = 0;
-                if ( m_Decoder.Decode( payload, size, job, jobSize ) )
+                if ( m_Decoder.Decode( payload, payloadSize, job, jobSize ) )
                 {
                     uint32_t jobId = 0; // The first thing a job holds
                     ConstMemoryStream js( job, jobSize );
@@ -1290,10 +1367,6 @@ namespace
                     SendCorruptResult( connection, jobId );
                 }
             }
-
-            FREE( (void *)m_CurrentMessage );
-            FREE( payload );
-            m_CurrentMessage = nullptr;
         }
 
         void SendCorruptResult( const ConnectionInfo * connection, uint32_t jobId )
@@ -1316,7 +1389,6 @@ namespace
         }
 
         JobStreamDecoder m_Decoder;
-        const Protocol::IMessage * m_CurrentMessage = nullptr;
         Atomic<uint32_t> m_NumResultsSent{ 0 };
     };
 }
@@ -1464,90 +1536,85 @@ void TestDistributed::SendMutexHoldsBackResults() const
     TEST_ASSERT( built );
 }
 
-// ToolchainIsSentBeforeAnyJob
+// Toolchain sending
 //------------------------------------------------------------------------------
 namespace
 {
     // A worker that completes the handshake but has no capacity, so no job is ever sent to it
-    class NoCapacityWorker : public TCPConnectionPool
+    class NoCapacityWorker : public FakeWorker
     {
     public:
-        NoCapacityWorker() = default;
+        static constexpr uint8_t kNoCapacity = 0;
+
+        explicit NoCapacityWorker( const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
+            : FakeWorker( kNoCapacity, toolchainInventory )
+        {
+        }
         explicit NoCapacityWorker( const NoCapacityWorker & other ) = delete;
         NoCapacityWorker & operator=( const NoCapacityWorker & other ) = delete;
 
         uint32_t GetNumManifests() const { return m_NumManifests.Load(); }
         uint32_t GetNumFiles() const { return m_NumFiles.Load(); }
+        uint32_t GetNumPchFiles() const { return m_NumPchFiles.Load(); }
         uint32_t GetNumJobs() const { return m_NumJobs.Load(); }
+        uint64_t GetLastToolId() const { return m_LastToolId.Load(); }
 
     private:
-        virtual void OnReceive( const ConnectionInfo * connection, void * data, uint32_t, bool & keepMemory ) override
+        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage & message, void *, uint32_t ) override
         {
-            keepMemory = true; // freed below
-
-            void * payload = nullptr;
-            if ( m_CurrentMessage == nullptr )
+            switch ( message.GetType() )
             {
-                m_CurrentMessage = static_cast<const Protocol::IMessage *>( data );
-                if ( m_CurrentMessage->HasPayload() )
-                {
-                    return;
-                }
-            }
-            else
-            {
-                payload = data;
-            }
-
-            switch ( m_CurrentMessage->GetType() )
-            {
-                case Protocol::MSG_CONNECTION:
-                {
-                    const Protocol::MsgConnectionAck ack( 0 );
-                    const Protocol::MsgPchInventory pchInventory( 0 );
-                    const Protocol::MsgToolchainInventory toolchainInventory( 0 );
-                    ack.Send( connection );
-                    pchInventory.Send( connection );
-                    toolchainInventory.Send( connection );
+                case Protocol::MSG_MANIFEST:
+                    m_LastToolId.Store( static_cast<const Protocol::MsgManifest &>( message ).GetToolId() );
+                    m_NumManifests.Increment();
                     break;
-                }
-                case Protocol::MSG_MANIFEST: m_NumManifests.Increment(); break;
                 case Protocol::MSG_FILE: m_NumFiles.Increment(); break;
+                case Protocol::MSG_PCH_FILE: m_NumPchFiles.Increment(); break;
                 case Protocol::MSG_JOB: m_NumJobs.Increment(); break;
                 default: break;
             }
-
-            FREE( (void *)m_CurrentMessage );
-            FREE( payload );
-            m_CurrentMessage = nullptr;
         }
 
-        const Protocol::IMessage * m_CurrentMessage = nullptr;
         Atomic<uint32_t> m_NumManifests{ 0 };
         Atomic<uint32_t> m_NumFiles{ 0 };
+        Atomic<uint32_t> m_NumPchFiles{ 0 };
         Atomic<uint32_t> m_NumJobs{ 0 };
+        Atomic<uint64_t> m_LastToolId{ 0 };
     };
 
-    struct ToolchainWatch
+    // Aborts a build once something has happened on the worker
+    struct BuildStop
     {
-        const NoCapacityWorker * m_Worker = nullptr;
-        Atomic<bool> m_ToolchainArrived{ false };
+        enum When
+        {
+            TOOLCHAIN_ARRIVES,  // The manifest and a file have reached the worker
+            PCH_ARRIVES,        // A PCH has reached the worker. A toolchain is sent ahead of it.
+        };
+        const NoCapacityWorker *    m_Worker = nullptr;
+        When                        m_When = TOOLCHAIN_ARRIVES;
+        Atomic<bool>                m_Reached{ false };
     };
 }
 
-/*static*/ uint32_t TestDistributed::AbortOnceToolchainArrives( void * param )
+/*static*/ uint32_t TestDistributed::StopBuild( void * param )
 {
-    ToolchainWatch * watch = static_cast<ToolchainWatch *>( param );
-    watch->m_ToolchainArrived.Store( WaitUntil( [ watch ]() { return ( watch->m_Worker->GetNumManifests() >= 1 ) &&
-                                                                       ( watch->m_Worker->GetNumFiles() >= 1 ); } ) );
+    BuildStop * stop = static_cast<BuildStop *>( param );
+    if ( stop->m_When == BuildStop::TOOLCHAIN_ARRIVES )
+    {
+        stop->m_Reached.Store( WaitUntil( [ stop ]() { return ( stop->m_Worker->GetNumManifests() >= 1 ) &&
+                                                               ( stop->m_Worker->GetNumFiles() >= 1 ); } ) );
+    }
+    else
+    {
+        stop->m_Reached.Store( WaitUntil( [ stop ]() { return ( stop->m_Worker->GetNumPchFiles() >= 1 ); } ) );
+    }
     FBuild::AbortBuild();
     return 0;
 }
 
-void TestDistributed::ToolchainIsSentBeforeAnyJob() const
+// Builds the library with a PCH against a worker that never gets a job, until the build is stopped
+void TestDistributed::BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when ) const
 {
-    // The worker has no capacity, so the build never sends it a job. It is sent the toolchain
-    // regardless, as soon as the compiler is known, so the upload does not wait for the first job.
     FBuildTestOptions options;
     options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
     options.m_AllowDistributed = true;
@@ -1558,20 +1625,89 @@ void TestDistributed::ToolchainIsSentBeforeAnyJob() const
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
-    NoCapacityWorker worker;
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
-    ToolchainWatch watch;
-    watch.m_Worker = &worker;
+    BuildStop stop;
+    stop.m_Worker = &worker;
+    stop.m_When = static_cast<BuildStop::When>( when );
     Thread watcher;
-    watcher.Start( AbortOnceToolchainArrives, "ToolchainWatch", &watch );
-    const bool built = fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
+    watcher.Start( StopBuild, "StopBuild", &stop );
+    const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
     watcher.Join();
     worker.ShutdownAllConnections();
 
     TEST_ASSERT( built == false ); // Aborted
-    TEST_ASSERT( watch.m_ToolchainArrived.Load() );
+    TEST_ASSERT( stop.m_Reached.Load() );
     TEST_ASSERT( worker.GetNumJobs() == 0 );
+}
+
+// ToolchainIsSentBeforeAnyJob
+//------------------------------------------------------------------------------
+void TestDistributed::ToolchainIsSentBeforeAnyJob() const
+{
+    // The worker has no capacity, so the build never sends it a job. It is sent the toolchain
+    // regardless, once the PCH starts building, so the upload does not wait for the first job.
+    NoCapacityWorker worker;
+    BuildPchLibraryUntilStopped( worker, BuildStop::TOOLCHAIN_ARRIVES );
+    TEST_ASSERT( worker.GetNumManifests() >= 1 );
+    TEST_ASSERT( worker.GetNumFiles() >= 1 );
+}
+
+// PchIsSentBeforeAnyJobIsDispatched
+//------------------------------------------------------------------------------
+void TestDistributed::PchIsSentBeforeAnyJobIsDispatched() const
+{
+    // The worker has no capacity, so no job is dispatched to it. The PCH the waiting jobs need
+    // is queued for sending anyway, so the uplink does not wait for a job to be taken.
+    NoCapacityWorker worker;
+    BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES );
+    TEST_ASSERT( worker.GetNumPchFiles() >= 1 );
+}
+
+// CachedToolchainIsNotSent
+//------------------------------------------------------------------------------
+void TestDistributed::CachedToolchainIsNotSent() const
+{
+    // Learn the toolchain's id from a first build
+    uint64_t toolId = 0;
+    {
+        NoCapacityWorker worker;
+        BuildPchLibraryUntilStopped( worker, BuildStop::TOOLCHAIN_ARRIVES );
+        toolId = worker.GetLastToolId();
+        TEST_ASSERT( toolId != 0 );
+    }
+
+    // A worker that says it has the toolchain is not sent it
+    Array<uint64_t> inventory;
+    inventory.Append( toolId );
+    NoCapacityWorker worker( inventory );
+    BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES );
+    TEST_ASSERT( worker.GetNumConnections() >= 1 );
+    TEST_ASSERT( worker.GetNumManifests() == 0 );
+    TEST_ASSERT( worker.GetNumFiles() == 0 );
+}
+
+// ToolchainIsNotSentWhenNothingIsDistributed
+//------------------------------------------------------------------------------
+void TestDistributed::ToolchainIsNotSentWhenNothingIsDistributed() const
+{
+    // The library is compiled here, so workers have no use for the toolchain
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    NoCapacityWorker worker;
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+    const bool built = fBuild.Build( "../tmp/Test/Distributed/Local/distpchlocal.lib" );
+    worker.ShutdownAllConnections();
+
+    TEST_ASSERT( built );
+    TEST_ASSERT( worker.GetNumConnections() >= 1 );
+    TEST_ASSERT( worker.GetNumManifests() == 0 );
+    TEST_ASSERT( worker.GetNumFiles() == 0 );
 }
 
 // Handshake tests

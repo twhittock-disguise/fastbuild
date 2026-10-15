@@ -196,6 +196,16 @@ ObjectNode::~ObjectNode() = default;
     const bool useCache = ShouldUseCache();
     const bool useDist = IsDistributionAllowed();
     const bool useSimpleDist = GetCompiler()->SimpleDistributionMode();
+
+    // Every distributed job of the list waits for this PCH to be built here (which is not itself
+    // distributed), so workers can be sent the toolchain meanwhile
+    if ( IsMSVC() && IsCreatingPCH() &&
+         m_OwnerObjectList->IsDistributionAllowed() &&
+         FBuild::Get().GetOptions().m_AllowDistributed &&
+         GetCompiler()->CanBeDistributed() )
+    {
+        FBuild::Get().OnDistributableCompiler( GetCompiler()->GetManifest() );
+    }
     bool usePreProcessor = !useSimpleDist && ( useCache || useDist || IsGCC() || IsSNC() || IsClang() || IsClangCl() || IsCodeWarriorWii() || IsGreenHillsWiiU() || IsVBCC() || IsOrbisWavePSSLC() );
     if ( GetDedicatedPreprocessor() )
     {

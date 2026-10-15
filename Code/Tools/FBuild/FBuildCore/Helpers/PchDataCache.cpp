@@ -278,20 +278,19 @@ size_t PchDataCache::GetNumCompressions() const
 // TakeReadyPchs
 //------------------------------------------------------------------------------
 bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
-                                  Array<uint64_t> & sent,
+                                  const Array<uint64_t> & onWorker,
                                   Array<ReadyPch> & outReady )
 {
     bool allOk = true;
 
-    // In the order they were asked for, which is the order they are sent
     Array<uint64_t> stillPending;
     for ( const uint64_t pchId : pending )
     {
-        // The worker may have reported it since it was queued
-        const bool alreadySent = ( sent.Find( pchId ) != nullptr );
+        // The worker may have reported it since it was requested
+        const bool workerHasIt = ( onWorker.Find( pchId ) != nullptr );
 
         Entry entry;
-        if ( ( alreadySent == false ) && Find( pchId, entry ) )
+        if ( ( workerHasIt == false ) && Find( pchId, entry ) )
         {
             const void * data = nullptr;
             size_t dataSize = 0;
@@ -301,7 +300,6 @@ bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
                     stillPending.Append( pchId );
                     break;
                 case READY:
-                    sent.Append( pchId );
                     outReady.Append( ReadyPch{ pchId, entry.uncompressedSize, data, dataSize } );
                     break;
                 case FAILED:

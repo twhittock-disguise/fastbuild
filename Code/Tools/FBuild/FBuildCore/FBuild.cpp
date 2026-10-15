@@ -12,7 +12,6 @@
 #include "Cache/ICache.h"
 #include "Cache/LightCache.h"
 #include "FLog.h"
-#include "Graph/CompilerNode.h"
 #include "Graph/Node.h"
 #include "Graph/NodeGraph.h"
 #include "Graph/NodeProxy.h"
@@ -979,12 +978,12 @@ uint32_t FBuild::GetNumWorkerConnections() const
 
 // OnDistributableCompiler
 //------------------------------------------------------------------------------
-void FBuild::OnDistributableCompiler( const CompilerNode & compiler )
+void FBuild::OnDistributableCompiler( const ToolManifest & manifest )
 {
     MutexHolder mh( m_ClientLifetimeMutex );
     if ( m_Client )
     {
-        m_Client->AddToolchain( &compiler.GetManifest() );
+        m_Client->AddToolchain( &manifest );
     }
 }
 

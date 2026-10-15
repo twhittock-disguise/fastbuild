@@ -64,12 +64,12 @@ public:
         size_t          dataSize;
     };
 
-    // Resolves the PCH ids a connection needs to send. Ids it has already sent, and
-    // ids with no entry, are dropped from pending. READY ones move to sent and
-    // outReady. Ones still compressing stay pending. Returns false if any failed
-    // for good (those are dropped from pending and not marked as sent).
+    // Resolves the PCH ids a connection needs to send. Ids the worker already has, and ids
+    // with no entry, are dropped from pending. READY ones are dropped and returned in outReady,
+    // in the order they were pending. Ones still compressing are skipped and stay pending, so a
+    // slow one does not hold up the rest. Returns false if any failed for good (those are dropped).
     bool TakeReadyPchs( Array<uint64_t> & pending,
-                        Array<uint64_t> & sent,
+                        const Array<uint64_t> & onWorker,
                         Array<ReadyPch> & outReady );
 
     // Clear all cached entries (call at build end)

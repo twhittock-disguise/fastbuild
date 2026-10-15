@@ -51,6 +51,23 @@ Library( "DistTestPCH" )
     #endif
 }
 
+#if __WINDOWS__
+// The same library, with nothing in it distributed
+Library( "DistTestPCHLocal" )
+{
+    .PCHInputFile               = "Tools/FBuild/FBuildTest/Data/TestDistributed/PrecompiledHeader.cpp"
+    .PCHOutputFile              = "$Out$/Test/Distributed/Local/PrecompiledHeader.pch"
+    .LibrarianOutput            = "$Out$\Test\Distributed\Local\distpchlocal.lib"
+    .CompilerInputPath          = "Tools/FBuild/FBuildTest/Data/TestDistributed/"
+    .CompilerInputPattern       = "*_pch.cpp"
+    .CompilerOutputPath         = "$Out$\Test\Distributed\Local\"
+    .CompilerOptions            + ' /Yu"PrecompiledHeader.h" /Fp"$PCHOutputFile$"'
+                                + ' /I"."'
+    .PCHOptions                 + ' /I"."'
+    .AllowDistribution          = false
+}
+#endif
+
 // RegressionTest - Formatting errors with % in them caused a crash
 ObjectList( "badcode" )
 {

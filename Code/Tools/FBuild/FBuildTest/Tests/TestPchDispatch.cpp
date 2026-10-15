@@ -18,11 +18,17 @@ private:
     DECLARE_TESTS
 
     void RunnableJobsGoFirst() const;
+    void JobsWithoutAPchKeepTheirOrder() const;
     void HeldJobsAreBounded() const;
     void HeldJobsAreForThePchBeingSent() const;
     void NextPchIsTheOneWithMostJobs() const;
+    void WorkersChooseTheSameNextPch() const;
     void NextPchIsQueuedBehindTheCurrentOne() const;
+    void PchsAlreadyRequestedAreNotQueuedAgain() const;
     void EmptyQueue() const;
+    void PchSendStateTransitions() const;
+
+    static constexpr uint32_t kMaxHeld = 4; // Far more than any case here holds
 
     class IdList : public Array<uint64_t>
     {
@@ -38,6 +44,12 @@ private:
     };
 
     // The queue holds the PCH id of each job, the last being the next to be taken
+    // The PCHs the queued jobs need, with how many jobs need each
+    static uint64_t SelectPch( const Array<uint64_t> & pchIds, const Array<uint32_t> & numJobs, const PchSendState & state )
+    {
+        return PchDispatch::SelectPchToQueue( pchIds, numJobs, state );
+    }
+
     static int32_t Select( const Array<uint64_t> & queue,
                            const Array<uint64_t> & onWorker,
                            const Array<uint64_t> & sending,
@@ -45,8 +57,8 @@ private:
                            uint32_t maxHeld )
     {
         PchWorkerState state;
-        state.m_OnWorker = &onWorker;
-        state.m_Sending = &sending;
+        state.m_OnWorker = onWorker;
+        state.m_Sending = sending;
         state.m_NumHeld = numHeld;
         state.m_MaxHeld = maxHeld;
         return PchDispatch::SelectJob( queue.GetSize(), [ &queue ]( size_t i ) { return queue[ i ]; }, state );
@@ -57,11 +69,15 @@ private:
 //------------------------------------------------------------------------------
 REGISTER_TESTS_BEGIN( TestPchDispatch )
     REGISTER_TEST( RunnableJobsGoFirst )
+    REGISTER_TEST( JobsWithoutAPchKeepTheirOrder )
     REGISTER_TEST( HeldJobsAreBounded )
     REGISTER_TEST( HeldJobsAreForThePchBeingSent )
     REGISTER_TEST( NextPchIsTheOneWithMostJobs )
+    REGISTER_TEST( WorkersChooseTheSameNextPch )
     REGISTER_TEST( NextPchIsQueuedBehindTheCurrentOne )
+    REGISTER_TEST( PchsAlreadyRequestedAreNotQueuedAgain )
     REGISTER_TEST( EmptyQueue )
+    REGISTER_TEST( PchSendStateTransitions )
 REGISTER_TESTS_END
 
 // RunnableJobsGoFirst
@@ -71,7 +87,7 @@ void TestPchDispatch::RunnableJobsGoFirst() const
     // A job with no PCH can start at once, even behind one that cannot
     {
         const IdList queue( { 1, 2, 1, 0, 1 } );
-        TEST_ASSERT( Select( queue, Array<uint64_t>(), Array<uint64_t>(), 0, 4 ) == 3 );
+        TEST_ASSERT( Select( queue, Array<uint64_t>(), Array<uint64_t>(), 0, kMaxHeld ) == 3 );
     }
 
     // So can a job whose PCH the worker has, however many others are waiting for theirs
@@ -79,30 +95,44 @@ void TestPchDispatch::RunnableJobsGoFirst() const
         const IdList queue( { 2, 1, 1, 1 } );
         const IdList onWorker( { 2 } );
         const IdList sending( { 1 } );
-        TEST_ASSERT( Select( queue, onWorker, sending, 0, 4 ) == 0 );
+        TEST_ASSERT( Select( queue, onWorker, sending, 0, kMaxHeld ) == 0 );
 
         // The bound on jobs held for a PCH never keeps a runnable job from the worker
-        TEST_ASSERT( Select( queue, onWorker, sending, 4, 4 ) == 0 );
+        TEST_ASSERT( Select( queue, onWorker, sending, kMaxHeld, kMaxHeld ) == 0 );
     }
 
     // The most expensive runnable job goes first
     {
         const IdList queue( { 2, 2, 1 } );
         const IdList onWorker( { 2 } );
-        TEST_ASSERT( Select( queue, onWorker, Array<uint64_t>(), 0, 4 ) == 1 );
+        TEST_ASSERT( Select( queue, onWorker, Array<uint64_t>(), 0, kMaxHeld ) == 1 );
     }
+}
+
+// JobsWithoutAPchKeepTheirOrder
+//------------------------------------------------------------------------------
+void TestPchDispatch::JobsWithoutAPchKeepTheirOrder() const
+{
+    // A build without PCHs takes jobs from the end of the queue, as it always did
+    const IdList queue( { 0, 0, 0 } );
+    TEST_ASSERT( Select( queue, Array<uint64_t>(), Array<uint64_t>(), 0, kMaxHeld ) == 2 );
 }
 
 // HeldJobsAreBounded
 //------------------------------------------------------------------------------
 void TestPchDispatch::HeldJobsAreBounded() const
 {
+    const uint32_t kBound = 2;
     const IdList queue( { 1, 1, 1 } );
     const IdList sending( { 1 } );
-    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, 0, 2 ) == 2 );
-    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, 1, 2 ) == 2 );
-    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, 2, 2 ) == -1 );
-    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, 3, 2 ) == -1 );
+    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, 0, kBound ) == 2 );
+    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, kBound - 1, kBound ) == 2 );
+    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, kBound, kBound ) == -1 );
+    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, kBound + 1, kBound ) == -1 );
+
+    // A worker always takes one, and at most half of its slots are held
+    TEST_ASSERT( PchDispatch::MaxHeldJobs( 1 ) == 1 );
+    TEST_ASSERT( PchDispatch::MaxHeldJobs( 18 ) == 9 );
 }
 
 // HeldJobsAreForThePchBeingSent
@@ -112,11 +142,16 @@ void TestPchDispatch::HeldJobsAreForThePchBeingSent() const
     // The PCH sent first is the one jobs are held for, not the one with the most jobs
     const IdList queue( { 1, 1, 2, 1 } );
     const IdList sending( { 2, 1 } );
-    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, 0, 4 ) == 2 );
+    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, 0, kMaxHeld ) == 2 );
 
     // Once none are left for it, the PCH sent next takes its place
     const IdList queue2( { 1, 1 } );
-    TEST_ASSERT( Select( queue2, Array<uint64_t>(), sending, 0, 4 ) == 1 );
+    TEST_ASSERT( Select( queue2, Array<uint64_t>(), sending, 0, kMaxHeld ) == 1 );
+
+    // A job for a PCH that is not on its way is not given to the worker
+    const IdList queue3( { 3, 3 } );
+    TEST_ASSERT( Select( queue3, Array<uint64_t>(), sending, 0, kMaxHeld ) == -1 );
+    TEST_ASSERT( Select( queue3, Array<uint64_t>(), Array<uint64_t>(), 0, kMaxHeld ) == -1 );
 }
 
 // NextPchIsTheOneWithMostJobs
@@ -124,36 +159,134 @@ void TestPchDispatch::HeldJobsAreForThePchBeingSent() const
 void TestPchDispatch::NextPchIsTheOneWithMostJobs() const
 {
     {
-        const IdList queue( { 1, 2, 2, 3 } );
-        TEST_ASSERT( Select( queue, Array<uint64_t>(), Array<uint64_t>(), 0, 4 ) == 2 );
+        const IdList pchIds( { 1, 2, 3 } );
+        Array<uint32_t> numJobs;
+        numJobs.Append( 1 );
+        numJobs.Append( 7 );
+        numJobs.Append( 3 );
+        TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState() ) == 2 );
     }
 
     // Workers sharing an uplink choose alike: ties go to the lowest id
     {
-        const IdList queue( { 5, 3, 5, 3 } );
-        TEST_ASSERT( Select( queue, Array<uint64_t>(), Array<uint64_t>(), 0, 4 ) == 3 );
+        const IdList pchIds( { 5, 3, 4 } );
+        Array<uint32_t> numJobs;
+        numJobs.Append( 2 );
+        numJobs.Append( 2 );
+        numJobs.Append( 1 );
+        TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState() ) == 3 );
     }
+
+    // A PCH no job waits for is not sent
+    {
+        const IdList pchIds( { 5 } );
+        Array<uint32_t> numJobs;
+        numJobs.Append( 0 );
+        TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState() ) == 0 );
+    }
+}
+
+// WorkersChooseTheSameNextPch
+//------------------------------------------------------------------------------
+void TestPchDispatch::WorkersChooseTheSameNextPch() const
+{
+    // Two workers that have different PCHs already are given the same one to send next
+    const IdList pchIds( { 7, 4, 9 } );
+    Array<uint32_t> numJobs;
+    numJobs.Append( 2 );
+    numJobs.Append( 2 );
+    numJobs.Append( 2 );
+    PchSendState firstWorker;
+    const uint64_t first[] = { 1 };
+    firstWorker.OnInventory( first, 1 );
+    PchSendState secondWorker;
+    const uint64_t second[] = { 9, 2 };
+    secondWorker.OnInventory( second, 2 );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, firstWorker ) == 4 );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, secondWorker ) == 4 );
 }
 
 // NextPchIsQueuedBehindTheCurrentOne
 //------------------------------------------------------------------------------
 void TestPchDispatch::NextPchIsQueuedBehindTheCurrentOne() const
 {
-    // One PCH on its way with no jobs left: the link is kept busy by starting the next
-    const IdList queue( { 3, 2, 2 } );
-    const IdList sending( { 1 } );
-    TEST_ASSERT( Select( queue, Array<uint64_t>(), sending, 0, 4 ) == 2 );
+    // The next PCH is queued while the current one is sent, so the link has no gap between them
+    const IdList pchIds( { 2, 3 } );
+    Array<uint32_t> numJobs;
+    numJobs.Append( 1 );
+    numJobs.Append( 4 );
+    PchSendState state;
+    TEST_ASSERT( state.OnRequested( 1 ) );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, state ) == 3 );
 
-    // Two already on their way: no third is started
-    const IdList sendingTwo( { 1, 9 } );
-    TEST_ASSERT( Select( queue, Array<uint64_t>(), sendingTwo, 0, 4 ) == -1 );
+    // The cap is reached: no further PCH is queued until one has been handed to the socket
+    TEST_ASSERT( state.OnRequested( 3 ) );
+    TEST_ASSERT( state.GetSending().GetSize() == PchDispatch::kMaxSendingPchs );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, state ) == 0 );
+    state.OnDelivered( 1 );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, state ) == 2 );
+}
+
+// PchsAlreadyRequestedAreNotQueuedAgain
+//------------------------------------------------------------------------------
+void TestPchDispatch::PchsAlreadyRequestedAreNotQueuedAgain() const
+{
+    const IdList pchIds( { 1, 2, 3 } );
+    Array<uint32_t> numJobs;
+    numJobs.Append( 9 ); // On the worker
+    numJobs.Append( 8 ); // On its way
+    numJobs.Append( 1 );
+    PchSendState state;
+    const uint64_t inventory[] = { 1 };
+    state.OnInventory( inventory, 1 );
+    TEST_ASSERT( state.OnRequested( 2 ) );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, state ) == 3 );
 }
 
 // EmptyQueue
 //------------------------------------------------------------------------------
 void TestPchDispatch::EmptyQueue() const
 {
-    TEST_ASSERT( Select( Array<uint64_t>(), Array<uint64_t>(), Array<uint64_t>(), 0, 4 ) == -1 );
+    TEST_ASSERT( Select( Array<uint64_t>(), Array<uint64_t>(), Array<uint64_t>(), 0, kMaxHeld ) == -1 );
+    TEST_ASSERT( SelectPch( Array<uint64_t>(), Array<uint32_t>(), PchSendState() ) == 0 );
+}
+
+// PchSendStateTransitions
+//------------------------------------------------------------------------------
+void TestPchDispatch::PchSendStateTransitions() const
+{
+    PchSendState state;
+
+    // Requests are queued in order, once
+    TEST_ASSERT( state.OnRequested( 5 ) );
+    TEST_ASSERT( state.OnRequested( 3 ) );
+    TEST_ASSERT( state.OnRequested( 5 ) == false );
+    TEST_ASSERT( state.GetSending().GetSize() == 2 );
+    TEST_ASSERT( state.GetSending()[ 0 ] == 5 );
+    TEST_ASSERT( state.GetSending()[ 1 ] == 3 );
+    TEST_ASSERT( state.IsRequested( 5 ) );
+    TEST_ASSERT( state.IsOnWorker( 5 ) == false );
+
+    // The first PCH reaching the worker moves it off the sending list, and the next stays
+    state.OnDelivered( 5 );
+    TEST_ASSERT( state.IsOnWorker( 5 ) );
+    TEST_ASSERT( state.GetSending().GetSize() == 1 );
+    TEST_ASSERT( state.GetSending()[ 0 ] == 3 );
+
+    // Delivering twice, or requesting what the worker has, changes nothing
+    state.OnDelivered( 5 );
+    TEST_ASSERT( state.GetOnWorker().GetSize() == 1 );
+    TEST_ASSERT( state.OnRequested( 5 ) == false );
+    TEST_ASSERT( state.GetSending().GetSize() == 1 );
+
+    // The worker's inventory covers a PCH that was already requested, and ones never requested
+    const uint64_t inventory[] = { 3, 8, 8 };
+    state.OnInventory( inventory, 3 );
+    TEST_ASSERT( state.GetSending().IsEmpty() );
+    TEST_ASSERT( state.IsOnWorker( 3 ) );
+    TEST_ASSERT( state.IsOnWorker( 8 ) );
+    TEST_ASSERT( state.GetOnWorker().GetSize() == 3 );
+    TEST_ASSERT( state.OnRequested( 8 ) == false );
 }
 
 //------------------------------------------------------------------------------

@@ -50,9 +50,10 @@ public:
 
     uint32_t GetNumConnections() const;
 
-    // Compilers the build uses with distribution. Their toolchains are sent to workers as they connect.
+    // Toolchains the build is about to need on workers
     void AddToolchain( const ToolManifest * manifest );
     void GetToolchains( Array<const ToolManifest *> & outManifests ) const;
+    uint32_t GetToolchainsGeneration() const { return m_ToolchainsGeneration.Load(); } // Changes when one is added
 
 private:
     Client & operator=( const Client & other ) = delete;
@@ -85,6 +86,7 @@ private:
 
     mutable Mutex m_ToolchainsMutex;
     Array<const ToolManifest *> m_Toolchains;
+    Atomic<uint32_t> m_ToolchainsGeneration{ 0 };
 
     // State that remains constant throughout the build
     const bool m_DetailedLogging;

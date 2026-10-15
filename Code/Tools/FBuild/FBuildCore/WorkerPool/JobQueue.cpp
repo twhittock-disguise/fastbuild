@@ -14,6 +14,7 @@
 #include "Tools/FBuild/FBuildCore/Graph/ObjectNode.h"
 #include "Tools/FBuild/FBuildCore/Graph/SettingsNode.h"
 #include "Tools/FBuild/FBuildCore/Helpers/BuildProfiler.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/PchDispatch.h"
 
 // Core
 #include "Core/FileIO/FileIO.h"
@@ -633,6 +634,35 @@ Job * JobQueue::OnReturnRemoteJob( uint32_t jobId,
 
     ASSERT( false ); // Job not found - should be impossible
     return nullptr;
+}
+
+// CountDistributableJobsByPch
+//------------------------------------------------------------------------------
+// Lists the PCHs that jobs waiting for a worker need, and how many jobs need each
+void JobQueue::CountDistributableJobsByPch( Array<uint64_t> & outPchIds, Array<uint32_t> & outNumJobs )
+{
+    outPchIds.Clear();
+    outNumJobs.Clear();
+
+    MutexHolder m( m_DistributedJobsMutex );
+    for ( const Job * job : m_DistributableJobs_Available )
+    {
+        const uint64_t pchId = job->GetPchId();
+        if ( pchId == 0 )
+        {
+            continue;
+        }
+        const uint64_t * found = outPchIds.Find( pchId );
+        if ( found )
+        {
+            ++outNumJobs[ (size_t)( found - outPchIds.Begin() ) ];
+        }
+        else
+        {
+            outPchIds.Append( pchId );
+            outNumJobs.Append( 1 );
+        }
+    }
 }
 
 // ReturnUnfinishedDistributableJob

@@ -22,6 +22,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueue.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/PchDispatch.h"
 
 // Core
 #include "Core/Containers/UniquePtr.h"
@@ -132,6 +133,7 @@ public:
     ClientWorkerInfo * GetWorker() const { return m_Worker; }
 
     void PushToolchainsToWorker();
+    void QueuePchsToWorker();
     void PushJobsToWorker();
     void SendPendingPchs();
 
@@ -159,8 +161,7 @@ private:
 
     void ProcessJobResultCommon( bool isCompressed, const void * payload, size_t payloadSize );
 
-    void QueueToolchain( const ToolManifest & manifest );
-    void GetPchState( Array<uint64_t> & outOnWorker, Array<uint64_t> & outSending, uint32_t & outNumHeld ) const;
+    bool QueueToolchain( const ToolManifest & manifest );
     const ToolManifest * FindManifest( uint64_t toolId ) const;
     bool WriteFileToDisk( const AString & fileName, const MultiBuffer & multiBuffer, size_t index ) const;
 
@@ -196,9 +197,9 @@ private:
     Array<uint64_t> m_SentToolchains; // Protected by m_Mutex
     Array<uint64_t> m_CachedToolchains; // Reported by the worker and not used yet. Protected by m_Mutex
     Atomic<uint32_t> m_NumSkippedToolchains{ 0 }; // Toolchains the worker had, so we did not send them
-    Array<uint64_t> m_SentPchIds;     // Protected by m_Mutex
-    Array<uint64_t> m_DeliveredPchIds; // Reported by the worker, or fully sent to it. Protected by m_Mutex
+    PchSendState m_PchState;          // Protected by m_Mutex
     Array<uint64_t> m_PendingPchIds;  // Needed by this worker, not yet queued. Protected by m_Mutex
+    uint32_t m_ToolchainsGeneration = 0; // Client thread only: the toolchains pushed so far
     Atomic<uint32_t> m_UnsentJobs{ 0 }; // Queued for the send thread, not yet sent
     JobStreamEncoder m_JobEncoder; // Send thread only. A new connection starts a new stream.
 
@@ -247,6 +248,7 @@ void Client::AddToolchain( const ToolManifest * manifest )
     if ( m_Toolchains.Find( manifest ) == nullptr )
     {
         m_Toolchains.Append( manifest );
+        m_ToolchainsGeneration.Increment();
     }
 }
 
@@ -495,11 +497,11 @@ void Client::CommunicateJobAvailability()
 {
     PROFILE_FUNCTION;
 
-    // Toolchains and PCHs are sent independently of job availability
-    // (this comes before the early-out so they are still sent once the queue drains)
+    // Toolchains and PCHs are sent whether or not jobs are waiting
     for ( UniquePtr<ClientToWorkerConnection> & ss : m_ActiveConnections )
     {
         ss->PushToolchainsToWorker();
+        ss->QueuePchsToWorker();
         ss->SendPendingPchs();
     }
 
@@ -681,21 +683,9 @@ void ClientToWorkerConnection::Process( const Protocol::MsgPchInventory * msg,
         return;
     }
 
-    // Pre-populate m_SentPchIds with all IDs the worker already has
-    const uint64_t * pchIds = static_cast<const uint64_t *>( payload );
     {
         MutexHolder mh( m_Mutex );
-        for ( uint32_t i = 0; i < numEntries; ++i )
-        {
-            if ( m_SentPchIds.Find( pchIds[ i ] ) == nullptr )
-            {
-                m_SentPchIds.Append( pchIds[ i ] );
-            }
-            if ( m_DeliveredPchIds.Find( pchIds[ i ] ) == nullptr )
-            {
-                m_DeliveredPchIds.Append( pchIds[ i ] );
-            }
-        }
+        m_PchState.OnInventory( static_cast<const uint64_t *>( payload ), numEntries );
     }
 
     DIST_INFO( " - Worker %s has %u cached PCH entries\n",
@@ -738,12 +728,12 @@ void ClientToWorkerConnection::Process( const Protocol::MsgToolchainInventory * 
 
 // QueueToolchain
 //------------------------------------------------------------------------------
-void ClientToWorkerConnection::QueueToolchain( const ToolManifest & manifest )
+bool ClientToWorkerConnection::QueueToolchain( const ToolManifest & manifest )
 {
     const uint64_t toolId = manifest.GetToolId();
     if ( toolId == 0 )
     {
-        return;
+        return false; // Not known yet
     }
 
     MutexHolder mh( m_Mutex );
@@ -775,60 +765,80 @@ void ClientToWorkerConnection::QueueToolchain( const ToolManifest & manifest )
         m_NumSkippedToolchains.Increment();
         DIST_INFO( " - Toolchain 0x%016" PRIx64 " is cached on %s\n", toolId, m_Worker->m_Address.Get() );
     }
+    return true;
 }
 
 // PushToolchainsToWorker
 //------------------------------------------------------------------------------
 void ClientToWorkerConnection::PushToolchainsToWorker()
 {
-    // The compilers of the build are sent as soon as they are known, rather than when the first job
-    // is ready, so the upload overlaps the PCH builds and preprocessing that come first
+    // Toolchains go out ahead of any PCH queued after them: they are small and every job needs one
     if ( m_AwaitingInventory.Load() || m_Worker->m_DenyListed || m_SendThreadQuit.Load() )
+    {
+        return;
+    }
+
+    const uint32_t generation = m_Client->GetToolchainsGeneration();
+    if ( generation == m_ToolchainsGeneration )
     {
         return;
     }
 
     Array<const ToolManifest *> manifests;
     m_Client->GetToolchains( manifests );
+    bool allQueued = true;
     for ( const ToolManifest * manifest : manifests )
     {
-        QueueToolchain( *manifest );
+        allQueued &= QueueToolchain( *manifest );
+    }
+    if ( allQueued )
+    {
+        m_ToolchainsGeneration = generation;
     }
 }
 
-// GetPchState
+// QueuePchsToWorker
 //------------------------------------------------------------------------------
-void ClientToWorkerConnection::GetPchState( Array<uint64_t> & outOnWorker,
-                                            Array<uint64_t> & outSending,
-                                            uint32_t & outNumHeld ) const
+void ClientToWorkerConnection::QueuePchsToWorker()
 {
+    if ( m_AwaitingInventory.Load() || m_Worker->m_DenyListed || m_SendThreadQuit.Load() )
+    {
+        return;
+    }
+
+    {
+        MutexHolder mh( m_Mutex );
+        if ( m_PchState.GetSending().GetSize() >= PchDispatch::kMaxSendingPchs )
+        {
+            return;
+        }
+    }
+
+    // Keep the uplink busy: queue the next PCH while the current is sent, rather than once a job
+    // that needs it has been taken
+    Array<uint64_t> waitingPchIds;
+    Array<uint32_t> numWaiting;
+    JobQueue::Get().CountDistributableJobsByPch( waitingPchIds, numWaiting );
+
     MutexHolder mh( m_Mutex );
-
-    outOnWorker = m_DeliveredPchIds;
-
-    // Queued for sending, in the order they go out
-    for ( const uint64_t pchId : m_SentPchIds )
+    for ( ;; )
     {
-        if ( outOnWorker.Find( pchId ) == nullptr )
+        const uint64_t pchId = PchDispatch::SelectPchToQueue( waitingPchIds, numWaiting, m_PchState );
+        if ( pchId == 0 )
         {
-            outSending.Append( pchId );
+            break;
         }
-    }
-    for ( const uint64_t pchId : m_PendingPchIds )
-    {
-        if ( ( outOnWorker.Find( pchId ) == nullptr ) && ( outSending.Find( pchId ) == nullptr ) )
-        {
-            outSending.Append( pchId );
-        }
-    }
 
-    outNumHeld = 0;
-    for ( const Job * job : m_Jobs )
-    {
-        const uint64_t pchId = job->GetPchId();
-        if ( ( pchId != 0 ) && ( outOnWorker.Find( pchId ) == nullptr ) )
+        PchDataCache::Entry entry;
+        if ( PchDataCache::Get().Find( pchId, entry ) && ( PchDataCache::Get().HasCompressionFailed( pchId ) == false ) )
         {
-            ++outNumHeld;
+            m_PchState.OnRequested( pchId );
+            m_PendingPchIds.Append( pchId );
+        }
+        else
+        {
+            // Nothing to send for it: not considered again
+            numWaiting[ (size_t)( waitingPchIds.Find( pchId ) - waitingPchIds.Begin() ) ] = 0;
         }
     }
 }
@@ -849,8 +859,23 @@ void ClientToWorkerConnection::PushJobsToWorker()
     const uint8_t workerMinorProtocolVersion = m_ProtocolVersionMinor.Load();
     uint32_t toSend = capacity - inFlight;
 
-    // At most half the slots hold jobs waiting for a PCH, so jobs that can run are never shut out
-    const uint32_t maxHeld = Math::Max( 1u, capacity / 2u );
+    // The jobs already on the worker that wait for their PCH, and the PCHs on the worker or on
+    // their way. Kept up to date locally as jobs are taken.
+    PchWorkerState pchState;
+    pchState.m_MaxHeld = PchDispatch::MaxHeldJobs( capacity );
+    {
+        MutexHolder mh( m_Mutex );
+        pchState.m_OnWorker = m_PchState.GetOnWorker();
+        pchState.m_Sending = m_PchState.GetSending();
+        for ( const Job * job : m_Jobs )
+        {
+            const uint64_t pchId = job->GetPchId();
+            if ( ( pchId != 0 ) && ( m_PchState.IsOnWorker( pchId ) == false ) )
+            {
+                ++pchState.m_NumHeld;
+            }
+        }
+    }
 
     while ( toSend > 0 )
     {
@@ -860,14 +885,6 @@ void ClientToWorkerConnection::PushJobsToWorker()
         {
             break;
         }
-
-        Array<uint64_t> onWorker;
-        Array<uint64_t> sending;
-        PchWorkerState pchState;
-        GetPchState( onWorker, sending, pchState.m_NumHeld );
-        pchState.m_OnWorker = &onWorker;
-        pchState.m_Sending = &sending;
-        pchState.m_MaxHeld = maxHeld;
 
         Job * job = JobQueue::Get().GetDistributableJobToProcess( true, workerMinorProtocolVersion, &pchState );
         if ( job == nullptr )
@@ -882,24 +899,19 @@ void ClientToWorkerConnection::PushJobsToWorker()
 
         QueueToolchain( manifest );
 
-        // Queue PCH data if not yet sent to this worker
+        // A job is only given a PCH that is on its way (QueuePchsToWorker), so a failed one is
+        // not waited for
         const uint64_t pchId = job->GetPchId();
         if ( pchId != 0 )
         {
-            // No worker can receive a PCH that could not be read: leave the job to others
             if ( PchDataCache::Get().HasCompressionFailed( pchId ) )
             {
                 JobQueue::Get().ReturnUnfinishedDistributableJob( job );
                 break;
             }
-
-            PchDataCache::Entry entry;
-            MutexHolder mh( m_Mutex );
-            if ( ( m_SentPchIds.Find( pchId ) == nullptr ) &&
-                 ( m_PendingPchIds.Find( pchId ) == nullptr ) &&
-                 PchDataCache::Get().Find( pchId, entry ) )
+            if ( pchState.m_OnWorker.Find( pchId ) == nullptr )
             {
-                m_PendingPchIds.Append( pchId );
+                ++pchState.m_NumHeld;
             }
         }
 
@@ -954,7 +966,7 @@ void ClientToWorkerConnection::SendPendingPchs()
     }
 
     Array<PchDataCache::ReadyPch> ready;
-    const bool allOk = PchDataCache::Get().TakeReadyPchs( m_PendingPchIds, m_SentPchIds, ready );
+    const bool allOk = PchDataCache::Get().TakeReadyPchs( m_PendingPchIds, m_PchState.GetOnWorker(), ready );
     for ( const PchDataCache::ReadyPch & pch : ready )
     {
         EnqueueSend( Protocol::MsgPchFile( pch.pchId, pch.uncompressedSize ),
@@ -1672,7 +1684,7 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
                 if ( item.m_PchId != 0 )
                 {
                     MutexHolder mh( m_Mutex );
-                    m_DeliveredPchIds.Append( item.m_PchId );
+                    m_PchState.OnDelivered( item.m_PchId );
                 }
             }
 
