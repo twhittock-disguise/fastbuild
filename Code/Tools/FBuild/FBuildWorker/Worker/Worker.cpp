@@ -229,7 +229,6 @@ uint32_t Worker::WorkThread()
 //------------------------------------------------------------------------------
 bool Worker::HasEnoughDiskSpace()
 {
-#if defined( __WINDOWS__ )
     // Only check disk space every few seconds
     const float elapsedTime = m_TimerLastDiskSpaceCheck.GetElapsedMS();
     if ( ( elapsedTime < 15000.0f ) && ( m_LastDiskSpaceResult != -1 ) )
@@ -240,15 +239,11 @@ bool Worker::HasEnoughDiskSpace()
 
     constexpr uint64_t MIN_DISK_SPACE = 1024 * 1024 * 1024; // 1 GiB
 
-    uint64_t freeBytesAvailable = 0;
-    uint64_t totalNumberOfBytes = 0;
-    uint64_t totalNumberOfFreeBytes = 0;
-
     // Check available disk space of temp path
     AStackString tmpPath;
     VERIFY( FBuild::GetTempDir( tmpPath ) );
-    const BOOL result = GetDiskFreeSpaceExA( tmpPath.Get(), (PULARGE_INTEGER)&freeBytesAvailable, (PULARGE_INTEGER)&totalNumberOfBytes, (PULARGE_INTEGER)&totalNumberOfFreeBytes );
-    if ( result && ( freeBytesAvailable >= MIN_DISK_SPACE ) )
+    uint64_t freeBytesAvailable = 0;
+    if ( FileIO::GetFreeDiskSpace( tmpPath, freeBytesAvailable ) && ( freeBytesAvailable >= MIN_DISK_SPACE ) )
     {
         m_LastDiskSpaceResult = 1;
         return true;
@@ -257,9 +252,6 @@ bool Worker::HasEnoughDiskSpace()
     // The drive doesn't have enough free space or could not be queried. Exclude this machine from worker pool.
     m_LastDiskSpaceResult = 0;
     return false;
-#else
-    return true; // TODO:MAC TODO:LINUX Implement disk space checks
-#endif
 }
 
 // HasEnoughMemory
