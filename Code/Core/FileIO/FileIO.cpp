@@ -31,6 +31,7 @@
     #include <limits.h>
     #include <stdio.h>
     #include <sys/stat.h>
+    #include <sys/statvfs.h>
     #include <unistd.h>
 #endif
 #if defined( __LINUX__ )
@@ -793,6 +794,30 @@ public:
     return false; // Not a mount point
 }
 #endif
+
+// GetFreeDiskSpace
+//------------------------------------------------------------------------------
+/*static*/ bool FileIO::GetFreeDiskSpace( const AString & path, uint64_t & outFreeBytes )
+{
+#if defined( __WINDOWS__ )
+    ULARGE_INTEGER freeBytesAvailable;
+    if ( GetDiskFreeSpaceExA( path.Get(), &freeBytesAvailable, nullptr, nullptr ) )
+    {
+        outFreeBytes = freeBytesAvailable.QuadPart;
+        return true;
+    }
+#elif defined( __APPLE__ ) || defined( __LINUX__ )
+    struct statvfs st;
+    if ( statvfs( path.Get(), &st ) == 0 )
+    {
+        outFreeBytes = ( (uint64_t)st.f_bavail * (uint64_t)st.f_frsize );
+        return true;
+    }
+#else
+    #error Unknown platform
+#endif
+    return false;
+}
 
 // GetFileLastWriteTime
 //------------------------------------------------------------------------------

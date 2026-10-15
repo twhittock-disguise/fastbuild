@@ -52,6 +52,9 @@ public:
     static bool GetCurrentDir( AString & output );
     static bool SetCurrentDir( const AString & dir );
     static bool GetTempDir( AString & output );
+
+    // Bytes available to this process on the volume holding the path (which must exist)
+    [[nodiscard]] static bool GetFreeDiskSpace( const AString & path, uint64_t & outFreeBytes );
     static bool DirectoryCreate( const AString & path );
     static bool DirectoryExists( const AString & path );
     static bool EnsurePathExists( const AString & path );

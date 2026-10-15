@@ -12,6 +12,7 @@
 #endif
 #include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/FileStream.h"
+#include "Core/FileIO/PathUtils.h"
 #include "Core/Math/Random.h"
 #include "Core/Process/Process.h"
 #include "Core/Process/Thread.h"
@@ -38,6 +39,7 @@ private:
     void FileMove() const;
     void ReadOnly() const;
     void FileTime() const;
+    void FreeDiskSpace() const;
     void LongPaths() const;
 #if defined( __WINDOWS__ )
     void NormalizeWindowsPathCasing() const;
@@ -60,6 +62,7 @@ REGISTER_TESTS_BEGIN( TestFileIO )
     REGISTER_TEST( FileMove )
     REGISTER_TEST( ReadOnly )
     REGISTER_TEST( FileTime )
+    REGISTER_TEST( FreeDiskSpace )
     REGISTER_TEST( LongPaths )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( NormalizeWindowsPathCasing )
@@ -106,6 +109,26 @@ void TestFileIO::FileExists() const
         // Ensure FileExists returns false if passed the directory path
         TEST_ASSERT( FileIO::FileExists( dirPath.Get() ) == false );
     }
+}
+
+// FreeDiskSpace
+//------------------------------------------------------------------------------
+void TestFileIO::FreeDiskSpace() const
+{
+    AStackString tempDir;
+    TEST_ASSERT( FileIO::GetTempDir( tempDir ) );
+
+    // The volume holding the temp directory has some free space
+    uint64_t freeBefore = 0;
+    TEST_ASSERT( FileIO::GetFreeDiskSpace( tempDir, freeBefore ) );
+    TEST_ASSERT( freeBefore > 0 );
+
+    // The same with or without the trailing slash
+    AStackString noSlash( tempDir );
+    noSlash.TrimEnd( NATIVE_SLASH );
+    uint64_t freeWithoutSlash = 0;
+    TEST_ASSERT( FileIO::GetFreeDiskSpace( noSlash, freeWithoutSlash ) );
+    TEST_ASSERT( freeWithoutSlash > 0 );
 }
 
 // FileDelete
