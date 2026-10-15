@@ -6828,6 +6828,25 @@ void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
         TEST_ASSERT( ready[ 0 ].uncompressedSize == fileSize );
     }
 
+    // A PCH that compresses but has no pointers is not transformed either
+    {
+        Array<char> notAPch;
+        const AStackString<> notAPchPath( "../tmp/Test/Distributed/PchTransformForms/notapch.pch" );
+        TEST_ASSERT( WriteTestFile( notAPchPath.Get(), ( 2 * MEGABYTE ) + 3, notAPch ) );
+        PchDataCache::Entry notAPchEntry;
+        notAPchEntry.pchId = PchId::Calc( notAPch.Begin(), notAPch.GetSize() );
+        notAPchEntry.uncompressedSize = (uint32_t)notAPch.GetSize();
+        notAPchEntry.filePath = notAPchPath;
+        cache.Store( notAPchEntry );
+        AStackString<> asked;
+        uint64_t askedSize = 0;
+        bool askedTransformed = true;
+        TEST_ASSERT( WaitForForm( cache, notAPchEntry, true, asked, askedSize, askedTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( askedTransformed == false );
+        TEST_ASSERT( DecodesToFile( asked, notAPch ) );
+        TEST_ASSERT( cache.GetNumCompressions() == 3 );
+    }
+
     // A PCH the transform does not help is sent as it is to a worker that reads the transform, and is made once
     {
         Array<char> random;
@@ -6854,14 +6873,14 @@ void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
         TEST_ASSERT( LoadFile( asked, askedBlob ) );
         TEST_ASSERT( ( GetBlobType( askedBlob ) & ~0xFFu ) == 0 ); // Not of a transform
         TEST_ASSERT( DecodesToFile( asked, random ) );
-        TEST_ASSERT( cache.GetNumCompressions() == 3 );
+        TEST_ASSERT( cache.GetNumCompressions() == 4 );
 
         AStackString<> other;
         uint64_t otherSize = 0;
         bool otherTransformed = true;
         TEST_ASSERT( cache.GetCompressed( randomEntry, other, otherSize, false, &otherTransformed ) == PchDataCache::READY );
         TEST_ASSERT( ( other == asked ) && ( otherSize == askedSize ) && ( otherTransformed == false ) );
-        TEST_ASSERT( cache.GetNumCompressions() == 3 );
+        TEST_ASSERT( cache.GetNumCompressions() == 4 );
     }
 }
 

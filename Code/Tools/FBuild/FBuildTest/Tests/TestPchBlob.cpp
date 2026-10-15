@@ -822,6 +822,19 @@ void TestPchBlob::RejectsTransformedBlobsThatAreNotValid() const
         TEST_ASSERT( isRejected( bad ) );
     }
 
+    // Data that is not compressed is not data of a transform, though it is the size of the PCH
+    {
+        Array<char> random;
+        MakeRandomBytes( 100000, 22, random );
+        Array<char> copy;
+        TEST_ASSERT( MakePchBlob( random, 0, copy ) );
+        TEST_ASSERT( GetHeaderWord( copy, 0 ) == Compressor::eUncompressed );
+        const uint64_t randomId = PchId::Calc( random.Begin(), random.GetSize() );
+        TEST_ASSERT( PchBlob::Verify( copy.Begin(), copy.GetSize(), randomId, (uint32_t)random.GetSize() ) );
+        SetHeaderWord( copy, 0, Compressor::eUncompressed | ( (uint32_t)PchTransform::kPtrXfId << 8 ) | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) );
+        TEST_ASSERT( PchBlob::Verify( copy.Begin(), copy.GetSize(), randomId, (uint32_t)random.GetSize() ) == false );
+    }
+
     // A size that is not that of the PCH
     const int32_t differences[] = { -1, 1, -8, 8 };
     for ( const int32_t difference : differences )
