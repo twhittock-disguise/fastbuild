@@ -10,6 +10,7 @@
 // Forward Declarations
 //------------------------------------------------------------------------------
 template <class T> class Atomic;
+class FileStream;
 
 // PchBlob
 //------------------------------------------------------------------------------
@@ -35,12 +36,14 @@ public:
 
     // Decompresses the stored file to rawFile, a piece at a time, and checks it is the PCH with this id. It
     // is written to tempFile first, so rawFile is only ever seen whole. Nothing is left behind on failure.
+    // writer is the stream tempFile is written through, if it is not a plain FileStream (tests make one fail).
     [[nodiscard]] static UnpackResult Unpack( const AString & storedFile,
                                               uint64_t pchId,
                                               const AString & tempFile,
                                               const AString & rawFile,
                                               const Atomic<bool> * abort,
-                                              uint64_t & outSize );
+                                              uint64_t & outSize,
+                                              FileStream * writer = nullptr );
 };
 
 //------------------------------------------------------------------------------

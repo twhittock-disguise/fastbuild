@@ -273,9 +273,6 @@ void JobQueueRemote::FinishedProcessingJob( Job * job, Node::BuildResult result 
         m_InFlightJobs.Erase( it );
     }
 
-    // The compile is over, so the PCH is no longer used by it
-    job->ReleasePchLease();
-
     // handle jobs which were cancelled while in flight
     if ( job->GetUserData() == nullptr )
     {
@@ -296,31 +293,6 @@ void JobQueueRemote::FinishedProcessingJob( Job * job, Node::BuildResult result 
     }
 
     WakeMainThread();
-}
-
-// GetPchIdsInUse
-//------------------------------------------------------------------------------
-void JobQueueRemote::GetPchIdsInUse( Array<uint64_t> & outPchIds ) const
-{
-    {
-        MutexHolder mh( m_PendingJobsMutex );
-        for ( const Job * job : m_PendingJobs )
-        {
-            if ( job->GetPchId() != 0 )
-            {
-                outPchIds.Append( job->GetPchId() );
-            }
-        }
-    }
-
-    MutexHolder mh( m_InFlightJobsMutex );
-    for ( const Job * job : m_InFlightJobs )
-    {
-        if ( job->GetPchId() != 0 )
-        {
-            outPchIds.Append( job->GetPchId() );
-        }
-    }
 }
 
 // DoBuild

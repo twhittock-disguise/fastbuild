@@ -48,13 +48,6 @@ namespace
     const char * const kUnpackTempFilePrefix = "unpack.";
     const char * const kUnpackTempFileExtension = ".pch";
 
-    // File time ticks in a second
-#if defined( __WINDOWS__ )
-    constexpr uint64_t kFileTimePerSecond = 10000000ull;
-#else
-    constexpr uint64_t kFileTimePerSecond = 1000000000ull;
-#endif
-
     // Collects the directories found while listing files
     class DirectoryCollector : public GetFilesHelper
     {
@@ -145,6 +138,52 @@ namespace
         if ( FBuild::GetWorkerCacheDir( outFile ) == false ) { return false; }
         outFile.AppendFormat( "pch.%016" PRIx64 "%c%s", pchId, (char)NATIVE_SLASH, PchBlob::kStoredFileName );
         return true;
+    }
+
+    // The directory of a file, without the trailing slash
+    bool GetDirectoryOf( const AString & file, AString & outDirectory )
+    {
+        const char * lastSlash = file.FindLast( NATIVE_SLASH );
+        if ( lastSlash == nullptr )
+        {
+            return false;
+        }
+        outDirectory.Assign( file.Get(), lastSlash );
+        return true;
+    }
+
+    // The id of the PCH whose directory (<basePath>pch.<16 hex digits>) holds the file, or 0 if the file is in none
+    uint64_t GetPchIdOfFile( const AString & file, const AString & basePath )
+    {
+        const char * dirEnd = file.FindLast( NATIVE_SLASH );
+        if ( dirEnd == nullptr )
+        {
+            return 0;
+        }
+        const char * dirStart = dirEnd;
+        while ( ( dirStart > file.Get() ) && ( dirStart[ -1 ] != NATIVE_SLASH ) )
+        {
+            --dirStart;
+        }
+        if ( ( (size_t)( dirStart - file.Get() ) != basePath.GetLength() ) ||
+             ( AString::StrNCmp( file.Get(), basePath.Get(), basePath.GetLength() ) != 0 ) ||
+             ( ( dirEnd - dirStart ) != ( 4 + 16 ) ) ||
+             ( AString::StrNCmp( dirStart, "pch.", 4 ) != 0 ) )
+        {
+            return 0;
+        }
+        uint64_t pchId = 0;
+        for ( const char * p = ( dirStart + 4 ); p < dirEnd; ++p )
+        {
+            const char c = *p;
+            uint8_t nibble;
+            if ( ( c >= '0' ) && ( c <= '9' ) )      { nibble = (uint8_t)( c - '0' ); }
+            else if ( ( c >= 'a' ) && ( c <= 'f' ) ) { nibble = (uint8_t)( c - 'a' + 10 ); }
+            else if ( ( c >= 'A' ) && ( c <= 'F' ) ) { nibble = (uint8_t)( c - 'A' + 10 ); }
+            else { return 0; }
+            pchId = ( ( pchId << 4 ) | nibble );
+        }
+        return pchId;
     }
 
     // Removes the toolchain directory that holds the manifest file, and everything in it
@@ -882,17 +921,10 @@ bool Server::IsPchBeingReceived( uint64_t pchId ) const
 
 // IsPchCached
 //------------------------------------------------------------------------------
-bool Server::IsPchCached( uint64_t pchId ) const
+bool Server::IsPchCached( uint64_t pchId )
 {
     MutexHolder mh( m_PchCacheMutex );
-    for ( const PchCacheEntry & e : m_PchCache )
-    {
-        if ( e.pchId == pchId )
-        {
-            return true;
-        }
-    }
-    return false;
+    return ( FindStoredPch( pchId ) != nullptr );
 }
 
 // Process( MsgPchFile )
@@ -928,12 +960,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
     // Touch timestamp to prevent periodic cleanup
     FileIO::SetFileLastWriteTimeToNow( pchFilePath );
 
-    // Everything that takes other locks or the disk happens before m_PchCacheMutex, which
-    // FindCachedPch needs while holding m_ClientListMutex. The PCH just received is in use: the
-    // jobs waiting for it are not queued yet.
-    Array<uint64_t> pchIdsInUse;
-    CollectPchIdsInUse( pchIdsInUse );
-    pchIdsInUse.Append( pchId );
+    // The disk is read before m_PchCacheMutex is taken
     FileIO::FileInfo storedInfo;
     const uint64_t storedSize = FileIO::GetFileInfo( pchFilePath, storedInfo ) ? storedInfo.m_Size : msg->GetCompressedSize();
     uint64_t cacheBytes = storedSize;
@@ -951,14 +978,10 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
         const uint64_t now = Time::GetCurrentFileTime();
 
         // Check not already in cache (race with another connection)
-        for ( PchCacheEntry & e : m_PchCache )
+        if ( PchCacheEntry * existing = FindStoredPch( pchId ) )
         {
-            if ( e.pchId == pchId )
-            {
-                e.lastWriteTime = now;
-                newlyCached = false;
-                break;
-            }
+            existing->lastWriteTime = now;
+            newlyCached = false;
         }
 
         if ( newlyCached )
@@ -970,7 +993,10 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
             entry.size = storedSize; // What the file on disk comes to
             m_PchCache.Append( Move( entry ) );
 
-            // A PCH being unpacked, or that a job needs, stays, though it was not when the ones in use were listed
+            // Every job holds a lease on its PCH from when it arrives, so what leases or an unpack
+            // hold stays, and so does the PCH just received (the jobs waiting for it have leases too)
+            Array<uint64_t> pchIdsInUse;
+            pchIdsInUse.Append( pchId );
             for ( const PchRawEntry & raw : m_PchRaw )
             {
                 if ( ( raw.numLeases > 0 ) || ( raw.state == PchRawEntry::UNPACKING ) )
@@ -982,7 +1008,6 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
             EvictPchs( m_PchCache, limits.m_Bytes, limits.m_MinEntries, pchIdsInUse, &evictedIds );
             for ( const uint64_t evictedId : evictedIds )
             {
-                // Its working copy went with it, and no job needs it
                 const PchRawEntry * raw = FindRawPch( evictedId );
                 if ( raw )
                 {
@@ -1042,11 +1067,12 @@ void Server::ScanPchCache()
     // Use GetFilesEx to get timestamps for LRU eviction
     Array<PchCacheEntry> scannedEntries;
 
-    // Scan for the compressed PCHs (pch.zst) under pch.<hex> subdirs.
+    // Scan for the compressed PCHs (pch.zst) in the pch.<hex> directories.
     // Parse pchId from the directory name rather than reading/hashing each file.
-    // A working copy (pch.pch) is not the cache's: nothing is using it now, so it is deleted. That
-    // also removes the directories that hold nothing else, which is all that PCHs stored as they were
-    // before they were compressed leave.
+    // A working copy (pch.pch) is not the cache's: no job exists yet, so it is deleted. That also
+    // removes the directories that hold nothing else, which is all that PCHs stored as they were
+    // before they were compressed leave. There is one worker per machine (see FBuildWorker's Main), so
+    // no other process has a working copy in use. Files in other directories are not touched.
     Array<FileIO::FileInfo> pchFiles;
     Array<AString> pchPatterns;
     pchPatterns.Append( AString( PchBlob::kStoredFileName ) );
@@ -1055,28 +1081,14 @@ void Server::ScanPchCache()
     {
         for ( const FileIO::FileInfo & fi : pchFiles )
         {
+            const uint64_t pchId = GetPchIdOfFile( fi.m_Name, basePath );
+            if ( pchId == 0 ) { continue; }
+
             if ( fi.m_Name.EndsWith( PchBlob::kRawFileName ) )
             {
                 FileIO::FileDelete( fi.m_Name.Get() );
                 continue;
             }
-
-            // Path is: <basePath>/pch.<hex>/pch.zst — extract hex from parent dir
-            const char * pchDot = fi.m_Name.Find( "pch." );
-            if ( pchDot == nullptr ) { continue; }
-            const char * hexStart = pchDot + 4; // skip "pch."
-            uint64_t pchId = 0;
-            for ( const char * p = hexStart; *p && *p != NATIVE_SLASH && *p != '/'; ++p )
-            {
-                char c = *p;
-                uint8_t nibble;
-                if ( c >= '0' && c <= '9' )      { nibble = (uint8_t)( c - '0' ); }
-                else if ( c >= 'a' && c <= 'f' ) { nibble = (uint8_t)( c - 'a' + 10 ); }
-                else if ( c >= 'A' && c <= 'F' ) { nibble = (uint8_t)( c - 'A' + 10 ); }
-                else { pchId = 0; break; } // Invalid hex
-                pchId = ( pchId << 4 ) | nibble;
-            }
-            if ( pchId == 0 ) { continue; }
 
             PchCacheEntry entry;
             entry.pchId = pchId;
@@ -1142,40 +1154,6 @@ void Server::ScanPchCache()
     }
 }
 
-// CollectPchIdsInUse
-//------------------------------------------------------------------------------
-void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
-{
-    JobQueueRemote::Get().GetPchIdsInUse( outPchIds );
-
-    // Jobs waiting for their toolchain or PCH are not in the job queue yet
-    {
-        MutexHolder mhC( m_ClientListMutex );
-        for ( ClientState * cs : m_ClientList )
-        {
-            MutexHolder mh( cs->m_Mutex );
-            for ( const Job * job : cs->m_WaitingJobs )
-            {
-                if ( job->GetPchId() != 0 )
-                {
-                    outPchIds.Append( job->GetPchId() );
-                }
-            }
-        }
-    }
-
-    // A job holds a lease on its PCH from the time it arrives to the time it is destroyed, so these
-    // include the jobs that moved between the lists above while they were read
-    MutexHolder mhP( m_PchCacheMutex );
-    for ( const PchRawEntry & raw : m_PchRaw )
-    {
-        if ( ( raw.numLeases > 0 ) || ( raw.state == PchRawEntry::UNPACKING ) )
-        {
-            outPchIds.Append( raw.pchId );
-        }
-    }
-}
-
 // EvictPchs
 //------------------------------------------------------------------------------
 /*static*/ void Server::EvictPchs( Array<PchCacheEntry> & entries,
@@ -1190,24 +1168,11 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
     for ( size_t i = evictions.GetSize(); i > 0; --i )
     {
         const size_t idx = evictions[ i - 1 ];
-        const AString & file = entries[ idx ].filePath;
-        AStackString<> rawFile;
-        if ( GetRawPchPath( file, rawFile ) )
-        {
-            FileIO::FileDelete( rawFile.Get() );
-        }
-        FileIO::FileDelete( file.Get() );
+        RemovePchFiles( entries[ idx ] );
         FLOG_VERBOSE( "PCH cache: evicting 0x%016" PRIx64 " (%u MiB compressed)\n", entries[ idx ].pchId, (uint32_t)( entries[ idx ].size / MEGABYTE ) );
         if ( outEvictedIds )
         {
             outEvictedIds->Append( entries[ idx ].pchId );
-        }
-
-        // The directory goes with it, unless something else is in it
-        const char * lastSlash = file.FindLast( NATIVE_SLASH );
-        if ( lastSlash )
-        {
-            FileIO::DirectoryDelete( AStackString<>( file.Get(), lastSlash ) );
         }
         entries.EraseIndex( idx );
     }
@@ -1460,21 +1425,33 @@ void Server::EvictToolchains( const ToolManifest * keep )
     }
 }
 
+// FindStoredPch
+//------------------------------------------------------------------------------
+Server::PchCacheEntry * Server::FindStoredPch( uint64_t pchId )
+{
+    for ( PchCacheEntry & e : m_PchCache )
+    {
+        if ( e.pchId == pchId )
+        {
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
 // FindCachedPch
 //------------------------------------------------------------------------------
 bool Server::FindCachedPch( uint64_t pchId, AString & outPath )
 {
     MutexHolder mh( m_PchCacheMutex );
-    for ( PchCacheEntry & e : m_PchCache )
+    PchCacheEntry * stored = FindStoredPch( pchId );
+    if ( stored == nullptr )
     {
-        if ( e.pchId == pchId )
-        {
-            e.lastWriteTime = Time::GetCurrentFileTime();
-            outPath = e.filePath;
-            return true;
-        }
+        return false;
     }
-    return false;
+    stored->lastWriteTime = Time::GetCurrentFileTime();
+    outPath = stored->filePath;
+    return true;
 }
 
 // FindRawPch
@@ -1510,14 +1487,32 @@ uint64_t Server::CountRawPchBytes() const
 //------------------------------------------------------------------------------
 /*static*/ bool Server::GetRawPchPath( const AString & storedFile, AString & outRawFile )
 {
-    const char * lastSlash = storedFile.FindLast( NATIVE_SLASH );
-    if ( lastSlash == nullptr )
+    AStackString<> directory;
+    if ( GetDirectoryOf( storedFile, directory ) == false )
     {
         return false;
     }
-    outRawFile.Assign( storedFile.Get(), lastSlash + 1 );
-    outRawFile += PchBlob::kRawFileName;
+    outRawFile.Format( "%s%c%s", directory.Get(), (char)NATIVE_SLASH, PchBlob::kRawFileName );
     return true;
+}
+
+// RemovePchFiles
+//------------------------------------------------------------------------------
+/*static*/ void Server::RemovePchFiles( const PchCacheEntry & entry )
+{
+    AStackString<> rawFile;
+    if ( GetRawPchPath( entry.filePath, rawFile ) )
+    {
+        FileIO::FileDelete( rawFile.Get() );
+    }
+    FileIO::FileDelete( entry.filePath.Get() );
+
+    // The directory goes with it, unless something else is in it
+    AStackString<> directory;
+    if ( GetDirectoryOf( entry.filePath, directory ) )
+    {
+        FileIO::DirectoryDelete( directory );
+    }
 }
 
 // AcquirePchLease
@@ -1555,9 +1550,6 @@ PchLease Server::AcquirePchLease( uint64_t pchId )
     {
         m_PchRaw.EraseIndex( (size_t)( raw - m_PchRaw.Begin() ) );
     }
-
-    // What is unused may be too much now
-    m_PchTrimRequested.Store( true );
 }
 
 // TryResolvePch
@@ -1567,15 +1559,7 @@ bool Server::TryResolvePch( Job & job )
     const uint64_t pchId = job.GetPchId();
     MutexHolder mh( m_PchCacheMutex );
 
-    PchCacheEntry * stored = nullptr;
-    for ( PchCacheEntry & e : m_PchCache )
-    {
-        if ( e.pchId == pchId )
-        {
-            stored = &e;
-            break;
-        }
-    }
+    PchCacheEntry * stored = FindStoredPch( pchId );
     if ( stored == nullptr )
     {
         return false; // Not here: the job waits for it to be sent
@@ -1584,26 +1568,18 @@ bool Server::TryResolvePch( Job & job )
     stored->lastWriteTime = now;
 
     AStackString<> rawFile;
-    if ( GetRawPchPath( stored->filePath, rawFile ) == false )
-    {
-        return false;
-    }
     PchRawEntry * raw = FindRawPch( pchId );
     ASSERT( raw ); // The job has a lease
-    if ( raw == nullptr )
+    if ( ( raw == nullptr ) || ( GetRawPchPath( stored->filePath, rawFile ) == false ) )
     {
         return false;
     }
 
-    if ( raw->state == PchRawEntry::READY )
+    if ( raw->state == PchRawEntry::READY ) // Only removed under this mutex, with its entry
     {
-        if ( FileIO::FileExists( rawFile.Get() ) )
-        {
-            raw->lastUsed = now;
-            job.SetPchCachePath( rawFile );
-            return true;
-        }
-        raw->state = PchRawEntry::ABSENT; // Something removed it: it is made again
+        raw->lastUsed = now;
+        job.SetPchCachePath( rawFile );
+        return true;
     }
     if ( raw->state == PchRawEntry::ABSENT )
     {
@@ -1659,30 +1635,51 @@ void Server::UnpackPch( uint64_t pchId )
 
     AStackString<> storedFile;
     AStackString<> rawFile;
-    AStackString<> tempFile;
     bool haveStored = false;
     {
         MutexHolder mh( m_PchCacheMutex );
-        for ( const PchCacheEntry & e : m_PchCache )
+        PchRawEntry * raw = FindRawPch( pchId );
+        if ( raw == nullptr )
         {
-            if ( e.pchId == pchId )
-            {
-                storedFile = e.filePath;
-                haveStored = GetRawPchPath( storedFile, rawFile );
-                break;
-            }
+            return;
+        }
+        if ( raw->numLeases == 0 )
+        {
+            // The jobs that needed it are gone
+            m_PchRaw.EraseIndex( (size_t)( raw - m_PchRaw.Begin() ) );
+            return;
+        }
+        const PchCacheEntry * stored = FindStoredPch( pchId );
+        if ( stored )
+        {
+            storedFile = stored->filePath;
+            haveStored = GetRawPchPath( storedFile, rawFile );
         }
     }
 
-    PchBlob::UnpackResult result = PchBlob::UNPACK_CORRUPT;
+    PchBlob::UnpackResult result = PchBlob::UNPACK_CORRUPT; // A PCH that is not stored is as good as a damaged one
     uint64_t rawSize = 0;
     const Timer timer;
     if ( haveStored )
     {
         const char * lastSlash = rawFile.FindLast( NATIVE_SLASH );
-        AStackString<> dir( rawFile.Get(), lastSlash + 1 );
-        TempFiles::MakeName( dir, kUnpackTempFilePrefix, kUnpackTempFileExtension, tempFile );
-        result = PchBlob::Unpack( storedFile, pchId, tempFile, rawFile, &m_ShouldExit, rawSize );
+        const AStackString<> dir( rawFile.Get(), lastSlash + 1 );
+        for ( uint32_t attempt = 0; attempt < 2; ++attempt )
+        {
+            AStackString<> tempFile;
+            TempFiles::MakeName( dir, kUnpackTempFilePrefix, kUnpackTempFileExtension, tempFile );
+            m_NumPchUnpackAttempts.Increment();
+            result = PchBlob::Unpack( storedFile, pchId, tempFile, rawFile, &m_ShouldExit, rawSize );
+            if ( result != PchBlob::UNPACK_CANNOT_WRITE )
+            {
+                break;
+            }
+            if ( attempt == 0 )
+            {
+                FLOG_WARN( "PCH 0x%016" PRIx64 ": the working copy cannot be written, dropping those nothing uses and trying again\n", pchId );
+                DropUnusedRawPchs();
+            }
+        }
         if ( result == PchBlob::UNPACK_OK )
         {
             m_NumPchsUnpacked.Increment();
@@ -1712,23 +1709,13 @@ void Server::UnpackPch( uint64_t pchId )
                 }
             }
 
-            // A PCH that cannot be unpacked is not kept: the jobs that need it ask for it again
-            if ( result != PchBlob::UNPACK_ABORTED )
+            // Only a damaged file is dropped. One that cannot be unpacked for want of room is fine:
+            // sending it again would not make room.
+            PchCacheEntry * stored = ( result == PchBlob::UNPACK_CORRUPT ) ? FindStoredPch( pchId ) : nullptr;
+            if ( stored )
             {
-                for ( size_t i = 0; i < m_PchCache.GetSize(); ++i )
-                {
-                    if ( m_PchCache[ i ].pchId == pchId )
-                    {
-                        FileIO::FileDelete( m_PchCache[ i ].filePath.Get() );
-                        const char * lastSlash = m_PchCache[ i ].filePath.FindLast( NATIVE_SLASH );
-                        if ( lastSlash )
-                        {
-                            FileIO::DirectoryDelete( AStackString<>( m_PchCache[ i ].filePath.Get(), lastSlash ) );
-                        }
-                        m_PchCache.EraseIndex( i );
-                        break;
-                    }
-                }
+                RemovePchFiles( *stored );
+                m_PchCache.EraseIndex( (size_t)( stored - m_PchCache.Begin() ) );
             }
         }
     }
@@ -1741,23 +1728,60 @@ void Server::UnpackPch( uint64_t pchId )
     {
         FLOG_VERBOSE( "PCH unpacked: 0x%016" PRIx64 " %u MiB in %u ms\n", pchId, (uint32_t)( rawSize / MEGABYTE ), (uint32_t)timer.GetElapsedMS() );
     }
+    else if ( result == PchBlob::UNPACK_CORRUPT )
+    {
+        // A client that can is asked for it again. The others cannot be, so their jobs go back to them.
+        FLOG_WARN( "PCH 0x%016" PRIx64 " is damaged: dropping it\n", pchId );
+        DisconnectClientsWaitingForPch( pchId, true /*onlyThoseThatCannotAsk*/ );
+    }
     else
     {
-        FLOG_WARN( "PCH 0x%016" PRIx64 " cannot be unpacked (%s): dropping it, it will be asked for again\n",
-                   pchId,
-                   ( result == PchBlob::UNPACK_CANNOT_WRITE ) ? "the working copy cannot be written" : "it is damaged" );
+        FLOG_WARN( "PCH 0x%016" PRIx64 " cannot be unpacked, as its working copy cannot be written: returning the jobs that need it to their clients\n", pchId );
+        DisconnectClientsWaitingForPch( pchId, false );
+        return; // Nothing changed for the jobs of other clients: they would only ask for it to be unpacked again
     }
 
-    m_PchTrimRequested.Store( true );
     ReleaseReadyWaitingJobs();
     JobQueueRemote::Get().WakeMainThread();
+}
+
+// DisconnectClientsWaitingForPch
+//------------------------------------------------------------------------------
+void Server::DisconnectClientsWaitingForPch( uint64_t pchId, bool onlyThoseThatCannotAsk )
+{
+    // Their jobs are cancelled and so go back to the clients, to be built elsewhere
+    Array<const ConnectionInfo *> connections;
+    {
+        MutexHolder mhC( m_ClientListMutex );
+        for ( ClientState * cs : m_ClientList )
+        {
+            MutexHolder mh( cs->m_Mutex );
+            if ( onlyThoseThatCannotAsk && ( cs->m_Capabilities & Protocol::CAP_PCH_REQUEST ) )
+            {
+                continue;
+            }
+            for ( const Job * job : cs->m_WaitingJobs )
+            {
+                if ( ( job->GetPchId() == pchId ) && job->GetPchCachePath().IsEmpty() )
+                {
+                    connections.Append( cs->m_Connection );
+                    break;
+                }
+            }
+        }
+    }
+    for ( const ConnectionInfo * connection : connections )
+    {
+        Disconnect( connection );
+    }
 }
 
 // SelectRawPchTrims
 //------------------------------------------------------------------------------
 /*static*/ void Server::SelectRawPchTrims( const Array<PchRawEntry> & entries,
                                             uint64_t budgetBytes,
-                                            uint64_t idleBefore,
+                                            uint64_t now,
+                                            uint32_t idleSeconds,
                                             Array<size_t> & outIndicesToTrim )
 {
     outIndicesToTrim.Clear();
@@ -1777,7 +1801,8 @@ void Server::UnpackPch( uint64_t pchId )
 
     for ( const size_t index : unused )
     {
-        const bool idle = ( entries[ index ].lastUsed < idleBefore );
+        const uint64_t lastUsed = entries[ index ].lastUsed;
+        const bool idle = ( now > lastUsed ) && ( Time::FileTimeToSeconds( now - lastUsed ) > idleSeconds );
         if ( idle || ( unusedBytes > budgetBytes ) )
         {
             outIndicesToTrim.Append( index );
@@ -1795,26 +1820,34 @@ void Server::TrimRawPchs( uint64_t now )
         MutexHolder mh( m_PchCacheMutex );
         cacheBytes = ( CountPchBytes( m_PchCache ) + CountRawPchBytes() );
     }
-    const PchCacheLimits limits = GetPchCacheLimits( cacheBytes );
-    const uint64_t idleTime = ( (uint64_t)kRawPchIdleSeconds * kFileTimePerSecond );
+    RemoveUnusedRawPchs( now, GetPchCacheLimits( cacheBytes ).m_RawBytes );
+}
 
+// DropUnusedRawPchs
+//------------------------------------------------------------------------------
+void Server::DropUnusedRawPchs()
+{
+    RemoveUnusedRawPchs( Time::GetCurrentFileTime(), 0 );
+}
+
+// RemoveUnusedRawPchs
+//------------------------------------------------------------------------------
+void Server::RemoveUnusedRawPchs( uint64_t now, uint64_t budgetBytes )
+{
     // Deleted under the lock, so that a job that needs the PCH sees it is not there and has it made again
     MutexHolder mh( m_PchCacheMutex );
     Array<size_t> trims;
-    SelectRawPchTrims( m_PchRaw, limits.m_RawBytes, ( now > idleTime ) ? ( now - idleTime ) : 0, trims );
+    SelectRawPchTrims( m_PchRaw, budgetBytes, now, kRawPchIdleSeconds, trims );
     trims.Sort();
     for ( size_t i = trims.GetSize(); i > 0; --i )
     {
         const size_t index = trims[ i - 1 ];
         const uint64_t pchId = m_PchRaw[ index ].pchId;
         AStackString<> rawFile;
-        for ( const PchCacheEntry & e : m_PchCache )
+        const PchCacheEntry * stored = FindStoredPch( pchId );
+        if ( stored && GetRawPchPath( stored->filePath, rawFile ) )
         {
-            if ( ( e.pchId == pchId ) && GetRawPchPath( e.filePath, rawFile ) )
-            {
-                FileIO::FileDelete( rawFile.Get() );
-                break;
-            }
+            FileIO::FileDelete( rawFile.Get() );
         }
         if ( rawFile.IsEmpty() || ( FileIO::FileExists( rawFile.Get() ) == false ) )
         {
@@ -1845,10 +1878,9 @@ void Server::ThreadFunc()
 
         TouchToolchains();
 
-        // Working copies are dropped when jobs are done with them and they are too many or have not been used lately
-        if ( m_PchTrimRequested.Load() || ( m_PchTrimTimer.GetElapsed() > 10.0f ) )
+        // Working copies nothing uses are dropped when they are too many or have not been used lately
+        if ( m_PchTrimTimer.GetElapsed() > 10.0f )
         {
-            m_PchTrimRequested.Store( false );
             m_PchTrimTimer.Restart();
             TrimRawPchs( Time::GetCurrentFileTime() );
         }

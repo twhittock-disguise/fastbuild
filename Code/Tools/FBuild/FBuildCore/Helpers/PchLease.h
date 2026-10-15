@@ -52,8 +52,6 @@ public:
     explicit PchLease( const PchLease & other ) = delete;
     PchLease & operator=( const PchLease & other ) = delete;
 
-    bool IsHeld() const { return ( m_Owner != nullptr ); }
-
     void Release()
     {
         if ( m_Owner )

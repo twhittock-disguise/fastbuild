@@ -43,9 +43,6 @@ public:
     void MainThreadWait( uint32_t timeoutMS );
     void WakeMainThread();
 
-    // Appends the PCH ids of pending and in-flight jobs
-    void GetPchIdsInUse( Array<uint64_t> & outPchIds ) const;
-
     // Worker threads can wait:
     void WorkerThreadWait();    // Wait for a job to be available (active thread)
     void WorkerThreadSleep();   // Sleep (inactive thread)

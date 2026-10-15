@@ -68,7 +68,8 @@ namespace
                                                   const AString & tempFile,
                                                   const AString & rawFile,
                                                   const Atomic<bool> * abort,
-                                                  uint64_t & outSize )
+                                                  uint64_t & outSize,
+                                                  FileStream * writer )
 {
     if ( FileIO::EnsurePathExistsForFile( rawFile ) == false )
     {
@@ -79,7 +80,8 @@ namespace
     UnpackResult result = UNPACK_OK;
     uint32_t size = 0;
     {
-        FileStream file;
+        FileStream plainFile;
+        FileStream & file = writer ? *writer : plainFile;
         if ( file.Open( tempFile.Get(), FileStream::WRITE_ONLY ) == false )
         {
             return UNPACK_CANNOT_WRITE;
@@ -100,6 +102,7 @@ namespace
         {
             result = UNPACK_CORRUPT;
         }
+        file.Close(); // A writer from outside outlives this scope
     }
 
     if ( ( result == UNPACK_OK ) && ( FileIO::FileMove( tempFile, rawFile ) == false ) )

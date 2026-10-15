@@ -7,6 +7,7 @@
 
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/FLog.h"
+#include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/TempFiles.h"
 
@@ -22,12 +23,6 @@
 //------------------------------------------------------------------------------
 namespace
 {
-    bool IsFileOfSize( const AString & file, uint32_t size )
-    {
-        FileStream f;
-        return ( f.Open( file.Get() ) && ( f.GetFileSize() == size ) );
-    }
-
     // The most a compressed PCH can be larger than the PCH, so a sender cannot make us store more
     uint64_t GetMaxCompressedSize( uint32_t uncompressedSize )
     {
@@ -80,8 +75,8 @@ PchReceiver::Result PchReceiver::OnChunk( const Protocol::MsgPchFile & msg,
         m_ChunkSize = msg.GetChunkSize();
         m_NextIndex = 0;
 
-        // The id identifies the content, so a file of the size of what is being sent is the PCH
-        m_AlreadyCached = IsFileOfSize( pchFile, m_CompressedSize );
+        // The id identifies the content, so a stored file is the PCH however it was compressed
+        m_AlreadyCached = FileIO::FileExists( pchFile.Get() );
     }
     else if ( ( m_Active == false ) ||
               ( pchId != m_PchId ) ||
@@ -167,6 +162,11 @@ PchReceiver::Result PchReceiver::Finish( const AString & pchFile, bool & outAlre
 
     // What is kept is the data as it came. It is unpacked again when a job needs it, so what is
     // checked here is that it will be what its id says then, and not decompressed into a file.
+    Compressor::HeaderInfo header = {};
+    if ( Compressor::ParseHeader( m_Compressed.Begin(), m_Compressed.GetSize(), header ) && ( header.m_Type == Compressor::eLZ4 ) )
+    {
+        return Fail( m_PchId, "it is compressed with LZ4: only zstd and uncompressed data are stored" );
+    }
     if ( PchBlob::Verify( m_Compressed.Begin(), m_Compressed.GetSize(), m_PchId, m_UncompressedSize ) == false )
     {
         return Fail( m_PchId, "its data is not a PCH of the announced size and id" );
@@ -197,14 +197,15 @@ PchReceiver::Result PchReceiver::Finish( const AString & pchFile, bool & outAlre
         return Fail( m_PchId, "it cannot be written" );
     }
 
-    // Another connection may have finished the same PCH first, and a job may be unpacking it
-    if ( IsFileOfSize( pchFile, m_CompressedSize ) )
+    // Another connection may have finished the same PCH first, and a job may be unpacking it: a stored
+    // file is never replaced
+    if ( FileIO::FileExists( pchFile.Get() ) )
     {
         outAlreadyCached = true;
     }
     else if ( FileIO::FileMove( m_TempFile, pchFile ) == false )
     {
-        if ( IsFileOfSize( pchFile, m_CompressedSize ) == false )
+        if ( FileIO::FileExists( pchFile.Get() ) == false )
         {
             return Fail( m_PchId, "it cannot be moved into place" );
         }

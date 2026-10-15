@@ -61,7 +61,6 @@ public:
 
     // The PCH is kept for as long as the job exists
     void SetPchLease( PchLease && lease ) { m_PchLease = static_cast<PchLease &&>( lease ); }
-    void ReleasePchLease() { m_PchLease.Release(); } // Once it has been built: nothing reads the PCH any more
 
     void SetPchId( uint64_t id ) { m_PchId = id; }
     uint64_t GetPchId() const { return m_PchId; }
