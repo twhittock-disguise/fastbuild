@@ -1916,6 +1916,14 @@ bool ClientToWorkerConnection::SendItem( const ConnectionInfo * ci, const Client
         encodeTime = encodeTimer.GetElapsed();
     }
 
+    // The last chunk of a PCH counts as delivered before it is sent: a worker that has lost the PCH asks
+    // again as soon as it has it, which can be before this thread returns from the send
+    if ( item.m_PchId != 0 )
+    {
+        MutexHolder mh( m_Mutex );
+        m_PchState.OnDelivered( item.m_PchId );
+    }
+
     // Send message
     const Timer sendTimer;
     const bool sendOk = item.m_HasPayload ? Send( ci,
@@ -1946,12 +1954,6 @@ bool ClientToWorkerConnection::SendItem( const ConnectionInfo * ci, const Client
         if ( item.m_Kind != SendKind::Pch ) // Bulk data is meant to wait
         {
             stats.m_MaxQueueDelay = Math::Max( stats.m_MaxQueueDelay, queueDelay );
-        }
-
-        if ( item.m_PchId != 0 )
-        {
-            MutexHolder mh( m_Mutex );
-            m_PchState.OnDelivered( item.m_PchId );
         }
     }
 
