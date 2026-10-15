@@ -76,6 +76,7 @@ private:
         ClientState & operator=( const ClientState & other ) = delete;
 
         Mutex m_Mutex;
+        Mutex m_SendMutex; // Sends on the connection come from several threads. Innermost lock.
 
         const Protocol::IMessage * m_CurrentMessage = nullptr;
         const ConnectionInfo * m_Connection = nullptr;

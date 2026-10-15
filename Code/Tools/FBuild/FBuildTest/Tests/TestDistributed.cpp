@@ -67,6 +67,7 @@ private:
     void ToolchainInventoryFollowsAck() const;
     void ToolchainInventoryIsBounded() const;
     void JobStreamAcrossReconnect() const;
+    void ResultsAreCompressed() const;
     void MismatchedProtocolVersionIsRefused() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
@@ -142,6 +143,7 @@ private:
 
     // The totals of the jobs lines in the client's stats log
     static void ReadJobStats( const AString & logPath, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outSentBytes );
+    static void ReadResultStats( const AString & logPath, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outReceivedBytes );
 
     mutable SyntheticToolchain::ScratchWorkerCache m_WorkerCache;
 };
@@ -168,6 +170,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ToolchainInventoryFollowsAck )
     REGISTER_TEST( ToolchainInventoryIsBounded )
     REGISTER_TEST( JobStreamAcrossReconnect )
+    REGISTER_TEST( ResultsAreCompressed )
     REGISTER_TEST( MismatchedProtocolVersionIsRefused )
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
@@ -595,6 +598,7 @@ void TestDistributed::DistributionStatsLog() const
         stats.m_NumSkippedToolchains = 2;
         stats.m_ResultsReceived = 3;
         stats.m_ResultBytesReceived = ( 1 * (uint64_t)MEGABYTE );
+        stats.m_ResultRawBytes = ( 4 * (uint64_t)MEGABYTE );
 
         AStackString<> text;
         DistributionStats::Format( stats, "2026-01-02 03:04:05", text );
@@ -602,7 +606,7 @@ void TestDistributed::DistributionStatsLog() const
         TEST_ASSERT( text.Find( "toolchain: 18 msgs, 40.0 MB raw, 2.0 MB sent" ) );
         TEST_ASSERT( text.Find( "jobs:      3 msgs, 24.0 MB raw, 3.0 MB sent, send time 0.5s, encode time 0.4s" ) );
         TEST_ASSERT( text.Find( "toolchain: 2 cached on the worker, not sent" ) );
-        TEST_ASSERT( text.Find( "results:   3 received, 1.0 MB" ) );
+        TEST_ASSERT( text.Find( "results:   3 received, 4.0 MB raw, 1.0 MB received" ) );
         TEST_ASSERT( text.Find( "upload:    6.0 MB in 2.0s of send time = 3.00 MB/s (24.0 Mbit/s)" ) );
     }
 
@@ -1125,6 +1129,126 @@ void TestDistributed::JobStreamAcrossReconnect() const
     // The jobs share most of their source, so each connection pays for it once: about 1% of their size.
     // Compressing the jobs one by one costs about 10%.
     TEST_ASSERT( ( sentBytes * 20 ) < rawBytes );
+}
+
+// ReadResultStats
+//------------------------------------------------------------------------------
+/*static*/ void TestDistributed::ReadResultStats( const AString & logPath, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outReceivedBytes )
+{
+    outNumBlocks = 0;
+    outRawBytes = 0;
+    outReceivedBytes = 0;
+
+    FileStream f;
+    if ( f.Open( logPath.Get(), FileStream::READ_ONLY ) == false )
+    {
+        return;
+    }
+    Array<char> log;
+    log.SetSize( (size_t)f.GetFileSize() + 1 );
+    if ( f.Read( log.Begin(), log.GetSize() - 1 ) != ( log.GetSize() - 1 ) )
+    {
+        return;
+    }
+    log[ log.GetSize() - 1 ] = 0;
+
+    // One block per connection, with a line like "  results:   12 received, 1.1 MB raw, 240.2 KB received"
+    auto toBytes = []( double amount, char unit ) { return (uint64_t)( amount * ( ( unit == 'M' ) ? 1048576.0 : 1024.0 ) ); };
+    const char * line = log.Begin();
+    while ( ( line = strstr( line, "  results:   " ) ) != nullptr )
+    {
+        char * p = nullptr;
+        (void)strtoul( line + 13, &p, 10 );
+        if ( strncmp( p, " received, ", 11 ) != 0 )
+        {
+            break;
+        }
+        const double raw = strtod( p + 11, &p );
+        const char rawUnit = p[ 1 ];
+        const double received = strtod( p + 9, &p ); // Past " MB raw, "
+        const char receivedUnit = p[ 1 ];
+
+        ++outNumBlocks;
+        outRawBytes += toBytes( raw, rawUnit );
+        outReceivedBytes += toBytes( received, receivedUnit );
+        line = p;
+    }
+}
+
+// ResultsAreCompressed
+//------------------------------------------------------------------------------
+void TestDistributed::ResultsAreCompressed() const
+{
+    const char * outputDir( "../tmp/Test/Distributed/ResultCompression" );
+    const char * target( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
+
+    // Only this build's connections should be in the log
+    AStackString<> logPath;
+    TEST_ASSERT( FBuild::GetTempDir( logPath ) );
+    logPath += "FBuild-distribution-stats.log";
+    FileIO::FileDelete( logPath.Get() );
+
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+
+        Server s( 1 );
+        TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+        Array<AString> files;
+        FileIO::GetFiles( AStackString( outputDir ), AStackString( "*.*" ), true, &files );
+        for ( const AString & file : files )
+        {
+            FileIO::FileDelete( file.Get() );
+        }
+
+        TEST_ASSERT( fBuild.Build( target ) );
+        TEST_ASSERT( FileIO::FileExists( target ) );
+    }
+
+    // The object file returned by the worker is intact: it still holds the whole table
+    Array<AString> objects;
+    FileIO::GetFiles( AStackString( outputDir ), AStackString( "Table.*" ), false, &objects );
+    TEST_ASSERT( objects.GetSize() == 1 );
+    FileStream f;
+    TEST_ASSERT( f.Open( objects[ 0 ].Get(), FileStream::READ_ONLY ) );
+    Array<char> object;
+    object.SetSize( (size_t)f.GetFileSize() );
+    TEST_ASSERT( f.Read( object.Begin(), object.GetSize() ) == object.GetSize() );
+    const char pattern[ 8 ] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    uint32_t longestRun = 0;
+    uint32_t run = 0;
+    for ( size_t i = 0; ( i + sizeof( pattern ) ) <= object.GetSize(); )
+    {
+        if ( memcmp( object.Begin() + i, pattern, sizeof( pattern ) ) == 0 )
+        {
+            ++run;
+            i += sizeof( pattern );
+            longestRun = Math::Max( longestRun, run );
+        }
+        else
+        {
+            run = 0;
+            ++i;
+        }
+    }
+    TEST_ASSERT( longestRun == 4096 ); // 64 x 64 repeats of the pattern
+
+    // The object is mostly a repeated table, so it returns at a small fraction of its size (about 1/28 when
+    // measured). Results sent without compression are at least as large as the object.
+    uint32_t numConnections;
+    uint64_t rawBytes;
+    uint64_t receivedBytes;
+    ReadResultStats( logPath, numConnections, rawBytes, receivedBytes );
+    TEST_ASSERT( numConnections >= 1 );
+    TEST_ASSERT( rawBytes >= 32768 );
+    TEST_ASSERT( receivedBytes > 0 );
+    TEST_ASSERT( ( receivedBytes * 10 ) < rawBytes );
 }
 
 // Handshake tests

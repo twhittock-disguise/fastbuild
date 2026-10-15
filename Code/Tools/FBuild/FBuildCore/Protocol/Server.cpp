@@ -1186,24 +1186,26 @@ void Server::FinalizeCompletedJobs()
             // get associated connection
             ClientState * cs = (ClientState *)job->GetUserData();
 
+            // Build the message before taking any lock
+            MemoryStream ms;
+            ms.Write( job->GetJobId() );
+            ms.Write( job->GetNode()->GetName() );
+            ms.Write( result == Node::BuildResult::eOk );
+            ms.Write( job->GetSystemErrorCount() > 0 );
+            ms.Write( job->GetMessages() );
+            ms.Write( job->GetNode()->GetLastBuildTime() );
+            ms.Write( job->GetRemoteThreadIndex() ); // The thread used to build the job to assist with visualization
+
+            // write the data - build result for success, or output+errors for failure
+            ms.Write( (uint32_t)job->GetDataSize() );
+            ms.WriteBuffer( job->GetData(), job->GetDataSize() );
+
+            // Holding the client list keeps the connection alive while we send
             MutexHolder mh( m_ClientListMutex );
 
             const bool connectionStillActive = ( m_ClientList.Find( cs ) != nullptr );
             if ( connectionStillActive )
             {
-                MemoryStream ms;
-                ms.Write( job->GetJobId() );
-                ms.Write( job->GetNode()->GetName() );
-                ms.Write( result == Node::BuildResult::eOk );
-                ms.Write( job->GetSystemErrorCount() > 0 );
-                ms.Write( job->GetMessages() );
-                ms.Write( job->GetNode()->GetLastBuildTime() );
-                ms.Write( job->GetRemoteThreadIndex() ); // The thread used to build the job to assist with visualization
-
-                // write the data - build result for success, or output+errors for failure
-                ms.Write( (uint32_t)job->GetDataSize() );
-                ms.WriteBuffer( job->GetData(), job->GetDataSize() );
-
                 {
                     ASSERT( cs->m_NumJobsActive.Load() > 0 );
                     cs->m_NumJobsActive.Decrement();
@@ -1212,7 +1214,9 @@ void Server::FinalizeCompletedJobs()
                     const uint32_t allocated = cs->m_AllocatedCapacity;
                     const uint8_t remaining = (uint8_t)( allocated > active ? allocated - active : 0 );
 
-                    MutexHolder mh2( cs->m_Mutex );
+                    // Not cs->m_Mutex: a large result can take a while to send and must not hold up the
+                    // jobs arriving on this connection
+                    MutexHolder sendMH( cs->m_SendMutex );
 
                     if ( job->GetResultCompressionLevel() == 0 )
                     {
@@ -1305,7 +1309,11 @@ void Server::RequestMissingFiles( const ConnectionInfo * connection, ToolManifes
         {
             // request this file
             const Protocol::MsgRequestFile reqFileMsg( manifest->GetToolId(), (uint32_t)i );
-            reqFileMsg.Send( connection );
+            {
+                ClientState * cs = (ClientState *)connection->GetUserData();
+                MutexHolder sendMH( cs->m_SendMutex );
+                reqFileMsg.Send( connection );
+            }
 
             // prevent it being requested again
             manifest->MarkFileAsSynchronizing( i );

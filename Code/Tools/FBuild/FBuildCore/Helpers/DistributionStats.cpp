@@ -70,8 +70,11 @@ namespace
     }
     AppendBulkLine( outText, "pch:", stats.m_Pch );
     AppendBulkLine( outText, "jobs:", stats.m_Jobs );
-    outText.AppendFormat( "  results:   %u received, %.1f MB\n",
-                          stats.m_ResultsReceived, ToMB( stats.m_ResultBytesReceived ) );
+    outText.AppendFormat( "  results:   %u received, ", stats.m_ResultsReceived );
+    AppendSize( outText, stats.m_ResultRawBytes );
+    outText += " raw, ";
+    AppendSize( outText, stats.m_ResultBytesReceived );
+    outText += " received\n";
     outText.AppendFormat( "  upload:    %.1f MB in %.1fs of send time = %.2f MB/s (%.1f Mbit/s)\n\n",
                           ToMB( totalSent ), totalSendTime, mbPerSecond, mbPerSecond * 8.0 );
 }

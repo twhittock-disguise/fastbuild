@@ -31,6 +31,7 @@ struct DistributionConnectionStats
     DistributionSendStats   m_Jobs;
     uint32_t                m_ResultsReceived = 0;
     uint64_t                m_ResultBytesReceived = 0;
+    uint64_t                m_ResultRawBytes = 0; // Before compression on the worker
 };
 
 // DistributionStats

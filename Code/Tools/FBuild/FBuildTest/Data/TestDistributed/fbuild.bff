@@ -76,6 +76,14 @@ Library( "JobStream" )
     .LibrarianOutput    = '$Out$/Test/Distributed/JobStream/JobStream.lib'
 }
 
+// ResultCompression - An object file that compresses well
+Library( "ResultCompression" )
+{
+    .CompilerInputPath  = 'Tools/FBuild/FBuildTest/Data/TestDistributed/ResultCompression/'
+    .CompilerOutputPath = '$Out$/Test/Distributed/ResultCompression/'
+    .LibrarianOutput    = '$Out$/Test/Distributed/ResultCompression/ResultCompression.lib'
+}
+
 // ForceInclude - Ensure this is handled correctly
 #if __WINDOWS__
     Library( "forceinclude" )

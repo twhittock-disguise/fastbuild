@@ -198,6 +198,7 @@ private:
     Timer m_ConnectionTimer;
     Atomic<uint32_t> m_ResultsReceived{ 0 };
     Atomic<uint64_t> m_ResultBytesReceived{ 0 };
+    Atomic<uint64_t> m_ResultRawBytes{ 0 }; // Result data once decompressed
 
     // Queue of messages to send
     Mutex m_SendQueueMutex;
@@ -812,8 +813,8 @@ void ClientToWorkerConnection::PushJobsToWorker()
         MemoryStream stream;
         job->Serialize( stream );
 
-        // Determine compression level for results
-        int16_t resultCompressionLevel = -1;
+        // Determine compression level for results (objects compress about 4.7x with zstd 3)
+        int16_t resultCompressionLevel = (int16_t)Compressor::kZstdTransferLevel;
         if ( FBuild::IsValid() )
         {
             const int16_t cacheCompressionLevel = FBuild::Get().GetOptions().m_CacheCompressionLevel;
@@ -911,6 +912,10 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
     uint32_t dataSize = 0;
     ms.Read( dataSize );
     const void * data = (const char *)ms.GetData() + ms.Tell();
+
+    // Only the data of a successful job is in compressor format
+    const bool dataIsCompressed = isCompressed && result && Compressor::IsValidData( data, dataSize );
+    m_ResultRawBytes.Add( dataIsCompressed ? Compressor::GetUncompressedSize( data, dataSize ) : dataSize );
 
     {
         MutexHolder mh( m_Mutex );
@@ -1121,13 +1126,15 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
 
         // Decompress if needed
         MultiBuffer mb( data, dataSize );
-        if ( isCompressed )
-        {
-            mb.Decompress();
-        }
+        const bool decompressed = ( isCompressed == false ) || mb.Decompress();
 
         const AString & nodeName = objectNode->GetName();
-        if ( Node::EnsurePathExistsForFile( nodeName ) == false )
+        if ( decompressed == false )
+        {
+            FLOG_ERROR( "Failed to decompress the result for '%s'", nodeName.Get() );
+            result = false;
+        }
+        else if ( Node::EnsurePathExistsForFile( nodeName ) == false )
         {
             FLOG_ERROR( "Failed to create path for '%s'", nodeName.Get() );
             result = false;
@@ -1458,6 +1465,7 @@ void ClientToWorkerConnection::WriteStats() const
     stats.m_Jobs = m_SendStats[ (size_t)SendKind::Job ];
     stats.m_ResultsReceived = m_ResultsReceived.Load();
     stats.m_ResultBytesReceived = m_ResultBytesReceived.Load();
+    stats.m_ResultRawBytes = m_ResultRawBytes.Load();
 
     // Connections that never got as far as sending work are not interesting
     if ( ( stats.m_Toolchain.m_Messages + stats.m_Pch.m_Messages + stats.m_Jobs.m_Messages ) == 0 )
