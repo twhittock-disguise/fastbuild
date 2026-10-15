@@ -5,10 +5,12 @@
 // Includes
 //------------------------------------------------------------------------------
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchReceiver.h"
 
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
+#include "Core/Process/Semaphore.h"
 #include "Core/Time/Timer.h"
 
 // Forward Declarations
@@ -29,7 +31,7 @@ class ToolManifest;
 
 // Protocol
 //------------------------------------------------------------------------------
-class Server : public TCPConnectionPool
+class Server : public TCPConnectionPool, private PchLease::Owner
 {
     friend class TestDistributed;
 public:
@@ -132,40 +134,95 @@ private:
     void EvictToolchains( const ToolManifest * keep );
     Atomic<uint32_t> m_NumManifestsReceived;
     Atomic<uint32_t> m_NumToolFilesReceived;
+    Atomic<uint32_t> m_NumPchChunksReceived;
+    Atomic<uint32_t> m_NumPchsUnpacked;
 
-    // PCH cache for distributed builds
+    // PCH cache for distributed builds. A PCH is kept compressed, as it was sent (pch.<id>/pch.zst).
+    // A job that needs one is held until it is unpacked into a working copy for the compiler
+    // (pch.<id>/pch.pch), by a thread of its own so that no connection waits for the disk.
     struct PchCacheEntry
     {
         uint64_t    pchId;
-        AString     filePath;
+        AString     filePath;       // The compressed PCH
         uint64_t    lastWriteTime;
-        uint64_t    size = 0;   // Bytes on disk
+        uint64_t    size = 0;       // Bytes on disk of the compressed PCH
     };
 
-    // The cache keeps to kPchCacheSharePercent of ( free space + what it holds ), within the min and max
-    // bytes; the oldest PCHs beyond that go, but not those in use or the last kMinCachedPchEntries.
-    static constexpr uint64_t kMaxPchCacheBytes = ( 12ull * 1024 * 1024 * 1024 );
+    // The compressed PCHs keep to kPchCacheSharePercent of ( free space + what the cache holds ), within
+    // the min and max bytes; the oldest beyond that go, but not those in use or the last kMinCachedPchEntries.
+    // Compressed, the PCHs of a large project are a few GiB, so a worker with a small disk can hold all of
+    // them: half of what could be had, up to 8 GiB.
+    static constexpr uint64_t kMaxPchCacheBytes = ( 8ull * 1024 * 1024 * 1024 );
     static constexpr uint64_t kMinPchCacheBytes = ( 1ull * 1024 * 1024 * 1024 );
-    static constexpr uint32_t kPchCacheSharePercent = 40;
+    static constexpr uint32_t kPchCacheSharePercent = 50;
     static constexpr uint32_t kMinCachedPchEntries = 4;
     static constexpr uint32_t kMaxCachedPchEntries = 256;
     static uint64_t CalculatePchCacheBudget( uint64_t freeBytes, uint64_t cacheBytes ); // Pure
 
+    // The working copies that no job is using are kept for the next ones, up to kRawPchSharePercent of
+    // ( free space + what the cache holds ) and at most kMaxRawPchBytes (about ten of the PCHs of a large
+    // project), and for kRawPchIdleSeconds. The ones that jobs use are not counted: they have to exist.
+    static constexpr uint64_t kMaxRawPchBytes = ( 2ull * 1024 * 1024 * 1024 );
+    static constexpr uint32_t kRawPchSharePercent = 20;
+    static constexpr uint32_t kRawPchIdleSeconds = 300;
+    static uint64_t CalculateRawPchBudget( uint64_t freeBytes, uint64_t cacheBytes ); // Pure
+
     struct PchCacheLimits
     {
-        uint64_t m_Bytes;
+        uint64_t m_Bytes;           // Of compressed PCHs
         uint32_t m_MinEntries;
+        uint64_t m_RawBytes = 0;    // Of working copies nothing uses
     };
-    // The limits for a cache holding cacheBytes, or false if they cannot be told. Tests replace it.
+    // The limits for a cache holding cacheBytes (compressed PCHs and working copies), or false if they
+    // cannot be told. Tests replace it.
     using PchCacheLimitsFunc = bool ( * )( uint64_t cacheBytes, PchCacheLimits & outLimits );
     static bool QueryPchCacheLimits( uint64_t cacheBytes, PchCacheLimits & outLimits ); // From the free space of the cache volume
     PchCacheLimits GetPchCacheLimits( uint64_t cacheBytes ) const; // Reads the disk: not under m_PchCacheMutex
     static uint64_t CountPchBytes( const Array<PchCacheEntry> & entries );
     void ScanPchCache();
     static void RemoveEmptyPchDirectories( const AString & basePath ); // Left by evicted PCHs
-    bool FindCachedPch( uint64_t pchId, AString & outPath ); // refreshes LRU recency
+    bool FindCachedPch( uint64_t pchId, AString & outPath ); // The compressed PCH. Refreshes LRU recency.
 
-    // PCH ids referenced by jobs that are waiting, pending or in flight
+    // The working copy of a PCH
+    struct PchRawEntry
+    {
+        enum State : uint8_t
+        {
+            ABSENT,     // There is no working copy
+            UNPACKING,  // A thread is making it
+            READY,      // It is on disk, whole
+        };
+        uint64_t    pchId;
+        State       state = ABSENT;
+        uint32_t    numLeases = 0;      // Jobs that need the PCH
+        uint64_t    size = 0;           // Bytes on disk when READY
+        uint64_t    lastUsed = 0;       // File time
+    };
+
+    // PchLease::Owner: the job that held a lease is gone
+    virtual void ReleasePchLease( uint64_t pchId ) override;
+    PchLease AcquirePchLease( uint64_t pchId );
+
+    // Sets the working copy as the job's PCH if it exists. If it does not, asks for it to be made (once)
+    // and returns false: the job waits. Also false if the PCH is not cached. The caller holds cs.m_Mutex.
+    bool TryResolvePch( Job & job );
+
+    static uint32_t UnpackThreadFuncStatic( void * param );
+    void UnpackThreadFunc();
+    void UnpackPch( uint64_t pchId );
+    static bool GetRawPchPath( const AString & storedFile, AString & outRawFile ); // The working copy next to the stored PCH
+
+    // What goes: the working copies nothing uses, the longest unused first, until they come to budgetBytes;
+    // and those unused since before idleBefore
+    static void SelectRawPchTrims( const Array<PchRawEntry> & entries,
+                                   uint64_t budgetBytes,
+                                   uint64_t idleBefore,
+                                   Array<size_t> & outIndicesToTrim );
+    void TrimRawPchs( uint64_t now ); // Reads the disk, then takes m_PchCacheMutex
+    uint64_t CountRawPchBytes() const; // Caller holds m_PchCacheMutex
+    PchRawEntry * FindRawPch( uint64_t pchId ); // Caller holds m_PchCacheMutex
+
+    // PCH ids referenced by jobs that are waiting, pending or in flight, and those being unpacked
     void CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const;
 
     // Oldest entries first, skipping those in pchIdsInUse, until the entries are within budgetBytes
@@ -175,15 +232,23 @@ private:
                                      uint32_t minEntries,
                                      const Array<uint64_t> & pchIdsInUse,
                                      Array<size_t> & outIndicesToEvict );
+    // Deletes the PCHs, and their working copies. The ids of those evicted are added to outEvictedIds.
     static void EvictPchs( Array<PchCacheEntry> & entries,
                            uint64_t budgetBytes,
                            uint32_t minEntries,
-                           const Array<uint64_t> & pchIdsInUse );
+                           const Array<uint64_t> & pchIdsInUse,
+                           Array<uint64_t> * outEvictedIds = nullptr );
 
     mutable Mutex m_PchCacheMutex;
     Array<PchCacheEntry> m_PchCache;
+    Array<PchRawEntry> m_PchRaw;                // Under m_PchCacheMutex, like the above
+    Array<uint64_t> m_PchUnpackQueue;           // Under m_PchCacheMutex
     bool m_PchCacheScanned = false;
     PchCacheLimitsFunc m_PchCacheLimitsFunc = &QueryPchCacheLimits;
+    Thread m_PchUnpackThread;
+    Semaphore m_PchUnpackSemaphore;
+    Atomic<bool> m_PchTrimRequested{ false };  // A lease ended, or a working copy was made
+    Timer m_PchTrimTimer;
 
 #if defined( __OSX__ ) || defined( __LINUX__ )
     Timer m_TouchToolchainTimer;

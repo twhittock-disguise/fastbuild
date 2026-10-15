@@ -4,6 +4,8 @@
 
 // Includes
 //------------------------------------------------------------------------------
+#include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
+
 #include "Core/Env/MSVCStaticAnalysis.h"
 #include "Core/Env/Types.h"
 #include "Core/Process/Atomic.h"
@@ -24,6 +26,10 @@ public:
     explicit Job( Node * node );
     explicit Job( IOStream & stream );
     ~Job();
+
+    // Non-copyable
+    explicit Job( const Job & other ) = delete;
+    Job & operator=( const Job & other ) = delete;
 
     uint32_t GetJobId() const { return m_JobId; }
     bool operator==( uint32_t jobId ) const { return ( m_JobId == jobId ); }
@@ -52,6 +58,10 @@ public:
 
     void SetPchCachePath( const AString & path ) { m_PchCachePath = path; }
     const AString & GetPchCachePath() const { return m_PchCachePath; }
+
+    // The PCH is kept for as long as the job exists
+    void SetPchLease( PchLease && lease ) { m_PchLease = static_cast<PchLease &&>( lease ); }
+    void ReleasePchLease() { m_PchLease.Release(); } // Once it has been built: nothing reads the PCH any more
 
     void SetPchId( uint64_t id ) { m_PchId = id; }
     uint64_t GetPchId() const { return m_PchId; }
@@ -134,6 +144,7 @@ private:
     ToolManifest * m_ToolManifest = nullptr;
     uint64_t m_PchId = 0;
     AString m_PchCachePath;
+    PchLease m_PchLease;
 
     Array<AString> m_Messages;
 

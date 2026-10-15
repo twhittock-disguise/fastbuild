@@ -14,9 +14,9 @@
 // PchReceiver
 //------------------------------------------------------------------------------
 // One per coordinator connection. The chunks of a PCH are kept in memory as they arrive. The last
-// one decompresses them, checks the size and the id (the PchId of the file) and moves the
-// result into place, so a PCH file is only ever seen complete. The chunks of one PCH arrive in
-// order and without another PCH in between.
+// one checks that they are a PCH of the announced size and id (the PchId of the file) and moves
+// them into place as they are, compressed, so a PCH file is only ever seen complete. The chunks
+// of one PCH arrive in order and without another PCH in between.
 class PchReceiver
 {
 public:
@@ -34,7 +34,7 @@ public:
         FAILED,     // Not valid, and nothing is left on disk. The sender should be disconnected.
     };
 
-    // pchFile is the path the PCH is kept at
+    // pchFile is the path the compressed PCH is kept at
     Result OnChunk( const Protocol::MsgPchFile & msg,
                     const void * data,
                     size_t size,
@@ -74,7 +74,7 @@ private:
     uint32_t        m_ChunkSize = 0;
     uint32_t        m_NextIndex = 0;
     Array<char>     m_Compressed;   // As received, so far
-    AString         m_TempFile;     // The decompressed PCH, until it is moved into place
+    AString         m_TempFile;     // The compressed PCH, until it is moved into place
     Atomic<uint32_t> m_NumChunksReceived{ 0 };
     Atomic<uint64_t> m_ReceivingPchId{ 0 }; // The PCH being received, or 0
 };

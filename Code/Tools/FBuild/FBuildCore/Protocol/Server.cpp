@@ -7,6 +7,7 @@
 #include "Protocol.h"
 
 #include "Tools/FBuild/FBuildCore/FLog.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
@@ -43,7 +44,16 @@
 
 namespace
 {
-    const char * const kPchFileName = "pch.pch";
+    // The temporary file a PCH is unpacked to, next to the working copy
+    const char * const kUnpackTempFilePrefix = "unpack.";
+    const char * const kUnpackTempFileExtension = ".pch";
+
+    // File time ticks in a second
+#if defined( __WINDOWS__ )
+    constexpr uint64_t kFileTimePerSecond = 10000000ull;
+#else
+    constexpr uint64_t kFileTimePerSecond = 1000000000ull;
+#endif
 
     // Collects the directories found while listing files
     class DirectoryCollector : public GetFilesHelper
@@ -126,12 +136,14 @@ namespace
 
     // Persistent on-disk cache layout (toolchains and PCHs), under FBuild::GetWorkerCacheDir:
     //   toolchain.<toolId hex>/...
-    //   pch.<pchId hex>/pch.pch
+    //   pch.<pchId hex>/pch.zst (the PCH, compressed)
+    //   pch.<pchId hex>/pch.pch (a working copy for the compiler, while jobs need it)
     //   pch.<pchId hex>/incoming.<process id>.<number>.pch (while a PCH is being received)
+    //   pch.<pchId hex>/unpack.<process id>.<number>.pch (while a working copy is being made)
     bool BuildPchFilePath( uint64_t pchId, AStackString<> & outFile )
     {
         if ( FBuild::GetWorkerCacheDir( outFile ) == false ) { return false; }
-        outFile.AppendFormat( "pch.%016" PRIx64 "%c%s", pchId, (char)NATIVE_SLASH, kPchFileName );
+        outFile.AppendFormat( "pch.%016" PRIx64 "%c%s", pchId, (char)NATIVE_SLASH, PchBlob::kStoredFileName );
         return true;
     }
 
@@ -189,6 +201,7 @@ Server::Server( uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
     m_JobQueueRemote = FNEW( JobQueueRemote( numCores ) );
 
     m_Thread.Start( ThreadFuncStatic, "Server", this );
+    m_PchUnpackThread.Start( UnpackThreadFuncStatic, "PchUnpack", this, 256 * 1024 );
 
     // Pre-scan caches so they're ready before any connections arrive
     ScanPchCache();
@@ -202,6 +215,8 @@ Server::~Server()
     m_ShouldExit.Store( true );
     JobQueueRemote::Get().WakeMainThread();
     m_Thread.Join();
+    m_PchUnpackSemaphore.Signal();
+    m_PchUnpackThread.Join();
 
     ShutdownAllConnections();
 
@@ -587,18 +602,18 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
         job->SetUserData( cs );
         job->SetResultCompressionLevel( msg->GetResultCompressionLevel(), true /*allowZstdUse*/ );
 
-        // Resolve PCH cache path if job was bundled with PCH distribution data
+        // Resolve PCH cache path if job was bundled with PCH distribution data. The job holds the PCH
+        // from here to its end, so it is not evicted or unpacked and deleted while the job waits.
         const uint64_t pchId = job->GetPchId();
         bool pchReady = true;
         if ( pchId != 0 )
         {
-            AString pchPath;
-            if ( FindCachedPch( pchId, pchPath ) )
+            job->SetPchLease( AcquirePchLease( pchId ) );
+            if ( TryResolvePch( *job ) )
             {
-                job->SetPchCachePath( pchPath );
                 cs->m_PchNeededSent.FindAndErase( pchId );
                 FLOG_VERBOSE( "MsgJob: PCH resolved pchId=0x%016" PRIx64 " -> '%s' for '%s'\n",
-                              pchId, pchPath.Get(), job->GetRemoteName().Get() );
+                              pchId, job->GetPchCachePath().Get(), job->GetRemoteName().Get() );
             }
             else
             {
@@ -811,10 +826,8 @@ void Server::ReleaseReadyWaitingJobs()
             bool pchReady = true;
             if ( pchId != 0 && job->GetPchCachePath().IsEmpty() )
             {
-                AString pchPath;
-                if ( FindCachedPch( pchId, pchPath ) )
+                if ( TryResolvePch( *job ) )
                 {
-                    job->SetPchCachePath( pchPath );
                     cs->m_PchNeededSent.FindAndErase( pchId );
                 }
                 else
@@ -890,6 +903,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
     ASSERT( cs );
 
     const uint64_t pchId = msg->GetPchId();
+    m_NumPchChunksReceived.Increment();
 
     AStackString pchFilePath;
     if ( BuildPchFilePath( pchId, pchFilePath ) == false )
@@ -920,10 +934,12 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
     Array<uint64_t> pchIdsInUse;
     CollectPchIdsInUse( pchIdsInUse );
     pchIdsInUse.Append( pchId );
-    uint64_t cacheBytes = msg->GetUncompressedSize();
+    FileIO::FileInfo storedInfo;
+    const uint64_t storedSize = FileIO::GetFileInfo( pchFilePath, storedInfo ) ? storedInfo.m_Size : msg->GetCompressedSize();
+    uint64_t cacheBytes = storedSize;
     {
         MutexHolder mh( m_PchCacheMutex );
-        cacheBytes += CountPchBytes( m_PchCache );
+        cacheBytes += ( CountPchBytes( m_PchCache ) + CountRawPchBytes() );
     }
     const PchCacheLimits limits = GetPchCacheLimits( cacheBytes );
 
@@ -951,10 +967,29 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
             entry.pchId = pchId;
             entry.filePath = pchFilePath;
             entry.lastWriteTime = now;
-            entry.size = msg->GetUncompressedSize(); // What the file on disk comes to
+            entry.size = storedSize; // What the file on disk comes to
             m_PchCache.Append( Move( entry ) );
 
-            EvictPchs( m_PchCache, limits.m_Bytes, limits.m_MinEntries, pchIdsInUse );
+            // A PCH being unpacked, or that a job needs, stays, though it was not when the ones in use were listed
+            for ( const PchRawEntry & raw : m_PchRaw )
+            {
+                if ( ( raw.numLeases > 0 ) || ( raw.state == PchRawEntry::UNPACKING ) )
+                {
+                    pchIdsInUse.Append( raw.pchId );
+                }
+            }
+            Array<uint64_t> evictedIds;
+            EvictPchs( m_PchCache, limits.m_Bytes, limits.m_MinEntries, pchIdsInUse, &evictedIds );
+            for ( const uint64_t evictedId : evictedIds )
+            {
+                // Its working copy went with it, and no job needs it
+                const PchRawEntry * raw = FindRawPch( evictedId );
+                if ( raw )
+                {
+                    ASSERT( raw->numLeases == 0 );
+                    m_PchRaw.EraseIndex( (size_t)( raw - m_PchRaw.Begin() ) );
+                }
+            }
         }
     }
     cs->m_PchReceiver.EndReceiving(); // Jobs find it in the cache from here on
@@ -1007,17 +1042,26 @@ void Server::ScanPchCache()
     // Use GetFilesEx to get timestamps for LRU eviction
     Array<PchCacheEntry> scannedEntries;
 
-    // Scan for pch.pch files under pch.<hex> subdirs.
+    // Scan for the compressed PCHs (pch.zst) under pch.<hex> subdirs.
     // Parse pchId from the directory name rather than reading/hashing each file.
+    // A working copy (pch.pch) is not the cache's: nothing is using it now, so it is deleted. That
+    // also removes the directories that hold nothing else, which is all that PCHs stored as they were
+    // before they were compressed leave.
     Array<FileIO::FileInfo> pchFiles;
-    AStackString pchWildcard( kPchFileName );
     Array<AString> pchPatterns;
-    pchPatterns.Append( pchWildcard );
+    pchPatterns.Append( AString( PchBlob::kStoredFileName ) );
+    pchPatterns.Append( AString( PchBlob::kRawFileName ) );
     if ( FileIO::GetFilesEx( basePath, &pchPatterns, true /*recurse*/, &pchFiles ) )
     {
         for ( const FileIO::FileInfo & fi : pchFiles )
         {
-            // Path is: <basePath>/pch.<hex>/pch.pch — extract hex from parent dir
+            if ( fi.m_Name.EndsWith( PchBlob::kRawFileName ) )
+            {
+                FileIO::FileDelete( fi.m_Name.Get() );
+                continue;
+            }
+
+            // Path is: <basePath>/pch.<hex>/pch.zst — extract hex from parent dir
             const char * pchDot = fi.m_Name.Find( "pch." );
             if ( pchDot == nullptr ) { continue; }
             const char * hexStart = pchDot + 4; // skip "pch."
@@ -1044,6 +1088,7 @@ void Server::ScanPchCache()
     }
 
     TempFiles::RemoveStale( basePath, PchReceiver::kTempFilePrefix, PchReceiver::kTempFileExtension, true );
+    TempFiles::RemoveStale( basePath, kUnpackTempFilePrefix, kUnpackTempFileExtension, true );
     RemoveEmptyPchDirectories( basePath );
 
     if ( scannedEntries.IsEmpty() )
@@ -1104,16 +1149,29 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
     JobQueueRemote::Get().GetPchIdsInUse( outPchIds );
 
     // Jobs waiting for their toolchain or PCH are not in the job queue yet
-    MutexHolder mhC( m_ClientListMutex );
-    for ( ClientState * cs : m_ClientList )
     {
-        MutexHolder mh( cs->m_Mutex );
-        for ( const Job * job : cs->m_WaitingJobs )
+        MutexHolder mhC( m_ClientListMutex );
+        for ( ClientState * cs : m_ClientList )
         {
-            if ( job->GetPchId() != 0 )
+            MutexHolder mh( cs->m_Mutex );
+            for ( const Job * job : cs->m_WaitingJobs )
             {
-                outPchIds.Append( job->GetPchId() );
+                if ( job->GetPchId() != 0 )
+                {
+                    outPchIds.Append( job->GetPchId() );
+                }
             }
+        }
+    }
+
+    // A job holds a lease on its PCH from the time it arrives to the time it is destroyed, so these
+    // include the jobs that moved between the lists above while they were read
+    MutexHolder mhP( m_PchCacheMutex );
+    for ( const PchRawEntry & raw : m_PchRaw )
+    {
+        if ( ( raw.numLeases > 0 ) || ( raw.state == PchRawEntry::UNPACKING ) )
+        {
+            outPchIds.Append( raw.pchId );
         }
     }
 }
@@ -1123,7 +1181,8 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
 /*static*/ void Server::EvictPchs( Array<PchCacheEntry> & entries,
                                     uint64_t budgetBytes,
                                     uint32_t minEntries,
-                                    const Array<uint64_t> & pchIdsInUse )
+                                    const Array<uint64_t> & pchIdsInUse,
+                                    Array<uint64_t> * outEvictedIds )
 {
     Array<size_t> evictions;
     SelectPchEvictions( entries, budgetBytes, minEntries, pchIdsInUse, evictions );
@@ -1132,8 +1191,17 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
     {
         const size_t idx = evictions[ i - 1 ];
         const AString & file = entries[ idx ].filePath;
+        AStackString<> rawFile;
+        if ( GetRawPchPath( file, rawFile ) )
+        {
+            FileIO::FileDelete( rawFile.Get() );
+        }
         FileIO::FileDelete( file.Get() );
-        FLOG_VERBOSE( "PCH cache: evicting 0x%016" PRIx64 " (%u MiB)\n", entries[ idx ].pchId, (uint32_t)( entries[ idx ].size / MEGABYTE ) );
+        FLOG_VERBOSE( "PCH cache: evicting 0x%016" PRIx64 " (%u MiB compressed)\n", entries[ idx ].pchId, (uint32_t)( entries[ idx ].size / MEGABYTE ) );
+        if ( outEvictedIds )
+        {
+            outEvictedIds->Append( entries[ idx ].pchId );
+        }
 
         // The directory goes with it, unless something else is in it
         const char * lastSlash = file.FindLast( NATIVE_SLASH );
@@ -1155,6 +1223,15 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
     return Math::Max( kMinPchCacheBytes, Math::Min( kMaxPchCacheBytes, share ) );
 }
 
+// CalculateRawPchBudget
+//------------------------------------------------------------------------------
+/*static*/ uint64_t Server::CalculateRawPchBudget( uint64_t freeBytes, uint64_t cacheBytes )
+{
+    const uint64_t available = ( freeBytes > ( kNoLimit - cacheBytes ) ) ? kNoLimit : ( freeBytes + cacheBytes );
+    const uint64_t share = ( available / 100 ) * kRawPchSharePercent;
+    return Math::Min( kMaxRawPchBytes, share ); // No minimum: on a full disk nothing is kept for later
+}
+
 // QueryPchCacheLimits
 //------------------------------------------------------------------------------
 /*static*/ bool Server::QueryPchCacheLimits( uint64_t cacheBytes, PchCacheLimits & outLimits )
@@ -1169,6 +1246,7 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
     }
     outLimits.m_Bytes = CalculatePchCacheBudget( freeBytes, cacheBytes );
     outLimits.m_MinEntries = kMinCachedPchEntries;
+    outLimits.m_RawBytes = CalculateRawPchBudget( freeBytes, cacheBytes );
     return true;
 }
 
@@ -1188,6 +1266,7 @@ Server::PchCacheLimits Server::GetPchCacheLimits( uint64_t cacheBytes ) const
         }
         limits.m_Bytes = kMinPchCacheBytes;
         limits.m_MinEntries = kMinCachedPchEntries;
+        limits.m_RawBytes = 0;
     }
     return limits;
 }
@@ -1398,6 +1477,353 @@ bool Server::FindCachedPch( uint64_t pchId, AString & outPath )
     return false;
 }
 
+// FindRawPch
+//------------------------------------------------------------------------------
+Server::PchRawEntry * Server::FindRawPch( uint64_t pchId )
+{
+    for ( PchRawEntry & raw : m_PchRaw )
+    {
+        if ( raw.pchId == pchId )
+        {
+            return &raw;
+        }
+    }
+    return nullptr;
+}
+
+// CountRawPchBytes
+//------------------------------------------------------------------------------
+uint64_t Server::CountRawPchBytes() const
+{
+    uint64_t bytes = 0;
+    for ( const PchRawEntry & raw : m_PchRaw )
+    {
+        if ( raw.state == PchRawEntry::READY )
+        {
+            bytes += raw.size;
+        }
+    }
+    return bytes;
+}
+
+// GetRawPchPath
+//------------------------------------------------------------------------------
+/*static*/ bool Server::GetRawPchPath( const AString & storedFile, AString & outRawFile )
+{
+    const char * lastSlash = storedFile.FindLast( NATIVE_SLASH );
+    if ( lastSlash == nullptr )
+    {
+        return false;
+    }
+    outRawFile.Assign( storedFile.Get(), lastSlash + 1 );
+    outRawFile += PchBlob::kRawFileName;
+    return true;
+}
+
+// AcquirePchLease
+//------------------------------------------------------------------------------
+PchLease Server::AcquirePchLease( uint64_t pchId )
+{
+    MutexHolder mh( m_PchCacheMutex );
+    PchRawEntry * raw = FindRawPch( pchId );
+    if ( raw == nullptr )
+    {
+        PchRawEntry entry;
+        entry.pchId = pchId;
+        m_PchRaw.Append( entry );
+        raw = &m_PchRaw[ m_PchRaw.GetSize() - 1 ];
+    }
+    ++raw->numLeases;
+    raw->lastUsed = Time::GetCurrentFileTime();
+    return PchLease( this, pchId );
+}
+
+// ReleasePchLease
+//------------------------------------------------------------------------------
+/*virtual*/ void Server::ReleasePchLease( uint64_t pchId )
+{
+    MutexHolder mh( m_PchCacheMutex );
+    PchRawEntry * raw = FindRawPch( pchId );
+    ASSERT( raw && ( raw->numLeases > 0 ) );
+    if ( raw == nullptr )
+    {
+        return;
+    }
+    --raw->numLeases;
+    raw->lastUsed = Time::GetCurrentFileTime();
+    if ( ( raw->numLeases == 0 ) && ( raw->state == PchRawEntry::ABSENT ) )
+    {
+        m_PchRaw.EraseIndex( (size_t)( raw - m_PchRaw.Begin() ) );
+    }
+
+    // What is unused may be too much now
+    m_PchTrimRequested.Store( true );
+}
+
+// TryResolvePch
+//------------------------------------------------------------------------------
+bool Server::TryResolvePch( Job & job )
+{
+    const uint64_t pchId = job.GetPchId();
+    MutexHolder mh( m_PchCacheMutex );
+
+    PchCacheEntry * stored = nullptr;
+    for ( PchCacheEntry & e : m_PchCache )
+    {
+        if ( e.pchId == pchId )
+        {
+            stored = &e;
+            break;
+        }
+    }
+    if ( stored == nullptr )
+    {
+        return false; // Not here: the job waits for it to be sent
+    }
+    const uint64_t now = Time::GetCurrentFileTime();
+    stored->lastWriteTime = now;
+
+    AStackString<> rawFile;
+    if ( GetRawPchPath( stored->filePath, rawFile ) == false )
+    {
+        return false;
+    }
+    PchRawEntry * raw = FindRawPch( pchId );
+    ASSERT( raw ); // The job has a lease
+    if ( raw == nullptr )
+    {
+        return false;
+    }
+
+    if ( raw->state == PchRawEntry::READY )
+    {
+        if ( FileIO::FileExists( rawFile.Get() ) )
+        {
+            raw->lastUsed = now;
+            job.SetPchCachePath( rawFile );
+            return true;
+        }
+        raw->state = PchRawEntry::ABSENT; // Something removed it: it is made again
+    }
+    if ( raw->state == PchRawEntry::ABSENT )
+    {
+        raw->state = PchRawEntry::UNPACKING;
+        m_PchUnpackQueue.Append( pchId );
+        m_PchUnpackSemaphore.Signal();
+    }
+    return false; // Until the thread that unpacks it is done
+}
+
+// UnpackThreadFuncStatic
+//------------------------------------------------------------------------------
+/*static*/ uint32_t Server::UnpackThreadFuncStatic( void * param )
+{
+    PROFILE_SET_THREAD_NAME( "PchUnpackThread" );
+
+    Server * s = (Server *)param;
+    s->UnpackThreadFunc();
+    return 0;
+}
+
+// UnpackThreadFunc
+//------------------------------------------------------------------------------
+void Server::UnpackThreadFunc()
+{
+    while ( m_ShouldExit.Load() == false )
+    {
+        m_PchUnpackSemaphore.Wait();
+
+        // One at a time: the disk and a core are what a build on this worker needs as well
+        while ( m_ShouldExit.Load() == false )
+        {
+            uint64_t pchId = 0;
+            {
+                MutexHolder mh( m_PchCacheMutex );
+                if ( m_PchUnpackQueue.IsEmpty() )
+                {
+                    break;
+                }
+                pchId = m_PchUnpackQueue[ 0 ];
+                m_PchUnpackQueue.PopFront();
+            }
+            UnpackPch( pchId );
+        }
+    }
+}
+
+// UnpackPch
+//------------------------------------------------------------------------------
+void Server::UnpackPch( uint64_t pchId )
+{
+    PROFILE_FUNCTION;
+
+    AStackString<> storedFile;
+    AStackString<> rawFile;
+    AStackString<> tempFile;
+    bool haveStored = false;
+    {
+        MutexHolder mh( m_PchCacheMutex );
+        for ( const PchCacheEntry & e : m_PchCache )
+        {
+            if ( e.pchId == pchId )
+            {
+                storedFile = e.filePath;
+                haveStored = GetRawPchPath( storedFile, rawFile );
+                break;
+            }
+        }
+    }
+
+    PchBlob::UnpackResult result = PchBlob::UNPACK_CORRUPT;
+    uint64_t rawSize = 0;
+    const Timer timer;
+    if ( haveStored )
+    {
+        const char * lastSlash = rawFile.FindLast( NATIVE_SLASH );
+        AStackString<> dir( rawFile.Get(), lastSlash + 1 );
+        TempFiles::MakeName( dir, kUnpackTempFilePrefix, kUnpackTempFileExtension, tempFile );
+        result = PchBlob::Unpack( storedFile, pchId, tempFile, rawFile, &m_ShouldExit, rawSize );
+        if ( result == PchBlob::UNPACK_OK )
+        {
+            m_NumPchsUnpacked.Increment();
+        }
+    }
+
+    {
+        MutexHolder mh( m_PchCacheMutex );
+        PchRawEntry * raw = FindRawPch( pchId );
+        if ( result == PchBlob::UNPACK_OK )
+        {
+            if ( raw )
+            {
+                raw->state = PchRawEntry::READY;
+                raw->size = rawSize;
+                raw->lastUsed = Time::GetCurrentFileTime();
+            }
+        }
+        else
+        {
+            if ( raw )
+            {
+                raw->state = PchRawEntry::ABSENT;
+                if ( raw->numLeases == 0 )
+                {
+                    m_PchRaw.EraseIndex( (size_t)( raw - m_PchRaw.Begin() ) );
+                }
+            }
+
+            // A PCH that cannot be unpacked is not kept: the jobs that need it ask for it again
+            if ( result != PchBlob::UNPACK_ABORTED )
+            {
+                for ( size_t i = 0; i < m_PchCache.GetSize(); ++i )
+                {
+                    if ( m_PchCache[ i ].pchId == pchId )
+                    {
+                        FileIO::FileDelete( m_PchCache[ i ].filePath.Get() );
+                        const char * lastSlash = m_PchCache[ i ].filePath.FindLast( NATIVE_SLASH );
+                        if ( lastSlash )
+                        {
+                            FileIO::DirectoryDelete( AStackString<>( m_PchCache[ i ].filePath.Get(), lastSlash ) );
+                        }
+                        m_PchCache.EraseIndex( i );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if ( result == PchBlob::UNPACK_ABORTED )
+    {
+        return;
+    }
+    if ( result == PchBlob::UNPACK_OK )
+    {
+        FLOG_VERBOSE( "PCH unpacked: 0x%016" PRIx64 " %u MiB in %u ms\n", pchId, (uint32_t)( rawSize / MEGABYTE ), (uint32_t)timer.GetElapsedMS() );
+    }
+    else
+    {
+        FLOG_WARN( "PCH 0x%016" PRIx64 " cannot be unpacked (%s): dropping it, it will be asked for again\n",
+                   pchId,
+                   ( result == PchBlob::UNPACK_CANNOT_WRITE ) ? "the working copy cannot be written" : "it is damaged" );
+    }
+
+    m_PchTrimRequested.Store( true );
+    ReleaseReadyWaitingJobs();
+    JobQueueRemote::Get().WakeMainThread();
+}
+
+// SelectRawPchTrims
+//------------------------------------------------------------------------------
+/*static*/ void Server::SelectRawPchTrims( const Array<PchRawEntry> & entries,
+                                            uint64_t budgetBytes,
+                                            uint64_t idleBefore,
+                                            Array<size_t> & outIndicesToTrim )
+{
+    outIndicesToTrim.Clear();
+
+    // The working copies nothing uses, the one used longest ago first
+    Array<size_t> unused;
+    uint64_t unusedBytes = 0;
+    for ( size_t i = 0; i < entries.GetSize(); ++i )
+    {
+        if ( ( entries[ i ].state == PchRawEntry::READY ) && ( entries[ i ].numLeases == 0 ) )
+        {
+            unused.Append( i );
+            unusedBytes += entries[ i ].size;
+        }
+    }
+    unused.Sort( [ &entries ]( size_t a, size_t b ) { return ( entries[ a ].lastUsed < entries[ b ].lastUsed ); } );
+
+    for ( const size_t index : unused )
+    {
+        const bool idle = ( entries[ index ].lastUsed < idleBefore );
+        if ( idle || ( unusedBytes > budgetBytes ) )
+        {
+            outIndicesToTrim.Append( index );
+            unusedBytes -= entries[ index ].size;
+        }
+    }
+}
+
+// TrimRawPchs
+//------------------------------------------------------------------------------
+void Server::TrimRawPchs( uint64_t now )
+{
+    uint64_t cacheBytes = 0;
+    {
+        MutexHolder mh( m_PchCacheMutex );
+        cacheBytes = ( CountPchBytes( m_PchCache ) + CountRawPchBytes() );
+    }
+    const PchCacheLimits limits = GetPchCacheLimits( cacheBytes );
+    const uint64_t idleTime = ( (uint64_t)kRawPchIdleSeconds * kFileTimePerSecond );
+
+    // Deleted under the lock, so that a job that needs the PCH sees it is not there and has it made again
+    MutexHolder mh( m_PchCacheMutex );
+    Array<size_t> trims;
+    SelectRawPchTrims( m_PchRaw, limits.m_RawBytes, ( now > idleTime ) ? ( now - idleTime ) : 0, trims );
+    trims.Sort();
+    for ( size_t i = trims.GetSize(); i > 0; --i )
+    {
+        const size_t index = trims[ i - 1 ];
+        const uint64_t pchId = m_PchRaw[ index ].pchId;
+        AStackString<> rawFile;
+        for ( const PchCacheEntry & e : m_PchCache )
+        {
+            if ( ( e.pchId == pchId ) && GetRawPchPath( e.filePath, rawFile ) )
+            {
+                FileIO::FileDelete( rawFile.Get() );
+                break;
+            }
+        }
+        if ( rawFile.IsEmpty() || ( FileIO::FileExists( rawFile.Get() ) == false ) )
+        {
+            FLOG_VERBOSE( "PCH cache: dropping the working copy of 0x%016" PRIx64 "\n", pchId );
+            m_PchRaw.EraseIndex( index );
+        }
+    }
+}
+
 // ThreadFuncStatic
 //------------------------------------------------------------------------------
 /*static*/ uint32_t Server::ThreadFuncStatic( void * param )
@@ -1418,6 +1844,14 @@ void Server::ThreadFunc()
         FinalizeCompletedJobs();
 
         TouchToolchains();
+
+        // Working copies are dropped when jobs are done with them and they are too many or have not been used lately
+        if ( m_PchTrimRequested.Load() || ( m_PchTrimTimer.GetElapsed() > 10.0f ) )
+        {
+            m_PchTrimRequested.Store( false );
+            m_PchTrimTimer.Restart();
+            TrimRawPchs( Time::GetCurrentFileTime() );
+        }
 
         JobQueueRemote::Get().MainThreadWait( 100 );
     }

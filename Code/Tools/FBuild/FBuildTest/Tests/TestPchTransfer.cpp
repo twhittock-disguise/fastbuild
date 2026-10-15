@@ -30,6 +30,7 @@ private:
 
     void ReceiverReassemblesChunks() const;
     void ReceiverRejectsAWrongId() const;
+    void ReceiverRejectsAWrongSize() const;
     void ReceiverRejectsMalformedChunks() const;
     void ReceiverAcceptsTheLimits() const;
     void ReceiverDropsAPartialPch() const;
@@ -77,6 +78,7 @@ private:
 REGISTER_TESTS_BEGIN( TestPchTransfer )
     REGISTER_TEST( ReceiverReassemblesChunks )
     REGISTER_TEST( ReceiverRejectsAWrongId )
+    REGISTER_TEST( ReceiverRejectsAWrongSize )
     REGISTER_TEST( ReceiverRejectsMalformedChunks )
     REGISTER_TEST( ReceiverAcceptsTheLimits )
     REGISTER_TEST( ReceiverDropsAPartialPch )
@@ -156,7 +158,7 @@ TestPchTransfer::TestChunk::TestChunk( const TestPch & pch, uint32_t chunkSize, 
         FileIO::FileDelete( file.Get() );
     }
     outPchFile = dir;
-    outPchFile += "pch.pch";
+    outPchFile += "pch.zst";
 }
 
 // GetDirOf
@@ -221,8 +223,8 @@ void TestPchTransfer::ReceiverReassemblesChunks() const
 
         Array<char> content;
         TEST_ASSERT( ReadFile( file, content ) );
-        TEST_ASSERT( content.GetSize() == pch.m_Raw.GetSize() );
-        TEST_ASSERT( memcmp( content.Begin(), pch.m_Raw.Begin(), content.GetSize() ) == 0 );
+        TEST_ASSERT( content.GetSize() == pch.m_Compressed.GetSize() );
+        TEST_ASSERT( memcmp( content.Begin(), pch.m_Compressed.Begin(), content.GetSize() ) == 0 );
 
         // Only the PCH is left
         TEST_ASSERT( CountFiles( dir ) == 1 );
@@ -251,6 +253,33 @@ void TestPchTransfer::ReceiverRejectsAWrongId() const
         TEST_ASSERT( result == ( ( i + 1 ) == numChunks ? PchReceiver::FAILED : PchReceiver::CONTINUE ) );
     }
     TEST_ASSERT( CountFiles( dir ) == 0 );
+}
+
+// ReceiverRejectsAWrongSize
+//------------------------------------------------------------------------------
+void TestPchTransfer::ReceiverRejectsAWrongSize() const
+{
+    // The data is kept as it came, so the size it is to come to is checked while it is received
+    for ( int32_t difference = -1; difference <= 1; difference += 2 )
+    {
+        TestPch pch;
+        MakePch( ( 3 * kChunkSize ) + 9, 110, pch );
+        pch.m_UncompressedSize += (uint32_t)difference;
+
+        AStackString<> file;
+        GetCleanPchFile( "WrongSize2", pch.m_Id, file );
+        AStackString<> dir;
+        GetDirOf( file, dir );
+        PchReceiver receiver;
+        const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)pch.m_Compressed.GetSize(), kChunkSize );
+        for ( uint32_t i = 0; i < numChunks; ++i )
+        {
+            bool alreadyCached = false;
+            const PchReceiver::Result result = Feed( receiver, TestChunk( pch, kChunkSize, i ), file, alreadyCached );
+            TEST_ASSERT( result == ( ( i + 1 ) == numChunks ? PchReceiver::FAILED : PchReceiver::CONTINUE ) );
+        }
+        TEST_ASSERT( CountFiles( dir ) == 0 );
+    }
 }
 
 // ReceiverRejectsMalformedChunks
@@ -417,8 +446,8 @@ void TestPchTransfer::ReceiversOfTheSamePchDoNotMeet() const
 
     Array<char> content;
     TEST_ASSERT( ReadFile( file, content ) );
-    TEST_ASSERT( content.GetSize() == pch.m_Raw.GetSize() );
-    TEST_ASSERT( memcmp( content.Begin(), pch.m_Raw.Begin(), content.GetSize() ) == 0 );
+    TEST_ASSERT( content.GetSize() == pch.m_Compressed.GetSize() );
+    TEST_ASSERT( memcmp( content.Begin(), pch.m_Compressed.Begin(), content.GetSize() ) == 0 );
     TEST_ASSERT( CountFiles( dir ) == 1 ); // No temporary file is left
 }
 
@@ -487,8 +516,8 @@ void TestPchTransfer::ReceiverReplacesAPchOfTheWrongSize() const
     TEST_ASSERT( alreadyCached == false );
     Array<char> content;
     TEST_ASSERT( ReadFile( file, content ) );
-    TEST_ASSERT( content.GetSize() == pch.m_Raw.GetSize() );
-    TEST_ASSERT( memcmp( content.Begin(), pch.m_Raw.Begin(), content.GetSize() ) == 0 );
+    TEST_ASSERT( content.GetSize() == pch.m_Compressed.GetSize() );
+    TEST_ASSERT( memcmp( content.Begin(), pch.m_Compressed.Begin(), content.GetSize() ) == 0 );
 }
 
 // ReceiverCleansUpWhenItCannotPublish

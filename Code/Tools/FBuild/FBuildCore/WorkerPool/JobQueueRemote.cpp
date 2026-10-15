@@ -273,6 +273,9 @@ void JobQueueRemote::FinishedProcessingJob( Job * job, Node::BuildResult result 
         m_InFlightJobs.Erase( it );
     }
 
+    // The compile is over, so the PCH is no longer used by it
+    job->ReleasePchLease();
+
     // handle jobs which were cancelled while in flight
     if ( job->GetUserData() == nullptr )
     {

@@ -7,8 +7,7 @@
 
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/FLog.h"
-#include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
-#include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/TempFiles.h"
 
 // Core
@@ -81,8 +80,8 @@ PchReceiver::Result PchReceiver::OnChunk( const Protocol::MsgPchFile & msg,
         m_ChunkSize = msg.GetChunkSize();
         m_NextIndex = 0;
 
-        // The id identifies the content, so a file of the right size is the PCH
-        m_AlreadyCached = IsFileOfSize( pchFile, m_UncompressedSize );
+        // The id identifies the content, so a file of the size of what is being sent is the PCH
+        m_AlreadyCached = IsFileOfSize( pchFile, m_CompressedSize );
     }
     else if ( ( m_Active == false ) ||
               ( pchId != m_PchId ) ||
@@ -166,24 +165,11 @@ PchReceiver::Result PchReceiver::Finish( const AString & pchFile, bool & outAlre
         return COMPLETE;
     }
 
-    Compressor decompressor;
-    if ( ( Compressor::IsValidData( m_Compressed.Begin(), m_Compressed.GetSize() ) == false ) ||
-         ( decompressor.Decompress( m_Compressed.Begin() ) == false ) )
+    // What is kept is the data as it came. It is unpacked again when a job needs it, so what is
+    // checked here is that it will be what its id says then, and not decompressed into a file.
+    if ( PchBlob::Verify( m_Compressed.Begin(), m_Compressed.GetSize(), m_PchId, m_UncompressedSize ) == false )
     {
-        return Fail( m_PchId, "its data cannot be decompressed" );
-    }
-    {
-        Array<char> empty;
-        m_Compressed.Swap( empty );
-    }
-
-    if ( decompressor.GetResultSize() != m_UncompressedSize )
-    {
-        return Fail( m_PchId, "its size is not the one announced" );
-    }
-    if ( PchId::Calc( decompressor.GetResult(), decompressor.GetResultSize() ) != m_PchId )
-    {
-        return Fail( m_PchId, "its content does not match its id" );
+        return Fail( m_PchId, "its data is not a PCH of the announced size and id" );
     }
 
     // Write it next to where it goes, and close it before anything can fail: a file that is open
@@ -200,21 +186,25 @@ PchReceiver::Result PchReceiver::Finish( const AString & pchFile, bool & outAlre
     {
         FileStream f;
         written = ( f.Open( m_TempFile.Get(), FileStream::WRITE_ONLY ) &&
-                    ( f.Write( decompressor.GetResult(), decompressor.GetResultSize() ) == decompressor.GetResultSize() ) );
+                    ( f.Write( m_Compressed.Begin(), m_Compressed.GetSize() ) == m_Compressed.GetSize() ) );
+    }
+    {
+        Array<char> empty;
+        m_Compressed.Swap( empty );
     }
     if ( written == false )
     {
         return Fail( m_PchId, "it cannot be written" );
     }
 
-    // Another connection may have finished the same PCH first, and a compile may be using it
-    if ( IsFileOfSize( pchFile, m_UncompressedSize ) )
+    // Another connection may have finished the same PCH first, and a job may be unpacking it
+    if ( IsFileOfSize( pchFile, m_CompressedSize ) )
     {
         outAlreadyCached = true;
     }
     else if ( FileIO::FileMove( m_TempFile, pchFile ) == false )
     {
-        if ( IsFileOfSize( pchFile, m_UncompressedSize ) == false )
+        if ( IsFileOfSize( pchFile, m_CompressedSize ) == false )
         {
             return Fail( m_PchId, "it cannot be moved into place" );
         }
