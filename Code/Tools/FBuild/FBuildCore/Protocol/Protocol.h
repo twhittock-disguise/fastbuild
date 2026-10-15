@@ -36,6 +36,12 @@ namespace Protocol
 
     inline static const uint16_t kTestPort = kPort + 1; // Different port for use by tests
 
+    // Send buffer of a client's connection to a worker. What is in it goes out ahead of a job sent
+    // after it. Over a 30 Mbit/s link with 22 ms a message sent behind bulk data waited 3.0 s with
+    // 10 MiB, 0.7 s with 2 MiB and 0.4 s with 1 MiB. Two is enough for 300 Mbit/s at 50 ms, and the
+    // links we know need under 300 KB (100 Mbit/s with 22 ms, 1 Gbit/s with 2 ms).
+    inline static const uint32_t kClientSendBufferSize = ( 2 * 1024 * 1024 );
+
     // Identifiers for all unique messages
     //------------------------------------------------------------------------------
     enum MessageType : uint8_t
@@ -47,7 +53,7 @@ namespace Protocol
         MSG_MANIFEST = 5,               // Client -> Worker : Push tool manifest
         MSG_FILE = 6,                   // Client -> Worker : Push a tool file
         MSG_CONNECTION_ACK = 7,         // Worker -> Client : Handshake ack with capacity
-        MSG_PCH_FILE = 8,              // Client -> Worker : Push a PCH file
+        MSG_PCH_FILE = 8,              // Client -> Worker : Push a chunk of a PCH file
         MSG_PCH_INVENTORY = 9,         // Worker -> Client : Advertise cached PCH IDs
         MSG_REQUEST_MANIFEST = 10,      // Worker -> Client : Request manifest (disconnect recovery)
         MSG_REQUEST_FILE = 11,          // Worker -> Client : Request file (disconnect recovery)
@@ -239,19 +245,35 @@ namespace Protocol
 
     // MsgPchFile
     //------------------------------------------------------------------------------
+    // A PCH is sent as a zstd compressed blob cut into chunks (the last holds the rest), each in a
+    // message of its own so jobs can be sent between them. Every chunk of a PCH carries the same
+    // sizes and chunk size.
+    inline static const uint32_t kPchChunkSize = ( 1024 * 1024 );
+    inline static const uint32_t kMinPchChunkSize = ( 16 * 1024 ); // Bounds what a sender can ask a worker to handle
+    inline static const uint32_t kMaxPchChunkSize = ( 16 * 1024 * 1024 );
+
     class MsgPchFile : public IMessage
     {
     public:
-        MsgPchFile( uint64_t pchId, uint32_t uncompressedSize );
+        MsgPchFile( uint64_t pchId, uint32_t uncompressedSize, uint32_t compressedSize, uint32_t chunkSize, uint32_t chunkIndex );
 
         uint64_t GetPchId() const { return m_PchId; }
         uint32_t GetUncompressedSize() const { return m_UncompressedSize; }
+        uint32_t GetCompressedSize() const { return m_CompressedSize; }
+        uint32_t GetChunkSize() const { return m_ChunkSize; }
+        uint32_t GetChunkIndex() const { return m_ChunkIndex; }
+
+        static uint32_t GetNumChunks( uint32_t compressedSize, uint32_t chunkSize );
+        static uint32_t GetChunkSize( uint32_t compressedSize, uint32_t chunkSize, uint32_t chunkIndex ); // 0 if past the end
 
     private:
         uint64_t m_PchId;
         uint32_t m_UncompressedSize;
+        uint32_t m_CompressedSize;
+        uint32_t m_ChunkSize;
+        uint32_t m_ChunkIndex;
     };
-    static_assert( sizeof( MsgPchFile ) == sizeof( IMessage ) + 20, "MsgPchFile message has incorrect size" );
+    static_assert( sizeof( MsgPchFile ) == sizeof( IMessage ) + 28, "MsgPchFile message has incorrect size" );
 
     // MsgPchInventory
     //------------------------------------------------------------------------------

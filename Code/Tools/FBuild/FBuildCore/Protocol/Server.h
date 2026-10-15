@@ -5,6 +5,7 @@
 // Includes
 //------------------------------------------------------------------------------
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchReceiver.h"
 
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
@@ -89,6 +90,7 @@ private:
         // Jobs are compressed against the earlier ones from the same connection,
         // so they are decoded in arrival order on the connection's receive thread
         JobStreamDecoder m_JobDecoder;
+        PchReceiver m_PchReceiver; // The chunks of the PCH being received, in order
         Array<ToolManifest *> m_KnownTools; // toolchains this client may send jobs for, each holding a use
     };
 

@@ -198,11 +198,32 @@ Protocol::MsgFile::MsgFile( uint64_t toolId, uint32_t fileId )
 
 // MsgPchFile
 //------------------------------------------------------------------------------
-Protocol::MsgPchFile::MsgPchFile( uint64_t pchId, uint32_t uncompressedSize )
+Protocol::MsgPchFile::MsgPchFile( uint64_t pchId, uint32_t uncompressedSize, uint32_t compressedSize, uint32_t chunkSize, uint32_t chunkIndex )
     : Protocol::IMessage( Protocol::MSG_PCH_FILE, sizeof( MsgPchFile ), true )
     , m_PchId( pchId )
     , m_UncompressedSize( uncompressedSize )
+    , m_CompressedSize( compressedSize )
+    , m_ChunkSize( chunkSize )
+    , m_ChunkIndex( chunkIndex )
 {
+}
+
+//------------------------------------------------------------------------------
+/*static*/ uint32_t Protocol::MsgPchFile::GetNumChunks( uint32_t compressedSize, uint32_t chunkSize )
+{
+    ASSERT( chunkSize > 0 );
+    return (uint32_t)( ( (uint64_t)compressedSize + chunkSize - 1 ) / chunkSize );
+}
+
+//------------------------------------------------------------------------------
+/*static*/ uint32_t Protocol::MsgPchFile::GetChunkSize( uint32_t compressedSize, uint32_t chunkSize, uint32_t chunkIndex )
+{
+    const uint64_t offset = ( (uint64_t)chunkIndex * chunkSize );
+    if ( offset >= compressedSize )
+    {
+        return 0;
+    }
+    return (uint32_t)Math::Min<uint64_t>( chunkSize, compressedSize - offset );
 }
 
 // MsgPchInventory

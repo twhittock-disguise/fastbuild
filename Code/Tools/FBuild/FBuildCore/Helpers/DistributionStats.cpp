@@ -35,7 +35,7 @@ namespace
         }
     }
 
-    // "<label> <n> msgs, <raw> raw, <sent> sent, send time <t>s[, encode time <t>s], done at <t>s"
+    // "<label> <n> msgs, <raw> raw, <sent> sent, send time <t>s[, encode time <t>s][, max wait <t>s], done at <t>s"
     void AppendBulkLine( AString & text, const char * label, const DistributionSendStats & s )
     {
         text.AppendFormat( "  %-10s %u msgs, ", label, s.m_Messages );
@@ -46,6 +46,10 @@ namespace
         if ( s.m_EncodeTime > 0.0 )
         {
             text.AppendFormat( ", encode time %.1fs", s.m_EncodeTime );
+        }
+        if ( s.m_MaxQueueDelay > 0.0 )
+        {
+            text.AppendFormat( ", max wait %.1fs", s.m_MaxQueueDelay );
         }
         text.AppendFormat( ", done at %.1fs\n", s.m_LastSentAt );
     }

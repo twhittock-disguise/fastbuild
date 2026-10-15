@@ -107,6 +107,10 @@ public:
     static void GetAddressAsString( uint32_t addr, AString & address );
 
 protected:
+    // The send buffer of the sockets Connect() makes, instead of the large default. Data already in
+    // the buffer goes out ahead of anything sent later.
+    void SetConnectSendBufferSize( uint32_t bytes ) { m_ConnectSendBufferSize = bytes; }
+
     // network events - NOTE: these happen in another thread! (but never at the same time)
     virtual void OnReceive( const ConnectionInfo *, void * /*data*/, uint32_t /*size*/, bool & /*keepMemory*/ )
     {
@@ -159,7 +163,10 @@ private:
     void EnableKeepAlive( TCPSocket socket ) const;
     static void WaitForSocket( TCPSocket socket, bool forWrite );
     void SetLargeBufferSizes( TCPSocket socket ) const;
+    void SetSendBufferSize( TCPSocket socket, uint32_t bytes ) const;
     void SetNonBlocking( TCPSocket socket ) const;
+
+    uint32_t m_ConnectSendBufferSize = 0; // 0 for the default
 
     // listen socket related info
     ConnectionInfo * m_ListenConnection;

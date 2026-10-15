@@ -293,6 +293,10 @@ const ConnectionInfo * TCPConnectionPool::Connect( uint32_t hostIP, uint16_t por
     DisableNagle( sockfd );         // Disable Nagle's algorithm
     EnableKeepAlive( sockfd );      // Keep idle connections alive
     SetLargeBufferSizes( sockfd );  // Set large send/recv buffer sizes
+    if ( m_ConnectSendBufferSize != 0 )
+    {
+        SetSendBufferSize( sockfd, m_ConnectSendBufferSize );
+    }
     SetNonBlocking( sockfd );       // Set non-blocking
 
     // setup destination address
@@ -1289,6 +1293,17 @@ void TCPConnectionPool::SetLargeBufferSizes( TCPSocket socket ) const
         {
             TCPDEBUG( "setsockopt(SO_SNDBUF) failed. Error: %s\n", LAST_NETWORK_ERROR_STR );
         }
+    }
+}
+
+// SetSendBufferSize
+//------------------------------------------------------------------------------
+void TCPConnectionPool::SetSendBufferSize( TCPSocket socket, uint32_t bytes ) const
+{
+    const int ret = setsockopt( socket, SOL_SOCKET, SO_SNDBUF, (const char *)&bytes, sizeof( bytes ) );
+    if ( ret != 0 )
+    {
+        TCPDEBUG( "setsockopt(SO_SNDBUF) failed. Error: %s\n", LAST_NETWORK_ERROR_STR );
     }
 }
 

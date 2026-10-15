@@ -746,68 +746,41 @@ void Server::ReleaseReadyWaitingJobs()
 
 // Process( MsgPchFile )
 //------------------------------------------------------------------------------
-void Server::Process( const ConnectionInfo * /*connection*/, const Protocol::MsgPchFile * msg, const void * payload, size_t payloadSize )
+void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchFile * msg, const void * payload, size_t payloadSize )
 {
+    ClientState * cs = (ClientState *)connection->GetUserData();
+    ASSERT( cs );
+
     const uint64_t pchId = msg->GetPchId();
-    const uint32_t uncompressedSize = msg->GetUncompressedSize();
 
     AStackString pchDir;
     if ( BuildPchCacheDir( pchId, pchDir ) == false )
     {
         FLOG_WARN( "Failed to get temp dir for PCH cache\n" );
+        Disconnect( connection );
         return;
     }
 
-    AStackString pchFilePath( pchDir );
-    pchFilePath += "pch.pch";
+    PchReceiver::Chunk chunk;
+    chunk.m_PchId = pchId;
+    chunk.m_UncompressedSize = msg->GetUncompressedSize();
+    chunk.m_CompressedSize = msg->GetCompressedSize();
+    chunk.m_ChunkSize = msg->GetChunkSize();
+    chunk.m_Index = msg->GetChunkIndex();
+    chunk.m_Data = payload;
+    chunk.m_Size = payloadSize;
 
-    // Check if already cached on disk (size match is sufficient — pchId
-    // in the directory name already identifies the content)
+    AStackString pchFilePath;
     bool alreadyCached = false;
+    const PchReceiver::Result result = cs->m_PchReceiver.OnChunk( chunk, pchDir, pchFilePath, alreadyCached );
+    if ( result == PchReceiver::FAILED )
     {
-        FileStream f;
-        if ( f.Open( pchFilePath.Get() ) )
-        {
-            alreadyCached = ( (uint32_t)f.GetFileSize() == uncompressedSize );
-        }
+        Disconnect( connection );
+        return;
     }
-
-    if ( alreadyCached == false )
+    if ( result == PchReceiver::CONTINUE )
     {
-        // Decompress payload
-        Compressor c;
-        if ( ( Compressor::IsValidData( payload, payloadSize ) == false ) || ( c.Decompress( payload ) == false ) )
-        {
-            FLOG_WARN( "Failed to decompress PCH data for pchId 0x%016" PRIx64 "\n", pchId );
-            return;
-        }
-
-        // Validate decompressed size
-        if ( (uint32_t)c.GetResultSize() != uncompressedSize )
-        {
-            FLOG_WARN( "PCH size mismatch for pchId 0x%016" PRIx64 " (expected %u, got %zu)\n",
-                       pchId, uncompressedSize, c.GetResultSize() );
-            return;
-        }
-
-        // Ensure directory exists and write file
-        if ( FileIO::EnsurePathExists( pchDir ) == false )
-        {
-            FLOG_WARN( "Failed to create PCH cache dir: %s\n", pchDir.Get() );
-            return;
-        }
-
-        FileStream f;
-        if ( f.Open( pchFilePath.Get(), FileStream::WRITE_ONLY ) == false )
-        {
-            FLOG_WARN( "Failed to open PCH cache file for writing: %s\n", pchFilePath.Get() );
-            return;
-        }
-        if ( f.Write( c.GetResult(), c.GetResultSize() ) != c.GetResultSize() )
-        {
-            FLOG_WARN( "Failed to write PCH cache file: %s\n", pchFilePath.Get() );
-            return;
-        }
+        return;
     }
 
     // Touch timestamp to prevent periodic cleanup

@@ -16,6 +16,7 @@ struct DistributionSendStats
     uint64_t    m_SentBytes = 0;
     double      m_SendTime = 0.0;   // Seconds spent handing data to the socket
     double      m_EncodeTime = 0.0; // Seconds spent compressing, for data compressed as it is sent
+    double      m_MaxQueueDelay = 0.0; // The longest a message waited to be sent, for everything that is not bulk data
     double      m_LastSentAt = 0.0; // Connection time of the last message handed over
 };
 

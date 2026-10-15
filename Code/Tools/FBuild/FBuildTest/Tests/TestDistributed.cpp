@@ -22,6 +22,7 @@
 #include "Core/Containers/UniquePtr.h"
 #include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/FileStream.h"
+#include "Core/Math/xxHash.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
@@ -65,6 +66,9 @@ private:
     void PchTakeReadyPchs() const;
     void DistributionStatsLog() const;
     void PayloadsAcceptedByWorker() const;
+    void PchChunksReachTheWorker() const;
+    void PchLeftHalfSentIsDropped() const;
+    void PchInChunksThroughTheBuild() const;
     void ToolchainEviction() const;
     void ToolchainCacheStartupScan() const;
     void ToolchainCachedAcrossWorkerRestart() const;
@@ -188,6 +192,9 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchTakeReadyPchs )
     REGISTER_TEST( DistributionStatsLog )
     REGISTER_TEST( PayloadsAcceptedByWorker )
+    REGISTER_TEST( PchChunksReachTheWorker )
+    REGISTER_TEST( PchLeftHalfSentIsDropped )
+    REGISTER_TEST( PchInChunksThroughTheBuild )
     REGISTER_TEST( ToolchainEviction )
     REGISTER_TEST( ToolchainCacheStartupScan )
     REGISTER_TEST( ToolchainCachedAcrossWorkerRestart )
@@ -635,6 +642,7 @@ void TestDistributed::DistributionStatsLog() const
         stats.m_Jobs.m_SentBytes = ( 3 * (uint64_t)MEGABYTE );
         stats.m_Jobs.m_SendTime = 0.5;
         stats.m_Jobs.m_EncodeTime = 0.4;
+        stats.m_Jobs.m_MaxQueueDelay = 0.2;
         stats.m_NumSkippedToolchains = 2;
         stats.m_ResultsReceived = 3;
         stats.m_ResultBytesReceived = ( 1 * (uint64_t)MEGABYTE );
@@ -644,7 +652,8 @@ void TestDistributed::DistributionStatsLog() const
         DistributionStats::Format( stats, "2026-01-02 03:04:05", text );
         TEST_ASSERT( text.Find( "[2026-01-02 03:04:05] worker 10.0.0.7, connected 12.5s" ) );
         TEST_ASSERT( text.Find( "toolchain: 18 msgs, 40.0 MB raw, 2.0 MB sent" ) );
-        TEST_ASSERT( text.Find( "jobs:      3 msgs, 24.0 MB raw, 3.0 MB sent, send time 0.5s, encode time 0.4s" ) );
+        TEST_ASSERT( text.Find( "jobs:      3 msgs, 24.0 MB raw, 3.0 MB sent, send time 0.5s, encode time 0.4s, max wait 0.2s, done at" ) );
+        TEST_ASSERT( text.Find( "pch:       1 msgs, 0.0 KB raw, 1.0 MB sent, send time 0.5s, done at" ) ); // No wait is shown for bulk data
         TEST_ASSERT( text.Find( "toolchain: 2 cached on the worker, not sent" ) );
         TEST_ASSERT( text.Find( "results:   3 received, 4.0 MB raw, 1.0 MB received" ) );
         TEST_ASSERT( text.Find( "upload:    6.0 MB in 2.0s of send time = 3.00 MB/s (24.0 Mbit/s)" ) );
@@ -713,6 +722,79 @@ void TestDistributed::DistributionStatsLog() const
     }
 }
 
+// PCH sending
+//------------------------------------------------------------------------------
+namespace
+{
+    // Sends the chunks of a PCH to a worker, as a coordinator does
+    class PchSender : public TCPConnectionPool
+    {
+    public:
+        PchSender() = default;
+        virtual ~PchSender() override { ShutdownAllConnections(); }
+        explicit PchSender( const PchSender & other ) = delete;
+        PchSender & operator=( const PchSender & other ) = delete;
+
+        bool ConnectToWorker()
+        {
+            m_Connection = Connect( AStackString<>( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+            return ( m_Connection != nullptr );
+        }
+
+        void DisconnectFromWorker()
+        {
+            Disconnect( m_Connection );
+            m_Connection = nullptr;
+        }
+
+        // The chunks from firstChunk up to, not including, endChunk
+        bool SendChunks( uint64_t pchId,
+                         uint32_t uncompressedSize,
+                         const void * compressedData,
+                         uint32_t compressedSize,
+                         uint32_t chunkSize,
+                         uint32_t firstChunk,
+                         uint32_t endChunk )
+        {
+            for ( uint32_t i = firstChunk; i < endChunk; ++i )
+            {
+                const Protocol::MsgPchFile msg( pchId, uncompressedSize, compressedSize, chunkSize, i );
+                const ConstMemoryStream payload( static_cast<const char *>( compressedData ) + ( (size_t)i * chunkSize ),
+                                                 Protocol::MsgPchFile::GetChunkSize( compressedSize, chunkSize, i ) );
+                if ( msg.Send( m_Connection, payload ) == false )
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+    private:
+        const ConnectionInfo * m_Connection = nullptr;
+    };
+
+    // Where a worker keeps a PCH
+    void GetWorkerPchDir( uint64_t pchId, AString & outDir )
+    {
+        VERIFY( FBuild::GetWorkerCacheDir( outDir ) );
+        outDir.AppendFormat( "pch.%016" PRIx64 "%c", pchId, (char)NATIVE_SLASH );
+    }
+
+    // Data that does not compress
+    void MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes )
+    {
+        outBytes.SetSize( size );
+        uint64_t x = ( seed | 1 );
+        for ( char & c : outBytes )
+        {
+            x ^= ( x << 13 );
+            x ^= ( x >> 7 );
+            x ^= ( x << 17 );
+            c = (char)( x >> 24 );
+        }
+    }
+}
+
 // PchAndToolchainPayloadsAcceptedByWorker
 //------------------------------------------------------------------------------
 void TestDistributed::PayloadsAcceptedByWorker() const
@@ -729,11 +811,11 @@ void TestDistributed::PayloadsAcceptedByWorker() const
     const uint32_t fileSize = ( 2 * MEGABYTE );
     TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
 
-    // The sender's payload for a PCH goes through the worker's receive path. The id is new
-    // each run, so the worker has to decode it rather than find it cached from a previous run.
+    // The sender's payload for a PCH goes through the worker's receive path. The worker's cache
+    // starts empty, so it has to decode the PCH. A PCH's id is the hash of its content.
     PchDataCache cache;
     PchDataCache::Entry entry;
-    entry.pchId = ( 0x7E57ULL << 48 ) | ( Time::GetCurrentFileTime() & 0xFFFFFFFFFFFFULL );
+    entry.pchId = xxHash::Calc64( content.Begin(), fileSize );
     entry.uncompressedSize = fileSize;
     entry.filePath = path;
     cache.Store( entry );
@@ -742,11 +824,14 @@ void TestDistributed::PayloadsAcceptedByWorker() const
     TEST_ASSERT( WaitForCompression( cache, entry, data, dataSize ) == PchDataCache::READY );
 
     Server worker( 1 );
-    const Protocol::MsgPchFile msg( entry.pchId, fileSize );
-    worker.Process( nullptr, &msg, data, dataSize );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+    PchSender sender;
+    TEST_ASSERT( sender.ConnectToWorker() );
+    const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)dataSize, Protocol::kPchChunkSize );
+    TEST_ASSERT( sender.SendChunks( entry.pchId, fileSize, data, (uint32_t)dataSize, Protocol::kPchChunkSize, 0, numChunks ) );
 
     AStackString<> cachedPath;
-    TEST_ASSERT( worker.FindCachedPch( entry.pchId, cachedPath ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( entry.pchId, cachedPath ); } ) );
     {
         FileStream f;
         TEST_ASSERT( f.Open( cachedPath.Get(), FileStream::READ_ONLY ) );
@@ -767,6 +852,148 @@ void TestDistributed::PayloadsAcceptedByWorker() const
     TEST_ASSERT( toolData );
     TEST_ASSERT( toolDataSize < fileSize );
     TEST_ASSERT( DecodesTo( toolData, toolDataSize, content ) );
+}
+
+// PchChunksReachTheWorker
+//------------------------------------------------------------------------------
+void TestDistributed::PchChunksReachTheWorker() const
+{
+    // A PCH of several chunks, through a connection as a coordinator makes one
+    Array<char> content;
+    MakeRandomBytes( ( 3 * MEGABYTE ) + 777, 1, content );
+    Compressor compressed;
+    compressed.CompressZstd( content.Begin(), content.GetSize(), Compressor::kZstdTransferLevel );
+    const uint32_t compressedSize = (uint32_t)compressed.GetResultSize();
+    const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize );
+    TEST_ASSERT( numChunks >= 4 );
+    const uint64_t pchId = xxHash::Calc64( content.Begin(), content.GetSize() );
+
+    Server worker( 1 );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+    PchSender sender;
+    TEST_ASSERT( sender.ConnectToWorker() );
+    TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, numChunks ) );
+
+    AStackString<> cachedPath;
+    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, cachedPath ); } ) );
+    FileStream f;
+    TEST_ASSERT( f.Open( cachedPath.Get(), FileStream::READ_ONLY ) );
+    TEST_ASSERT( f.GetFileSize() == content.GetSize() );
+    Array<char> onWorker;
+    onWorker.SetSize( content.GetSize() );
+    TEST_ASSERT( f.Read( onWorker.Begin(), onWorker.GetSize() ) == onWorker.GetSize() );
+    TEST_ASSERT( memcmp( onWorker.Begin(), content.Begin(), content.GetSize() ) == 0 );
+}
+
+// PchLeftHalfSentIsDropped
+//------------------------------------------------------------------------------
+void TestDistributed::PchLeftHalfSentIsDropped() const
+{
+    Array<char> content;
+    MakeRandomBytes( ( 3 * MEGABYTE ) + 777, 2, content );
+    Compressor compressed;
+    compressed.CompressZstd( content.Begin(), content.GetSize(), Compressor::kZstdTransferLevel );
+    const uint32_t compressedSize = (uint32_t)compressed.GetResultSize();
+    const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize );
+    TEST_ASSERT( numChunks >= 4 );
+    const uint64_t pchId = xxHash::Calc64( content.Begin(), content.GetSize() );
+    AStackString<> pchDir;
+    GetWorkerPchDir( pchId, pchDir );
+
+    Server worker( 1 );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+    auto numClients = [ &worker ]()
+    {
+        MutexHolder mh( worker.m_ClientListMutex );
+        return worker.m_ClientList.GetSize();
+    };
+
+    // The connection ends with half of the PCH sent
+    {
+        PchSender sender;
+        TEST_ASSERT( sender.ConnectToWorker() );
+        TEST_ASSERT( WaitUntil( [ & ]() { return numClients() == 1; } ) );
+        TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, 2 ) );
+
+        // What has been sent is being kept on disk
+        Array<AString> files;
+        TEST_ASSERT( WaitUntil( [ & ]() { files.Clear(); FileIO::GetFiles( pchDir, AStackString( "*" ), true, &files ); return ( files.GetSize() == 1 ); } ) );
+
+        sender.DisconnectFromWorker();
+        TEST_ASSERT( WaitUntil( [ & ]() { return numClients() == 0; } ) );
+    }
+
+    // Nothing is left of it, and the worker does not have the PCH
+    Array<AString> files;
+    FileIO::GetFiles( pchDir, AStackString( "*" ), true, &files );
+    TEST_ASSERT( files.IsEmpty() );
+    AStackString<> cachedPath;
+    TEST_ASSERT( worker.FindCachedPch( pchId, cachedPath ) == false );
+
+    // It is sent again from the start
+    PchSender sender;
+    TEST_ASSERT( sender.ConnectToWorker() );
+    TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, numChunks ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, cachedPath ); } ) );
+}
+
+// PchInChunksThroughTheBuild
+//------------------------------------------------------------------------------
+void TestDistributed::PchInChunksThroughTheBuild() const
+{
+    // The PCH of the library is sent in pieces far smaller than usual
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true; // The jobs need the PCH on the worker
+    options.m_DistributionPchChunkSize = Protocol::kMinPchChunkSize;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    Array<AString> files;
+    FileIO::GetFiles( AStackString( "../tmp/Test/Distributed" ), AStackString( "*.*" ), true, &files );
+    for ( const AString & file : files )
+    {
+        FileIO::FileDelete( file.Get() );
+    }
+
+    const char * target( "../tmp/Test/Distributed/distpch.lib" );
+    {
+        Server worker( 1 );
+        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( fBuild.Build( target ) );
+        TEST_ASSERT( FileIO::FileExists( target ) );
+    }
+
+    // It went in several messages
+    AStackString<> logPath;
+    TEST_ASSERT( FBuild::GetTempDir( logPath ) );
+    logPath += "FBuild-distribution-stats.log";
+    FileStream log;
+    TEST_ASSERT( log.Open( logPath.Get(), FileStream::READ_ONLY ) );
+    AStackString<> text;
+    TEST_ASSERT( log.ReadIntoString( text ) );
+    const char * pchLine = text.Find( "  pch:       " );
+    TEST_ASSERT( pchLine );
+    TEST_ASSERT( atoi( pchLine + 13 ) >= 3 );
+
+    // Nothing is left of the pieces on the worker
+    AStackString<> cacheDir;
+    TEST_ASSERT( FBuild::GetWorkerCacheDir( cacheDir ) );
+    Array<AString> cached;
+    FileIO::GetFiles( cacheDir, AStackString( "*" ), true, &cached );
+    uint32_t numPchs = 0;
+    for ( const AString & file : cached )
+    {
+        TEST_ASSERT( file.EndsWith( ".zst" ) == false );
+        if ( file.EndsWith( ".pch" ) )
+        {
+            TEST_ASSERT( file.EndsWith( "pch.pch" ) );
+            ++numPchs;
+        }
+    }
+    TEST_ASSERT( numPchs >= 1 );
 }
 
 // ToolchainEviction

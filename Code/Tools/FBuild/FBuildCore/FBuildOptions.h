@@ -81,6 +81,7 @@ public:
     bool m_NoLocalConsumptionOfRemoteJobs = false;
     bool m_AllowLocalRace = true;
     uint16_t m_DistributionPort = Protocol::kPort;
+    uint32_t m_DistributionPchChunkSize = Protocol::kPchChunkSize; // The pieces a PCH is sent in
 
     // General Output
     bool m_ShowVerbose = false;
