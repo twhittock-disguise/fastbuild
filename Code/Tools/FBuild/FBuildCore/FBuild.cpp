@@ -924,6 +924,22 @@ bool FBuild::GenerateCompilationDatabase( const Array<AString> & targets ) const
     return FileIO::GetTempDir( outTempDir );
 }
 
+// GetWorkerCacheDir
+//------------------------------------------------------------------------------
+/*static*/ bool FBuild::GetWorkerCacheDir( AString & outDir )
+{
+    if ( GetTempDir( outDir ) == false )
+    {
+        return false;
+    }
+#if defined( __WINDOWS__ )
+    outDir += ".fbuild.tmp\\worker\\";
+#else
+    outDir += "_fbuild.tmp/worker/";
+#endif
+    return true;
+}
+
 // CacheOutputInfo
 //------------------------------------------------------------------------------
 bool FBuild::CacheOutputInfo() const

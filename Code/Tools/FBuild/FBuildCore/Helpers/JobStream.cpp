@@ -14,13 +14,6 @@
 
 #include <string.h>
 
-// JobStreamEncoder
-//------------------------------------------------------------------------------
-JobStreamEncoder::JobStreamEncoder( int windowLog )
-    : m_WindowLog( windowLog )
-{
-}
-
 // DESTRUCTOR
 //------------------------------------------------------------------------------
 JobStreamEncoder::~JobStreamEncoder()
@@ -48,7 +41,7 @@ bool JobStreamEncoder::Encode( const void * data, size_t dataSize )
         }
         const bool paramsOk =
             !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_compressionLevel, JobStream::kCompressionLevel ) ) &&
-            !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_windowLog, m_WindowLog ) ) &&
+            !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_windowLog, JobStream::kWindowLog ) ) &&
             !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_enableLongDistanceMatching, 1 ) ) &&
             !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_ldmHashLog, JobStream::kLdmHashLog ) );
         if ( paramsOk == false )
@@ -89,13 +82,6 @@ bool JobStreamEncoder::Encode( const void * data, size_t dataSize )
 
     m_ResultSize = ( headerSize + out.pos );
     return true;
-}
-
-// GetMemoryUsage
-//------------------------------------------------------------------------------
-size_t JobStreamEncoder::GetMemoryUsage() const
-{
-    return m_Context ? ZSTD_sizeof_CCtx( m_Context ) : 0;
 }
 
 // JobStreamDecoder
@@ -184,13 +170,6 @@ bool JobStreamDecoder::Decode( const void * chunk, size_t chunkSize, void * & ou
     outData = output;
     outSize = uncompressedSize;
     return true;
-}
-
-// GetMemoryUsage
-//------------------------------------------------------------------------------
-size_t JobStreamDecoder::GetMemoryUsage() const
-{
-    return m_Context ? ZSTD_sizeof_DCtx( m_Context ) : 0;
 }
 
 //------------------------------------------------------------------------------

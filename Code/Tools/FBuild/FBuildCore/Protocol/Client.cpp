@@ -185,12 +185,10 @@ private:
     // Push-based job tracking
     Atomic<uint32_t> m_WorkerCapacity{ 0 };
     Atomic<uint32_t> m_JobsInFlight{ 0 };
-    Atomic<bool> m_AckReceived{ false };
-    Atomic<bool> m_AwaitingInventory{ true }; // Jobs wait for the worker's toolchain inventory, so they are not sent what it already has
+    Atomic<bool> m_AwaitingInventory{ true }; // Jobs wait for the worker's inventories, so they are not sent what it already has. Our worker always sends them.
     Array<uint64_t> m_SentToolchains; // Protected by m_Mutex
-    Array<uint64_t> m_CachedToolchains; // Reported by the worker. Protected by m_Mutex
-    mutable Mutex m_SkippedToolchainsMutex; // Separate from m_Mutex as the send thread reads it while m_Mutex is held to wait for that thread
-    Array<uint64_t> m_SkippedToolchains; // Of those, the ones we would otherwise have sent
+    Array<uint64_t> m_CachedToolchains; // Reported by the worker and not used yet. Protected by m_Mutex
+    Atomic<uint32_t> m_NumSkippedToolchains{ 0 }; // Toolchains the worker had, so we did not send them
     Array<uint64_t> m_SentPchIds;     // Protected by m_Mutex
     Array<uint64_t> m_PendingPchIds;  // Needed by this worker, not yet queued. Protected by m_Mutex
     Atomic<uint32_t> m_UnsentJobs{ 0 }; // Queued for the send thread, not yet sent
@@ -244,11 +242,6 @@ uint32_t Client::GetNumConnections() const
 {
     MutexHolder mh( m_Mutex );
     DIST_INFO( "Disconnected: %s\n", m_Worker->m_Address.Get() );
-    if ( m_AckReceived.Load() == false )
-    {
-        FLOG_WARN( "Worker %s closed the connection before completing the handshake. A worker with a different protocol version does this (this client uses v%u). FBuild and FBuildWorker must be updated together.\n",
-                   m_Worker->m_Address.Get(), Protocol::kVersionMajor );
-    }
     if ( m_Jobs.IsEmpty() == false )
     {
         for ( Job * job : m_Jobs )
@@ -627,7 +620,6 @@ void ClientToWorkerConnection::Process( const Protocol::MsgConnectionAck * msg )
     m_WorkerVersion.Store( msg->GetWorkerVersion() );
     m_ProtocolVersionMinor.Store( msg->GetProtocolVersionMinor() );
     m_WorkerCapacity.Store( msg->GetWorkerCapacity() );
-    m_AckReceived.Store( true );
     DIST_INFO( " - Worker %s is v%u.%u (protocol v%u.%u) capacity=%u\n",
                m_Worker->m_Address.Get(),
                ( m_WorkerVersion.Load() / 100U ),
@@ -775,14 +767,10 @@ void ClientToWorkerConnection::PushJobsToWorker()
                 }
                 m_SentToolchains.Append( toolId );
             }
-            else if ( m_CachedToolchains.Find( toolId ) != nullptr )
+            else if ( m_CachedToolchains.FindAndErase( toolId ) )
             {
-                MutexHolder skippedMH( m_SkippedToolchainsMutex );
-                if ( m_SkippedToolchains.Find( toolId ) == nullptr )
-                {
-                    m_SkippedToolchains.Append( toolId );
-                    DIST_INFO( " - Toolchain 0x%016" PRIx64 " is cached on %s\n", toolId, m_Worker->m_Address.Get() );
-                }
+                m_NumSkippedToolchains.Increment();
+                DIST_INFO( " - Toolchain 0x%016" PRIx64 " is cached on %s\n", toolId, m_Worker->m_Address.Get() );
             }
         }
 
@@ -1479,10 +1467,7 @@ void ClientToWorkerConnection::WriteStats() const
 
     stats.m_WorkerAddress = m_Worker->m_Address;
     stats.m_ConnectedTime = m_ConnectionTimer.GetElapsed();
-    {
-        MutexHolder mh( m_SkippedToolchainsMutex );
-        stats.m_SkippedToolchains = m_SkippedToolchains;
-    }
+    stats.m_NumSkippedToolchains = m_NumSkippedToolchains.Load();
     DistributionStats::WriteToTempLog( stats );
 }
 
@@ -1519,9 +1504,11 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
             // Compress here, in the order jobs go out, as each is compressed against the ones before it
             const void * payload = item.m_Payload.GetData();
             size_t payloadSize = item.m_Payload.GetSize();
+            double encodeTime = 0.0;
             if ( item.m_StreamCompress )
             {
                 PROFILE_SECTION( "CompressJob" );
+                const Timer encodeTimer;
                 if ( m_JobEncoder.Encode( payload, payloadSize ) == false )
                 {
                     FLOG_WARN( "Failed to compress a job for %s. Closing the connection.\n", m_Worker->m_Address.Get() );
@@ -1530,6 +1517,7 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
                 }
                 payload = m_JobEncoder.GetResult();
                 payloadSize = m_JobEncoder.GetResultSize();
+                encodeTime = encodeTimer.GetElapsed();
             }
 
             // Send message
@@ -1557,6 +1545,7 @@ void ClientToWorkerConnection::SendQueueMainLoop( const ConnectionInfo * ci )
                 stats.m_RawBytes += item.m_RawBytes;
                 stats.m_SentBytes += ( item.m_Message.GetSize() + ( item.m_HasPayload ? payloadSize : 0 ) );
                 stats.m_SendTime += sendTimer.GetElapsed();
+                stats.m_EncodeTime += encodeTime;
                 stats.m_LastSentAt = m_ConnectionTimer.GetElapsed();
             }
 

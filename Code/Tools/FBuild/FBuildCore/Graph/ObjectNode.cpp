@@ -508,7 +508,6 @@ Node::BuildResult ObjectNode::DoBuildWithPreProcessor( Job * job, bool useDeopti
     if ( canDistribute && belowMemoryLimit )
     {
         // yes... re-queue for secondary build
-        // (job data stays uncompressed, as it is compressed against the other jobs for the worker it is sent to)
         return BuildResult::eNeedSecondPass;
     }
 

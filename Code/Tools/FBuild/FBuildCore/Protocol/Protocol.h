@@ -31,7 +31,7 @@ namespace Protocol
     inline static const uint16_t kPort = 31264; // Arbitrarily chosen port
 
     // Protocol Version
-    inline static const uint32_t kVersionMajor = 25; // Changes here make workers incompatible
+    inline static const uint32_t kVersionMajor = 24; // Changes here make workers incompatible
     inline static const uint8_t kVersionMinor = 6; // Changes must be forwards and backwards compatible
 
     inline static const uint16_t kTestPort = kPort + 1; // Different port for use by tests

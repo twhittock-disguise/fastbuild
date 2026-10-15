@@ -68,6 +68,14 @@ Library( "AnonymousNamespaces" )
     #endif
 }
 
+// JobStream - Jobs that share most of their preprocessed source
+Library( "JobStream" )
+{
+    .CompilerInputPath  = 'Tools/FBuild/FBuildTest/Data/TestDistributed/JobStream/'
+    .CompilerOutputPath = '$Out$/Test/Distributed/JobStream/'
+    .LibrarianOutput    = '$Out$/Test/Distributed/JobStream/JobStream.lib'
+}
+
 // ForceInclude - Ensure this is handled correctly
 #if __WINDOWS__
     Library( "forceinclude" )

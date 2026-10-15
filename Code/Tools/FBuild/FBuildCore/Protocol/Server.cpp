@@ -42,7 +42,6 @@
 namespace
 {
     constexpr uint32_t kMaxCachedPchEntries = 20;
-    constexpr uint32_t kMaxCachedToolchains = 6;
 
     // Picks entries to evict, least recently used first, until at most maxEntries remain.
     // Protected entries are never picked, so more than maxEntries may remain.
@@ -88,29 +87,76 @@ namespace
         }
     }
 
-    // Persistent on-disk cache layout (toolchains and PCHs):
-    //   <tmpDir>/<.fbuild|_fbuild>.tmp/worker/toolchain.<toolId hex>/...
-    //   <tmpDir>/<.fbuild|_fbuild>.tmp/worker/pch.<pchId hex>/pch.pch
-    bool BuildPchCacheRoot( AStackString<> & outRoot )
-    {
-        if ( FBuild::GetTempDir( outRoot ) == false ) { return false; }
-    #if defined( __WINDOWS__ )
-        outRoot += ".fbuild.tmp\\worker\\";
-    #else
-        outRoot += "_fbuild.tmp/worker/";
-    #endif
-        return true;
-    }
-
+    // Persistent on-disk cache layout (toolchains and PCHs), under FBuild::GetWorkerCacheDir:
+    //   toolchain.<toolId hex>/...
+    //   pch.<pchId hex>/pch.pch
     bool BuildPchCacheDir( uint64_t pchId, AStackString<> & outDir )
     {
-        if ( BuildPchCacheRoot( outDir ) == false ) { return false; }
+        if ( FBuild::GetWorkerCacheDir( outDir ) == false ) { return false; }
     #if defined( __WINDOWS__ )
         outDir.AppendFormat( "pch.%016" PRIx64 "\\", pchId );
     #else
         outDir.AppendFormat( "pch.%016" PRIx64 "/", pchId );
     #endif
         return true;
+    }
+
+    // Sends the ids a worker has cached, so the coordinator does not send them again
+    template <class MSG>
+    void SendIdInventory( const ConnectionInfo * connection, const Array<uint64_t> & ids )
+    {
+        const MSG msg( (uint32_t)ids.GetSize() );
+        if ( ids.IsEmpty() )
+        {
+            msg.Send( connection );
+            return;
+        }
+        MemoryStream ms;
+        for ( const uint64_t id : ids )
+        {
+            ms.Write( id );
+        }
+        msg.Send( connection, ms );
+    }
+
+    // Removes the toolchain directory that holds the manifest file, and everything in it
+    void DeleteToolchainDirectory( const AString & manifestPath )
+    {
+        const char * lastSlash = manifestPath.FindLast( NATIVE_SLASH );
+        if ( lastSlash == nullptr )
+        {
+            return;
+        }
+        AStackString<> root( manifestPath.Get(), lastSlash );
+        const char * name = root.FindLast( NATIVE_SLASH );
+        name = ( name ? ( name + 1 ) : root.Get() );
+        if ( AString::StrNCmp( name, "toolchain.", 10 ) != 0 )
+        {
+            return;
+        }
+
+        Array<AString> files;
+        FileIO::GetFiles( root, AStackString<>( "*" ), true, &files );
+        Array<AString> directories;
+        directories.Append( root );
+        for ( const AString & file : files )
+        {
+            FileIO::FileDelete( file.Get() );
+
+            AStackString<> directory( file.Get(), file.FindLast( NATIVE_SLASH ) );
+            while ( ( directory.GetLength() > root.GetLength() ) && ( directories.Find( directory ) == nullptr ) )
+            {
+                directories.Append( directory );
+                directory.SetLength( (uint32_t)( directory.FindLast( NATIVE_SLASH ) - directory.Get() ) );
+            }
+        }
+
+        // Deepest first, so a directory is empty by the time it is removed
+        directories.Sort( []( const AString & a, const AString & b ) { return a.GetLength() > b.GetLength(); } );
+        for ( const AString & directory : directories )
+        {
+            FileIO::DirectoryDelete( directory );
+        }
     }
 }
 
@@ -235,16 +281,11 @@ bool Server::IsSynchingTool( AString & statusStr ) const
     }
 
     // This client no longer needs its toolchains to stay available
-    if ( cs->m_KnownTools.IsEmpty() == false )
+    for ( ToolManifest * tm : cs->m_KnownTools )
     {
-        MutexHolder manifestMH( m_ToolManifestsMutex );
-        for ( ToolManifest * tm : cs->m_KnownTools )
-        {
-            tm->MarkUsed();
-            tm->ReleaseUse();
-        }
-        cs->m_KnownTools.Clear();
+        tm->ReleaseUse();
     }
+    cs->m_KnownTools.Clear();
 
     // free the serverstate structure
     {
@@ -380,7 +421,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     {
         AStackString remoteAddr;
         TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-        FLOG_WARN( "Disconnecting '%s' due to incompatible protocol version (client v%u, this worker v%u). FBuild and FBuildWorker must be updated together.\n",
+        FLOG_WARN( "Disconnecting '%s' due to bad protocol version (client v%u, worker v%u)\n",
                    remoteAddr.Get(), msg->GetProtocolVersion(), Protocol::kVersionMajor );
         Disconnect( connection );
         return;
@@ -412,24 +453,15 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     ack.Send( connection );
 
     // Send PCH inventory so coordinator knows what's already cached
+    Array<uint64_t> pchIds;
     {
         MutexHolder mh( m_PchCacheMutex );
-        const uint32_t numEntries = (uint32_t)m_PchCache.GetSize();
-        const Protocol::MsgPchInventory inventoryMsg( numEntries );
-        if ( numEntries > 0 )
+        for ( const PchCacheEntry & e : m_PchCache )
         {
-            MemoryStream ms;
-            for ( const PchCacheEntry & e : m_PchCache )
-            {
-                ms.Write( e.pchId );
-            }
-            inventoryMsg.Send( connection, ms );
-        }
-        else
-        {
-            inventoryMsg.Send( connection );
+            pchIds.Append( e.pchId );
         }
     }
+    SendIdInventory<Protocol::MsgPchInventory>( connection, pchIds );
 
     // Send toolchain inventory so coordinator can skip sending toolchains we already have.
     // It follows the PCH inventory, so the coordinator knows both have arrived.
@@ -454,8 +486,6 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
         Disconnect( connection );
         return;
     }
-    m_JobBytesReceived.Add( payloadSize );
-    m_JobBytesDecoded.Add( jobDataSize );
     cs->m_NumJobsActive.Increment();
 
     MutexHolder mh( cs->m_Mutex );
@@ -565,7 +595,6 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgMani
 
         // This client will send jobs for the toolchain, so it must not be evicted
         manifest->AcquireUse();
-        manifest->MarkUsed();
     }
     {
         MutexHolder mh( cs->m_Mutex );
@@ -613,8 +642,6 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgFile
         {
             manifest->SetUserData( (void *)connection );
         }
-        ASSERT( manifest->GetUserData() == connection );
-        (void)connection;
 
         bool corruptData = false;
         if ( manifest->ReceiveFileData( fileId, payload, payloadSize, corruptData ) == false )
@@ -822,7 +849,7 @@ void Server::ScanPchCache()
     m_PchCacheScanned = true;
 
     AStackString basePath;
-    if ( BuildPchCacheRoot( basePath ) == false )
+    if ( FBuild::GetWorkerCacheDir( basePath ) == false )
     {
         return;
     }
@@ -942,19 +969,6 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
                              outIndicesToEvict );
 }
 
-// SelectToolchainEvictions
-//------------------------------------------------------------------------------
-/*static*/ void Server::SelectToolchainEvictions( const Array<ToolchainEvictionEntry> & entries,
-                                                   uint32_t maxEntries,
-                                                   Array<size_t> & outIndicesToEvict )
-{
-    SelectLeastRecentlyUsed( entries.GetSize(),
-                             maxEntries,
-                             [ &entries ]( size_t i ) { return entries[ i ].lastUsed; },
-                             [ &entries ]( size_t i ) { return entries[ i ].isProtected; },
-                             outIndicesToEvict );
-}
-
 // ScanToolchainCache
 //------------------------------------------------------------------------------
 void Server::ScanToolchainCache()
@@ -962,28 +976,40 @@ void Server::ScanToolchainCache()
     PROFILE_FUNCTION;
 
     AStackString basePath;
-    if ( ( BuildPchCacheRoot( basePath ) == false ) || ( FileIO::DirectoryExists( basePath ) == false ) )
+    if ( ( FBuild::GetWorkerCacheDir( basePath ) == false ) || ( FileIO::DirectoryExists( basePath ) == false ) )
     {
         return;
     }
 
     Array<AString> patterns;
-    patterns.Append( AString( ToolManifest::GetPersistedFileName() ) );
+    patterns.Append( AString( ToolManifest::kPersistedFileName ) );
     Array<FileIO::FileInfo> manifestFiles;
     if ( FileIO::GetFilesEx( basePath, &patterns, true /*recurse*/, &manifestFiles ) == false )
     {
         return;
     }
 
+    // Most recently used first, so the toolchains that will not be kept are dropped
+    // before any of their files are read
+    Array<size_t> newestFirst;
+    for ( size_t i = 0; i < manifestFiles.GetSize(); ++i )
+    {
+        newestFirst.Append( i );
+    }
+    newestFirst.Sort( [ &manifestFiles ]( size_t a, size_t b ) { return manifestFiles[ a ].m_LastWriteTime > manifestFiles[ b ].m_LastWriteTime; } );
+
     // A toolchain is only registered if every file in it still matches its manifest,
     // so everything advertised later can be used as is.
     uint32_t numLoaded = 0;
-    for ( const FileIO::FileInfo & fi : manifestFiles )
+    for ( const size_t index : newestFirst )
     {
-        ToolManifest * manifest = ToolManifest::LoadFromDisk( fi.m_Name );
+        const AString & manifestPath = manifestFiles[ index ].m_Name;
+        ToolManifest * manifest = ( numLoaded < kMaxCachedToolchains ) ? ToolManifest::LoadFromDisk( manifestPath ) : nullptr;
         if ( manifest == nullptr )
         {
-            FLOG_VERBOSE( "Toolchain cache: ignoring '%s' (incomplete or modified)\n", fi.m_Name.Get() );
+            // Over the cap, incomplete or modified: only the manifest file marks the directory as ours
+            FLOG_VERBOSE( "Toolchain cache: removing '%s'\n", manifestPath.Get() );
+            DeleteToolchainDirectory( manifestPath );
             continue;
         }
 
@@ -997,8 +1023,6 @@ void Server::ScanToolchainCache()
         ++numLoaded;
     }
 
-    EvictToolchains( nullptr );
-
     FLOG_OUTPUT( "Toolchain inventory: %u toolchains loaded from disk cache\n", numLoaded );
 }
 
@@ -1006,8 +1030,9 @@ void Server::ScanToolchainCache()
 //------------------------------------------------------------------------------
 void Server::SendToolchainInventory( const ConnectionInfo * connection, ClientState * cs )
 {
-    // The coordinator will not send toolchains listed here, so they must stay
-    // available while it is connected.
+    // The coordinator will not send the toolchains listed here, so they must stay available
+    // while it is connected. Only the most recently used ones are offered, which bounds how
+    // many a connection can hold on to.
     Array<ToolManifest *> advertised;
     {
         MutexHolder manifestMH( m_ToolManifestsMutex );
@@ -1015,19 +1040,25 @@ void Server::SendToolchainInventory( const ConnectionInfo * connection, ClientSt
         {
             if ( tm->IsSynchronized() )
             {
-                tm->AcquireUse();
-                tm->MarkUsed();
                 advertised.Append( tm );
             }
         }
+        advertised.Sort( []( const ToolManifest * a, const ToolManifest * b ) { return a->GetLastUsed() > b->GetLastUsed(); } );
+        if ( advertised.GetSize() > kMaxCachedToolchains )
+        {
+            advertised.SetSize( kMaxCachedToolchains );
+        }
+        for ( ToolManifest * tm : advertised )
+        {
+            tm->AcquireUse();
+        }
     }
 
-    MemoryStream ms;
+    Array<uint64_t> toolIds;
     for ( const ToolManifest * tm : advertised )
     {
-        ms.Write( tm->GetToolId() );
+        toolIds.Append( tm->GetToolId() );
     }
-
     {
         MutexHolder mh( cs->m_Mutex );
         for ( ToolManifest * tm : advertised )
@@ -1036,15 +1067,7 @@ void Server::SendToolchainInventory( const ConnectionInfo * connection, ClientSt
         }
     }
 
-    const Protocol::MsgToolchainInventory inventoryMsg( (uint32_t)advertised.GetSize() );
-    if ( advertised.IsEmpty() )
-    {
-        inventoryMsg.Send( connection );
-    }
-    else
-    {
-        inventoryMsg.Send( connection, ms );
-    }
+    SendIdInventory<Protocol::MsgToolchainInventory>( connection, toolIds );
 }
 
 // OnToolchainSynchronized
@@ -1053,10 +1076,13 @@ void Server::OnToolchainSynchronized( ToolManifest * manifest )
 {
     {
         MutexHolder manifestMH( m_ToolManifestsMutex );
-        if ( manifest->SaveToDisk() == false )
-        {
-            FLOG_VERBOSE( "Toolchain cache: 0x%016" PRIx64 " will not be reused after the worker restarts\n", manifest->GetToolId() );
-        }
+        manifest->MarkUsed(); // Just arrived, so the most recent
+    }
+
+    // The connection that sent the toolchain holds a use of it, so it stays while it is written
+    if ( manifest->SaveToDisk() == false )
+    {
+        FLOG_VERBOSE( "Toolchain cache: 0x%016" PRIx64 " will not be reused after the worker restarts\n", manifest->GetToolId() );
     }
     EvictToolchains( manifest );
 }
@@ -1072,19 +1098,20 @@ void Server::EvictToolchains( const ToolManifest * keep )
         MutexHolder manifestMH( m_ToolManifestsMutex );
 
         Array<ToolManifest *> candidates;
-        Array<ToolchainEvictionEntry> entries;
         for ( ToolManifest * tm : m_Tools )
         {
-            if ( tm->IsSynchronized() == false )
+            if ( tm->IsSynchronized() ) // The others are still being received
             {
-                continue; // still being received
+                candidates.Append( tm );
             }
-            candidates.Append( tm );
-            entries.Append( ToolchainEvictionEntry{ tm->GetLastUsed(), ( tm == keep ) || tm->IsInUse() } );
         }
 
         Array<size_t> evictions;
-        SelectToolchainEvictions( entries, kMaxCachedToolchains, evictions );
+        SelectLeastRecentlyUsed( candidates.GetSize(),
+                                 kMaxCachedToolchains,
+                                 [ &candidates ]( size_t i ) { return candidates[ i ]->GetLastUsed(); },
+                                 [ &candidates, keep ]( size_t i ) { return ( candidates[ i ] == keep ) || candidates[ i ]->IsInUse(); },
+                                 evictions );
         for ( const size_t idx : evictions )
         {
             m_Tools.FindAndErase( candidates[ idx ] );

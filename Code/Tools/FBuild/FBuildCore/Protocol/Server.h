@@ -104,23 +104,14 @@ private:
     Array<ToolManifest *> m_Tools;
 
     // Toolchain cache: synchronized toolchains stay on disk (with a persisted manifest) across
-    // connections and worker restarts, and are advertised to clients that support it
-    struct ToolchainEvictionEntry
-    {
-        uint64_t    lastUsed;
-        bool        isProtected; // in use, or just added
-    };
+    // connections and worker restarts, and are advertised to clients
+    static constexpr uint32_t kMaxCachedToolchains = 6;
     void ScanToolchainCache();
     void SendToolchainInventory( const ConnectionInfo * connection, ClientState * cs );
     void OnToolchainSynchronized( ToolManifest * manifest );
     void EvictToolchains( const ToolManifest * keep );
-    static void SelectToolchainEvictions( const Array<ToolchainEvictionEntry> & entries,
-                                          uint32_t maxEntries,
-                                          Array<size_t> & outIndicesToEvict );
     Atomic<uint32_t> m_NumManifestsReceived;
     Atomic<uint32_t> m_NumToolFilesReceived;
-    Atomic<uint64_t> m_JobBytesReceived; // Compressed
-    Atomic<uint64_t> m_JobBytesDecoded;
 
     // PCH cache for distributed builds
     struct PchCacheEntry

@@ -33,7 +33,28 @@ namespace
 {
     // Start of a manifest stored in a worker's toolchain directory
     constexpr uint32_t kPersistedManifestMagic = 0x4d544246; // 'FBTM'
-    constexpr const char * kPersistedManifestName = "fbuild_toolchain.manifest";
+
+    // True if the file would be stored outside the toolchain directory
+    bool EscapesToolchainDirectory( const AString & root, const AString & fileName )
+    {
+        AStackString relativePath;
+        ToolManifest::GetRelativePath( root, fileName, relativePath );
+        const char * component = relativePath.Get();
+        while ( *component )
+        {
+            const char * end = component;
+            while ( *end && ( *end != '/' ) && ( *end != '\\' ) )
+            {
+                ++end;
+            }
+            if ( ( end - component == 2 ) && ( component[ 0 ] == '.' ) && ( component[ 1 ] == '.' ) )
+            {
+                return true;
+            }
+            component = ( *end ? end + 1 : end );
+        }
+        return false;
+    }
 }
 
 // Reflection
@@ -197,6 +218,7 @@ void ToolManifestFile::Migrate( const ToolManifestFile & oldFile )
     ASSERT( m_Name == oldFile.m_Name );
     m_TimeStamp = oldFile.m_TimeStamp;
     m_Hash = oldFile.m_Hash;
+    m_UncompressedContentSize = oldFile.m_UncompressedContentSize; // Part of the toolId and of what is sent to workers
 }
 
 // Generate
@@ -318,8 +340,12 @@ void ToolManifest::SerializeForRemote( IOStream & ms ) const
 //------------------------------------------------------------------------------
 bool ToolManifest::DeserializeFromRemote( IOStream & ms )
 {
-    // Should not be called more than once
-    ASSERT( m_Files.IsEmpty() );
+    // The first manifest received for a toolchain wins. A later one describes the same
+    // files (the toolId covers their contents), and the files may already be in use.
+    if ( m_Files.IsEmpty() == false )
+    {
+        return true;
+    }
     ASSERT( m_CustomEnvironmentVariables.IsEmpty() );
 
     // Read header info
@@ -351,7 +377,8 @@ bool ToolManifest::DeserializeFromRemote( IOStream & ms )
              !ms.Read( uncompressedContentSize ) ||
              ( AString::StrLen( name.Get() ) != name.GetLength() ) ||
              ( timeStamp == 0 ) ||
-             ( hash == 0 ) )
+             ( hash == 0 ) ||
+             EscapesToolchainDirectory( mainExecutablePath, name ) )
         {
             return false; // Corrupt stream (likely old broken worker)
         }
@@ -760,21 +787,14 @@ void ToolManifest::GetRemoteFilePath( uint32_t fileId, AString & remotePath ) co
 //------------------------------------------------------------------------------
 void ToolManifest::GetRemotePath( AString & path ) const
 {
-    VERIFY( FBuild::GetTempDir( path ) );
+    VERIFY( FBuild::GetWorkerCacheDir( path ) );
     AStackString subDir;
 #if defined( __WINDOWS__ )
-    subDir.Format( ".fbuild.tmp\\worker\\toolchain.%016" PRIx64 "\\", m_ToolId );
+    subDir.Format( "toolchain.%016" PRIx64 "\\", m_ToolId );
 #else
-    subDir.Format( "_fbuild.tmp/worker/toolchain.%016" PRIx64 "/", m_ToolId );
+    subDir.Format( "toolchain.%016" PRIx64 "/", m_ToolId );
 #endif
     path += subDir;
-}
-
-// GetPersistedFileName
-//------------------------------------------------------------------------------
-/*static*/ const char * ToolManifest::GetPersistedFileName()
-{
-    return kPersistedManifestName;
 }
 
 // GetPersistedPath
@@ -782,7 +802,7 @@ void ToolManifest::GetRemotePath( AString & path ) const
 void ToolManifest::GetPersistedPath( AString & path ) const
 {
     GetRemotePath( path );
-    path += kPersistedManifestName;
+    path += kPersistedFileName;
 }
 
 // SaveToDisk
@@ -850,6 +870,14 @@ bool ToolManifest::SaveToDisk()
         return nullptr;
     }
 
+    // It must live where it was found, or it could not be deleted again
+    AStackString expectedPath;
+    manifest->GetPersistedPath( expectedPath );
+    if ( expectedPath.EqualsI( manifestPath ) == false )
+    {
+        return nullptr;
+    }
+
     manifest->m_Persisted = true;
     manifest->m_LastUsed = FileIO::GetFileLastWriteTime( manifestPath );
     return manifest.ReleaseOwnership();
@@ -860,13 +888,21 @@ bool ToolManifest::SaveToDisk()
 void ToolManifest::MarkUsed()
 {
     m_LastUsed = Time::GetCurrentFileTime();
-    if ( m_Persisted )
+}
+
+// ReleaseUse
+//------------------------------------------------------------------------------
+void ToolManifest::ReleaseUse()
+{
+    // Keep the recency across worker restarts. This happens while this use still keeps the
+    // toolchain from being evicted, so it can not be deleted underneath the update.
+    if ( m_Persisted && ( m_NumUsers.Load() == 1 ) )
     {
-        // Keeps the recency across worker restarts
         AStackString path;
         GetPersistedPath( path );
         FileIO::SetFileLastWriteTimeToNow( path );
     }
+    m_NumUsers.Decrement();
 }
 
 // DeleteFromDisk

@@ -93,19 +93,20 @@ public:
     bool DeserializeFromRemote( IOStream & ms );
 
     // Worker-side persistence, so a toolchain survives a worker restart
+    static constexpr const char * kPersistedFileName = "fbuild_toolchain.manifest";
     bool SaveToDisk();
     static ToolManifest * LoadFromDisk( const AString & manifestPath ); // Only returns a toolchain whose files all verify
-    static const char * GetPersistedFileName();
     void GetPersistedPath( AString & path ) const;
     void DeleteFromDisk();
 
     // Worker-side use tracking: a toolchain with users must not be evicted.
     // Users are jobs, and connections that expect the toolchain to remain available.
+    // Taking a use needs the owner's lock, so a toolchain can not be taken while it is evicted.
     void AcquireUse() { m_NumUsers.Increment(); }
-    void ReleaseUse() { m_NumUsers.Decrement(); }
+    void ReleaseUse(); // Also records the recency on disk when the last user leaves
     bool IsInUse() const { return ( m_NumUsers.Load() > 0 ); }
     uint64_t GetLastUsed() const { return m_LastUsed; }
-    void MarkUsed();
+    void MarkUsed(); // Recency for eviction. Needs the owner's lock.
 
     bool IsSynchronized() const { return m_Synchronized; }
     bool GetSynchronizationStatus( uint32_t & syncDone, uint32_t & syncTotal ) const;

@@ -4,6 +4,7 @@
 // Includes
 //------------------------------------------------------------------------------
 #include "Tools/FBuild/FBuildTest/Tests/FBuildTest.h"
+#include "Tools/FBuild/FBuildTest/Tests/SyntheticToolchain.h"
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/Graph/CompilerNode.h"
@@ -18,8 +19,8 @@
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
 
 // Core
-#include "Core/FileIO/FileIO.h"
 #include "Core/Containers/UniquePtr.h"
+#include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/FileStream.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Network/TCPConnectionPool.h"
@@ -29,6 +30,9 @@
 #include "Core/Time/Time.h"
 #include "Core/Time/Timer.h"
 #include "Core/Tracing/Tracing.h"
+
+#include <stdlib.h>
+#include <string.h>
 
 // Defines
 //------------------------------------------------------------------------------
@@ -43,6 +47,9 @@ class TestDistributed : public FBuildTest
 private:
     DECLARE_TESTS
 
+    virtual void PreTest() const override;
+    virtual void PostTest() const override;
+
     void TestWith1RemoteWorkerThread() const;
     void TestWith4RemoteWorkerThreads() const;
     void WithPCH() const;
@@ -53,11 +60,13 @@ private:
     void PchTakeReadyPchs() const;
     void DistributionStatsLog() const;
     void PayloadsAcceptedByWorker() const;
-    void ToolchainCacheEvictionPolicy() const;
+    void ToolchainEviction() const;
+    void ToolchainCacheStartupScan() const;
     void ToolchainCachedAcrossWorkerRestart() const;
     void ToolchainCorruptedFileIsResent() const;
     void ToolchainInventoryFollowsAck() const;
-    void JobStreamDistributed() const;
+    void ToolchainInventoryIsBounded() const;
+    void JobStreamAcrossReconnect() const;
     void MismatchedProtocolVersionIsRefused() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
@@ -83,8 +92,24 @@ private:
                      bool shouldFail = false,
                      bool allowRace = false ) const;
 
-    // PchDataCache helpers
+    // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
+    template <class CONDITION>
+    static bool WaitUntil( const CONDITION & condition, float timeoutSeconds = kWaitTimeoutSeconds )
+    {
+        const Timer timer;
+        while ( condition() == false )
+        {
+            if ( timer.GetElapsed() > timeoutSeconds )
+            {
+                return false;
+            }
+            Thread::Sleep( 1 );
+        }
+        return true;
+    }
+
+    // PchDataCache helpers
     struct CompressionRequest
     {
         PchDataCache *                  m_Cache = nullptr;
@@ -104,6 +129,21 @@ private:
     void BuildOnNewWorker( uint32_t & outManifestsReceived,
                            uint32_t & outToolFilesReceived,
                            AString & outWorkerToolchainFile ) const;
+
+    // Drops the worker's connections once a job is being built on its toolchain
+    struct ConnectionDrop
+    {
+        Server *        m_Server = nullptr;
+        Atomic<bool>    m_Stop{ false };
+        Atomic<bool>    m_Dropped{ false };
+    };
+    static bool WorkerIsBuildingAJob( Server & server );
+    static uint32_t DropConnectionOnFirstJob( void * param );
+
+    // The totals of the jobs lines in the client's stats log
+    static void ReadJobStats( const AString & logPath, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outSentBytes );
+
+    mutable SyntheticToolchain::ScratchWorkerCache m_WorkerCache;
 };
 
 // Register Tests
@@ -121,11 +161,13 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchTakeReadyPchs )
     REGISTER_TEST( DistributionStatsLog )
     REGISTER_TEST( PayloadsAcceptedByWorker )
-    REGISTER_TEST( ToolchainCacheEvictionPolicy )
+    REGISTER_TEST( ToolchainEviction )
+    REGISTER_TEST( ToolchainCacheStartupScan )
     REGISTER_TEST( ToolchainCachedAcrossWorkerRestart )
     REGISTER_TEST( ToolchainCorruptedFileIsResent )
     REGISTER_TEST( ToolchainInventoryFollowsAck )
-    REGISTER_TEST( JobStreamDistributed )
+    REGISTER_TEST( ToolchainInventoryIsBounded )
+    REGISTER_TEST( JobStreamAcrossReconnect )
     REGISTER_TEST( MismatchedProtocolVersionIsRefused )
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
@@ -148,6 +190,28 @@ REGISTER_TESTS_BEGIN( TestDistributed )
 #endif
     REGISTER_TEST( CleanMessageToPreventMSBuildFailure )
 REGISTER_TESTS_END
+
+// PreTest
+//------------------------------------------------------------------------------
+/*virtual*/ void TestDistributed::PreTest() const
+{
+    FBuildTest::PreTest();
+
+    // The workers started by these tests keep toolchains and PCHs where a real worker on the
+    // machine would, and trim what they find there
+    AStackString<> codeDir;
+    GetCodeDir( codeDir );
+    m_WorkerCache.Enter( codeDir, "Distributed" );
+}
+
+// PostTest
+//------------------------------------------------------------------------------
+/*virtual*/ void TestDistributed::PostTest() const
+{
+    m_WorkerCache.Leave();
+
+    FBuildTest::PostTest();
+}
 
 // Test
 //------------------------------------------------------------------------------
@@ -295,13 +359,12 @@ void TestDistributed::PchCacheEvictionPolicy() const
                                                                               const void *& outData,
                                                                               size_t & outSize )
 {
-    const Timer timer;
-    PchDataCache::CompressedState state = cache.GetCompressed( entry, outData, outSize );
-    while ( ( state == PchDataCache::COMPRESSING ) && ( timer.GetElapsed() < kWaitTimeoutSeconds ) )
+    PchDataCache::CompressedState state = PchDataCache::COMPRESSING;
+    WaitUntil( [ & ]()
     {
-        Thread::Sleep( 10 );
         state = cache.GetCompressed( entry, outData, outSize );
-    }
+        return ( state != PchDataCache::COMPRESSING );
+    } );
     return state;
 }
 
@@ -399,11 +462,7 @@ void TestDistributed::PchCompressRetry() const
         size_t size = 0;
         TEST_ASSERT( cache.GetCompressed( entry, data, size ) == PchDataCache::COMPRESSING );
 
-        const Timer timer;
-        while ( ( cache.GetFailedAttempts( entry.pchId ) == 0 ) && ( timer.GetElapsed() < kWaitTimeoutSeconds ) )
-        {
-            Thread::Sleep( 1 );
-        }
+        TEST_ASSERT( WaitUntil( [ & ]() { return ( cache.GetFailedAttempts( entry.pchId ) != 0 ); } ) );
         TEST_ASSERT( cache.GetFailedAttempts( entry.pchId ) == 1 );
         TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
 
@@ -481,16 +540,14 @@ void TestDistributed::PchTakeReadyPchs() const
 
     Array<PchDataCache::ReadyPch> ready;
     bool allOk = true;
-    const Timer timer;
-    while ( pending.IsEmpty() == false )
+    TEST_ASSERT( WaitUntil( [ & ]()
     {
-        TEST_ASSERT( timer.GetElapsed() < kWaitTimeoutSeconds );
         if ( cache.TakeReadyPchs( pending, sent, ready ) == false )
         {
             allOk = false;
         }
-        Thread::Sleep( 10 );
-    }
+        return pending.IsEmpty();
+    } ) );
 
     // The unreadable PCH is reported once, then dropped without being marked as sent
     TEST_ASSERT( allOk == false );
@@ -534,6 +591,8 @@ void TestDistributed::DistributionStatsLog() const
         stats.m_Jobs.m_RawBytes = ( 24 * (uint64_t)MEGABYTE );
         stats.m_Jobs.m_SentBytes = ( 3 * (uint64_t)MEGABYTE );
         stats.m_Jobs.m_SendTime = 0.5;
+        stats.m_Jobs.m_EncodeTime = 0.4;
+        stats.m_NumSkippedToolchains = 2;
         stats.m_ResultsReceived = 3;
         stats.m_ResultBytesReceived = ( 1 * (uint64_t)MEGABYTE );
 
@@ -541,7 +600,8 @@ void TestDistributed::DistributionStatsLog() const
         DistributionStats::Format( stats, "2026-01-02 03:04:05", text );
         TEST_ASSERT( text.Find( "[2026-01-02 03:04:05] worker 10.0.0.7, connected 12.5s" ) );
         TEST_ASSERT( text.Find( "toolchain: 18 msgs, 40.0 MB raw, 2.0 MB sent" ) );
-        TEST_ASSERT( text.Find( "jobs:      3 msgs, 24.0 MB raw, 3.0 MB sent" ) );
+        TEST_ASSERT( text.Find( "jobs:      3 msgs, 24.0 MB raw, 3.0 MB sent, send time 0.5s, encode time 0.4s" ) );
+        TEST_ASSERT( text.Find( "toolchain: 2 cached on the worker, not sent" ) );
         TEST_ASSERT( text.Find( "results:   3 received, 1.0 MB" ) );
         TEST_ASSERT( text.Find( "upload:    6.0 MB in 2.0s of send time = 3.00 MB/s (24.0 Mbit/s)" ) );
     }
@@ -554,6 +614,10 @@ void TestDistributed::DistributionStatsLog() const
         AStackString<> text;
         DistributionStats::Format( stats, "t", text );
         TEST_ASSERT( text.Find( "= 0.00 MB/s (0.0 Mbit/s)" ) );
+
+        // Small amounts show in KB, not as 0.0 MB
+        TEST_ASSERT( text.Find( "0.0 KB raw, 1.0 KB sent" ) );
+        TEST_ASSERT( text.Find( "cached on the worker" ) == nullptr );
     }
 
     // The log moves to <path>.old instead of growing past its limit
@@ -661,47 +725,137 @@ void TestDistributed::PayloadsAcceptedByWorker() const
     TEST_ASSERT( DecodesTo( toolData, toolDataSize, content ) );
 }
 
-// ToolchainCacheEvictionPolicy
+// ToolchainEviction
 //------------------------------------------------------------------------------
-void TestDistributed::ToolchainCacheEvictionPolicy() const
+void TestDistributed::ToolchainEviction() const
 {
-    // Entries are deliberately not in age order, so the sort is exercised
-    Array<Server::ToolchainEvictionEntry> entries;
-    entries.Append( Server::ToolchainEvictionEntry{ 300, false } );
-    entries.Append( Server::ToolchainEvictionEntry{ 100, false } );
-    entries.Append( Server::ToolchainEvictionEntry{ 400, false } );
-    entries.Append( Server::ToolchainEvictionEntry{ 200, false } );
+    Server s( 1 );
 
-    Array<size_t> evictions;
+    // More toolchains than a worker keeps, the least recently used first
+    const uint32_t kNumToolchains = ( Server::kMaxCachedToolchains + 3 );
+    const uint64_t kFirstToolId = 0x1000;
+    Array<AString> toolFiles;
+    for ( uint32_t i = 0; i < kNumToolchains; ++i )
+    {
+        AStackString<> content;
+        content.Format( "compiler %u", i );
+        ToolManifest * manifest = SyntheticToolchain::Create( kFirstToolId + i, content.Get() );
+        TEST_ASSERT( manifest );
+        manifest->MarkUsed();
+        AStackString<> toolFile;
+        manifest->GetRemoteFilePath( 0, toolFile );
+        toolFiles.Append( toolFile );
+        {
+            MutexHolder mh( s.m_ToolManifestsMutex );
+            s.m_Tools.Append( manifest );
+        }
+        Thread::Sleep( 20 ); // File times have a limited resolution
+    }
 
-    // At the cap: nothing evicted
-    Server::SelectToolchainEvictions( entries, 4, evictions );
-    TEST_ASSERT( evictions.IsEmpty() );
+    // The least recently used is being used by a job. The next one was only just received.
+    ToolManifest * inUse = s.m_Tools[ 0 ];
+    inUse->AcquireUse();
+    const ToolManifest * justReceived = s.m_Tools[ 1 ];
+    s.EvictToolchains( justReceived );
 
-    // Over the cap by two: the two oldest go, whatever their position
-    Server::SelectToolchainEvictions( entries, 2, evictions );
-    TEST_ASSERT( evictions.GetSize() == 2 );
-    TEST_ASSERT( entries[ evictions[ 0 ] ].lastUsed == 100 );
-    TEST_ASSERT( entries[ evictions[ 1 ] ].lastUsed == 200 );
+    // Three had to go: the least recently used that were neither
+    auto kept = [ &s ]( uint64_t toolId )
+    {
+        MutexHolder mh( s.m_ToolManifestsMutex );
+        return ( s.m_Tools.FindDeref( toolId ) != nullptr );
+    };
+    for ( uint32_t i = 0; i < kNumToolchains; ++i )
+    {
+        const bool shouldBeKept = ( i < 2 ) || ( i >= 5 );
+        TEST_ASSERT( kept( kFirstToolId + i ) == shouldBeKept );
+        TEST_ASSERT( FileIO::FileExists( toolFiles[ i ].Get() ) == shouldBeKept ); // What is evicted is also removed from disk
+    }
 
-    // The oldest is protected (in use, or just added): the next-oldest go instead
-    entries[ 1 ].isProtected = true;
-    Server::SelectToolchainEvictions( entries, 2, evictions );
-    TEST_ASSERT( evictions.GetSize() == 2 );
-    TEST_ASSERT( entries[ evictions[ 0 ] ].lastUsed == 200 );
-    TEST_ASSERT( entries[ evictions[ 1 ] ].lastUsed == 300 );
+    inUse->ReleaseUse();
+}
 
-    // Everything but one entry is protected: only that one can go, so the cap is exceeded
-    entries[ 0 ].isProtected = true;
-    entries[ 3 ].isProtected = true;
-    Server::SelectToolchainEvictions( entries, 2, evictions );
-    TEST_ASSERT( evictions.GetSize() == 1 );
-    TEST_ASSERT( entries[ evictions[ 0 ] ].lastUsed == 400 );
+// ToolchainCacheStartupScan
+//------------------------------------------------------------------------------
+void TestDistributed::ToolchainCacheStartupScan() const
+{
+    // What a worker left on disk: more toolchains than it keeps, one of them modified since,
+    // and the directory of a toolchain that another worker is still receiving
+    const uint32_t kNumToolchains = ( Server::kMaxCachedToolchains + 2 );
+    const uint64_t kFirstToolId = 0x3000;
+    const uint32_t kModified = ( kNumToolchains - 2 );  // Among the most recent
+    const uint32_t kOldest = 0;
+    Array<AString> toolFiles;
+    Array<AString> manifestFiles;
+    for ( uint32_t i = 0; i < kNumToolchains; ++i )
+    {
+        AStackString<> content;
+        content.Format( "compiler %u", i );
+        UniquePtr<ToolManifest> manifest( SyntheticToolchain::Create( kFirstToolId + i, content.Get() ) );
+        TEST_ASSERT( manifest.Get() && manifest->SaveToDisk() );
 
-    // Everything is protected: nothing can go
-    entries[ 2 ].isProtected = true;
-    Server::SelectToolchainEvictions( entries, 2, evictions );
-    TEST_ASSERT( evictions.IsEmpty() );
+        AStackString<> toolFile;
+        manifest->GetRemoteFilePath( 0, toolFile );
+        toolFiles.Append( toolFile );
+        AStackString<> manifestFile;
+        manifest->GetPersistedPath( manifestFile );
+        manifestFiles.Append( manifestFile );
+    } // The files are no longer held open
+
+    // The more recent, the later the manifest was written
+    const uint64_t kStep = 1000000000ULL;
+    const uint64_t base = FileIO::GetFileLastWriteTime( manifestFiles[ 0 ] );
+    for ( uint32_t i = 0; i < kNumToolchains; ++i )
+    {
+        TEST_ASSERT( FileIO::SetFileLastWriteTime( manifestFiles[ i ], base + ( i * kStep ) ) );
+    }
+
+    Array<char> content;
+    {
+        FileStream in;
+        TEST_ASSERT( in.Open( toolFiles[ kModified ].Get() ) );
+        content.SetSize( (size_t)in.GetFileSize() );
+        TEST_ASSERT( in.Read( content.Begin(), content.GetSize() ) == content.GetSize() );
+    }
+    content[ 2 ] ^= 0x55;
+    {
+        FileStream out;
+        TEST_ASSERT( out.Open( toolFiles[ kModified ].Get(), FileStream::WRITE_ONLY ) );
+        TEST_ASSERT( out.Write( content.Begin(), content.GetSize() ) == content.GetSize() );
+    }
+
+    const ToolManifest receiving( 0x3F00 );
+    AStackString<> receivingFile;
+    receiving.GetRemotePath( receivingFile );
+    TEST_ASSERT( FileIO::EnsurePathExists( receivingFile ) );
+    receivingFile += "tool.exe";
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( receivingFile.Get(), FileStream::WRITE_ONLY ) );
+    }
+
+    Server s( 1 );
+
+    // The most recent that are intact are loaded: the modified one does not count towards what is kept
+    auto isLoaded = [ &s ]( uint64_t toolId )
+    {
+        MutexHolder mh( s.m_ToolManifestsMutex );
+        return ( s.m_Tools.FindDeref( toolId ) != nullptr );
+    };
+    uint32_t numLoaded = 0;
+    for ( uint32_t i = 0; i < kNumToolchains; ++i )
+    {
+        const bool shouldBeLoaded = ( i != kModified ) && ( i != kOldest );
+        TEST_ASSERT( isLoaded( kFirstToolId + i ) == shouldBeLoaded );
+        numLoaded += ( shouldBeLoaded ? 1 : 0 );
+
+        // What is not loaded is removed, so it does not take up disk space for ever
+        TEST_ASSERT( FileIO::FileExists( toolFiles[ i ].Get() ) == shouldBeLoaded );
+        TEST_ASSERT( FileIO::FileExists( manifestFiles[ i ].Get() ) == shouldBeLoaded );
+    }
+    TEST_ASSERT( numLoaded == Server::kMaxCachedToolchains );
+
+    // A directory without a manifest may be another worker's, so it is left alone
+    TEST_ASSERT( FileIO::FileExists( receivingFile.Get() ) );
 }
 
 // BuildOnNewWorker
@@ -762,8 +916,10 @@ void TestDistributed::ToolchainCachedAcrossWorkerRestart() const
     uint32_t files( 0 );
     AStackString toolchainFile;
 
-    // Whether or not an earlier run left the toolchain behind, it is there afterwards
+    // Nothing is cached, so the toolchain is sent
     BuildOnNewWorker( manifests, files, toolchainFile );
+    TEST_ASSERT( manifests > 0 );
+    TEST_ASSERT( files > 0 );
 
     // A new worker finds the toolchain on disk, so the coordinator never sends it
     BuildOnNewWorker( manifests, files, toolchainFile );
@@ -808,14 +964,118 @@ void TestDistributed::ToolchainCorruptedFileIsResent() const
     TEST_ASSERT( files == 0 );
 }
 
-// JobStreamDistributed
+// WorkerIsBuildingAJob
 //------------------------------------------------------------------------------
-void TestDistributed::JobStreamDistributed() const
+/*static*/ bool TestDistributed::WorkerIsBuildingAJob( Server & server )
 {
-    const char * target( "../tmp/Test/Distributed/dist.lib" );
+    // The toolchain the job needs is complete...
+    {
+        MutexHolder mh( server.m_ToolManifestsMutex );
+        bool synchronized = false;
+        for ( const ToolManifest * tool : server.m_Tools )
+        {
+            synchronized = ( synchronized || tool->IsSynchronized() );
+        }
+        if ( synchronized == false )
+        {
+            return false;
+        }
+    }
 
-    // Each build has its own worker, so each connection starts a new stream
-    for ( uint32_t build = 0; build < 2; ++build )
+    // ...and a job has arrived
+    MutexHolder mh( server.m_ClientListMutex );
+    for ( const Server::ClientState * cs : server.m_ClientList )
+    {
+        if ( cs->m_NumJobsActive.Load() > 0 )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// DropConnectionOnFirstJob
+//------------------------------------------------------------------------------
+/*static*/ uint32_t TestDistributed::DropConnectionOnFirstJob( void * param )
+{
+    ConnectionDrop * drop = static_cast<ConnectionDrop *>( param );
+    while ( drop->m_Stop.Load() == false )
+    {
+        if ( WorkerIsBuildingAJob( *drop->m_Server ) )
+        {
+            // The worker keeps listening, so the coordinator can connect again
+            Array<const ConnectionInfo *> connections;
+            {
+                MutexHolder mh( drop->m_Server->m_ClientListMutex );
+                for ( const Server::ClientState * cs : drop->m_Server->m_ClientList )
+                {
+                    connections.Append( cs->m_Connection );
+                }
+            }
+            for ( const ConnectionInfo * connection : connections )
+            {
+                drop->m_Server->Disconnect( connection );
+            }
+            drop->m_Dropped.Store( true );
+            break;
+        }
+        Thread::Sleep( 1 );
+    }
+    return 0;
+}
+
+// ReadJobStats
+//------------------------------------------------------------------------------
+/*static*/ void TestDistributed::ReadJobStats( const AString & logPath, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outSentBytes )
+{
+    outNumBlocks = 0;
+    outRawBytes = 0;
+    outSentBytes = 0;
+
+    FileStream f;
+    if ( f.Open( logPath.Get(), FileStream::READ_ONLY ) == false )
+    {
+        return;
+    }
+    Array<char> log;
+    log.SetSize( (size_t)f.GetFileSize() + 1 );
+    if ( f.Read( log.Begin(), log.GetSize() - 1 ) != ( log.GetSize() - 1 ) )
+    {
+        return;
+    }
+    log[ log.GetSize() - 1 ] = 0;
+
+    // One block per connection, with a line like "  jobs:      12 msgs, 1.1 MB raw, 40.2 KB sent, send time ..."
+    auto toBytes = []( double amount, char unit ) { return (uint64_t)( amount * ( ( unit == 'M' ) ? 1048576.0 : 1024.0 ) ); };
+    const char * line = log.Begin();
+    while ( ( line = strstr( line, "  jobs: " ) ) != nullptr )
+    {
+        char * p = nullptr;
+        (void)strtoul( line + 8, &p, 10 );
+        if ( strncmp( p, " msgs, ", 7 ) != 0 )
+        {
+            break;
+        }
+        const double raw = strtod( p + 7, &p );
+        const char rawUnit = p[ 1 ];
+        const double sent = strtod( p + 9, &p ); // Past " MB raw, "
+        const char sentUnit = p[ 1 ];
+
+        ++outNumBlocks;
+        outRawBytes += toBytes( raw, rawUnit );
+        outSentBytes += toBytes( sent, sentUnit );
+        line = p;
+    }
+}
+
+// JobStreamAcrossReconnect
+//------------------------------------------------------------------------------
+void TestDistributed::JobStreamAcrossReconnect() const
+{
+    const char * target( "../tmp/Test/Distributed/JobStream/JobStream.lib" );
+
+    // The connection is dropped under a job, so the build only completes if the coordinator
+    // reconnects and its jobs reach the worker again on a new stream
     {
         FBuildTestOptions options;
         options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
@@ -826,27 +1086,45 @@ void TestDistributed::JobStreamDistributed() const
         TEST_ASSERT( fBuild.Initialize() );
 
         Server s( 1 );
-        s.Listen( Protocol::kTestPort );
+        TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
         Array<AString> files;
-        FileIO::GetFiles( AStackString( "../tmp/Test/Distributed" ), AStackString( "*.*" ), true, &files );
+        FileIO::GetFiles( AStackString( "../tmp/Test/Distributed/JobStream" ), AStackString( "*.*" ), true, &files );
         for ( const AString & file : files )
         {
             FileIO::FileDelete( file.Get() );
         }
 
-        TEST_ASSERT( fBuild.Build( target ) );
+        ConnectionDrop drop;
+        drop.m_Server = &s;
+        Thread dropper;
+        dropper.Start( DropConnectionOnFirstJob, "DropConnection", &drop );
+        const bool built = fBuild.Build( target );
+        drop.m_Stop.Store( true );
+        dropper.Join();
+
+        TEST_ASSERT( drop.m_Dropped.Load() );
+        TEST_ASSERT( built );
         TEST_ASSERT( FileIO::FileExists( target ) );
 
-        // The jobs were built by the worker, from data it decoded
-        const uint64_t received = s.m_JobBytesReceived.Load();
-        const uint64_t decoded = s.m_JobBytesDecoded.Load();
-        TEST_ASSERT( decoded > 0 );
-        OUTPUT( "JobStreamDistributed: build %u, jobs %u bytes received for %u bytes decoded\n", build, (uint32_t)received, (uint32_t)decoded );
-
-        // and they were compressed against each other, not one by one
-        TEST_ASSERT( received < ( decoded / 3 ) );
+        // The toolchain was complete before the connection was dropped, so the worker still had it
+        TEST_ASSERT( s.m_NumManifestsReceived.Load() == 1 );
     }
+
+    // Each connection reported what it sent once it was closed
+    AStackString<> logPath;
+    TEST_ASSERT( FBuild::GetTempDir( logPath ) );
+    logPath += "FBuild-distribution-stats.log";
+    uint32_t numConnections;
+    uint64_t rawBytes;
+    uint64_t sentBytes;
+    ReadJobStats( logPath, numConnections, rawBytes, sentBytes );
+    TEST_ASSERT( numConnections >= 2 );
+    TEST_ASSERT( rawBytes > 0 );
+
+    // The jobs share most of their source, so each connection pays for it once: about 1% of their size.
+    // Compressing the jobs one by one costs about 10%.
+    TEST_ASSERT( ( sentBytes * 20 ) < rawBytes );
 }
 
 // Handshake tests
@@ -868,25 +1146,14 @@ namespace
             return m_MessageTypes[ index ];
         }
         bool IsDisconnected() const { return m_Disconnected.Load(); }
-
-        // Waits for a condition that depends on messages from the worker
-        template <class FUNC>
-        static bool WaitFor( const FUNC & condition )
+        void GetToolchainIds( Array<uint64_t> & outToolIds ) const
         {
-            const Timer timer;
-            while ( condition() == false )
-            {
-                if ( timer.GetElapsed() > 5.0f )
-                {
-                    return false;
-                }
-                Thread::Sleep( 10 );
-            }
-            return true;
+            MutexHolder mh( m_Mutex );
+            outToolIds = m_ToolchainIds;
         }
 
     private:
-        virtual void OnReceive( const ConnectionInfo *, void * data, uint32_t, bool & keepMemory ) override
+        virtual void OnReceive( const ConnectionInfo *, void * data, uint32_t size, bool & keepMemory ) override
         {
             keepMemory = true; // freed below
 
@@ -907,6 +1174,14 @@ namespace
             {
                 MutexHolder mh( m_Mutex );
                 m_MessageTypes.Append( (uint8_t)m_CurrentMessage->GetType() );
+                if ( ( m_CurrentMessage->GetType() == Protocol::MSG_TOOLCHAIN_INVENTORY ) && payload )
+                {
+                    const uint64_t * toolIds = static_cast<const uint64_t *>( payload );
+                    for ( size_t i = 0; i < ( size / sizeof( uint64_t ) ); ++i )
+                    {
+                        m_ToolchainIds.Append( toolIds[ i ] );
+                    }
+                }
             }
 
             FREE( (void *)m_CurrentMessage );
@@ -917,6 +1192,7 @@ namespace
 
         mutable Mutex m_Mutex;
         Array<uint8_t> m_MessageTypes;
+        Array<uint64_t> m_ToolchainIds;
         Atomic<bool> m_Disconnected{ false };
         const Protocol::IMessage * m_CurrentMessage = nullptr;
     };
@@ -935,7 +1211,7 @@ void TestDistributed::ToolchainInventoryFollowsAck() const
     const Protocol::MsgConnection msg;
     TEST_ASSERT( probe.Send( ci, &msg, sizeof( msg ) ) );
 
-    TEST_ASSERT( HandshakeProbe::WaitFor( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
 
     // The coordinator holds back its jobs until the last of these arrives
     TEST_ASSERT( probe.GetNumMessages() == 3 );
@@ -944,6 +1220,73 @@ void TestDistributed::ToolchainInventoryFollowsAck() const
     TEST_ASSERT( probe.GetMessageType( 2 ) == Protocol::MSG_TOOLCHAIN_INVENTORY );
 
     probe.ShutdownAllConnections();
+}
+
+// ToolchainInventoryIsBounded
+//------------------------------------------------------------------------------
+void TestDistributed::ToolchainInventoryIsBounded() const
+{
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    // More toolchains than a worker keeps, the least recently used first
+    const uint32_t kNumToolchains = ( Server::kMaxCachedToolchains + 2 );
+    const uint64_t kFirstToolId = 0x2000;
+    for ( uint32_t i = 0; i < kNumToolchains; ++i )
+    {
+        AStackString<> content;
+        content.Format( "compiler %u", i );
+        ToolManifest * manifest = SyntheticToolchain::Create( kFirstToolId + i, content.Get() );
+        TEST_ASSERT( manifest );
+        manifest->MarkUsed();
+        {
+            MutexHolder mh( s.m_ToolManifestsMutex );
+            s.m_Tools.Append( manifest );
+        }
+        Thread::Sleep( 20 ); // File times have a limited resolution
+    }
+    auto isKept = [ kNumToolchains ]( uint32_t index ) { return ( index >= ( kNumToolchains - Server::kMaxCachedToolchains ) ); };
+
+    HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    TEST_ASSERT( ci );
+    const Protocol::MsgConnection msg;
+    TEST_ASSERT( probe.Send( ci, &msg, sizeof( msg ) ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
+
+    // Only the most recently used are offered, so a connection can not hold on to more than a worker keeps
+    Array<uint64_t> advertised;
+    probe.GetToolchainIds( advertised );
+    TEST_ASSERT( advertised.GetSize() == Server::kMaxCachedToolchains );
+    {
+        MutexHolder mh( s.m_ToolManifestsMutex );
+        for ( uint32_t i = 0; i < kNumToolchains; ++i )
+        {
+            const uint64_t toolId = ( kFirstToolId + i );
+            TEST_ASSERT( ( advertised.Find( toolId ) != nullptr ) == isKept( i ) );
+
+            // and what is offered has to stay for as long as the connection does
+            TEST_ASSERT( ( *s.m_Tools.FindDeref( toolId ) )->IsInUse() == isKept( i ) );
+        }
+    }
+
+    // Without the connection nothing holds the toolchains, so the worker trims to what it keeps
+    probe.ShutdownAllConnections();
+    auto numToolchains = [ &s ]()
+    {
+        MutexHolder mh( s.m_ToolManifestsMutex );
+        return s.m_Tools.GetSize();
+    };
+    TEST_ASSERT( WaitUntil( [ & ]() { return ( numToolchains() == Server::kMaxCachedToolchains ); } ) );
+    {
+        MutexHolder mh( s.m_ToolManifestsMutex );
+        for ( uint32_t i = 0; i < kNumToolchains; ++i )
+        {
+            ToolManifest ** found = s.m_Tools.FindDeref( kFirstToolId + i );
+            TEST_ASSERT( ( found != nullptr ) == isKept( i ) );
+            TEST_ASSERT( ( found == nullptr ) || ( ( *found )->IsInUse() == false ) ); // The connection let go
+        }
+    }
 }
 
 // MismatchedProtocolVersionIsRefused
@@ -967,7 +1310,7 @@ void TestDistributed::MismatchedProtocolVersionIsRefused() const
     TEST_ASSERT( probe.Send( ci, bytes, sizeof( bytes ) ) );
 
     // The worker drops the connection without acknowledging it
-    TEST_ASSERT( HandshakeProbe::WaitFor( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
     TEST_ASSERT( probe.GetNumMessages() == 0 );
 
     probe.ShutdownAllConnections();

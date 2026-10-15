@@ -111,6 +111,9 @@ public:
 
     static bool GetTempDir( AString & outTempDir );
 
+    // Where a worker keeps toolchains (toolchain.<id>) and PCHs (pch.<id>) between connections
+    static bool GetWorkerCacheDir( AString & outDir );
+
     bool CacheOutputInfo() const;
     bool CacheTrim() const;
 

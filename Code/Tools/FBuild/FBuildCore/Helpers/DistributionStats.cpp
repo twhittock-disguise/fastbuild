@@ -22,12 +22,32 @@ namespace
 {
     double ToMB( uint64_t bytes ) { return ( (double)bytes / (double)MEGABYTE ); }
 
-    // "<label> <n> msgs, <raw> MB raw, <sent> MB sent, send time <t>s, done at <t>s"
+    // In MB, or in KB below 1 MB so small transfers do not show as 0.0 MB
+    void AppendSize( AString & text, uint64_t bytes )
+    {
+        if ( bytes >= MEGABYTE )
+        {
+            text.AppendFormat( "%.1f MB", ToMB( bytes ) );
+        }
+        else
+        {
+            text.AppendFormat( "%.1f KB", ( (double)bytes / 1024.0 ) );
+        }
+    }
+
+    // "<label> <n> msgs, <raw> raw, <sent> sent, send time <t>s[, encode time <t>s], done at <t>s"
     void AppendBulkLine( AString & text, const char * label, const DistributionSendStats & s )
     {
-        text.AppendFormat( "  %-10s %u msgs, %.1f MB raw, %.1f MB sent, send time %.1fs, done at %.1fs\n",
-                           label, s.m_Messages, ToMB( s.m_RawBytes ), ToMB( s.m_SentBytes ),
-                           s.m_SendTime, s.m_LastSentAt );
+        text.AppendFormat( "  %-10s %u msgs, ", label, s.m_Messages );
+        AppendSize( text, s.m_RawBytes );
+        text += " raw, ";
+        AppendSize( text, s.m_SentBytes );
+        text.AppendFormat( " sent, send time %.1fs", s.m_SendTime );
+        if ( s.m_EncodeTime > 0.0 )
+        {
+            text.AppendFormat( ", encode time %.1fs", s.m_EncodeTime );
+        }
+        text.AppendFormat( ", done at %.1fs\n", s.m_LastSentAt );
     }
 }
 
@@ -44,9 +64,9 @@ namespace
     outText.AppendFormat( "[%s] worker %s, connected %.1fs\n",
                           timestamp, stats.m_WorkerAddress.Get(), stats.m_ConnectedTime );
     AppendBulkLine( outText, "toolchain:", stats.m_Toolchain );
-    for ( const uint64_t toolId : stats.m_SkippedToolchains )
+    if ( stats.m_NumSkippedToolchains > 0 )
     {
-        outText.AppendFormat( "  toolchain: 0x%016" PRIx64 " skipped (cached on worker)\n", toolId );
+        outText.AppendFormat( "  toolchain: %u cached on the worker, not sent\n", stats.m_NumSkippedToolchains );
     }
     AppendBulkLine( outText, "pch:", stats.m_Pch );
     AppendBulkLine( outText, "jobs:", stats.m_Jobs );

@@ -78,6 +78,7 @@ void Job::SetToolManifest( ToolManifest * manifest )
     if ( m_ToolManifest )
     {
         m_ToolManifest->AcquireUse();
+        m_ToolManifest->MarkUsed();
     }
 }
 

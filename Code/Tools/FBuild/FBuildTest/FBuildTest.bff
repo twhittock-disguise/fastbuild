@@ -29,6 +29,9 @@
             // Input (Unity)
             .CompilerInputUnity         = '$ProjectName$-Unity-$Platform$-$BuildConfigName$'
 
+            // Extra Compiler Options
+            .CompilerOptions            + .ZstdIncludePaths
+
             // Output
             .CompilerOutputPath         = '$OutputBase$/$ProjectPath$/'
         }

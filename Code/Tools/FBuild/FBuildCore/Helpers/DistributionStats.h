@@ -4,7 +4,6 @@
 
 // Includes
 //------------------------------------------------------------------------------
-#include "Core/Containers/Array.h"
 #include "Core/Env/Types.h"
 #include "Core/Strings/AString.h"
 
@@ -16,6 +15,7 @@ struct DistributionSendStats
     uint64_t    m_RawBytes = 0;     // Before compression
     uint64_t    m_SentBytes = 0;
     double      m_SendTime = 0.0;   // Seconds spent handing data to the socket
+    double      m_EncodeTime = 0.0; // Seconds spent compressing, for data compressed as it is sent
     double      m_LastSentAt = 0.0; // Connection time of the last message handed over
 };
 
@@ -26,7 +26,7 @@ struct DistributionConnectionStats
     AString                 m_WorkerAddress;
     double                  m_ConnectedTime = 0.0;
     DistributionSendStats   m_Toolchain;
-    Array<uint64_t>         m_SkippedToolchains; // Already cached on the worker
+    uint32_t                m_NumSkippedToolchains = 0; // Already cached on the worker, so not sent
     DistributionSendStats   m_Pch;
     DistributionSendStats   m_Jobs;
     uint32_t                m_ResultsReceived = 0;

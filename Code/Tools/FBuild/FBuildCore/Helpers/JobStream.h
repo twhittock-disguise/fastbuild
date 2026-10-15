@@ -22,10 +22,16 @@ struct ZSTD_DCtx_s;
 //------------------------------------------------------------------------------
 namespace JobStream
 {
+    // Spent once per job, unlike the one-off toolchain and PCH transfers (Compressor::kZstdTransferLevel)
     constexpr int kCompressionLevel = 6;
-    constexpr int kWindowLog = 26;      // 64 MiB of history, which the decoder has to hold too
+
+    // History shared between jobs. Each connection costs about 70 MiB on the coordinator
+    // (compressor) and 64 MiB on the worker (decompressor).
+    constexpr int kWindowLog = 26;
     constexpr int kLdmHashLog = 16;     // Long distance matching table (windowLog - 10)
-    constexpr size_t kMaxChunkSize = ( 1024u * 1024u * 1024u );
+
+    // A preprocessed job is a few MiB. The size comes from the sender, so it is bounded.
+    constexpr size_t kMaxChunkSize = ( 64u * 1024u * 1024u );
 }
 
 // JobStreamEncoder
@@ -33,7 +39,7 @@ namespace JobStream
 class JobStreamEncoder
 {
 public:
-    explicit JobStreamEncoder( int windowLog = JobStream::kWindowLog );
+    JobStreamEncoder() = default;
     ~JobStreamEncoder();
 
     // Non-copyable
@@ -47,10 +53,7 @@ public:
     const void * GetResult() const { return m_Buffer; }
     size_t GetResultSize() const { return m_ResultSize; }
 
-    size_t GetMemoryUsage() const; // As reserved by zstd
-
 private:
-    const int m_WindowLog;
     ZSTD_CCtx_s * m_Context = nullptr;
     char * m_Buffer = nullptr;
     size_t m_BufferSize = 0;
@@ -73,8 +76,6 @@ public:
     // Fails on corrupt, out of order or oversized (window) data, after which the
     // stream is unusable and the connection should be closed.
     [[nodiscard]] bool Decode( const void * chunk, size_t chunkSize, void * & outData, size_t & outSize );
-
-    size_t GetMemoryUsage() const; // As reserved by zstd
 
 private:
     ZSTD_DCtx_s * m_Context = nullptr;
