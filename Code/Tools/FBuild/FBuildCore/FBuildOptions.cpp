@@ -523,10 +523,51 @@ FBuildOptions::OptionsResult FBuildOptions::ProcessCommandLine( int argc, char *
         }
     }
 
+    // Port used to reach workers (for example, to put a link shaper in front of one)
+    AStackString workerPort;
+    if ( Env::GetEnvVariable( "FASTBUILD_WORKER_PORT", workerPort ) )
+    {
+        if ( ParsePort( workerPort, m_DistributionPort ) == false )
+        {
+            OUTPUT( "Warning: FASTBUILD_WORKER_PORT is invalid (%s) and will be ignored\n", workerPort.Get() );
+        }
+    }
+
     // Global mutex names depend on workingDir which is managed by FBuildOptions
     m_ProgramName = programName;
 
     return OPTIONS_OK;
+}
+
+// ParsePort
+//------------------------------------------------------------------------------
+/*static*/ bool FBuildOptions::ParsePort( const AString & text, uint16_t & outPort )
+{
+    if ( text.IsEmpty() )
+    {
+        return false;
+    }
+
+    uint32_t port = 0;
+    for ( const char c : text )
+    {
+        if ( ( c < '0' ) || ( c > '9' ) )
+        {
+            return false;
+        }
+        port = ( port * 10 ) + (uint32_t)( c - '0' );
+        if ( port > 65535 )
+        {
+            return false;
+        }
+    }
+    if ( port == 0 )
+    {
+        return false;
+    }
+
+    outPort = (uint16_t)port;
+    return true;
 }
 
 // FBuildOptions::SetWorkingDir

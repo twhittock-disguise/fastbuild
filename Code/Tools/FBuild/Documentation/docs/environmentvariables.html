@@ -48,6 +48,10 @@
     <td>Set the list of workers explicitly.</td>
   </tr>
   <tr>
+    <td><a href="#FASTBUILD_WORKER_PORT">FASTBUILD_WORKER_PORT</a></td>
+    <td>Set the port used to connect to workers.</td>
+  </tr>
+  <tr>
     <td><a href="#FASTBUILD_CACHE_PATH">FASTBUILD_CACHE_PATH</a></td>
     <td>Set the location of the cache.</td>
   </tr> 
@@ -81,6 +85,13 @@ The location of the brokerage path can be set via the FASTBUILD_BROKERAGE_PATH.<
     <div class='newsitembody'>
 <p>The list of FBuildWorkers can be set explicitly as a ; delimited list via the FASTBUILD_WORKERS
 environment variable.</p>
+</div>
+
+    <div class='newsitemheader' id="FASTBUILD_WORKER_PORT">FASTBUILD_WORKER_PORT</div>
+    <div class='newsitembody'>
+<p>FBuild connects to workers on port 31264. A different port (1-65535) can be set via the FASTBUILD_WORKER_PORT
+environment variable, for example to reach workers through a port-forwarding proxy. An invalid value is ignored
+with a warning.</p>
 </div>
 
     <div class='newsitemheader' id="FASTBUILD_CACHE_PATH">FASTBUILD_CACHE_PATH</div>

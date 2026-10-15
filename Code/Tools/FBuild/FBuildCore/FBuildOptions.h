@@ -27,6 +27,9 @@ public:
     };
     OptionsResult ProcessCommandLine( int argc, char * argv[] );
 
+    // Parses a TCP port (1-65535, decimal digits only). outPort is only written on success.
+    static bool ParsePort( const AString & text, uint16_t & outPort );
+
     enum WrapperMode
     {
         WRAPPER_MODE_NONE,
