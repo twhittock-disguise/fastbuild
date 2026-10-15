@@ -3,6 +3,7 @@ Using( .StandardEnvironment )
 Settings
 {
     .Workers        = { "127.0.0.1" }
+    .CachePath      = '$Out$/Test/Distributed/Cache' // Only used by tests that enable the cache
 }
 
 Library( "DistTest" )

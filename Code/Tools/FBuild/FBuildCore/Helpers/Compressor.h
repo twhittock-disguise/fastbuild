@@ -17,7 +17,7 @@ public:
     static bool IsValidData( const void * data, size_t dataSize );
     static uint32_t GetUncompressedSize( const void * data, size_t dataSize );
 
-    // Zstd level for toolchain and PCH files pushed to workers
+    // Zstd level for data sent between coordinator and workers: toolchain and PCH files, and job results
     inline static const int32_t kZstdTransferLevel = 3;
 
     // compressionLevel:

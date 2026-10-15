@@ -68,6 +68,8 @@ private:
     void ToolchainInventoryIsBounded() const;
     void JobStreamAcrossReconnect() const;
     void ResultsAreCompressed() const;
+    void CorruptResultIsRejected() const;
+    void SendMutexHoldsBackResults() const;
     void MismatchedProtocolVersionIsRefused() const;
     void RegressionTest_RemoteCrashOnErrorFormatting();
     void TestLocalRace();
@@ -141,9 +143,21 @@ private:
     static bool WorkerIsBuildingAJob( Server & server );
     static uint32_t DropConnectionOnFirstJob( void * param );
 
-    // The totals of the jobs lines in the client's stats log
-    static void ReadJobStats( const AString & logPath, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outSentBytes );
-    static void ReadResultStats( const AString & logPath, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outReceivedBytes );
+    // Holds a connection's send mutex while its first job completes
+    struct SendHold
+    {
+        Server *        m_Server = nullptr;
+        Atomic<bool>    m_Stop{ false };
+        Atomic<bool>    m_BuildDone{ false };
+        Atomic<bool>    m_ReachedSend{ false };
+        Atomic<bool>    m_StateMutexFree{ false };
+        Atomic<bool>    m_ResultDeliveredWhileHeld{ false };
+    };
+    static uint32_t HoldSendMutexOnFirstJob( void * param );
+
+    // Totals over the lines starting with linePrefix in the client's stats log, for lines like
+    // "  jobs:      12 msgs, 1.1 MB raw, 40.2 KB sent, ..." (first is raw, second is sent or received)
+    static void ReadStats( const AString & logPath, const char * linePrefix, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outOtherBytes );
 
     mutable SyntheticToolchain::ScratchWorkerCache m_WorkerCache;
 };
@@ -171,6 +185,8 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ToolchainInventoryIsBounded )
     REGISTER_TEST( JobStreamAcrossReconnect )
     REGISTER_TEST( ResultsAreCompressed )
+    REGISTER_TEST( CorruptResultIsRejected )
+    REGISTER_TEST( SendMutexHoldsBackResults )
     REGISTER_TEST( MismatchedProtocolVersionIsRefused )
     REGISTER_TEST( RegressionTest_RemoteCrashOnErrorFormatting )
     REGISTER_TEST( TestLocalRace )
@@ -1028,13 +1044,13 @@ void TestDistributed::ToolchainCorruptedFileIsResent() const
     return 0;
 }
 
-// ReadJobStats
+// ReadStats
 //------------------------------------------------------------------------------
-/*static*/ void TestDistributed::ReadJobStats( const AString & logPath, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outSentBytes )
+/*static*/ void TestDistributed::ReadStats( const AString & logPath, const char * linePrefix, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outOtherBytes )
 {
     outNumBlocks = 0;
     outRawBytes = 0;
-    outSentBytes = 0;
+    outOtherBytes = 0;
 
     FileStream f;
     if ( f.Open( logPath.Get(), FileStream::READ_ONLY ) == false )
@@ -1049,25 +1065,36 @@ void TestDistributed::ToolchainCorruptedFileIsResent() const
     }
     log[ log.GetSize() - 1 ] = 0;
 
-    // One block per connection, with a line like "  jobs:      12 msgs, 1.1 MB raw, 40.2 KB sent, send time ..."
-    auto toBytes = []( double amount, char unit ) { return (uint64_t)( amount * ( ( unit == 'M' ) ? 1048576.0 : 1024.0 ) ); };
+    // One block per connection. Sizes are written with a KB or MB unit.
+    auto readBytes = []( char *& p )
+    {
+        const double amount = strtod( p, &p );
+        const bool megabytes = ( p[ 1 ] == 'M' );
+        return (uint64_t)( amount * ( megabytes ? 1048576.0 : 1024.0 ) );
+    };
     const char * line = log.Begin();
-    while ( ( line = strstr( line, "  jobs: " ) ) != nullptr )
+    while ( ( line = strstr( line, linePrefix ) ) != nullptr )
     {
         char * p = nullptr;
-        (void)strtoul( line + 8, &p, 10 );
-        if ( strncmp( p, " msgs, ", 7 ) != 0 )
+        (void)strtoul( line + strlen( linePrefix ), &p, 10 );
+        p = strstr( p, ", " );
+        if ( p == nullptr )
         {
             break;
         }
-        const double raw = strtod( p + 7, &p );
-        const char rawUnit = p[ 1 ];
-        const double sent = strtod( p + 9, &p ); // Past " MB raw, "
-        const char sentUnit = p[ 1 ];
+        p += 2;
+        const uint64_t raw = readBytes( p );
+        p = strstr( p, "raw, " );
+        if ( p == nullptr )
+        {
+            break;
+        }
+        p += 5;
+        const uint64_t other = readBytes( p );
 
         ++outNumBlocks;
-        outRawBytes += toBytes( raw, rawUnit );
-        outSentBytes += toBytes( sent, sentUnit );
+        outRawBytes += raw;
+        outOtherBytes += other;
         line = p;
     }
 }
@@ -1122,57 +1149,13 @@ void TestDistributed::JobStreamAcrossReconnect() const
     uint32_t numConnections;
     uint64_t rawBytes;
     uint64_t sentBytes;
-    ReadJobStats( logPath, numConnections, rawBytes, sentBytes );
+    ReadStats( logPath, "  jobs: ", numConnections, rawBytes, sentBytes );
     TEST_ASSERT( numConnections >= 2 );
     TEST_ASSERT( rawBytes > 0 );
 
-    // The jobs share most of their source, so each connection pays for it once: about 1% of their size.
-    // Compressing the jobs one by one costs about 10%.
+    // The jobs share most of their source, so each connection pays for it once. Compressing the
+    // jobs one by one would cost about 10% of their size.
     TEST_ASSERT( ( sentBytes * 20 ) < rawBytes );
-}
-
-// ReadResultStats
-//------------------------------------------------------------------------------
-/*static*/ void TestDistributed::ReadResultStats( const AString & logPath, uint32_t & outNumBlocks, uint64_t & outRawBytes, uint64_t & outReceivedBytes )
-{
-    outNumBlocks = 0;
-    outRawBytes = 0;
-    outReceivedBytes = 0;
-
-    FileStream f;
-    if ( f.Open( logPath.Get(), FileStream::READ_ONLY ) == false )
-    {
-        return;
-    }
-    Array<char> log;
-    log.SetSize( (size_t)f.GetFileSize() + 1 );
-    if ( f.Read( log.Begin(), log.GetSize() - 1 ) != ( log.GetSize() - 1 ) )
-    {
-        return;
-    }
-    log[ log.GetSize() - 1 ] = 0;
-
-    // One block per connection, with a line like "  results:   12 received, 1.1 MB raw, 240.2 KB received"
-    auto toBytes = []( double amount, char unit ) { return (uint64_t)( amount * ( ( unit == 'M' ) ? 1048576.0 : 1024.0 ) ); };
-    const char * line = log.Begin();
-    while ( ( line = strstr( line, "  results:   " ) ) != nullptr )
-    {
-        char * p = nullptr;
-        (void)strtoul( line + 13, &p, 10 );
-        if ( strncmp( p, " received, ", 11 ) != 0 )
-        {
-            break;
-        }
-        const double raw = strtod( p + 11, &p );
-        const char rawUnit = p[ 1 ];
-        const double received = strtod( p + 9, &p ); // Past " MB raw, "
-        const char receivedUnit = p[ 1 ];
-
-        ++outNumBlocks;
-        outRawBytes += toBytes( raw, rawUnit );
-        outReceivedBytes += toBytes( received, receivedUnit );
-        line = p;
-    }
 }
 
 // ResultsAreCompressed
@@ -1182,11 +1165,10 @@ void TestDistributed::ResultsAreCompressed() const
     const char * outputDir( "../tmp/Test/Distributed/ResultCompression" );
     const char * target( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
 
-    // Only this build's connections should be in the log
+    // PreTest emptied the temp directory, so only this build's connections are in the log
     AStackString<> logPath;
     TEST_ASSERT( FBuild::GetTempDir( logPath ) );
     logPath += "FBuild-distribution-stats.log";
-    FileIO::FileDelete( logPath.Get() );
 
     {
         FBuildTestOptions options;
@@ -1239,16 +1221,244 @@ void TestDistributed::ResultsAreCompressed() const
     }
     TEST_ASSERT( longestRun == 4096 ); // 64 x 64 repeats of the pattern
 
-    // The object is mostly a repeated table, so it returns at a small fraction of its size (about 1/28 when
-    // measured). Results sent without compression are at least as large as the object.
+    // The object is mostly a repeated table, so it returns at a small fraction of its size
     uint32_t numConnections;
     uint64_t rawBytes;
     uint64_t receivedBytes;
-    ReadResultStats( logPath, numConnections, rawBytes, receivedBytes );
+    ReadStats( logPath, "  results: ", numConnections, rawBytes, receivedBytes );
     TEST_ASSERT( numConnections >= 1 );
     TEST_ASSERT( rawBytes >= 32768 );
     TEST_ASSERT( receivedBytes > 0 );
     TEST_ASSERT( ( receivedBytes * 10 ) < rawBytes );
+}
+
+// Corrupt result
+//------------------------------------------------------------------------------
+namespace
+{
+    // A worker that completes the handshake and answers every job with a result that is not valid compressed data
+    class CorruptResultWorker : public TCPConnectionPool
+    {
+    public:
+        CorruptResultWorker() = default;
+        explicit CorruptResultWorker( const CorruptResultWorker & other ) = delete;
+        CorruptResultWorker & operator=( const CorruptResultWorker & other ) = delete;
+
+        uint32_t GetNumResultsSent() const { return m_NumResultsSent.Load(); }
+
+    private:
+        virtual void OnReceive( const ConnectionInfo * connection, void * data, uint32_t size, bool & keepMemory ) override
+        {
+            keepMemory = true; // freed below
+
+            void * payload = nullptr;
+            if ( m_CurrentMessage == nullptr )
+            {
+                m_CurrentMessage = static_cast<const Protocol::IMessage *>( data );
+                if ( m_CurrentMessage->HasPayload() )
+                {
+                    return;
+                }
+            }
+            else
+            {
+                payload = data;
+            }
+
+            if ( m_CurrentMessage->GetType() == Protocol::MSG_CONNECTION )
+            {
+                const Protocol::MsgConnectionAck ack( 4 );
+                const Protocol::MsgPchInventory pchInventory( 0 );
+                const Protocol::MsgToolchainInventory toolchainInventory( 0 );
+                ack.Send( connection );
+                pchInventory.Send( connection );
+                toolchainInventory.Send( connection );
+            }
+            else if ( m_CurrentMessage->GetType() == Protocol::MSG_JOB )
+            {
+                void * job = nullptr;
+                size_t jobSize = 0;
+                if ( m_Decoder.Decode( payload, size, job, jobSize ) )
+                {
+                    uint32_t jobId = 0; // The first thing a job holds
+                    ConstMemoryStream js( job, jobSize );
+                    js.Read( jobId );
+                    FREE( job );
+                    SendCorruptResult( connection, jobId );
+                }
+            }
+
+            FREE( (void *)m_CurrentMessage );
+            FREE( payload );
+            m_CurrentMessage = nullptr;
+        }
+
+        void SendCorruptResult( const ConnectionInfo * connection, uint32_t jobId )
+        {
+            MemoryStream ms;
+            ms.Write( jobId );
+            ms.Write( AStackString( "corrupt" ) );
+            ms.Write( true );  // Built ok, so the data should be object files
+            ms.Write( false ); // Not a system error
+            ms.Write( Array<AString>() );
+            ms.Write( (uint32_t)0 ); // Build time
+            ms.Write( (uint16_t)0 ); // Thread
+            char garbage[ 64 ];
+            memset( garbage, 0xFF, sizeof( garbage ) );
+            ms.Write( (uint32_t)sizeof( garbage ) );
+            ms.WriteBuffer( garbage, sizeof( garbage ) );
+            const Protocol::MsgJobResultCompressed msg( 4 );
+            msg.Send( connection, ms );
+            m_NumResultsSent.Increment();
+        }
+
+        JobStreamDecoder m_Decoder;
+        const Protocol::IMessage * m_CurrentMessage = nullptr;
+        Atomic<uint32_t> m_NumResultsSent{ 0 };
+    };
+}
+
+// CorruptResultIsRejected
+//------------------------------------------------------------------------------
+void TestDistributed::CorruptResultIsRejected() const
+{
+    const char * outputDir( "../tmp/Test/Distributed/ResultCompression" );
+    const char * target( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
+
+    // Results are cached as they arrive, so use a cache that starts empty
+    AStackString<> cacheDir;
+    GetCodeDir( cacheDir );
+    cacheDir += "../tmp/Test/Distributed/Cache/";
+    Array<AString> cached;
+    FileIO::GetFiles( cacheDir, AStackString( "*" ), true, &cached );
+    for ( const AString & file : cached )
+    {
+        FileIO::FileDelete( file.Get() );
+    }
+
+    Array<AString> files;
+    FileIO::GetFiles( AStackString( outputDir ), AStackString( "*.*" ), true, &files );
+    for ( const AString & file : files )
+    {
+        FileIO::FileDelete( file.Get() );
+    }
+
+    bool built = true;
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_UseCacheWrite = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+
+        CorruptResultWorker worker;
+        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+        built = fBuild.Build( target );
+        TEST_ASSERT( worker.GetNumResultsSent() >= 1 );
+        worker.ShutdownAllConnections();
+    }
+
+    // The job fails, and nothing from the result is used
+    TEST_ASSERT( built == false );
+    Array<AString> objects;
+    FileIO::GetFiles( AStackString( outputDir ), AStackString( "Table.*" ), false, &objects );
+    TEST_ASSERT( objects.IsEmpty() );
+    Array<AString> cachedAfter;
+    FileIO::GetFiles( cacheDir, AStackString( "*" ), true, &cachedAfter );
+    TEST_ASSERT( cachedAfter.IsEmpty() );
+}
+
+// HoldSendMutexOnFirstJob
+//------------------------------------------------------------------------------
+/*static*/ uint32_t TestDistributed::HoldSendMutexOnFirstJob( void * param )
+{
+    SendHold * hold = static_cast<SendHold *>( param );
+
+    // Wait for a job to arrive. Building it takes long enough to get the lock first.
+    Server::ClientState * cs = nullptr;
+    while ( ( cs == nullptr ) && ( hold->m_Stop.Load() == false ) )
+    {
+        {
+            MutexHolder mh( hold->m_Server->m_ClientListMutex );
+            for ( Server::ClientState * client : hold->m_Server->m_ClientList )
+            {
+                if ( client->m_NumJobsActive.Load() > 0 )
+                {
+                    cs = client;
+                }
+            }
+        }
+        Thread::Sleep( 1 );
+    }
+    if ( cs == nullptr )
+    {
+        return 0;
+    }
+
+    cs->m_SendMutex.Lock();
+
+    // The worker finishes the job, but has to wait to send the result
+    hold->m_ReachedSend.Store( WaitUntil( [ cs ]() { return ( cs->m_NumJobsActive.Load() == 0 ); } ) );
+    if ( hold->m_ReachedSend.Load() )
+    {
+        // Jobs can still be received meanwhile
+        if ( cs->m_Mutex.TryLock() )
+        {
+            hold->m_StateMutexFree.Store( true );
+            cs->m_Mutex.Unlock();
+        }
+        Thread::Sleep( 200 );
+        hold->m_ResultDeliveredWhileHeld.Store( hold->m_BuildDone.Load() );
+    }
+
+    cs->m_SendMutex.Unlock();
+    return 0;
+}
+
+// SendMutexHoldsBackResults
+//------------------------------------------------------------------------------
+void TestDistributed::SendMutexHoldsBackResults() const
+{
+    const char * outputDir( "../tmp/Test/Distributed/ResultCompression" );
+    const char * target( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
+
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    Array<AString> files;
+    FileIO::GetFiles( AStackString( outputDir ), AStackString( "*.*" ), true, &files );
+    for ( const AString & file : files )
+    {
+        FileIO::FileDelete( file.Get() );
+    }
+
+    SendHold hold;
+    hold.m_Server = &s;
+    Thread holder;
+    holder.Start( HoldSendMutexOnFirstJob, "HoldSendMutex", &hold );
+    const bool built = fBuild.Build( target );
+    hold.m_BuildDone.Store( true );
+    hold.m_Stop.Store( true );
+    holder.Join();
+
+    // Nothing is sent on a connection while its send mutex is held, and the lock that guards the
+    // connection's jobs is a different one
+    TEST_ASSERT( hold.m_ReachedSend.Load() );
+    TEST_ASSERT( hold.m_ResultDeliveredWhileHeld.Load() == false );
+    TEST_ASSERT( hold.m_StateMutexFree.Load() );
+    TEST_ASSERT( built );
 }
 
 // Handshake tests

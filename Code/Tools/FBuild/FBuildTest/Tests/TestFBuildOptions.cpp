@@ -8,6 +8,7 @@
 #include "Tools/FBuild/FBuildCore/FBuildOptions.h"
 
 // Core
+#include "Core/Env/Env.h"
 #include "Core/Strings/AStackString.h"
 
 // TestFBuildOptions
@@ -18,12 +19,14 @@ private:
     DECLARE_TESTS
 
     void ParsePort() const;
+    void WorkerPortEnvironmentVariable() const;
 };
 
 // Register Tests
 //------------------------------------------------------------------------------
 REGISTER_TESTS_BEGIN( TestFBuildOptions )
     REGISTER_TEST( ParsePort )
+    REGISTER_TEST( WorkerPortEnvironmentVariable )
 REGISTER_TESTS_END
 
 // ParsePort
@@ -52,6 +55,45 @@ void TestFBuildOptions::ParsePort() const
         TEST_ASSERT( FBuildOptions::ParsePort( AStackString( text ), port ) == false );
         TEST_ASSERT( port == 7 );
     }
+}
+
+// WorkerPortEnvironmentVariable
+//------------------------------------------------------------------------------
+void TestFBuildOptions::WorkerPortEnvironmentVariable() const
+{
+    AStackString<> original;
+    const bool hadOriginal = Env::GetEnvVariable( "FASTBUILD_WORKER_PORT", original );
+    char programName[] = "fbuild";
+    char * argv[] = { programName };
+
+    // The port is used when it is valid
+    Env::SetEnvVariable( "FASTBUILD_WORKER_PORT", AStackString( "31265" ) );
+    {
+        FBuildOptions options;
+        TEST_ASSERT( options.ProcessCommandLine( 1, argv ) == FBuildOptions::OPTIONS_OK );
+        TEST_ASSERT( options.m_DistributionPort == 31265 );
+    }
+
+    // A mistyped port must not quietly send the build to the real workers
+    Env::SetEnvVariable( "FASTBUILD_WORKER_PORT", AStackString( "31264x" ) );
+    {
+        FBuildOptions options;
+        TEST_ASSERT( options.ProcessCommandLine( 1, argv ) == FBuildOptions::OPTIONS_ERROR );
+    }
+
+    // An empty variable is the same as none
+    Env::SetEnvVariable( "FASTBUILD_WORKER_PORT", AStackString<>() );
+    {
+        FBuildOptions options;
+        TEST_ASSERT( options.ProcessCommandLine( 1, argv ) == FBuildOptions::OPTIONS_OK );
+        TEST_ASSERT( options.m_DistributionPort == Protocol::kPort );
+    }
+
+    if ( hadOriginal == false )
+    {
+        original.Clear();
+    }
+    Env::SetEnvVariable( "FASTBUILD_WORKER_PORT", original );
 }
 
 //------------------------------------------------------------------------------

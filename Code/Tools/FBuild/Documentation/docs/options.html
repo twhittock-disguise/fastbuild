@@ -272,8 +272,8 @@ of the cache and how quickly it is growing. (See the related <a href='#cachetrim
     <div class='newsitemheader' id="cachecompressionlevel">-cachecompressionlevel [level]</div>
     <div class='newsitembody'>
 <p>Control compression level of items stored in the cache. (Default 1)</p>
-<p>Objects built by remote workers are returned compressed with Zstd level 3. When writing to the cache, a higher
-        cache level also applies to the objects returned by workers.</p>
+<p>Objects built by remote workers are returned compressed with Zstd level 3, or with the cache compression level
+        if that is higher and the cache is being written.</p>
 <p>This can be used to increase the level of compression, trading increased CPU time when storing to the cache
         in order to reduce network transfer and storage. This can be useful in network bandwidth limited environments.
         Since decompression speed remains fairly constant, an increase in compression time may also be a worthwhile

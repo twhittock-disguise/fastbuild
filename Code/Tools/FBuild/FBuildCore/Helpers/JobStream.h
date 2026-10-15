@@ -22,7 +22,7 @@ struct ZSTD_DCtx_s;
 //------------------------------------------------------------------------------
 namespace JobStream
 {
-    // Spent once per job, unlike the one-off toolchain and PCH transfers (Compressor::kZstdTransferLevel)
+    // Higher than Compressor::kZstdTransferLevel: jobs repeat each other's content, so the extra effort pays off
     constexpr int kCompressionLevel = 6;
 
     // History shared between jobs. Each connection costs about 70 MiB on the coordinator

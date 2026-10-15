@@ -59,7 +59,6 @@ private:
     void TouchToolchains();
     void ReleaseReadyWaitingJobs();
 
-    void RequestMissingFiles( const ConnectionInfo * connection, ToolManifest * manifest ) const;
     void RecalculateCapacity();        // Takes m_ClientListMutex
     void RecalculateCapacityLocked();  // Caller must hold m_ClientListMutex
 
@@ -76,7 +75,7 @@ private:
         ClientState & operator=( const ClientState & other ) = delete;
 
         Mutex m_Mutex;
-        Mutex m_SendMutex; // Sends on the connection come from several threads. Innermost lock.
+        Mutex m_SendMutex; // Held for every send on this connection (see SendTo). Innermost lock.
 
         const Protocol::IMessage * m_CurrentMessage = nullptr;
         const ConnectionInfo * m_Connection = nullptr;
@@ -93,6 +92,15 @@ private:
         Array<ToolManifest *> m_KnownTools; // toolchains this client may send jobs for, each holding a use
     };
 
+    // Messages for one connection come from the server thread (results), the connection's
+    // receive thread (ack, inventories) and OnDisconnected (file requests), so every send
+    // goes through here. Lock order: m_ClientListMutex, cs.m_Mutex, m_ToolManifestsMutex, m_SendMutex.
+    static bool SendTo( ClientState & cs, const Protocol::IMessage & msg );
+    static bool SendTo( ClientState & cs, const Protocol::IMessage & msg, const MemoryStream & payload );
+    template <class MSG>
+    static void SendIdInventory( ClientState & cs, const Array<uint64_t> & ids );
+    void RequestMissingFiles( ClientState & cs, ToolManifest * manifest ) const;
+
     uint32_t m_PrefetchBuffer = 0;
     JobQueueRemote * m_JobQueueRemote;
 
@@ -108,7 +116,7 @@ private:
     // connections and worker restarts, and are advertised to clients
     static constexpr uint32_t kMaxCachedToolchains = 6;
     void ScanToolchainCache();
-    void SendToolchainInventory( const ConnectionInfo * connection, ClientState * cs );
+    void SendToolchainInventory( ClientState & cs );
     void OnToolchainSynchronized( ToolManifest * manifest );
     void EvictToolchains( const ToolManifest * keep );
     Atomic<uint32_t> m_NumManifestsReceived;

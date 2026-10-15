@@ -9,6 +9,7 @@
 
 // Core
 #include "Core/Containers/UniquePtr.h"
+#include "Core/Env/WindowsHeader.h"
 #include "Core/FileIO/FileStream.h"
 #include "Core/Strings/AString.h"
 #include "Core/Time/Timer.h"
@@ -27,6 +28,9 @@ private:
     void CompressPreprocessedFile() const;
     void CompressObjFile() const;
     void TestHeaderValidity() const;
+#if defined( __WINDOWS__ )
+    void TestHeaderBounds() const;
+#endif
 
     void CompressSimpleHelper( const char * data,
                                size_t size,
@@ -43,6 +47,9 @@ REGISTER_TESTS_BEGIN( TestCompressor )
     REGISTER_TEST( CompressPreprocessedFile )
     REGISTER_TEST( CompressObjFile )
     REGISTER_TEST( TestHeaderValidity )
+#if defined( __WINDOWS__ )
+    REGISTER_TEST( TestHeaderBounds )
+#endif
 REGISTER_TESTS_END
 
 // CompressSimple
@@ -306,5 +313,30 @@ void TestCompressor::TestHeaderValidity() const
     data[ 2 ] = 32; // compressed
     TEST_ASSERT( Compressor::IsValidData( buffer.Get(), 44 ) == false );
 }
+
+// TestHeaderBounds
+//------------------------------------------------------------------------------
+#if defined( __WINDOWS__ )
+void TestCompressor::TestHeaderBounds() const
+{
+    // Data that ends right before an inaccessible page: reading a header past the end of it faults
+    const size_t pageSize = 4096;
+    char * pages = (char *)::VirtualAlloc( nullptr, pageSize * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+    TEST_ASSERT( pages );
+    DWORD oldProtection = 0;
+    TEST_ASSERT( ::VirtualProtect( pages + pageSize, pageSize, PAGE_NOACCESS, &oldProtection ) );
+
+    // The sizes come from the sender, so they can be shorter than a header
+    const size_t dataSizes[] = { 0, 1, 4, 8, 11 };
+    for ( const size_t dataSize : dataSizes )
+    {
+        char * data = ( pages + pageSize ) - dataSize;
+        memset( data, 0, dataSize );
+        TEST_ASSERT( Compressor::IsValidData( data, dataSize ) == false );
+    }
+
+    VERIFY( ::VirtualFree( pages, 0, MEM_RELEASE ) );
+}
+#endif
 
 //------------------------------------------------------------------------------

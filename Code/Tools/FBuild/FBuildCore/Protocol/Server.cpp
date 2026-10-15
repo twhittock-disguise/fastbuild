@@ -101,24 +101,6 @@ namespace
         return true;
     }
 
-    // Sends the ids a worker has cached, so the coordinator does not send them again
-    template <class MSG>
-    void SendIdInventory( const ConnectionInfo * connection, const Array<uint64_t> & ids )
-    {
-        const MSG msg( (uint32_t)ids.GetSize() );
-        if ( ids.IsEmpty() )
-        {
-            msg.Send( connection );
-            return;
-        }
-        MemoryStream ms;
-        for ( const uint64_t id : ids )
-        {
-            ms.Write( id );
-        }
-        msg.Send( connection, ms );
-    }
-
     // Removes the toolchain directory that holds the manifest file, and everything in it
     void DeleteToolchainDirectory( const AString & manifestPath )
     {
@@ -305,7 +287,7 @@ bool Server::IsSynchingTool( AString & statusStr ) const
                 ToolManifest * jMan = j->GetToolManifest();
                 if ( cancelledManifests.Find( jMan ) )
                 {
-                    RequestMissingFiles( otherCS->m_Connection, jMan );
+                    RequestMissingFiles( *otherCS, jMan );
                 }
             }
         }
@@ -412,6 +394,42 @@ bool Server::IsSynchingTool( AString & statusStr ) const
     cs->m_CurrentMessage = nullptr;
 }
 
+// SendTo
+//------------------------------------------------------------------------------
+/*static*/ bool Server::SendTo( ClientState & cs, const Protocol::IMessage & msg )
+{
+    MutexHolder sendMH( cs.m_SendMutex );
+    return msg.Send( cs.m_Connection );
+}
+
+// SendTo
+//------------------------------------------------------------------------------
+/*static*/ bool Server::SendTo( ClientState & cs, const Protocol::IMessage & msg, const MemoryStream & payload )
+{
+    MutexHolder sendMH( cs.m_SendMutex );
+    return msg.Send( cs.m_Connection, payload );
+}
+
+// SendIdInventory
+//------------------------------------------------------------------------------
+// Sends the ids a worker has cached, so the coordinator does not send them again
+template <class MSG>
+/*static*/ void Server::SendIdInventory( ClientState & cs, const Array<uint64_t> & ids )
+{
+    const MSG msg( (uint32_t)ids.GetSize() );
+    if ( ids.IsEmpty() )
+    {
+        SendTo( cs, msg );
+        return;
+    }
+    MemoryStream ms;
+    for ( const uint64_t id : ids )
+    {
+        ms.Write( id );
+    }
+    SendTo( cs, msg, ms );
+}
+
 // Process( MsgConnection )
 //------------------------------------------------------------------------------
 void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConnection * msg )
@@ -445,12 +463,12 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     }
 
     // Recalculate capacity across all connected coordinators
-    // (must NOT hold cs->m_Mutex here to avoid lock ordering with FinalizeCompletedJobs)
+    // (takes m_ClientListMutex, so cs->m_Mutex must not be held)
     RecalculateCapacity();
 
     // Send ack with allocated capacity
     const Protocol::MsgConnectionAck ack( (uint8_t)cs->m_AllocatedCapacity );
-    ack.Send( connection );
+    SendTo( *cs, ack );
 
     // Send PCH inventory so coordinator knows what's already cached
     Array<uint64_t> pchIds;
@@ -461,11 +479,11 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
             pchIds.Append( e.pchId );
         }
     }
-    SendIdInventory<Protocol::MsgPchInventory>( connection, pchIds );
+    SendIdInventory<Protocol::MsgPchInventory>( *cs, pchIds );
 
     // Send toolchain inventory so coordinator can skip sending toolchains we already have.
     // It follows the PCH inventory, so the coordinator knows both have arrived.
-    SendToolchainInventory( connection, cs );
+    SendToolchainInventory( *cs );
 }
 
 // Process( MsgJob )
@@ -728,7 +746,7 @@ void Server::ReleaseReadyWaitingJobs()
 
 // Process( MsgPchFile )
 //------------------------------------------------------------------------------
-void Server::Process( const ConnectionInfo * /*connection*/, const Protocol::MsgPchFile * msg, const void * payload, size_t /*payloadSize*/ )
+void Server::Process( const ConnectionInfo * /*connection*/, const Protocol::MsgPchFile * msg, const void * payload, size_t payloadSize )
 {
     const uint64_t pchId = msg->GetPchId();
     const uint32_t uncompressedSize = msg->GetUncompressedSize();
@@ -758,7 +776,7 @@ void Server::Process( const ConnectionInfo * /*connection*/, const Protocol::Msg
     {
         // Decompress payload
         Compressor c;
-        if ( c.Decompress( payload ) == false )
+        if ( ( Compressor::IsValidData( payload, payloadSize ) == false ) || ( c.Decompress( payload ) == false ) )
         {
             FLOG_WARN( "Failed to decompress PCH data for pchId 0x%016" PRIx64 "\n", pchId );
             return;
@@ -1028,7 +1046,7 @@ void Server::ScanToolchainCache()
 
 // SendToolchainInventory
 //------------------------------------------------------------------------------
-void Server::SendToolchainInventory( const ConnectionInfo * connection, ClientState * cs )
+void Server::SendToolchainInventory( ClientState & cs )
 {
     // The coordinator will not send the toolchains listed here, so they must stay available
     // while it is connected. Only the most recently used ones are offered, which bounds how
@@ -1060,14 +1078,14 @@ void Server::SendToolchainInventory( const ConnectionInfo * connection, ClientSt
         toolIds.Append( tm->GetToolId() );
     }
     {
-        MutexHolder mh( cs->m_Mutex );
+        MutexHolder mh( cs.m_Mutex );
         for ( ToolManifest * tm : advertised )
         {
-            cs->m_KnownTools.Append( tm );
+            cs.m_KnownTools.Append( tm );
         }
     }
 
-    SendIdInventory<Protocol::MsgToolchainInventory>( connection, toolIds );
+    SendIdInventory<Protocol::MsgToolchainInventory>( cs, toolIds );
 }
 
 // OnToolchainSynchronized
@@ -1186,26 +1204,34 @@ void Server::FinalizeCompletedJobs()
             // get associated connection
             ClientState * cs = (ClientState *)job->GetUserData();
 
-            // Build the message before taking any lock
-            MemoryStream ms;
-            ms.Write( job->GetJobId() );
-            ms.Write( job->GetNode()->GetName() );
-            ms.Write( result == Node::BuildResult::eOk );
-            ms.Write( job->GetSystemErrorCount() > 0 );
-            ms.Write( job->GetMessages() );
-            ms.Write( job->GetNode()->GetLastBuildTime() );
-            ms.Write( job->GetRemoteThreadIndex() ); // The thread used to build the job to assist with visualization
+            // The connection might have been lost before we completed. Check before copying
+            // the result into a message; it is checked again below, under the lock that matters.
+            bool connectionStillActive;
+            {
+                MutexHolder mh( m_ClientListMutex );
+                connectionStillActive = ( m_ClientList.Find( cs ) != nullptr );
+            }
 
-            // write the data - build result for success, or output+errors for failure
-            ms.Write( (uint32_t)job->GetDataSize() );
-            ms.WriteBuffer( job->GetData(), job->GetDataSize() );
-
-            // Holding the client list keeps the connection alive while we send
-            MutexHolder mh( m_ClientListMutex );
-
-            const bool connectionStillActive = ( m_ClientList.Find( cs ) != nullptr );
             if ( connectionStillActive )
             {
+                // Build the message before taking any lock, as the result can be large
+                MemoryStream ms;
+                ms.Write( job->GetJobId() );
+                ms.Write( job->GetNode()->GetName() );
+                ms.Write( result == Node::BuildResult::eOk );
+                ms.Write( job->GetSystemErrorCount() > 0 );
+                ms.Write( job->GetMessages() );
+                ms.Write( job->GetNode()->GetLastBuildTime() );
+                ms.Write( job->GetRemoteThreadIndex() ); // The thread used to build the job to assist with visualization
+
+                // write the data - build result for success, or output+errors for failure
+                ms.Write( (uint32_t)job->GetDataSize() );
+                ms.WriteBuffer( job->GetData(), job->GetDataSize() );
+
+                // Holding the client list keeps the connection alive while we send. Only
+                // cs->m_Mutex is free during the send, so jobs can still arrive on this connection.
+                MutexHolder mh( m_ClientListMutex );
+                if ( m_ClientList.Find( cs ) != nullptr )
                 {
                     ASSERT( cs->m_NumJobsActive.Load() > 0 );
                     cs->m_NumJobsActive.Decrement();
@@ -1214,28 +1240,19 @@ void Server::FinalizeCompletedJobs()
                     const uint32_t allocated = cs->m_AllocatedCapacity;
                     const uint8_t remaining = (uint8_t)( allocated > active ? allocated - active : 0 );
 
-                    // Not cs->m_Mutex: a large result can take a while to send and must not hold up the
-                    // jobs arriving on this connection
-                    MutexHolder sendMH( cs->m_SendMutex );
-
                     if ( job->GetResultCompressionLevel() == 0 )
                     {
                         // Uncompressed
                         const Protocol::MsgJobResult msg( remaining );
-                        msg.Send( cs->m_Connection, ms );
+                        SendTo( *cs, msg, ms );
                     }
                     else
                     {
                         // Compressed
                         const Protocol::MsgJobResultCompressed msg( remaining );
-                        msg.Send( cs->m_Connection, ms );
+                        SendTo( *cs, msg, ms );
                     }
                 }
-            }
-            else
-            {
-                // we might get here without finding the connection
-                // (if the connection was lost before we completed)
             }
         }
 
@@ -1296,7 +1313,7 @@ void Server::TouchToolchains()
 
 // RequestMissingFiles
 //------------------------------------------------------------------------------
-void Server::RequestMissingFiles( const ConnectionInfo * connection, ToolManifest * manifest ) const
+void Server::RequestMissingFiles( ClientState & cs, ToolManifest * manifest ) const
 {
     MutexHolder manifestMH( m_ToolManifestsMutex );
 
@@ -1309,11 +1326,7 @@ void Server::RequestMissingFiles( const ConnectionInfo * connection, ToolManifes
         {
             // request this file
             const Protocol::MsgRequestFile reqFileMsg( manifest->GetToolId(), (uint32_t)i );
-            {
-                ClientState * cs = (ClientState *)connection->GetUserData();
-                MutexHolder sendMH( cs->m_SendMutex );
-                reqFileMsg.Send( connection );
-            }
+            SendTo( cs, reqFileMsg );
 
             // prevent it being requested again
             manifest->MarkFileAsSynchronizing( i );
@@ -1321,8 +1334,8 @@ void Server::RequestMissingFiles( const ConnectionInfo * connection, ToolManifes
             // either this is the first file being synchronized, or we
             // are synchronizing multiple files from the same connection
             // (it should not be possible to have files requested from different connections)
-            ASSERT( ( manifest->GetUserData() == nullptr ) || ( manifest->GetUserData() == connection ) );
-            manifest->SetUserData( (void *)connection );
+            ASSERT( ( manifest->GetUserData() == nullptr ) || ( manifest->GetUserData() == cs.m_Connection ) );
+            manifest->SetUserData( (void *)cs.m_Connection );
         }
     }
 }

@@ -525,11 +525,12 @@ FBuildOptions::OptionsResult FBuildOptions::ProcessCommandLine( int argc, char *
 
     // Port used to reach workers (for example, to put a link shaper in front of one)
     AStackString workerPort;
-    if ( Env::GetEnvVariable( "FASTBUILD_WORKER_PORT", workerPort ) )
+    if ( Env::GetEnvVariable( "FASTBUILD_WORKER_PORT", workerPort ) && ( workerPort.IsEmpty() == false ) )
     {
         if ( ParsePort( workerPort, m_DistributionPort ) == false )
         {
-            OUTPUT( "Warning: FASTBUILD_WORKER_PORT is invalid (%s) and will be ignored\n", workerPort.Get() );
+            OUTPUT( "FASTBUILD_WORKER_PORT is invalid (%s)\n", workerPort.Get() );
+            return OPTIONS_ERROR;
         }
     }
 

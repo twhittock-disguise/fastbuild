@@ -813,7 +813,7 @@ void ClientToWorkerConnection::PushJobsToWorker()
         MemoryStream stream;
         job->Serialize( stream );
 
-        // Determine compression level for results (objects compress about 4.7x with zstd 3)
+        // Determine compression level for results
         int16_t resultCompressionLevel = (int16_t)Compressor::kZstdTransferLevel;
         if ( FBuild::IsValid() )
         {
@@ -912,10 +912,6 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
     uint32_t dataSize = 0;
     ms.Read( dataSize );
     const void * data = (const char *)ms.GetData() + ms.Tell();
-
-    // Only the data of a successful job is in compressor format
-    const bool dataIsCompressed = isCompressed && result && Compressor::IsValidData( data, dataSize );
-    m_ResultRawBytes.Add( dataIsCompressed ? Compressor::GetUncompressedSize( data, dataSize ) : dataSize );
 
     {
         MutexHolder mh( m_Mutex );
@@ -1104,8 +1100,17 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
 
         ObjectNode * objectNode = node->CastTo<ObjectNode>();
 
+        // Decompress first: a corrupt result must not reach the cache
+        MultiBuffer mb( data, dataSize );
+        const bool decompressed = ( isCompressed == false ) || mb.Decompress();
+        if ( decompressed )
+        {
+            m_ResultRawBytes.Add( mb.GetDataSize() );
+        }
+
         // Store to cache if needed
-        const bool writeToCache = FBuild::Get().GetOptions().m_UseCacheWrite &&
+        const bool writeToCache = decompressed &&
+                                  FBuild::Get().GetOptions().m_UseCacheWrite &&
                                   objectNode->ShouldUseCache();
         if ( writeToCache )
         {
@@ -1124,19 +1129,17 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
             }
         }
 
-        // Decompress if needed
-        MultiBuffer mb( data, dataSize );
-        const bool decompressed = ( isCompressed == false ) || mb.Decompress();
-
         const AString & nodeName = objectNode->GetName();
         if ( decompressed == false )
         {
-            FLOG_ERROR( "Failed to decompress the result for '%s'", nodeName.Get() );
+            FLOG_ERROR( "Failed to decompress the result for '%s' from %s\n", nodeName.Get(), m_Worker->m_Address.Get() );
+            objectNode->SetStatFlag( Node::STATS_FAILED );
             result = false;
         }
         else if ( Node::EnsurePathExistsForFile( nodeName ) == false )
         {
             FLOG_ERROR( "Failed to create path for '%s'", nodeName.Get() );
+            objectNode->SetStatFlag( Node::STATS_FAILED );
             result = false;
         }
         else
@@ -1216,6 +1219,7 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
     }
     else
     {
+        m_ResultRawBytes.Add( dataSize ); // Failure output is not compressed
         ( (FileNode *)node )->SetStatFlag( Node::STATS_FAILED );
 
         // was it a system error?
