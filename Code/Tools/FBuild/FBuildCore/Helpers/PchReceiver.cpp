@@ -125,6 +125,14 @@ PchReceiver::Result PchReceiver::OnChunk( const Protocol::MsgPchFile & msg,
 //------------------------------------------------------------------------------
 void PchReceiver::Abort()
 {
+    Reset();
+    EndReceiving();
+}
+
+// Reset
+//------------------------------------------------------------------------------
+void PchReceiver::Reset()
+{
     Array<char> empty;
     m_Compressed.Swap( empty );
 
@@ -136,7 +144,6 @@ void PchReceiver::Abort()
     }
     m_Active = false;
     m_AlreadyCached = false;
-    m_ReceivingPchId.Store( 0 );
 }
 
 // Fail
@@ -155,7 +162,7 @@ PchReceiver::Result PchReceiver::Finish( const AString & pchFile, bool & outAlre
     if ( m_AlreadyCached )
     {
         outAlreadyCached = true;
-        Abort();
+        Reset();
         return COMPLETE;
     }
 
@@ -214,7 +221,7 @@ PchReceiver::Result PchReceiver::Finish( const AString & pchFile, bool & outAlre
         outAlreadyCached = true;
     }
 
-    Abort(); // Removes the temporary file if it was not moved
+    Reset(); // Removes the temporary file if it was not moved
     return COMPLETE;
 }
 

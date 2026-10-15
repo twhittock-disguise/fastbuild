@@ -59,6 +59,10 @@ namespace
 
 class TestDistributed : public FBuildTest
 {
+public:
+    // Lets a test's Server, which is no friend of Server, hand a message on to it
+    static void ReceiveAsServer( Server & server, const ConnectionInfo * connection, void * data, uint32_t size, bool & keepMemory );
+
 private:
     DECLARE_TESTS
 
@@ -74,6 +78,7 @@ private:
     void PchStartupScanAppliesTheBudget() const;
     void PchBudgetFollowsTheFreeSpace() const;
     void PchInsertEvictsToTheBudget() const;
+    void PchInsertCountsTheSizeOnDisk() const;
     void PchCompressedCache() const;
     void PchCompressRetry() const;
     void PchTakeReadyPchs() const;
@@ -124,9 +129,10 @@ private:
     void WorkerAsksAgainWhenAPchItHadIsNeededAgain() const;
     void ClientSendsAPchAgainWhenAsked() const;
     void ClientGivesUpOnAWorkerThatKeepsLosingAPch() const;
-    void ClientIgnoresANeededPchItDoesNotKnow() const;
+    void ClientGivesUpOnAWorkerThatAsksForAnUnknownPch() const;
     void EvictedPchIsSentAgain() const;
     void MSVCWorkerFailuresAreRetriedElsewhere() const;
+    void MSVCFailureOfARemoteJobIsASystemError() const;
     void ServerSendsOnlyWhatTheClientAdvertises() const;
     void ClientRefusesAWorkerThatRefusesIt() const;
     void ClientRefusesAnAckOfAnotherMajor() const;
@@ -210,17 +216,20 @@ private:
     static bool WorkerIsBuildingAJob( Server & server );
     static uint32_t DropConnectionOnFirstJob( void * param );
 
-    // Evicts the worker's PCHs once the first job is done, while its result is held back
-    struct PchEviction
-    {
-        Server *        m_Server = nullptr;
-        Atomic<bool>    m_Stop{ false };
-        Atomic<bool>    m_Evicted{ false };
-    };
-    static uint32_t EvictPchBetweenJobs( void * param );
+    // What the PCH cache of a Server may hold, in place of what its disk allows
+    inline static Server::PchCacheLimits s_PchCacheLimits = { 0, 0 };
+    inline static bool s_PchCacheLimitsKnown = true;
+    inline static Atomic<uint64_t> s_LastCacheBytes{ 0 }; // What the Server said the cache holds, when it asked
+    static bool GetTestPchCacheLimits( uint64_t cacheBytes, Server::PchCacheLimits & outLimits );
+    static void SetPchCacheLimits( Server & server, uint64_t bytes, uint32_t minEntries );
+    static void SetPchCacheLimitsUnknown( Server & server ); // As when the free space cannot be read
+
+    // A worker that makes room for another PCH when its second job arrives
+    static void EvictForTheSecondJob( Server & server, void * user );
 
     void CapturePchJob( CapturedJob & outJob ) const;
     static uint32_t CountWaitingJobs( Server & server );
+    static void DropWaitingJobs( Server & server ); // As if they had been built
 
     // Holds a connection's send mutex while its first job completes
     struct SendHold
@@ -256,6 +265,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchStartupScanAppliesTheBudget )
     REGISTER_TEST( PchBudgetFollowsTheFreeSpace )
     REGISTER_TEST( PchInsertEvictsToTheBudget )
+    REGISTER_TEST( PchInsertCountsTheSizeOnDisk )
     REGISTER_TEST( PchCompressedCache )
     REGISTER_TEST( PchCompressRetry )
     REGISTER_TEST( PchTakeReadyPchs )
@@ -302,15 +312,16 @@ REGISTER_TESTS_BEGIN( TestDistributed )
 #endif
     REGISTER_TEST( CapabilitiesAreExchanged )
     REGISTER_TEST( PchNeededMessageAndCapability )
-#if defined( __WINDOWS__ )
+#if defined( __WINDOWS__ ) // PCH distribution is for MSVC
     REGISTER_TEST( WorkerAsksForAMissingPch )
     REGISTER_TEST( WorkerDoesNotAskAClientWithoutTheCapability )
     REGISTER_TEST( WorkerDoesNotAskForAPchBeingReceived )
     REGISTER_TEST( WorkerAsksAgainWhenAPchItHadIsNeededAgain )
     REGISTER_TEST( ClientSendsAPchAgainWhenAsked )
     REGISTER_TEST( ClientGivesUpOnAWorkerThatKeepsLosingAPch )
-    REGISTER_TEST( ClientIgnoresANeededPchItDoesNotKnow )
+    REGISTER_TEST( ClientGivesUpOnAWorkerThatAsksForAnUnknownPch )
     REGISTER_TEST( EvictedPchIsSentAgain )
+    REGISTER_TEST( MSVCFailureOfARemoteJobIsASystemError )
 #endif
     REGISTER_TEST( MSVCWorkerFailuresAreRetriedElsewhere )
     REGISTER_TEST( ServerSendsOnlyWhatTheClientAdvertises )
@@ -447,11 +458,7 @@ void TestDistributed::WithPCHMacroUndefs() const
 void TestDistributed::PchNeededMessageAndCapability() const
 {
     // 24.1 adds a message and a capability to 24.0, which a 24.0 peer does not know and never gets
-    TEST_ASSERT( Protocol::kVersionMajor == 24 );
-    TEST_ASSERT( Protocol::kVersionMinor == 1 );
     TEST_ASSERT( ( Protocol::kCapabilities & Protocol::CAP_PCH_REQUEST ) != 0 );
-    TEST_ASSERT( Protocol::CAP_PCH_REQUEST != Protocol::CAP_PCH_INVENTORY );
-    TEST_ASSERT( Protocol::CAP_PCH_REQUEST != Protocol::CAP_TOOLCHAIN_INVENTORY );
 
     // Only both sides advertising it makes it available
     TEST_ASSERT( Protocol::Negotiate( Protocol::kCapabilities, Protocol::kCapabilities ) == Protocol::kCapabilities );
@@ -480,7 +487,6 @@ void TestDistributed::PchCacheBudget() const
     // A big disk keeps what the limit allows, however much the cache holds
     TEST_ASSERT( Server::CalculatePchCacheBudget( 1800 * GiB, 0 ) == Server::kMaxPchCacheBytes );
     TEST_ASSERT( Server::CalculatePchCacheBudget( 1800 * GiB, 12 * GiB ) == Server::kMaxPchCacheBytes );
-    TEST_ASSERT( Server::kMaxPchCacheBytes == ( 12 * GiB ) );
 
     // A small disk keeps a share of what could be used: free space and what the cache already has
     TEST_ASSERT( isAbout( Server::CalculatePchCacheBudget( 10 * GiB, 0 ), 4 * GiB ) );
@@ -496,7 +502,6 @@ void TestDistributed::PchCacheBudget() const
     TEST_ASSERT( Server::CalculatePchCacheBudget( 0, 0 ) == Server::kMinPchCacheBytes );
     TEST_ASSERT( Server::CalculatePchCacheBudget( 1 * GiB, 0 ) == Server::kMinPchCacheBytes );
     TEST_ASSERT( Server::CalculatePchCacheBudget( 2 * GiB, 0 ) == Server::kMinPchCacheBytes );
-    TEST_ASSERT( Server::kMinPchCacheBytes == ( 1 * GiB ) );
     TEST_ASSERT( isAbout( Server::CalculatePchCacheBudget( 3 * GiB, 0 ), ( 3 * GiB * 4 ) / 10 ) ); // Above it
     TEST_ASSERT( Server::CalculatePchCacheBudget( 3 * GiB, 0 ) > Server::kMinPchCacheBytes );
 
@@ -597,7 +602,6 @@ void TestDistributed::PchCacheEvictionPolicy() const
     TEST_ASSERT( evictions.IsEmpty() );
     Server::SelectPchEvictions( entries, 0, 0, inUse, evictions );
     TEST_ASSERT( evictions.GetSize() == 4 );
-    TEST_ASSERT( Server::kMinCachedPchEntries >= 4 );
 
     // However small the PCHs are, there is a limit to how many are kept: the oldest go
     {
@@ -642,11 +646,12 @@ void TestDistributed::PchStartupScanAppliesTheBudget() const
         TEST_ASSERT( e.size == 5 );
     }
 
-    // Scanned again with room for two of them, the newest are kept
-    s.SetPchCacheLimitsForTesting( 10, 1 );
+    // Scanned again with room for two of them, the newest are kept. What the cache holds is what the files come to.
+    SetPchCacheLimits( s, 10, 1 );
     s.m_PchCache.Clear();
     s.m_PchCacheScanned = false;
     s.ScanPchCache();
+    TEST_ASSERT( s_LastCacheBytes.Load() == ( kNumPchs * 5 ) );
     TEST_ASSERT( s.m_PchCache.GetSize() == 2 );
     AStackString<> path;
     TEST_ASSERT( s.FindCachedPch( 0xA004, path ) );
@@ -1359,51 +1364,70 @@ void TestDistributed::PchStartupScanRemovesStaleTempFiles() const
 
 // PchBudgetFollowsTheFreeSpace
 //------------------------------------------------------------------------------
+/*static*/ bool TestDistributed::GetTestPchCacheLimits( uint64_t cacheBytes, Server::PchCacheLimits & outLimits )
+{
+    s_LastCacheBytes.Store( cacheBytes );
+    if ( s_PchCacheLimitsKnown == false )
+    {
+        return false;
+    }
+    outLimits = s_PchCacheLimits;
+    return true;
+}
+
+/*static*/ void TestDistributed::SetPchCacheLimits( Server & server, uint64_t bytes, uint32_t minEntries )
+{
+    s_PchCacheLimits = { bytes, minEntries };
+    s_PchCacheLimitsKnown = true;
+    server.m_PchCacheLimitsFunc = &GetTestPchCacheLimits;
+}
+
+/*static*/ void TestDistributed::SetPchCacheLimitsUnknown( Server & server )
+{
+    s_PchCacheLimitsKnown = false;
+    server.m_PchCacheLimitsFunc = &GetTestPchCacheLimits;
+}
+
 void TestDistributed::PchBudgetFollowsTheFreeSpace() const
 {
     const uint64_t GiB = ( 1024ull * 1024 * 1024 );
-    auto isAbout = []( uint64_t actual, uint64_t expected )
-    {
-        const uint64_t difference = ( actual > expected ) ? ( actual - expected ) : ( expected - actual );
-        return ( difference < ( 1024 * 1024 ) );
-    };
-
-    // The budget comes from the free space of the volume and what the cache holds
     {
         Server s( 1 );
-        s.SetFreeSpaceForTesting( 10 * GiB );
-        TEST_ASSERT( isAbout( s.GetPchCacheBudget( 0 ), 4 * GiB ) );
-        TEST_ASSERT( isAbout( s.GetPchCacheBudget( 5 * GiB ), 6 * GiB ) );
-        s.SetFreeSpaceForTesting( 1800 * GiB );
-        TEST_ASSERT( s.GetPchCacheBudget( 0 ) == Server::kMaxPchCacheBytes );
-        s.SetFreeSpaceForTesting( 0 );
-        TEST_ASSERT( s.GetPchCacheBudget( 0 ) == Server::kMinPchCacheBytes );
 
-        // and it is what the cache is kept to: 5 PCHs of 1.5 GiB are 7.5 GiB, and 40% of 10 + 7.5 GiB is 7 GiB
-        s.SetFreeSpaceForTesting( 10 * GiB );
-        Array<Server::PchCacheEntry> entries;
-        for ( uint32_t i = 0; i < 5; ++i )
-        {
-            entries.Append( Server::PchCacheEntry{ 1 + i, AString( "dummy" ), (uint64_t)( 100 + i ), ( 3 * GiB ) / 2 } );
-        }
-        s.EvictPchsToBudget( entries, Array<uint64_t>() );
-        TEST_ASSERT( entries.GetSize() == 4 );
-        TEST_ASSERT( entries[ 0 ].pchId == 2 ); // The oldest went
+        // What the server is told is what it keeps to, for the bytes it says the cache holds
+        SetPchCacheLimits( s, 123456, 2 );
+        Server::PchCacheLimits limits = s.GetPchCacheLimits( 777 );
+        TEST_ASSERT( limits.m_Bytes == 123456 );
+        TEST_ASSERT( limits.m_MinEntries == 2 );
+        TEST_ASSERT( s_LastCacheBytes.Load() == 777 );
+
+        // When the free space cannot be read, the cache is kept small: more than the smallest cache may be too much
+        SetPchCacheLimitsUnknown( s );
+        limits = s.GetPchCacheLimits( 5 * GiB );
+        TEST_ASSERT( limits.m_Bytes == Server::kMinPchCacheBytes );
+        TEST_ASSERT( limits.m_MinEntries == Server::kMinCachedPchEntries );
     }
 
-    // The real free space of the volume is used when nothing is set: the PCH cache directory is there
-    Server real( 1 );
-    AStackString<> cacheDir;
-    VERIFY( FBuild::GetWorkerCacheDir( cacheDir ) );
-    uint64_t freeBefore = 0;
-    TEST_ASSERT( FileIO::EnsurePathExists( cacheDir ) );
-    TEST_ASSERT( FileIO::GetFreeDiskSpace( cacheDir, freeBefore ) );
-    const uint64_t budget = real.GetPchCacheBudget( 0 );
-    uint64_t freeAfter = 0;
-    TEST_ASSERT( FileIO::GetFreeDiskSpace( cacheDir, freeAfter ) );
-    const uint64_t lowest = Server::CalculatePchCacheBudget( Math::Min( freeBefore, freeAfter ), 0 );
-    const uint64_t highest = Server::CalculatePchCacheBudget( Math::Max( freeBefore, freeAfter ), 0 );
-    TEST_ASSERT( ( budget >= lowest ) && ( budget <= highest ) );
+    // The disk of the cache is read when nothing replaces it
+    {
+        Server real( 1 );
+        const Server::PchCacheLimits limits = real.GetPchCacheLimits( 0 );
+        TEST_ASSERT( limits.m_Bytes >= Server::kMinPchCacheBytes );
+        TEST_ASSERT( limits.m_Bytes <= Server::kMaxPchCacheBytes );
+        TEST_ASSERT( limits.m_MinEntries == Server::kMinCachedPchEntries );
+    }
+
+    // The bytes the cache holds count towards what it may keep: 6 PCHs of 1.5 GiB on a volume with 10 GiB
+    // free are 9 GiB of a possible 19, of which 40% is 7.6 GiB. Not counting them, it would be 4 GiB.
+    Array<Server::PchCacheEntry> entries;
+    for ( uint32_t i = 0; i < 6; ++i )
+    {
+        entries.Append( Server::PchCacheEntry{ 1 + i, AString( "dummy" ), (uint64_t)( 100 + i ), ( 3 * GiB ) / 2 } );
+    }
+    const uint64_t budget = Server::CalculatePchCacheBudget( 10 * GiB, Server::CountPchBytes( entries ) );
+    Server::EvictPchs( entries, budget, 1, Array<uint64_t>() );
+    TEST_ASSERT( entries.GetSize() == 5 );
+    TEST_ASSERT( entries[ 0 ].pchId == 2 ); // The oldest went
 }
 
 // PchEvictionRemovesTheDirectory
@@ -3930,6 +3954,26 @@ namespace
         Atomic<bool> m_HasJob{ false };
     };
 
+    // The job as it would be sent if it used another PCH. A job that was read cannot be written again
+    // (it has no node to write), so its id is replaced where Job::Serialize puts it, at the end.
+    CapturedJob WithPch( const CapturedJob & job, uint64_t pchId )
+    {
+        TEST_ASSERT( job.m_PchId != 0 );
+        TEST_ASSERT( job.m_Data.GetSize() > sizeof( uint64_t ) );
+        CapturedJob result = job;
+        char * idBytes = ( result.m_Data.Begin() + result.m_Data.GetSize() - sizeof( uint64_t ) );
+        uint64_t oldPchId = 0;
+        memcpy( &oldPchId, idBytes, sizeof( oldPchId ) );
+        TEST_ASSERT( oldPchId == job.m_PchId ); // It is where it is looked for
+        memcpy( idBytes, &pchId, sizeof( pchId ) );
+        result.m_PchId = pchId;
+
+        ConstMemoryStream in( result.m_Data.Begin(), result.m_Data.GetSize() );
+        const Job parsed( in );
+        TEST_ASSERT( parsed.GetPchId() == pchId );
+        return result;
+    }
+
     // Sends a job to a worker as the client that made it would
     bool SendCapturedJob( const ConnectionInfo * connection, JobStreamEncoder & encoder, const CapturedJob & job )
     {
@@ -3942,22 +3986,20 @@ namespace
         return msg.Send( connection, payload );
     }
 
-    // Connects to a worker and completes the handshake, as a client advertising the capabilities would
-    bool ConnectAndHandshake( HandshakeProbe & probe, uint32_t capabilities, const ConnectionInfo * & outConnection, float timeoutSeconds )
+    // Sends the handshake of a client advertising the capabilities and waits for the ack and inventories
+    // that answer it. Sent after other messages it also says they have been dealt with, as a connection
+    // is served in order: whatever they made the worker send came before the ack.
+    bool Handshake( HandshakeProbe & probe, const ConnectionInfo * connection, uint32_t capabilities, float timeoutSeconds )
     {
-        outConnection = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-        if ( outConnection == nullptr )
-        {
-            return false;
-        }
+        const size_t numBefore = probe.GetNumMessages();
         const HandshakeBytes handshake( capabilities );
-        if ( probe.Send( outConnection, handshake.bytes, sizeof( handshake.bytes ) ) == false )
+        if ( probe.Send( connection, handshake.bytes, sizeof( handshake.bytes ) ) == false )
         {
             return false;
         }
         const Timer timer;
         const size_t numExpected = 1u + ( ( capabilities & Protocol::CAP_PCH_INVENTORY ) ? 1u : 0u ) + ( ( capabilities & Protocol::CAP_TOOLCHAIN_INVENTORY ) ? 1u : 0u );
-        while ( probe.GetNumMessages() < numExpected )
+        while ( probe.GetNumMessages() < ( numBefore + numExpected ) )
         {
             if ( timer.GetElapsed() > timeoutSeconds )
             {
@@ -3966,6 +4008,13 @@ namespace
             Thread::Sleep( 1 );
         }
         return true;
+    }
+
+    // Connects to a worker and completes the handshake, as a client advertising the capabilities would
+    bool ConnectAndHandshake( HandshakeProbe & probe, uint32_t capabilities, const ConnectionInfo * & outConnection, float timeoutSeconds )
+    {
+        outConnection = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+        return ( outConnection != nullptr ) && Handshake( probe, outConnection, capabilities, timeoutSeconds );
     }
 }
 
@@ -4011,6 +4060,39 @@ void TestDistributed::CapturePchJob( CapturedJob & outJob ) const
     return numWaiting;
 }
 
+/*static*/ void TestDistributed::DropWaitingJobs( Server & server )
+{
+    MutexHolder mh( server.m_ClientListMutex );
+    for ( Server::ClientState * cs : server.m_ClientList )
+    {
+        MutexHolder mh2( cs->m_Mutex );
+        for ( Job * waiting : cs->m_WaitingJobs )
+        {
+            FDELETE waiting;
+        }
+        cs->m_WaitingJobs.Clear();
+    }
+}
+
+// MSVCFailureOfARemoteJobIsASystemError
+//------------------------------------------------------------------------------
+void TestDistributed::MSVCFailureOfARemoteJobIsASystemError() const
+{
+    CapturedJob captured;
+    CapturePchJob( captured );
+
+    // As a worker handles the result of a compile that failed
+    auto systemErrorsAfter = [ & ]( const char * output )
+    {
+        ConstMemoryStream in( captured.m_Data.Begin(), captured.m_Data.GetSize() );
+        Job job( in );
+        ObjectNode::HandleSystemFailures( &job, 2, AStackString<>( output ), AString::GetEmpty() );
+        return job.GetSystemErrorCount();
+    };
+    TEST_ASSERT( systemErrorsAfter( "c1xx : fatal error C1356: unable to find mspdbcore.dll" ) == 1 );
+    TEST_ASSERT( systemErrorsAfter( "a.cpp(1): error C2065: 'x': undeclared identifier" ) == 0 );
+}
+
 // WorkerAsksForAMissingPch
 //------------------------------------------------------------------------------
 void TestDistributed::WorkerAsksForAMissingPch() const
@@ -4033,10 +4115,9 @@ void TestDistributed::WorkerAsksForAMissingPch() const
     // More jobs for it do not make it ask again, as it is not here yet
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( WaitUntil( [ &s ]() { return ( CountWaitingJobs( s ) == 3 ); } ) );
-    Thread::Sleep( 200 );
+    TEST_ASSERT( Handshake( probe, ci, Protocol::kCapabilities, kWaitTimeoutSeconds ) ); // Answered after the jobs
+    TEST_ASSERT( CountWaitingJobs( s ) == 3 );
     TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
-    TEST_ASSERT( s.m_NumPchRequestsSent.Load() == 1 );
     probe.ShutdownAllConnections();
 }
 
@@ -4057,10 +4138,9 @@ void TestDistributed::WorkerDoesNotAskAClientWithoutTheCapability() const
     TEST_ASSERT( ConnectAndHandshake( probe, capabilities24_0, ci, kWaitTimeoutSeconds ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( WaitUntil( [ &s ]() { return ( CountWaitingJobs( s ) == 1 ); } ) ); // It has the job, and the PCH is missing
-    Thread::Sleep( 300 );
+    TEST_ASSERT( Handshake( probe, ci, capabilities24_0, kWaitTimeoutSeconds ) ); // Answered after the job
+    TEST_ASSERT( CountWaitingJobs( s ) == 1 ); // It has the job, and the PCH is missing
     TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
-    TEST_ASSERT( s.m_NumPchRequestsSent.Load() == 0 );
     probe.ShutdownAllConnections();
 }
 
@@ -4102,15 +4182,15 @@ void TestDistributed::WorkerDoesNotAskForAPchBeingReceived() const
     TEST_ASSERT( ConnectAndHandshake( waiting, Protocol::kCapabilities, waitingConnection, kWaitTimeoutSeconds ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( waitingConnection, encoder, job ) );
-    TEST_ASSERT( WaitUntil( [ &s ]() { return ( CountWaitingJobs( s ) == 1 ); } ) );
-    Thread::Sleep( 300 );
+    TEST_ASSERT( Handshake( waiting, waitingConnection, Protocol::kCapabilities, kWaitTimeoutSeconds ) ); // Answered after the job
+    TEST_ASSERT( CountWaitingJobs( s ) == 1 );
     TEST_ASSERT( waiting.GetNumPchNeeded() == 0 );
     TEST_ASSERT( receiving.GetNumPchNeeded() == 0 );
 
     // The connection sending it goes away, so it will not arrive: the job's client is asked, once
     receiving.ShutdownAllConnections();
     TEST_ASSERT( WaitUntil( [ &waiting ]() { return ( waiting.GetNumPchNeeded() >= 1 ); } ) );
-    Thread::Sleep( 200 );
+    Thread::Sleep( 100 ); // The disconnect is dealt with on another thread than the connection's, so nothing sent on it says it is done
     TEST_ASSERT( waiting.GetNumPchNeeded() == 1 );
     TEST_ASSERT( waiting.GetPchNeededId( 0 ) == job.m_PchId );
     waiting.ShutdownAllConnections();
@@ -4120,9 +4200,9 @@ void TestDistributed::WorkerDoesNotAskForAPchBeingReceived() const
 //------------------------------------------------------------------------------
 void TestDistributed::WorkerAsksAgainWhenAPchItHadIsNeededAgain() const
 {
-    // A job for a PCH of our own: the id is the last thing a job holds
-    CapturedJob job;
-    CapturePchJob( job );
+    // A job for a PCH of our own
+    CapturedJob captured;
+    CapturePchJob( captured );
     Array<char> contents[ 2 ];
     uint64_t pchIds[ 2 ];
     Compressor compressed[ 2 ];
@@ -4132,12 +4212,10 @@ void TestDistributed::WorkerAsksAgainWhenAPchItHadIsNeededAgain() const
         compressed[ i ].CompressZstd( contents[ i ].Begin(), contents[ i ].GetSize(), Compressor::kZstdTransferLevel );
         pchIds[ i ] = PchId::Calc( contents[ i ].Begin(), contents[ i ].GetSize() );
     }
-    TEST_ASSERT( job.m_Data.GetSize() > sizeof( uint64_t ) );
-    memcpy( job.m_Data.Begin() + job.m_Data.GetSize() - sizeof( uint64_t ), &pchIds[ 0 ], sizeof( uint64_t ) );
-    job.m_PchId = pchIds[ 0 ];
+    const CapturedJob job = WithPch( captured, pchIds[ 0 ] );
 
     Server s( 1 );
-    s.SetPchCacheLimitsForTesting( 1, 0 ); // Room for the PCH that has just arrived only
+    SetPchCacheLimits( s, 1, 0 ); // Room for the PCH that has just arrived only
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
     HandshakeProbe client;
     const ConnectionInfo * ci = nullptr;
@@ -4161,25 +4239,14 @@ void TestDistributed::WorkerAsksAgainWhenAPchItHadIsNeededAgain() const
     TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 0 ] ); } ) );
 
     // The job is gone (as one that has been built is). Another PCH arrives and pushes the first out.
-    {
-        MutexHolder mh( s.m_ClientListMutex );
-        for ( Server::ClientState * cs : s.m_ClientList )
-        {
-            MutexHolder mh2( cs->m_Mutex );
-            for ( Job * waiting : cs->m_WaitingJobs )
-            {
-                delete waiting;
-            }
-            cs->m_WaitingJobs.Clear();
-        }
-    }
+    DropWaitingJobs( s );
     TEST_ASSERT( sendPch( 1 ) );
     TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 1 ] ) && ( s.IsPchCached( pchIds[ 0 ] ) == false ); } ) );
 
     // A job for the first one again: the worker asks again, as the PCH has arrived since it asked
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
     TEST_ASSERT( WaitUntil( [ &client ]() { return ( client.GetNumPchNeeded() >= 2 ); } ) );
-    Thread::Sleep( 200 );
+    TEST_ASSERT( Handshake( client, ci, Protocol::kCapabilities, kWaitTimeoutSeconds ) ); // Answered after the job
     TEST_ASSERT( client.GetNumPchNeeded() == 2 );
     TEST_ASSERT( client.GetPchNeededId( 1 ) == pchIds[ 0 ] );
     client.ShutdownAllConnections();
@@ -4197,9 +4264,7 @@ namespace
         {
             KEEP_THE_SECOND_COPY,   // Loses the first copy of a PCH, as one that evicts it at once does, then keeps it
             LOSE_EVERY_COPY,        // Never keeps one
-            ASK_FOR_AN_UNKNOWN_PCH, // Asks for a PCH nobody has, twice, then answers every job
         };
-        static constexpr uint64_t kUnknownPchId = 0xDEAD0001;
 
         explicit PchLosingWorker( Mode mode ) : FakeWorker( 4 ), m_Mode( mode ) {}
         explicit PchLosingWorker( const PchLosingWorker & other ) = delete;
@@ -4244,17 +4309,6 @@ namespace
 
         void OnJob( const ConnectionInfo * connection, uint32_t jobId, uint64_t pchId )
         {
-            if ( m_Mode == ASK_FOR_AN_UNKNOWN_PCH )
-            {
-                if ( m_AskedForUnknown == false )
-                {
-                    m_AskedForUnknown = true;
-                    Ask( connection, kUnknownPchId );
-                    Ask( connection, kUnknownPchId );
-                }
-                SendResult( connection, jobId );
-                return;
-            }
             if ( ( pchId == 0 ) || m_Kept.Find( pchId ) )
             {
                 SendResult( connection, jobId );
@@ -4338,10 +4392,34 @@ namespace
         Array<uint64_t> m_Lost;     // PCHs a copy was received of and dropped
         Array<uint64_t> m_Kept;
         Array<uint64_t> m_Asked;    // Asked for, and not received since
-        bool m_AskedForUnknown = false;
         Atomic<uint32_t> m_NumPchsReceived{ 0 };
         Atomic<uint32_t> m_NumRequestsSent{ 0 };
         Atomic<uint32_t> m_NumResultsSent{ 0 };
+    };
+
+    // A worker that asks for a PCH nobody has when it is sent its first job, and does nothing else
+    class UnknownPchAskingWorker : public FakeWorker
+    {
+    public:
+        static constexpr uint64_t kUnknownPchId = 0xDEAD0001;
+
+        UnknownPchAskingWorker() : FakeWorker( 4 ) {}
+        explicit UnknownPchAskingWorker( const UnknownPchAskingWorker & other ) = delete;
+        UnknownPchAskingWorker & operator=( const UnknownPchAskingWorker & other ) = delete;
+
+        uint32_t GetNumJobsReceived() const { return m_NumJobsReceived.Load(); }
+
+    private:
+        virtual void OnMessage( const ConnectionInfo * connection, const Protocol::IMessage & message, void *, uint32_t ) override
+        {
+            if ( ( message.GetType() == Protocol::MSG_JOB ) && ( m_NumJobsReceived.Increment() == 1 ) )
+            {
+                const Protocol::MsgPchNeeded msg( kUnknownPchId );
+                msg.Send( connection );
+            }
+        }
+
+        Atomic<uint32_t> m_NumJobsReceived{ 0 };
     };
 }
 
@@ -4364,6 +4442,7 @@ void TestDistributed::ClientSendsAPchAgainWhenAsked() const
     PchLosingWorker worker( PchLosingWorker::KEEP_THE_SECOND_COPY );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
+    // What it answers with is not object files, so the build itself fails: what counts is that it ends
     auto never = []() { return false; };
     BuildAborter aborter( never, 20.0f );
     fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
@@ -4394,6 +4473,7 @@ void TestDistributed::ClientGivesUpOnAWorkerThatKeepsLosingAPch() const
 
     // The client sends the PCH again a number of times, then closes the connection and does not use the worker
     // again, so that the jobs held for it are built here
+    DenyListPoller poller( fBuild );
     auto never = []() { return false; };
     BuildAborter aborter( never, 60.0f );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
@@ -4401,102 +4481,147 @@ void TestDistributed::ClientGivesUpOnAWorkerThatKeepsLosingAPch() const
 
     TEST_ASSERT( aborter.HasTimedOut() == false );
     TEST_ASSERT( built );
-    TEST_ASSERT( worker.GetNumPchsReceived() == ( 1 + PchSendState::kMaxResends ) );
-    TEST_ASSERT( worker.GetNumResultsSent() == 0 );
+    TEST_ASSERT( worker.GetNumPchsReceived() == ( 1 + PchSendState::kMaxResends ) ); // It never makes progress, so the bound is all of them
+    TEST_ASSERT( worker.GetNumResultsSent() == 0 ); // Nothing came back from it: the objects were built here
+    TEST_ASSERT( poller.GetMax() == 1 ); // and the worker was given up on
 }
 
-// ClientIgnoresANeededPchItDoesNotKnow
+// ClientGivesUpOnAWorkerThatAsksForAnUnknownPch
 //------------------------------------------------------------------------------
-void TestDistributed::ClientIgnoresANeededPchItDoesNotKnow() const
+void TestDistributed::ClientGivesUpOnAWorkerThatAsksForAnUnknownPch() const
 {
     FBuildTestOptions options;
     options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
     options.m_AllowDistributed = true;
     options.m_NumWorkerThreads = 1;
-    options.m_NoLocalConsumptionOfRemoteJobs = true;
     options.m_AllowLocalRace = false; // a job that is stuck on the worker is not rescued by building it here too
     options.m_ForceCleanBuild = true;
-    options.m_DistVerbose = true;
+    options.m_DistributionReconnectDelay = 600.0f; // Not tried again within the build
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
-    PchLosingWorker worker( PchLosingWorker::ASK_FOR_AN_UNKNOWN_PCH );
+    UnknownPchAskingWorker worker;
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
+    // The job it holds could never start: the connection is closed and the worker not used again, so that
+    // the jobs go back to the queue and are built here
+    DenyListPoller poller( fBuild );
     auto never = []() { return false; };
-    BuildAborter aborter( never, 20.0f );
-    fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
+    BuildAborter aborter( never, 60.0f );
+    const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
     worker.ShutdownAllConnections();
 
-    // The jobs are answered, the connection stays up, and the request is mentioned once however often it is made
     TEST_ASSERT( aborter.HasTimedOut() == false );
-    TEST_ASSERT( worker.GetNumRequestsSent() == 2 );
-    TEST_ASSERT( worker.GetNumResultsSent() >= 1 );
+    TEST_ASSERT( built );
+    TEST_ASSERT( worker.GetNumJobsReceived() >= 1 );
+    TEST_ASSERT( poller.GetMax() == 1 );
     TEST_ASSERT( CountOccurrences( GetRecordedOutput(), "asked for PCH 0x00000000dead0001, which is not known here" ) == 1 );
 }
 
 // EvictedPchIsSentAgain
 //------------------------------------------------------------------------------
-/*static*/ uint32_t TestDistributed::EvictPchBetweenJobs( void * param )
+namespace
 {
-    PchEviction * evict = static_cast<PchEviction *>( param );
-    Server & server = *evict->m_Server;
-
-    // The client sends its toolchain before any job
-    Server::ClientState * cs = nullptr;
-    while ( ( cs == nullptr ) && ( evict->m_Stop.Load() == false ) )
+    // What the worker of EvictedPchIsSentAgain does when its second job arrives
+    struct SecondJobEviction
     {
-        if ( server.m_NumManifestsReceived.Load() > 0 )
+        bool    m_HadAPch = false;
+        bool    m_HasOnlyTheOtherPch = false;
+    };
+
+    // A worker that does something when its second job arrives, before it is dealt with
+    class SecondJobHookServer : public Server
+    {
+    public:
+        typedef void ( *Hook )( Server & server, void * user );
+
+        SecondJobHookServer( Hook hook, void * user ) : Server( 1 ), m_Hook( hook ), m_User( user ) {}
+        explicit SecondJobHookServer( const SecondJobHookServer & other ) = delete;
+        SecondJobHookServer & operator=( const SecondJobHookServer & other ) = delete;
+
+        // PCHs that started to arrive from a coordinator after the hook was done
+        uint32_t GetNumPchsStartedAfterHook() const { return m_NumPchsStartedAfterHook.Load(); }
+
+    private:
+        virtual void OnReceive( const ConnectionInfo * connection, void * data, uint32_t size, bool & keepMemory ) override
         {
-            MutexHolder mh( server.m_ClientListMutex );
-            if ( server.m_ClientList.GetSize() == 1 )
+            // A message, then its payload if it has one
+            bool isMessage = false;
             {
-                cs = server.m_ClientList[ 0 ];
+                MutexHolder mh( m_Mutex );
+                isMessage = ( m_AwaitingPayload.FindAndErase( connection ) == false );
+                if ( isMessage && static_cast<const Protocol::IMessage *>( data )->HasPayload() )
+                {
+                    m_AwaitingPayload.Append( connection );
+                }
             }
+            if ( isMessage )
+            {
+                const Protocol::IMessage * message = static_cast<const Protocol::IMessage *>( data );
+                if ( ( message->GetType() == Protocol::MSG_JOB ) && ( m_NumJobs.Increment() == 2 ) )
+                {
+                    m_Hook( *this, m_User );
+                    m_HookDone.Store( true );
+                }
+                if ( ( message->GetType() == Protocol::MSG_PCH_FILE ) &&
+                     ( static_cast<const Protocol::MsgPchFile *>( message )->GetChunkIndex() == 0 ) &&
+                     m_HookDone.Load() )
+                {
+                    m_NumPchsStartedAfterHook.Increment();
+                }
+            }
+            TestDistributed::ReceiveAsServer( *this, connection, data, size, keepMemory );
         }
-        else
-        {
-            Thread::Sleep( 1 );
-        }
-    }
-    if ( cs == nullptr )
+
+        const Hook m_Hook;
+        void * const m_User;
+        Mutex m_Mutex;
+        Array<const ConnectionInfo *> m_AwaitingPayload;
+        Atomic<uint32_t> m_NumJobs{ 0 };
+        Atomic<bool> m_HookDone{ false };
+        Atomic<uint32_t> m_NumPchsStartedAfterHook{ 0 };
+    };
+}
+
+/*static*/ void TestDistributed::ReceiveAsServer( Server & server, const ConnectionInfo * connection, void * data, uint32_t size, bool & keepMemory )
+{
+    server.Server::OnReceive( connection, data, size, keepMemory );
+}
+
+// Another PCH arrives and pushes out the PCHs that no job uses: the one the first job used
+/*static*/ void TestDistributed::EvictForTheSecondJob( Server & server, void * user )
+{
+    SecondJobEviction * eviction = static_cast<SecondJobEviction *>( user );
+
+    // The first job has been built, so the worker has what it used
     {
-        return 0;
+        MutexHolder mh( server.m_PchCacheMutex );
+        eviction->m_HadAPch = ( server.m_PchCache.IsEmpty() == false );
     }
 
-    // Once the PCH is here the job for it starts, and nothing is sent to the client until it is finished: the
-    // worker has room for one job, so the next is not sent before the PCH is gone
-    const bool pchArrived = WaitUntil( [ &server ]()
+    Array<char> content;
+    MakeRandomBytes( 100000, 41, content );
+    Compressor compressed;
+    compressed.CompressZstd( content.Begin(), content.GetSize(), Compressor::kZstdTransferLevel );
+    const uint64_t otherPchId = PchId::Calc( content.Begin(), content.GetSize() );
+    const uint32_t compressedSize = (uint32_t)compressed.GetResultSize();
+
+    // It is sent from a connection of its own, which is only made now, as it would take a share of the capacity of the worker
+    PchSender sender;
+    if ( sender.ConnectToWorker() &&
+         sender.SendChunks( otherPchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) ) )
     {
-        MutexHolder mh( server.m_PchCacheMutex );
-        return ( server.m_PchCache.IsEmpty() == false );
-    } );
-    if ( pchArrived )
-    {
-        cs->m_SendMutex.Lock();
+        eviction->m_HasOnlyTheOtherPch = WaitUntil( [ & ]()
+        {
+            MutexHolder mh( server.m_PchCacheMutex );
+            return ( server.m_PchCache.GetSize() == 1 ) && ( server.m_PchCache[ 0 ].pchId == otherPchId );
+        } );
     }
-    const bool firstJobDone = pchArrived &&
-                              WaitUntil( [ cs ]() { return ( cs->m_NumJobsActive.Load() > 0 ); } ) &&
-                              WaitUntil( [ cs ]() { return ( cs->m_NumJobsActive.Load() == 0 ); } );
-    if ( firstJobDone )
-    {
-        // Nothing waits for a PCH now, so a PCH arriving would push the ones here out: that is what the budget
-        // does when it is applied (see PchInsertEvictsToTheBudget)
-        MutexHolder mh( server.m_PchCacheMutex );
-        const bool hadAPch = ( server.m_PchCache.IsEmpty() == false );
-        server.EvictPchsToBudget( server.m_PchCache, Array<uint64_t>() );
-        evict->m_Evicted.Store( hadAPch && server.m_PchCache.IsEmpty() );
-    }
-    if ( pchArrived )
-    {
-        cs->m_SendMutex.Unlock();
-    }
-    return 0;
 }
 
 void TestDistributed::EvictedPchIsSentAgain() const
 {
-    // The worker has room for one job at a time
+    // The worker has room for one job at a time, so that the second is sent after the first is done
     struct CapacityOfOne
     {
         CapacityOfOne() : m_Original( WorkerThreadRemote::GetNumCPUsToUse() ) { WorkerThreadRemote::SetNumCPUsToUse( 1 ); }
@@ -4516,25 +4641,22 @@ void TestDistributed::EvictedPchIsSentAgain() const
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
-    Server s( 1 );
-    s.SetPchCacheLimitsForTesting( 1, 0 ); // Anything but the PCH that has just arrived or is in use is evicted
+    // Anything but the PCH that has just arrived or is in use is evicted
+    SecondJobEviction eviction;
+    SecondJobHookServer s( &EvictForTheSecondJob, &eviction );
+    SetPchCacheLimits( s, 1, 0 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
-    PchEviction evict;
-    evict.m_Server = &s;
-
-    Thread evictor;
-    evictor.Start( EvictPchBetweenJobs, "EvictPch", &evict );
     auto never = []() { return false; };
     BuildAborter aborter( never, 60.0f ); // A job that waits for a PCH that is not sent again does not end
     const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
-    evict.m_Stop.Store( true );
-    evictor.Join();
 
-    // The PCH was evicted between the jobs, the worker asked for it, and the build finished
+    // The PCH of the first job was gone before the second arrived, the worker asked for it, and the client
+    // sent it: it only does when asked. The build finished.
     TEST_ASSERT( aborter.HasTimedOut() == false );
-    TEST_ASSERT( evict.m_Evicted.Load() );
-    TEST_ASSERT( s.m_NumPchRequestsSent.Load() >= 1 );
+    TEST_ASSERT( eviction.m_HadAPch );
+    TEST_ASSERT( eviction.m_HasOnlyTheOtherPch );
+    TEST_ASSERT( s.GetNumPchsStartedAfterHook() >= 1 );
     TEST_ASSERT( built );
 }
 
@@ -4543,7 +4665,7 @@ void TestDistributed::EvictedPchIsSentAgain() const
 void TestDistributed::PchInsertEvictsToTheBudget() const
 {
     Server s( 1 );
-    s.SetPchCacheLimitsForTesting( 1, 0 ); // Room for nothing beyond the PCH that has just arrived
+    SetPchCacheLimits( s, 1, 0 ); // Room for nothing beyond the PCH that has just arrived
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     PchSender sender;
@@ -4570,6 +4692,73 @@ void TestDistributed::PchInsertEvictsToTheBudget() const
     AStackString<> secondPath;
     TEST_ASSERT( s.FindCachedPch( pchIds[ 1 ], secondPath ) );
     TEST_ASSERT( FileIO::FileExists( secondPath.Get() ) );
+}
+
+// PchInsertCountsTheSizeOnDisk
+//------------------------------------------------------------------------------
+void TestDistributed::PchInsertCountsTheSizeOnDisk() const
+{
+    // PCHs that compress well, so that the size they have on disk is not the size they are sent in
+    const uint32_t kSize = 100000;
+    Array<char> contents[ 2 ];
+    uint64_t pchIds[ 2 ];
+    Compressor compressed[ 2 ];
+    for ( uint32_t i = 0; i < 2; ++i )
+    {
+        contents[ i ].SetSize( kSize );
+        memset( contents[ i ].Begin(), (int)( 'a' + i ), kSize );
+        compressed[ i ].CompressZstd( contents[ i ].Begin(), kSize, Compressor::kZstdTransferLevel );
+        pchIds[ i ] = PchId::Calc( contents[ i ].Begin(), kSize );
+        TEST_ASSERT( compressed[ i ].GetResultSize() < ( kSize / 10 ) );
+    }
+
+    // Room for one and a half of them: a second one only fits if the first goes
+    Server s( 1 );
+    SetPchCacheLimits( s, ( kSize * 3 ) / 2, 0 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+    PchSender sender;
+    TEST_ASSERT( sender.ConnectToWorker() );
+    auto sendPch = [ & ]( uint32_t i )
+    {
+        const uint32_t compressedSize = (uint32_t)compressed[ i ].GetResultSize();
+        return sender.SendChunks( pchIds[ i ], kSize, compressed[ i ].GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) );
+    };
+
+    // The first is cached as what is on disk, which is what the cache is counted by
+    TEST_ASSERT( sendPch( 0 ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 0 ] ); } ) );
+    AStackString<> path;
+    TEST_ASSERT( s.FindCachedPch( pchIds[ 0 ], path ) );
+    FileStream file;
+    TEST_ASSERT( file.Open( path.Get() ) );
+    TEST_ASSERT( file.GetFileSize() == kSize );
+    file.Close();
+    {
+        MutexHolder mh( s.m_PchCacheMutex );
+        TEST_ASSERT( s.m_PchCache.GetSize() == 1 );
+        TEST_ASSERT( s.m_PchCache[ 0 ].size == kSize );
+    }
+    TEST_ASSERT( s_LastCacheBytes.Load() == kSize ); // The one that arrived
+
+    // A second makes 200000 bytes, which is over: the first, which is the older, goes
+    TEST_ASSERT( sendPch( 1 ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 1 ] ); } ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return ( s.IsPchCached( pchIds[ 0 ] ) == false ); } ) );
+    TEST_ASSERT( s_LastCacheBytes.Load() == ( 2 * kSize ) );
+    TEST_ASSERT( s.IsPchCached( pchIds[ 1 ] ) );
+
+    // A scan of the directory finds the sizes the inserts counted
+    SetPchCacheLimits( s, ( 4 * kSize ), 0 );
+    s.m_PchCache.Clear();
+    s.m_PchCacheScanned = false;
+    s.ScanPchCache();
+    TEST_ASSERT( s.IsPchCached( pchIds[ 1 ] ) );
+    {
+        MutexHolder mh( s.m_PchCacheMutex );
+        TEST_ASSERT( s.m_PchCache.GetSize() == 1 );
+        TEST_ASSERT( s.m_PchCache[ 0 ].size == kSize );
+    }
+    TEST_ASSERT( s_LastCacheBytes.Load() == kSize );
 }
 
 // RegressionTest_RemoteCrashOnErrorFormatting

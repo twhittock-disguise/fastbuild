@@ -575,7 +575,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
     }
     cs->m_NumJobsActive.Increment();
 
-    // Locks are held in this scope only: asking the client for a PCH takes m_ClientListMutex
+    // Lock order: m_ClientListMutex before cs->m_Mutex, so asking for a PCH comes after this scope
     uint64_t missingPchId = 0;
     {
         MutexHolder mh( cs->m_Mutex );
@@ -819,7 +819,7 @@ void Server::ReleaseReadyWaitingJobs()
                 }
                 else
                 {
-                    RequestPchIfMissing( *cs, pchId ); // It may have been evicted, or the connection receiving it lost
+                    RequestPchIfMissing( *cs, pchId );
                     pchReady = false;
                 }
             }
@@ -851,7 +851,6 @@ void Server::RequestPchIfMissing( ClientState & cs, uint64_t pchId )
                   pchId, cs.m_HostName.Get() );
     const Protocol::MsgPchNeeded msg( pchId );
     SendTo( cs, msg );
-    m_NumPchRequestsSent.Increment();
 }
 
 // IsPchBeingReceived
@@ -915,12 +914,18 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
     // Touch timestamp to prevent periodic cleanup
     FileIO::SetFileLastWriteTimeToNow( pchFilePath );
 
-    // Snapshot the PCHs still needed before taking m_PchCacheMutex: the waiting-job scan
-    // takes m_ClientListMutex, which ReleaseReadyWaitingJobs holds while calling FindCachedPch.
-    // The PCH just received is protected too, as the jobs waiting for it are not queued yet.
+    // Everything that takes other locks or the disk happens before m_PchCacheMutex, which
+    // FindCachedPch needs while holding m_ClientListMutex. The PCH just received is in use: the
+    // jobs waiting for it are not queued yet.
     Array<uint64_t> pchIdsInUse;
     CollectPchIdsInUse( pchIdsInUse );
     pchIdsInUse.Append( pchId );
+    uint64_t cacheBytes = msg->GetUncompressedSize();
+    {
+        MutexHolder mh( m_PchCacheMutex );
+        cacheBytes += CountPchBytes( m_PchCache );
+    }
+    const PchCacheLimits limits = GetPchCacheLimits( cacheBytes );
 
     // Add to in-memory cache
     bool newlyCached = true;
@@ -949,9 +954,10 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
             entry.size = msg->GetUncompressedSize(); // What the file on disk comes to
             m_PchCache.Append( Move( entry ) );
 
-            EvictPchsToBudget( m_PchCache, pchIdsInUse );
+            EvictPchs( m_PchCache, limits.m_Bytes, limits.m_MinEntries, pchIdsInUse );
         }
     }
+    cs->m_PchReceiver.EndReceiving(); // Jobs find it in the cache from here on
 
     // It is here, so no connection needs to ask for it again if it is evicted later
     {
@@ -1046,7 +1052,8 @@ void Server::ScanPchCache()
     }
 
     // No jobs exist yet at startup, so nothing is in use
-    EvictPchsToBudget( scannedEntries, Array<uint64_t>() );
+    const PchCacheLimits limits = GetPchCacheLimits( CountPchBytes( scannedEntries ) );
+    EvictPchs( scannedEntries, limits.m_Bytes, limits.m_MinEntries, Array<uint64_t>() );
 
     // Populate in-memory cache
     {
@@ -1148,55 +1155,53 @@ void Server::CollectPchIdsInUse( Array<uint64_t> & outPchIds ) const
     return Math::Max( kMinPchCacheBytes, Math::Min( kMaxPchCacheBytes, share ) );
 }
 
-// GetPchCacheBudget
+// QueryPchCacheLimits
 //------------------------------------------------------------------------------
-uint64_t Server::GetPchCacheBudget( uint64_t cacheBytes ) const
+/*static*/ bool Server::QueryPchCacheLimits( uint64_t cacheBytes, PchCacheLimits & outLimits )
 {
-    if ( m_PchCacheLimitsSet )
-    {
-        return m_PchCacheBudgetOverride;
-    }
-
     AStackString<> dir;
-    uint64_t freeBytes = m_FreeSpaceOverride;
-    if ( m_FreeSpaceSet ||
-         ( FBuild::GetWorkerCacheDir( dir ) && FileIO::EnsurePathExists( dir ) && FileIO::GetFreeDiskSpace( dir, freeBytes ) ) )
+    uint64_t freeBytes = 0;
+    if ( ( FBuild::GetWorkerCacheDir( dir ) == false ) ||
+         ( FileIO::EnsurePathExists( dir ) == false ) ||
+         ( FileIO::GetFreeDiskSpace( dir, freeBytes ) == false ) )
     {
-        return CalculatePchCacheBudget( freeBytes, cacheBytes );
+        return false;
     }
-    return kMaxPchCacheBytes; // The free space is not known
+    outLimits.m_Bytes = CalculatePchCacheBudget( freeBytes, cacheBytes );
+    outLimits.m_MinEntries = kMinCachedPchEntries;
+    return true;
 }
 
-// SetPchCacheLimitsForTesting
+// GetPchCacheLimits
 //------------------------------------------------------------------------------
-void Server::SetPchCacheLimitsForTesting( uint64_t budgetBytes, uint32_t minEntries )
+Server::PchCacheLimits Server::GetPchCacheLimits( uint64_t cacheBytes ) const
 {
-    m_PchCacheLimitsSet = true;
-    m_PchCacheBudgetOverride = budgetBytes;
-    m_PchCacheMinEntriesOverride = minEntries;
+    PchCacheLimits limits;
+    if ( m_PchCacheLimitsFunc( cacheBytes, limits ) == false )
+    {
+        // The free space is not known: keep the cache small
+        static bool logged = false;
+        if ( logged == false )
+        {
+            logged = true;
+            FLOG_WARN( "Could not get the free disk space of the PCH cache: limiting it to %u MiB\n", (uint32_t)( kMinPchCacheBytes / MEGABYTE ) );
+        }
+        limits.m_Bytes = kMinPchCacheBytes;
+        limits.m_MinEntries = kMinCachedPchEntries;
+    }
+    return limits;
 }
 
-// SetFreeSpaceForTesting
+// CountPchBytes
 //------------------------------------------------------------------------------
-void Server::SetFreeSpaceForTesting( uint64_t freeBytes )
+/*static*/ uint64_t Server::CountPchBytes( const Array<PchCacheEntry> & entries )
 {
-    m_FreeSpaceSet = true;
-    m_FreeSpaceOverride = freeBytes;
-}
-
-// EvictPchsToBudget
-//------------------------------------------------------------------------------
-void Server::EvictPchsToBudget( Array<PchCacheEntry> & entries, const Array<uint64_t> & pchIdsInUse ) const
-{
-    uint64_t cacheBytes = 0;
+    uint64_t bytes = 0;
     for ( const PchCacheEntry & e : entries )
     {
-        cacheBytes += e.size;
+        bytes += e.size;
     }
-    EvictPchs( entries,
-               GetPchCacheBudget( cacheBytes ),
-               m_PchCacheLimitsSet ? m_PchCacheMinEntriesOverride : kMinCachedPchEntries,
-               pchIdsInUse );
+    return bytes;
 }
 
 // SelectPchEvictions

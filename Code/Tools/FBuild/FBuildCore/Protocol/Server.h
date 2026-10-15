@@ -142,25 +142,25 @@ private:
         uint64_t    size = 0;   // Bytes on disk
     };
 
-    // How much the PCH cache may hold. A worker is a shared machine and its free space varies from a few
-    // GiB to a lot, so the cache keeps to a share of what the volume has left, counting what the cache
-    // itself holds: budget = min( kMaxPchCacheBytes, kPchCacheSharePercent of ( free + cache ) ), and
-    // never less than kMinPchCacheBytes. The oldest PCHs beyond the budget are evicted (never one that
-    // a job waits for, is running with, or that has just arrived), but at least kMinCachedPchEntries
-    // stay, and kMaxCachedPchEntries is a limit on the count whatever the sizes. Checked whenever a PCH
-    // is added and at startup.
+    // The cache keeps to kPchCacheSharePercent of ( free space + what it holds ), within the min and max
+    // bytes; the oldest PCHs beyond that go, but not those in use or the last kMinCachedPchEntries.
     static constexpr uint64_t kMaxPchCacheBytes = ( 12ull * 1024 * 1024 * 1024 );
     static constexpr uint64_t kMinPchCacheBytes = ( 1ull * 1024 * 1024 * 1024 );
     static constexpr uint32_t kPchCacheSharePercent = 40;
     static constexpr uint32_t kMinCachedPchEntries = 4;
     static constexpr uint32_t kMaxCachedPchEntries = 256;
     static uint64_t CalculatePchCacheBudget( uint64_t freeBytes, uint64_t cacheBytes ); // Pure
-    uint64_t GetPchCacheBudget( uint64_t cacheBytes ) const; // Queries the free space of the cache volume
 
-    // Test knobs: replace the budget and the number of entries that always stay, or the free space
-    // that is found on the cache volume
-    void SetPchCacheLimitsForTesting( uint64_t budgetBytes, uint32_t minEntries );
-    void SetFreeSpaceForTesting( uint64_t freeBytes );
+    struct PchCacheLimits
+    {
+        uint64_t m_Bytes;
+        uint32_t m_MinEntries;
+    };
+    // The limits for a cache holding cacheBytes, or false if they cannot be told. Tests replace it.
+    using PchCacheLimitsFunc = bool ( * )( uint64_t cacheBytes, PchCacheLimits & outLimits );
+    static bool QueryPchCacheLimits( uint64_t cacheBytes, PchCacheLimits & outLimits ); // From the free space of the cache volume
+    PchCacheLimits GetPchCacheLimits( uint64_t cacheBytes ) const; // Reads the disk: not under m_PchCacheMutex
+    static uint64_t CountPchBytes( const Array<PchCacheEntry> & entries );
     void ScanPchCache();
     static void RemoveEmptyPchDirectories( const AString & basePath ); // Left by evicted PCHs
     bool FindCachedPch( uint64_t pchId, AString & outPath ); // refreshes LRU recency
@@ -179,17 +179,11 @@ private:
                            uint64_t budgetBytes,
                            uint32_t minEntries,
                            const Array<uint64_t> & pchIdsInUse );
-    void EvictPchsToBudget( Array<PchCacheEntry> & entries, const Array<uint64_t> & pchIdsInUse ) const;
 
-    Atomic<uint32_t> m_NumPchRequestsSent; // MSG_PCH_NEEDED sent, over all connections
     mutable Mutex m_PchCacheMutex;
     Array<PchCacheEntry> m_PchCache;
     bool m_PchCacheScanned = false;
-    bool m_PchCacheLimitsSet = false; // See SetPchCacheLimitsForTesting
-    uint64_t m_PchCacheBudgetOverride = 0;
-    uint32_t m_PchCacheMinEntriesOverride = 0;
-    bool m_FreeSpaceSet = false; // See SetFreeSpaceForTesting
-    uint64_t m_FreeSpaceOverride = 0;
+    PchCacheLimitsFunc m_PchCacheLimitsFunc = &QueryPchCacheLimits;
 
 #if defined( __OSX__ ) || defined( __LINUX__ )
     Timer m_TouchToolchainTimer;

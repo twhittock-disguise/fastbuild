@@ -58,37 +58,30 @@ public:
     };
 
     // The worker says a job waits for the PCH, so it does not have it
-    NeededResult OnNeeded( uint64_t pchId, uint32_t maxResends = kMaxResends )
+    NeededResult OnNeeded( uint64_t pchId )
     {
         if ( m_Sending.Find( pchId ) != nullptr )
         {
             return NEEDED_ALREADY_QUEUED;
         }
 
-        Resends * resends = nullptr;
-        for ( Resends & r : m_Resends )
-        {
-            if ( r.m_PchId == pchId )
-            {
-                resends = &r;
-            }
-        }
-        if ( resends == nullptr )
-        {
-            Resends newResends;
-            newResends.m_PchId = pchId;
-            m_Resends.Append( newResends );
-            resends = &m_Resends.Top();
-        }
-        if ( resends->m_Count >= maxResends )
+        Resends & resends = GetResends( pchId );
+        if ( resends.m_Count >= kMaxResends )
         {
             return NEEDED_LIMIT;
         }
-        ++resends->m_Count;
+        ++resends.m_Count;
 
         m_OnWorker.FindAndErase( pchId );
         m_Sending.Append( pchId );
         return NEEDED_QUEUED;
+    }
+
+    // A job that uses the PCH has completed on the worker: the PCH was there, so what it lost before
+    // does not count against it any more
+    void OnJobCompleted( uint64_t pchId )
+    {
+        GetResends( pchId ).m_Count = 0;
     }
 
     bool IsOnWorker( uint64_t pchId ) const { return m_OnWorker.Find( pchId ) != nullptr; }
@@ -103,6 +96,21 @@ private:
         uint64_t m_PchId = 0;
         uint32_t m_Count = 0;
     };
+
+    Resends & GetResends( uint64_t pchId )
+    {
+        for ( Resends & r : m_Resends )
+        {
+            if ( r.m_PchId == pchId )
+            {
+                return r;
+            }
+        }
+        Resends newResends;
+        newResends.m_PchId = pchId;
+        m_Resends.Append( newResends );
+        return m_Resends.Top();
+    }
 
     Array<uint64_t> m_OnWorker;
     Array<uint64_t> m_Sending;

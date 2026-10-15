@@ -249,6 +249,7 @@ protected:
     bool GetDeoptimizeWritableFiles() const;
     bool GetDeoptimizeWritableFilesWithToken() const;
     friend class ClientToWorkerConnection;
+    friend class TestDistributed; // HandleSystemFailures
     bool ShouldUseCache() const;
     [[nodiscard]] bool IsDistributionAllowed() const;
     ArgsResponseFileMode GetResponseFileMode() const;

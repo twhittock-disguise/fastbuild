@@ -46,8 +46,12 @@ public:
 
     uint32_t GetNumChunksReceived() const { return m_NumChunksReceived.Load(); }
 
-    // Whether the chunks of this PCH are arriving. Safe to ask from another connection's thread.
+    // Whether this PCH is arriving, or has completed and not yet been handed on (EndReceiving).
+    // Safe to ask from another connection's thread.
     bool IsReceiving( uint64_t pchId ) const { return ( m_ReceivingPchId.Load() == pchId ); }
+
+    // A COMPLETE PCH is where the jobs look for it now
+    void EndReceiving() { m_ReceivingPchId.Store( 0 ); }
 
     // The temporary file a PCH is written to before it is moved into place, next to pchFile, is named
     // as TempFiles does
@@ -60,6 +64,7 @@ public:
 private:
     Result Fail( uint64_t pchId, const char * reason );
     Result Finish( const AString & pchFile, bool & outAlreadyCached );
+    void Reset(); // Abort, except that a completed PCH is still being received until EndReceiving
 
     bool            m_Active = false;
     bool            m_AlreadyCached = false; // The PCH was already on disk: the chunks are dropped

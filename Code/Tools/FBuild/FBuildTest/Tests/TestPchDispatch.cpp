@@ -343,18 +343,44 @@ void TestPchDispatch::PchSendStateWhenTheWorkerNeedsAPch() const
         PchSendState state;
         state.OnDelivered( 5 );
         state.OnDelivered( 6 );
-        const uint32_t kMax = 3;
+        const uint32_t kMax = PchSendState::kMaxResends;
         for ( uint32_t i = 0; i < kMax; ++i )
         {
-            TEST_ASSERT( state.OnNeeded( 5, kMax ) == PchSendState::NEEDED_QUEUED );
+            TEST_ASSERT( state.OnNeeded( 5 ) == PchSendState::NEEDED_QUEUED );
             state.OnDelivered( 5 );
         }
-        TEST_ASSERT( state.OnNeeded( 5, kMax ) == PchSendState::NEEDED_LIMIT );
+        TEST_ASSERT( state.OnNeeded( 5 ) == PchSendState::NEEDED_LIMIT );
         TEST_ASSERT( state.IsOnWorker( 5 ) ); // Left as it was
         TEST_ASSERT( state.GetSending().IsEmpty() );
-        TEST_ASSERT( state.OnNeeded( 6, kMax ) == PchSendState::NEEDED_QUEUED ); // The count is kept for each
+        TEST_ASSERT( state.OnNeeded( 6 ) == PchSendState::NEEDED_QUEUED ); // The count is kept for each
     }
-    TEST_ASSERT( PchSendState::kMaxResends > 0 );
+
+    // A worker that loses a PCH again and again, but builds jobs with it in between, is not given up on:
+    // only resends without progress count
+    {
+        PchSendState state;
+        state.OnDelivered( 7 );
+        for ( uint32_t i = 0; i < ( 3 * PchSendState::kMaxResends ); ++i )
+        {
+            TEST_ASSERT( state.OnNeeded( 7 ) == PchSendState::NEEDED_QUEUED );
+            state.OnDelivered( 7 );
+            state.OnJobCompleted( 7 );
+        }
+
+        // and the bound is back to the full number of resends after the last job
+        for ( uint32_t i = 0; i < PchSendState::kMaxResends; ++i )
+        {
+            TEST_ASSERT( state.OnNeeded( 7 ) == PchSendState::NEEDED_QUEUED );
+            state.OnDelivered( 7 );
+        }
+        TEST_ASSERT( state.OnNeeded( 7 ) == PchSendState::NEEDED_LIMIT );
+
+        // A job for another PCH is no progress for this one
+        state.OnJobCompleted( 8 );
+        TEST_ASSERT( state.OnNeeded( 7 ) == PchSendState::NEEDED_LIMIT );
+        state.OnJobCompleted( 7 );
+        TEST_ASSERT( state.OnNeeded( 7 ) == PchSendState::NEEDED_QUEUED );
+    }
 }
 
 //------------------------------------------------------------------------------

@@ -2553,9 +2553,8 @@ Node::BuildResult ObjectNode::CompileHelper::SpawnCompiler( Job * job,
 //------------------------------------------------------------------------------
 /*static*/ bool ObjectNode::IsMSVCSystemFailure( const AString & stdOut )
 {
-    // But we need to determine if it's actually an out of space
-    // (rather than some compile error with missing file(s))
-    // These error codes have been observed in the wild
+    // Out of disk space and the like on the worker, rather than some compile error with missing
+    // file(s). These error codes have been observed in the wild
     if ( stdOut.Find( "C1082" ) ||
          stdOut.Find( "C1085" ) ||
          stdOut.Find( "C1088" ) )
