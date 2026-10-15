@@ -320,23 +320,25 @@ void Client::DenyListWorker( ClientWorkerInfo & worker )
 //------------------------------------------------------------------------------
 /*virtual*/ void ClientToWorkerConnection::OnDisconnected( const ConnectionInfo * /*connection*/ )
 {
-    MutexHolder mh( m_Mutex );
-    DIST_INFO( "Disconnected: %s\n", m_Worker->m_Address.Get() );
-    if ( ( m_HandshakeDone.Load() == false ) && ( m_ShuttingDown.Load() == false ) && ( m_Worker->m_ReportedHandshakeFailure.Load() == false ) && ( m_Worker->m_DenyListed.Load() == false ) )
     {
-        m_Worker->m_ReportedHandshakeFailure.Store( true );
-        FLOG_OUTPUT( "Distributed Compilation : worker %s closed the connection before the handshake finished\n", m_Worker->m_Address.Get() );
-    }
-    if ( m_Jobs.IsEmpty() == false )
-    {
-        for ( Job * job : m_Jobs )
+        MutexHolder mh( m_Mutex );
+        DIST_INFO( "Disconnected: %s\n", m_Worker->m_Address.Get() );
+        if ( ( m_HandshakeDone.Load() == false ) && ( m_ShuttingDown.Load() == false ) && ( m_Worker->m_ReportedHandshakeFailure.Load() == false ) && ( m_Worker->m_DenyListed.Load() == false ) )
         {
-            FLOG_MONITOR( "FINISH_JOB TIMEOUT %s \"%s\" \n",
-                          m_Worker->m_Address.Get(),
-                          job->GetNode()->GetName().Get() );
-            JobQueue::Get().ReturnUnfinishedDistributableJob( job );
+            m_Worker->m_ReportedHandshakeFailure.Store( true );
+            FLOG_OUTPUT( "Distributed Compilation : worker %s closed the connection before the handshake finished\n", m_Worker->m_Address.Get() );
         }
-        m_Jobs.Clear();
+        if ( m_Jobs.IsEmpty() == false )
+        {
+            for ( Job * job : m_Jobs )
+            {
+                FLOG_MONITOR( "FINISH_JOB TIMEOUT %s \"%s\" \n",
+                              m_Worker->m_Address.Get(),
+                              job->GetNode()->GetName().Get() );
+                JobQueue::Get().ReturnUnfinishedDistributableJob( job );
+            }
+            m_Jobs.Clear();
+        }
     }
 
     // This is usually null here, but might need to be freed if
@@ -350,7 +352,8 @@ void Client::DenyListWorker( ClientWorkerInfo & worker )
 
     // Wait for send thread to exit so that TCPConnectionPool can safely
     // free the ConnectionInfo when this function returns
-    // (i.e. ensure the send thread has finished using it)
+    // (i.e. ensure the send thread has finished using it). The lock is not held
+    // while waiting: the send thread takes it to count the last chunk of a PCH delivered.
     while ( m_Complete.Load() == false )
     {
         Thread::Sleep( 1 );

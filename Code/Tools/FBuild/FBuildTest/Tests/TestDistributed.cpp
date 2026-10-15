@@ -165,6 +165,7 @@ private:
     void ClientRejectsAnAckWithAPayload() const;
     void ClientDoesNotWaitForInventoriesTheWorkerLacks() const;
     void ClientIgnoresCapabilitiesItDidNotAdvertise() const;
+    void ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend() const;
     void PchTransformCapabilityIsNegotiated() const;
     void PchIsCompressedInTheFormsWorkersRead() const;
     void PchTransformThatDoesNotInvertIsNotSent() const;
@@ -428,6 +429,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ClientRejectsAnAckWithAPayload )
     REGISTER_TEST( ClientDoesNotWaitForInventoriesTheWorkerLacks )
     REGISTER_TEST( ClientIgnoresCapabilitiesItDidNotAdvertise )
+    REGISTER_TEST( ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend )
     REGISTER_TEST( PchTransformCapabilityIsNegotiated )
     REGISTER_TEST( PchIsCompressedInTheFormsWorkersRead )
     REGISTER_TEST( PchTransformThatDoesNotInvertIsNotSent )
@@ -7592,5 +7594,69 @@ void TestDistributed::PchTransformFallsBackThroughTheBuild() const
 }
 
 #endif // __WINDOWS__
+
+// Workers that drop the connection during a PCH
+//------------------------------------------------------------------------------
+namespace
+{
+    // A worker that ends the connection once it has the chunk before the last of a PCH, as the client is about
+    // to send the last. It takes no job.
+    class PchDroppingWorker : public FakeWorker
+    {
+    public:
+        PchDroppingWorker() : FakeWorker( 0 ) {}
+        explicit PchDroppingWorker( const PchDroppingWorker & other ) = delete;
+        PchDroppingWorker & operator=( const PchDroppingWorker & other ) = delete;
+
+        uint32_t GetNumDrops() const { return m_NumDrops.Load(); }
+
+    private:
+        virtual void OnMessage( const ConnectionInfo * connection, const Protocol::IMessage & message, void *, uint32_t ) override
+        {
+            if ( message.GetType() != Protocol::MSG_PCH_FILE )
+            {
+                return;
+            }
+            const Protocol::MsgPchFile & pchFile = static_cast<const Protocol::MsgPchFile &>( message );
+            const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( pchFile.GetCompressedSize(), pchFile.GetChunkSize() );
+            if ( ( numChunks >= 3 ) && ( ( pchFile.GetChunkIndex() + 2 ) == numChunks ) )
+            {
+                m_NumDrops.Increment();
+                Disconnect( connection );
+            }
+        }
+
+        Atomic<uint32_t> m_NumDrops{ 0 };
+    };
+}
+
+// ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend
+//------------------------------------------------------------------------------
+void TestDistributed::ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend() const
+{
+    // The PCH is sent in several chunks, and the worker ends the connection as the last is being sent. The client
+    // connects again, and again. The connection has to be ended however far the send thread has come.
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true;
+    options.m_AllowLocalRace = false;
+    options.m_ForceCleanBuild = true;
+    options.m_DistributionPchChunkSize = Protocol::kMinPchChunkSize;
+    options.m_DistributionReconnectDelay = 0.05f;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    PchDroppingWorker worker;
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+    const uint32_t kNumDrops = 40;
+    auto dropped = [ &worker, kNumDrops ]() { return ( worker.GetNumDrops() >= kNumDrops ); };
+    BuildAborter aborter( dropped, kWaitTimeoutSeconds );
+    const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
+    worker.ShutdownAllConnections();
+    TEST_ASSERT( built == false ); // Aborted
+    TEST_ASSERT( aborter.HasReached() );
+}
 
 //------------------------------------------------------------------------------
