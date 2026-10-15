@@ -118,17 +118,24 @@ void TestFileIO::FreeDiskSpace() const
     AStackString tempDir;
     TEST_ASSERT( FileIO::GetTempDir( tempDir ) );
 
-    // The volume holding the temp directory has some free space
-    uint64_t freeBefore = 0;
-    TEST_ASSERT( FileIO::GetFreeDiskSpace( tempDir, freeBefore ) );
-    TEST_ASSERT( freeBefore > 0 );
-
-    // The same with or without the trailing slash
+    // The volume holding the temp directory is asked, the same with or without the trailing slash
+    // (give or take what other processes write meanwhile)
+    uint64_t freeWithSlash = 0;
+    TEST_ASSERT( FileIO::GetFreeDiskSpace( tempDir, freeWithSlash ) );
     AStackString noSlash( tempDir );
     noSlash.TrimEnd( NATIVE_SLASH );
     uint64_t freeWithoutSlash = 0;
     TEST_ASSERT( FileIO::GetFreeDiskSpace( noSlash, freeWithoutSlash ) );
-    TEST_ASSERT( freeWithoutSlash > 0 );
+    const uint64_t difference = ( freeWithSlash > freeWithoutSlash ) ? ( freeWithSlash - freeWithoutSlash ) : ( freeWithoutSlash - freeWithSlash );
+    TEST_ASSERT( difference < ( 256ull * 1024 * 1024 ) );
+
+    // A path that is not there fails, and leaves the result as it was
+    AStackString missing;
+    GenerateTempFileName( missing );
+    missing.AppendFormat( "%cno%cdirectory", (char)NATIVE_SLASH, (char)NATIVE_SLASH );
+    uint64_t untouched = 12345;
+    TEST_ASSERT( FileIO::GetFreeDiskSpace( missing, untouched ) == false );
+    TEST_ASSERT( untouched == 12345 );
 }
 
 // FileDelete
