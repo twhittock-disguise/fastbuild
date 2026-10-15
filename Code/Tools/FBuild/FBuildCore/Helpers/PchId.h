@@ -15,9 +15,6 @@
 class PchId
 {
 public:
-    // A file is read in pieces of this size, so hashing it never holds the whole file
-    static constexpr uint32_t kReadChunkSize = ( 1024 * 1024 );
-
     // Hash in pieces
     using Accumulator = xxHash3Accumulator;
     static void AddData( Accumulator & accumulator, const void * data, size_t dataSize ) { accumulator.AddDataBig( data, dataSize ); }
@@ -28,8 +25,6 @@ public:
 
     // Hash a file without reading it all at once
     static bool CalcFile( const AString & path, uint64_t & outId, uint64_t & outSize );
-
-    static uint32_t GetNumFilesHashed(); // For tests: how many files CalcFile was asked to read
 };
 
 //------------------------------------------------------------------------------

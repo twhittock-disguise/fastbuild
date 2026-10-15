@@ -11,8 +11,10 @@
 #include "Tools/FBuild/FBuildCore/Graph/ObjectNode.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/DistributionStats.h"
+#include "Tools/FBuild/FBuildCore/Helpers/FileChunks.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchDataCache.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
+#include "Tools/FBuild/FBuildCore/Helpers/TempFiles.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
@@ -167,6 +169,7 @@ private:
     };
     static void MakeTestContent( uint32_t size, uint32_t seed, Array<char> & outContent );
     static bool WriteTestFile( const char * path, uint32_t size, Array<char> & outContent, uint32_t seed = 0 );
+    static bool MakeSmallFile( const AString & dir, const char * name, AString & outFile );
     static PchDataCache::CompressedState WaitForCompression( PchDataCache & cache,
                                                              const PchDataCache::Entry & entry,
                                                              AString & outFilePath,
@@ -449,6 +452,17 @@ void TestDistributed::PchCacheEvictionPolicy() const
     }
 }
 
+/*static*/ bool TestDistributed::MakeSmallFile( const AString & dir, const char * name, AString & outFile )
+{
+    outFile = dir;
+    outFile += name;
+    FileStream f;
+    const char data[] = "data";
+    return FileIO::EnsurePathExistsForFile( outFile ) &&
+           f.Open( outFile.Get(), FileStream::WRITE_ONLY ) &&
+           ( f.Write( data, sizeof( data ) ) == sizeof( data ) );
+}
+
 /*static*/ bool TestDistributed::WriteTestFile( const char * path, uint32_t size, Array<char> & outContent, uint32_t seed )
 {
     MakeTestContent( size, seed, outContent );
@@ -715,6 +729,7 @@ void TestDistributed::PchChangedAfterItWasRecorded() const
     // The id of a PCH is the hash of its file. A file rewritten since it was recorded does not hash
     // to it, so it is not sent: a worker would refuse it, and would be sent the same data again.
     PchDataCache cache( 2, 10 );
+    cache.SetTempDir( AStackString<>( "../tmp/Test/Distributed/PchChangedAfterItWasRecorded/tmp/" ) );
     Array<char> content;
     const AStackString<> path( "../tmp/Test/Distributed/PchChangedAfterItWasRecorded/test.pch" );
     const uint32_t fileSize = ( 1 * MEGABYTE );
@@ -734,6 +749,13 @@ void TestDistributed::PchChangedAfterItWasRecorded() const
     uint64_t size = 0;
     TEST_ASSERT( WaitForCompression( cache, entry, filePath, size ) == PchDataCache::FAILED );
     TEST_ASSERT( cache.HasCompressionFailed( entry.pchId ) );
+
+    // Nothing is left behind
+    AStackString<> sendDir;
+    TEST_ASSERT( cache.GetSendDirectory( sendDir ) );
+    Array<AString> left;
+    FileIO::GetFiles( sendDir, AStackString( "*" ), true, &left );
+    TEST_ASSERT( left.IsEmpty() );
 }
 
 // PchIdStreamsLikeOneShot
@@ -741,7 +763,7 @@ void TestDistributed::PchChangedAfterItWasRecorded() const
 void TestDistributed::PchIdStreamsLikeOneShot() const
 {
     // The id of a file read in pieces is the id of its content, whatever the sizes of the file and the pieces
-    const uint32_t kPiece = PchId::kReadChunkSize;
+    const uint32_t kPiece = FileChunks::kChunkSize;
     const uint32_t sizes[] = { 1, ( kPiece - 1 ), kPiece, ( kPiece + 1 ), ( 3 * kPiece ), ( 3 * kPiece ) + 7 };
     const AStackString<> path( "../tmp/Test/Distributed/PchIdStreamsLikeOneShot/test.bin" );
     for ( const uint32_t size : sizes )
@@ -765,6 +787,17 @@ void TestDistributed::PchIdStreamsLikeOneShot() const
     TEST_ASSERT( PchId::CalcFile( path, id, fileSize ) );
     TEST_ASSERT( fileSize == 0 );
     TEST_ASSERT( id == PchId::Calc( "", 0 ) );
+
+    // The algorithm is XXH3-64: a worker built from another version has to agree
+    TEST_ASSERT( PchId::Calc( "", 0 ) == 0x2d06800538d394c2ull );
+    TEST_ASSERT( PchId::Calc( "abc", 3 ) == 0x78af5f94892f3950ull );
+    Array<char> longer;
+    longer.SetSize( 1280 );
+    for ( size_t i = 0; i < longer.GetSize(); ++i )
+    {
+        longer[ i ] = (char)( i % 256 );
+    }
+    TEST_ASSERT( PchId::Calc( longer.Begin(), longer.GetSize() ) == 0x4844b009e164352eull );
     TEST_ASSERT( PchId::CalcFile( AStackString<>( "../tmp/Test/Distributed/PchIdStreamsLikeOneShot/missing.bin" ), id, fileSize ) == false );
 }
 
@@ -776,7 +809,7 @@ namespace
     {
         PchDataCache *          m_Cache = nullptr;
         const AString *         m_Path = nullptr;
-        Atomic<bool> *          m_Go = nullptr;
+        Atomic<uint32_t> *      m_Arrived = nullptr;
         PchDataCache::Entry     m_Entry;
         bool                    m_Ok = false;
     };
@@ -784,12 +817,35 @@ namespace
     uint32_t RecordInThread( void * param )
     {
         RecordRequest * request = static_cast<RecordRequest *>( param );
-        while ( request->m_Go->Load() == false )
-        {
-            Thread::Sleep( 0 );
-        }
+        request->m_Arrived->Increment();
         request->m_Ok = request->m_Cache->Record( *request->m_Path, request->m_Entry );
         return 0;
+    }
+
+    // What a thread that is about to read the file waits for: every requester to have asked for it, and
+    // then a moment for them to reach the cache. A thread that was not made to wait for the one reading
+    // would read as well.
+    struct ContendedRead
+    {
+        Atomic<uint32_t> *  m_Arrived = nullptr;
+        uint32_t            m_NumRequesters = 0;
+        Atomic<bool>        m_TimedOut{ false };
+    };
+
+    void WaitForRequesters( void * userData )
+    {
+        ContendedRead * contended = static_cast<ContendedRead *>( userData );
+        const Timer timer;
+        while ( contended->m_Arrived->Load() < contended->m_NumRequesters )
+        {
+            if ( timer.GetElapsed() > 10.0f )
+            {
+                contended->m_TimedOut.Store( true );
+                return;
+            }
+            Thread::Sleep( 1 );
+        }
+        Thread::Sleep( 50 );
     }
 }
 
@@ -798,31 +854,34 @@ void TestDistributed::PchRecordReadsTheFileOnce() const
     PchDataCache cache;
     Array<char> content;
     const AStackString<> path( "../tmp/Test/Distributed/PchRecordReadsTheFileOnce/test.pch" );
-    const uint32_t fileSize = ( 32 * MEGABYTE ); // Takes long enough to hash for the requests to overlap
+    const uint32_t fileSize = ( 8 * MEGABYTE );
     TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
     const uint64_t expectedId = PchId::Calc( content.Begin(), fileSize );
 
-    // Several jobs need the PCH at once
-    const uint32_t before = PchId::GetNumFilesHashed();
+    // Several jobs need the PCH at once, and the one that reads it is held until all have asked
     const uint32_t kNumRequesters = 8;
-    Atomic<bool> go( false );
+    Atomic<uint32_t> arrived( 0 );
+    ContendedRead contended;
+    contended.m_Arrived = &arrived;
+    contended.m_NumRequesters = kNumRequesters;
+    cache.SetHashHook( WaitForRequesters, &contended );
     RecordRequest requests[ kNumRequesters ];
     Thread threads[ kNumRequesters ];
     for ( uint32_t i = 0; i < kNumRequesters; ++i )
     {
         requests[ i ].m_Cache = &cache;
         requests[ i ].m_Path = &path;
-        requests[ i ].m_Go = &go;
+        requests[ i ].m_Arrived = &arrived;
         threads[ i ].Start( RecordInThread, "PchRecord", &requests[ i ] );
     }
-    go.Store( true );
     for ( uint32_t i = 0; i < kNumRequesters; ++i )
     {
         threads[ i ].Join();
     }
+    TEST_ASSERT( contended.m_TimedOut.Load() == false );
 
     // One read of the file, and all of them have what it gave
-    TEST_ASSERT( PchId::GetNumFilesHashed() == ( before + 1 ) );
+    TEST_ASSERT( cache.GetNumFilesHashed() == 1 );
     for ( const RecordRequest & request : requests )
     {
         TEST_ASSERT( request.m_Ok );
@@ -835,7 +894,7 @@ void TestDistributed::PchRecordReadsTheFileOnce() const
     PchDataCache::Entry again;
     TEST_ASSERT( cache.Record( path, again ) );
     TEST_ASSERT( again.pchId == expectedId );
-    TEST_ASSERT( PchId::GetNumFilesHashed() == ( before + 1 ) );
+    TEST_ASSERT( cache.GetNumFilesHashed() == 1 );
 
     // A file that is not there, or is empty, is not recorded
     PchDataCache::Entry none;
@@ -853,7 +912,7 @@ void TestDistributed::PchRecordReadsTheFileOnce() const
 void TestDistributed::PchCompressionAroundChunkSizes() const
 {
     // Read and compressed in pieces: the file the worker decodes is the PCH, whatever the sizes
-    const uint32_t kPiece = PchId::kReadChunkSize;
+    const uint32_t kPiece = FileChunks::kChunkSize;
     const uint32_t sizes[] = { 1, ( kPiece - 1 ), kPiece, ( kPiece + 1 ), ( 2 * kPiece ), ( 3 * kPiece ) + 5 };
     PchDataCache cache;
     for ( const uint32_t size : sizes )
@@ -873,6 +932,16 @@ void TestDistributed::PchCompressionAroundChunkSizes() const
         uint64_t compressedSize = 0;
         TEST_ASSERT( WaitForCompression( cache, entry, filePath, compressedSize ) == PchDataCache::READY );
         TEST_ASSERT( DecodesToFile( filePath, content ) );
+
+        // What compresses is sent compressed. One byte cannot, so it is kept as it is.
+        if ( size == 1 )
+        {
+            TEST_ASSERT( compressedSize == ( size + Compressor::kHeaderSize ) );
+        }
+        else if ( size >= 1024 )
+        {
+            TEST_ASSERT( compressedSize < size );
+        }
     }
 
     // Data that does not compress is kept as it is, with a header
@@ -903,62 +972,48 @@ void TestDistributed::PchCompressionAroundChunkSizes() const
 //------------------------------------------------------------------------------
 void TestDistributed::PchCompressedFilesAreCleanedUp() const
 {
-    AStackString<> dir( "../tmp/Test/Distributed/PchCompressedFilesAreCleanedUp/" );
+    const AStackString<> parent( "../tmp/Test/Distributed/PchCompressedFilesAreCleanedUp/tmp/" );
+    PchDataCache cache;
+    cache.SetTempDir( parent );
+    AStackString<> dir;
+    TEST_ASSERT( cache.GetSendDirectory( dir ) );
     Array<AString> old;
-    FileIO::GetFiles( dir, AStackString( "*" ), false, &old );
+    FileIO::GetFiles( dir, AStackString( "*" ), true, &old );
     for ( const AString & file : old )
     {
         FileIO::FileDelete( file.Get() );
     }
 
-    const uint32_t thisProcess = Process::GetCurrentId();
-    const uint32_t otherProcess = ( thisProcess + 1 );
-    auto makeFile = [ & ]( const char * name, AString & outFile )
+    // What a process that crashed left, what another that is running may be using however old it is,
+    // what this one is using, and what is not ours
+    auto nameOf = [ & ]( AString & outName, uint32_t processId, uint32_t number )
     {
-        outFile = dir;
-        outFile += name;
-        FileStream f;
-        TEST_ASSERT( FileIO::EnsurePathExistsForFile( outFile ) );
-        TEST_ASSERT( f.Open( outFile.Get(), FileStream::WRITE_ONLY ) );
-        const char data[] = "data";
-        TEST_ASSERT( f.Write( data, sizeof( data ) ) == sizeof( data ) );
+        outName.Format( "%s%u.%u%s", PchDataCache::kTempFilePrefix, processId, number, PchDataCache::kTempFileExtension );
     };
-    AStackString<> staleName;
-    staleName.Format( "%s%u.1.zst", PchDataCache::kTempFilePrefix, otherProcess );
-    AStackString<> freshName;
-    freshName.Format( "%s%u.2.zst", PchDataCache::kTempFilePrefix, otherProcess );
-    AStackString<> ownName;
-    ownName.Format( "%s%u.3.zst", PchDataCache::kTempFilePrefix, thisProcess );
-    AStackString<> stale;
-    AStackString<> fresh;
+    AStackString<> name;
+    AStackString<> gone;
+    AStackString<> goneToo;
+    AStackString<> running;
     AStackString<> own;
     AStackString<> unrelated;
-    makeFile( staleName.Get(), stale );
-    makeFile( freshName.Get(), fresh );
-    makeFile( ownName.Get(), own );
-    makeFile( "notes.txt", unrelated );
-
-    // Old enough to be left by a process that is gone: the other process's, and our own as well
+    nameOf( name, GetIdOfNoProcess(), 1 );
+    TEST_ASSERT( MakeSmallFile( dir, name.Get(), gone ) );
+    nameOf( name, GetIdOfAnotherProcess(), 2 );
+    TEST_ASSERT( MakeSmallFile( dir, name.Get(), running ) );
+    nameOf( name, Process::GetCurrentId(), 3 );
+    TEST_ASSERT( MakeSmallFile( dir, name.Get(), own ) );
+    TEST_ASSERT( MakeSmallFile( dir, "notes.txt", unrelated ) );
 #if defined( __WINDOWS__ )
     const uint64_t kDay = ( 24ULL * 3600ULL * 10000000ULL );
 #else
     const uint64_t kDay = ( 24ULL * 3600ULL * 1000000000ULL );
 #endif
     const uint64_t longAgo = ( Time::GetCurrentFileTime() - kDay );
-    TEST_ASSERT( FileIO::SetFileLastWriteTime( stale, longAgo ) );
+    TEST_ASSERT( FileIO::SetFileLastWriteTime( running, longAgo ) );
     TEST_ASSERT( FileIO::SetFileLastWriteTime( own, longAgo ) );
     TEST_ASSERT( FileIO::SetFileLastWriteTime( unrelated, longAgo ) );
 
-    // What another process may still be writing, what this one is writing, and what is not ours stay
-    PchDataCache::RemoveStaleTempFiles( dir );
-    TEST_ASSERT( FileIO::FileExists( stale.Get() ) == false );
-    TEST_ASSERT( FileIO::FileExists( fresh.Get() ) );
-    TEST_ASSERT( FileIO::FileExists( own.Get() ) );
-    TEST_ASSERT( FileIO::FileExists( unrelated.Get() ) );
-
     // A compressed PCH is a file here until the cache is cleared
-    PchDataCache cache;
-    cache.SetTempDir( dir );
     Array<char> content;
     const AStackString<> path( "../tmp/Test/Distributed/PchCompressedFilesAreCleanedUp/test.pch" );
     const uint32_t fileSize = ( 1 * MEGABYTE );
@@ -971,12 +1026,35 @@ void TestDistributed::PchCompressedFilesAreCleanedUp() const
     AStackString<> compressed;
     uint64_t compressedSize = 0;
     TEST_ASSERT( WaitForCompression( cache, entry, compressed, compressedSize ) == PchDataCache::READY );
-    TEST_ASSERT( compressed.Find( "PchCompressedFilesAreCleanedUp" ) ); // Where it was told to
+    TEST_ASSERT( compressed.BeginsWith( dir ) ); // Where it was told to
     TEST_ASSERT( compressed.Find( PchDataCache::kTempFilePrefix ) );
     TEST_ASSERT( FileIO::FileExists( compressed.Get() ) );
     TEST_ASSERT( DecodesToFile( compressed, content ) );
+
+    // The leftover of the process that is gone was removed when the directory was first used
+    TEST_ASSERT( FileIO::FileExists( gone.Get() ) == false );
+    TEST_ASSERT( FileIO::FileExists( running.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( own.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( unrelated.Get() ) );
+
+    // That happens once: what appears later is not looked for by every compression
+    nameOf( name, GetIdOfNoProcess(), 4 );
+    TEST_ASSERT( MakeSmallFile( dir, name.Get(), goneToo ) );
+    Array<char> second;
+    const AStackString<> path2( "../tmp/Test/Distributed/PchCompressedFilesAreCleanedUp/test2.pch" );
+    TEST_ASSERT( WriteTestFile( path2.Get(), fileSize, second, 3 ) );
+    PchDataCache::Entry entry2;
+    entry2.pchId = PchId::Calc( second.Begin(), fileSize );
+    entry2.uncompressedSize = fileSize;
+    entry2.filePath = path2;
+    cache.Store( entry2 );
+    AStackString<> compressed2;
+    TEST_ASSERT( WaitForCompression( cache, entry2, compressed2, compressedSize ) == PchDataCache::READY );
+    TEST_ASSERT( FileIO::FileExists( goneToo.Get() ) );
+
     cache.Clear();
     TEST_ASSERT( FileIO::FileExists( compressed.Get() ) == false );
+    TEST_ASSERT( FileIO::FileExists( compressed2.Get() ) == false );
 }
 
 // PchCompressionNeedsAPlaceToWrite
@@ -1028,55 +1106,34 @@ void TestDistributed::PchStartupScanRemovesStaleTempFiles() const
         FileIO::FileDelete( file.Get() );
     }
 
-    const uint32_t thisProcess = Process::GetCurrentId();
-    const uint32_t otherProcess = ( thisProcess + 1 );
-    auto makeFile = [ & ]( const char * name, AString & outFile )
+    auto nameOf = [ & ]( AString & outName, uint32_t processId, uint32_t number )
     {
-        outFile = dir;
-        outFile += name;
-        FileStream f;
-        TEST_ASSERT( FileIO::EnsurePathExistsForFile( outFile ) );
-        TEST_ASSERT( f.Open( outFile.Get(), FileStream::WRITE_ONLY ) );
-        const char data[] = "data";
-        TEST_ASSERT( f.Write( data, sizeof( data ) ) == sizeof( data ) );
+        outName.Format( "incoming.%u.%u.pch", processId, number );
     };
-    AStackString<> staleName;
-    staleName.Format( "incoming.%u.1.pch", otherProcess );
-    AStackString<> freshName;
-    freshName.Format( "incoming.%u.2.pch", otherProcess );
-    AStackString<> ownName;
-    ownName.Format( "incoming.%u.3.pch", thisProcess );
+    AStackString<> name;
     AStackString<> pch;
     AStackString<> stale;
-    AStackString<> fresh;
+    AStackString<> running;
     AStackString<> own;
     AStackString<> unrelated;
-    makeFile( "pch.pch", pch );
-    makeFile( staleName.Get(), stale );
-    makeFile( freshName.Get(), fresh );
-    makeFile( ownName.Get(), own );
-    makeFile( "notes.txt", unrelated );
-
-    // Old enough to be left by a process that is gone: the other process's, and our own as well
-#if defined( __WINDOWS__ )
-    const uint64_t kDay = ( 24ULL * 3600ULL * 10000000ULL );
-#else
-    const uint64_t kDay = ( 24ULL * 3600ULL * 1000000000ULL );
-#endif
-    const uint64_t longAgo = ( Time::GetCurrentFileTime() - kDay );
-    TEST_ASSERT( FileIO::SetFileLastWriteTime( stale, longAgo ) );
-    TEST_ASSERT( FileIO::SetFileLastWriteTime( own, longAgo ) );
-    TEST_ASSERT( FileIO::SetFileLastWriteTime( unrelated, longAgo ) );
+    TEST_ASSERT( MakeSmallFile( dir, "pch.pch", pch ) );
+    nameOf( name, GetIdOfNoProcess(), 1 );
+    TEST_ASSERT( MakeSmallFile( dir, name.Get(), stale ) );
+    nameOf( name, GetIdOfAnotherProcess(), 2 );
+    TEST_ASSERT( MakeSmallFile( dir, name.Get(), running ) );
+    nameOf( name, Process::GetCurrentId(), 3 );
+    TEST_ASSERT( MakeSmallFile( dir, name.Get(), own ) );
+    TEST_ASSERT( MakeSmallFile( dir, "notes.txt", unrelated ) );
 
     Server s( 1 );
 
-    // The PCH is registered, a leftover of another process is removed, and so is nothing that
-    // another process may still be writing, that is being written by this one, or that is not ours
+    // The PCH is registered, the leftover of a process that is gone is removed, and so is nothing
+    // that a running process may still be writing, that is being written by this one, or that is not ours
     AStackString<> cachedPath;
     TEST_ASSERT( s.FindCachedPch( kPchId, cachedPath ) );
     TEST_ASSERT( FileIO::FileExists( pch.Get() ) );
     TEST_ASSERT( FileIO::FileExists( stale.Get() ) == false );
-    TEST_ASSERT( FileIO::FileExists( fresh.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( running.Get() ) );
     TEST_ASSERT( FileIO::FileExists( own.Get() ) );
     TEST_ASSERT( FileIO::FileExists( unrelated.Get() ) );
 }
@@ -1153,7 +1210,7 @@ void TestDistributed::PchStartupScanRemovesEmptyDirectories() const
     AStackString<> receivingDir;
     AStackString<> otherDir;
     AStackString<> receivingName;
-    receivingName.Format( "incoming.%u.1.pch", Process::GetCurrentId() + 1 );
+    receivingName.Format( "incoming.%u.1.pch", GetIdOfAnotherProcess() ); // A process that is running
     makeDir( 0x9001, nullptr, emptyDir );
     makeDir( 0x9002, "pch.pch", pchDir );
     makeDir( 0x9003, receivingName.Get(), receivingDir );
@@ -1380,6 +1437,41 @@ void TestDistributed::PayloadsAcceptedByWorker() const
     }
     FileIO::FileDelete( cachedPath.Get() );
     FileIO::DirectoryDelete( AStackString<>( cachedPath.Get(), cachedPath.FindLast( NATIVE_SLASH ) ) );
+
+    // A PCH that does not compress is sent as the file holds it, in several chunks
+    {
+        Array<char> random;
+        MakeRandomBytes( ( 3 * MEGABYTE ) + 777, 5, random );
+        const AStackString<> randomPath( "../tmp/Test/Distributed/PayloadsAcceptedByWorker/random.pch" );
+        {
+            FileStream f;
+            TEST_ASSERT( FileIO::EnsurePathExistsForFile( randomPath ) );
+            TEST_ASSERT( f.Open( randomPath.Get(), FileStream::WRITE_ONLY ) );
+            TEST_ASSERT( f.Write( random.Begin(), (uint32_t)random.GetSize() ) == random.GetSize() );
+        }
+        PchDataCache::Entry randomEntry;
+        randomEntry.pchId = PchId::Calc( random.Begin(), random.GetSize() );
+        randomEntry.uncompressedSize = (uint32_t)random.GetSize();
+        randomEntry.filePath = randomPath;
+        cache.Store( randomEntry );
+        AStackString<> randomCompressed;
+        uint64_t randomDataSize = 0;
+        TEST_ASSERT( WaitForCompression( cache, randomEntry, randomCompressed, randomDataSize ) == PchDataCache::READY );
+        Array<char> randomData;
+        TEST_ASSERT( LoadFile( randomCompressed, randomData ) );
+        const uint32_t randomChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)randomDataSize, Protocol::kPchChunkSize );
+        TEST_ASSERT( randomChunks >= 4 );
+        TEST_ASSERT( sender.SendChunks( randomEntry.pchId, randomEntry.uncompressedSize, randomData.Begin(), (uint32_t)randomDataSize, Protocol::kPchChunkSize, 0, randomChunks ) );
+        AStackString<> randomCached;
+        TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( randomEntry.pchId, randomCached ); } ) );
+        FileStream f;
+        TEST_ASSERT( f.Open( randomCached.Get(), FileStream::READ_ONLY ) );
+        TEST_ASSERT( f.GetFileSize() == random.GetSize() );
+        Array<char> randomOnWorker;
+        randomOnWorker.SetSize( random.GetSize() );
+        TEST_ASSERT( f.Read( randomOnWorker.Begin(), randomOnWorker.GetSize() ) == randomOnWorker.GetSize() );
+        TEST_ASSERT( memcmp( randomOnWorker.Begin(), random.Begin(), random.GetSize() ) == 0 );
+    }
 
     // The same for a toolchain file: what the sender stores is what ReceiveFileData decodes
     const ToolManifestFile toolFile( AStackString<>( "tool.exe" ), 1, 1, fileSize );

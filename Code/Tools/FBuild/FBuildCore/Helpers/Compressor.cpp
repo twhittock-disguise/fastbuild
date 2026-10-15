@@ -7,13 +7,16 @@
 
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/FBuild.h"
+#include "Tools/FBuild/FBuildCore/Helpers/FileChunks.h"
 
 // Core
 #include "Core/Containers/UniquePtr.h"
 #include "Core/Env/Assert.h"
 #include "Core/Env/Types.h"
+#include "Core/FileIO/FileStream.h"
 #include "Core/Math/Conversions.h"
 #include "Core/Mem/Mem.h"
+#include "Core/Process/Atomic.h"
 #include "Core/Profile/Profile.h"
 
 // External
@@ -71,6 +74,104 @@ Compressor::~Compressor()
     header->m_CompressionType = zstd ? eZstd : eUncompressed;
     header->m_UncompressedSize = uncompressedSize;
     header->m_CompressedSize = zstd ? compressedSize : uncompressedSize;
+}
+
+// CompressZstdFile
+//------------------------------------------------------------------------------
+/*static*/ bool Compressor::CompressZstdFile( const char * sourcePath,
+                                              uint64_t sourceSize,
+                                              const char * destPath,
+                                              int32_t compressionLevel,
+                                              const Atomic<bool> * abort,
+                                              FileObserver & observer,
+                                              uint64_t & outSize )
+{
+    if ( ( sourceSize == 0 ) || ( sourceSize > kMaxFileSize ) )
+    {
+        return false;
+    }
+
+    // The header says how long the frame turned out to be, so it is written when that is known
+    FileStream source;
+    FileStream dest;
+    char header[ kHeaderSize ] = {};
+    if ( ( source.Open( sourcePath, FileStream::READ_ONLY ) == false ) ||
+         ( source.GetFileSize() != sourceSize ) ||
+         ( dest.Open( destPath, FileStream::WRITE_ONLY ) == false ) ||
+         ( dest.Write( header, sizeof( header ) ) != sizeof( header ) ) )
+    {
+        return false;
+    }
+
+    struct ZstdContext
+    {
+        ZstdContext() : m_Context( ZSTD_createCCtx() ) {}
+        ~ZstdContext() { ZSTD_freeCCtx( m_Context ); }
+        ZSTD_CCtx * m_Context;
+    } zstd;
+    if ( ( zstd.m_Context == nullptr ) ||
+         ZSTD_isError( ZSTD_CCtx_setParameter( zstd.m_Context, ZSTD_c_compressionLevel, compressionLevel ) ) ||
+         ZSTD_isError( ZSTD_CCtx_setPledgedSrcSize( zstd.m_Context, sourceSize ) ) )
+    {
+        return false;
+    }
+
+    const size_t outputSize = ZSTD_CStreamOutSize();
+    UniquePtr<char, FreeDeletor> output( static_cast<char *>( ALLOC( outputSize ) ) );
+    uint64_t consumed = 0;
+    uint64_t frameSize = 0;
+    observer.OnPass();
+    if ( FileChunks::ForEachPiece( source, sourceSize, abort, [ & ]( const void * data, uint32_t size )
+    {
+        observer.OnPiece( data, size );
+        consumed += size;
+        const bool last = ( consumed == sourceSize );
+        ZSTD_inBuffer in = { data, size, 0 };
+        size_t remaining;
+        do
+        {
+            ZSTD_outBuffer produced = { output.Get(), outputSize, 0 };
+            remaining = ZSTD_compressStream2( zstd.m_Context, &produced, &in, last ? ZSTD_e_end : ZSTD_e_continue );
+            if ( ZSTD_isError( remaining ) || ( dest.Write( output.Get(), static_cast<uint32_t>( produced.pos ) ) != produced.pos ) )
+            {
+                return false;
+            }
+            frameSize += produced.pos;
+        } while ( last ? ( remaining != 0 ) : ( in.pos < in.size ) );
+        return true;
+    } ) == false )
+    {
+        return false;
+    }
+
+    if ( frameSize < sourceSize )
+    {
+        WriteHeader( header, true, static_cast<uint32_t>( sourceSize ), static_cast<uint32_t>( frameSize ) );
+        if ( ( dest.Seek( 0 ) == false ) || ( dest.Write( header, sizeof( header ) ) != sizeof( header ) ) )
+        {
+            return false;
+        }
+        outSize = ( sizeof( header ) + frameSize );
+        return true;
+    }
+
+    // Not smaller: the file as it is, in place of the frame
+    WriteHeader( header, false, static_cast<uint32_t>( sourceSize ), static_cast<uint32_t>( sourceSize ) );
+    observer.OnPass();
+    if ( ( source.Seek( 0 ) == false ) ||
+         ( dest.Seek( 0 ) == false ) ||
+         ( dest.Write( header, sizeof( header ) ) != sizeof( header ) ) ||
+         ( FileChunks::ForEachPiece( source, sourceSize, abort, [ & ]( const void * data, uint32_t size )
+         {
+             observer.OnPiece( data, size );
+             return ( dest.Write( data, size ) == size );
+         } ) == false ) ||
+         ( dest.Truncate() == false ) )
+    {
+        return false;
+    }
+    outSize = ( sizeof( header ) + sourceSize );
+    return true;
 }
 
 // GetUncompressedSize

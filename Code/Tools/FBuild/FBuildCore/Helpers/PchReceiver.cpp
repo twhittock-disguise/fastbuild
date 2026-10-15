@@ -9,6 +9,7 @@
 #include "Tools/FBuild/FBuildCore/FLog.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
+#include "Tools/FBuild/FBuildCore/Helpers/TempFiles.h"
 
 // Core
 #include "Core/FileIO/FileIO.h"
@@ -16,18 +17,12 @@
 #include "Core/Math/Conversions.h"
 #include "Core/Math/xxHash.h"
 #include "Core/Process/Atomic.h"
-#include "Core/Process/Process.h"
 #include "Core/Strings/AStackString.h"
-
-#include <stdlib.h>
 
 // Static
 //------------------------------------------------------------------------------
 namespace
 {
-    const char * const kTempFilePrefix = "incoming.";
-    const char * const kTempFileExtension = ".pch";
-
     bool IsFileOfSize( const AString & file, uint32_t size )
     {
         FileStream f;
@@ -47,59 +42,6 @@ namespace
 PchReceiver::~PchReceiver()
 {
     Abort();
-}
-
-// MakeTempFileName
-//------------------------------------------------------------------------------
-/*static*/ void PchReceiver::MakeTempFileName( const AString & pchFile, AString & outFile )
-{
-    static Atomic<uint32_t> s_Counter{ 0 };
-    const char * lastSlash = pchFile.FindLast( NATIVE_SLASH );
-    if ( lastSlash )
-    {
-        outFile.Assign( pchFile.Get(), lastSlash + 1 );
-    }
-    else
-    {
-        outFile.Clear();
-    }
-    outFile.AppendFormat( "%s%u.%u%s", kTempFilePrefix, Process::GetCurrentId(), s_Counter.Increment(), kTempFileExtension );
-}
-
-// IsTempFileName
-//------------------------------------------------------------------------------
-/*static*/ bool PchReceiver::IsTempFileName( const char * fileName, uint32_t & outProcessId )
-{
-    const AStackString<> path( fileName );
-    const char * lastSlash = path.FindLast( NATIVE_SLASH );
-    if ( lastSlash == nullptr )
-    {
-        lastSlash = path.FindLast( '/' );
-    }
-    const char * name = lastSlash ? ( lastSlash + 1 ) : path.Get();
-
-    const size_t prefixLength = strlen( kTempFilePrefix );
-    if ( strncmp( name, kTempFilePrefix, prefixLength ) != 0 )
-    {
-        return false;
-    }
-
-    // <process id>.<number>.pch
-    const char * p = ( name + prefixLength );
-    char * end = nullptr;
-    const unsigned long processId = strtoul( p, &end, 10 );
-    if ( ( end == p ) || ( *end != '.' ) )
-    {
-        return false;
-    }
-    p = ( end + 1 );
-    strtoul( p, &end, 10 );
-    if ( ( end == p ) || ( strcmp( end, kTempFileExtension ) != 0 ) )
-    {
-        return false;
-    }
-    outProcessId = (uint32_t)processId;
-    return true;
 }
 
 // OnChunk
@@ -237,7 +179,13 @@ PchReceiver::Result PchReceiver::Finish( const AString & pchFile, bool & outAlre
 
     // Write it next to where it goes, and close it before anything can fail: a file that is open
     // cannot be deleted on Windows
-    MakeTempFileName( pchFile, m_TempFile );
+    const char * lastSlash = pchFile.FindLast( NATIVE_SLASH );
+    AStackString<> dir;
+    if ( lastSlash )
+    {
+        dir.Assign( pchFile.Get(), lastSlash + 1 );
+    }
+    TempFiles::MakeName( dir, kTempFilePrefix, kTempFileExtension, m_TempFile );
     bool written = false;
     if ( FileIO::EnsurePathExistsForFile( pchFile ) )
     {

@@ -14,6 +14,7 @@
 // Core
 #include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/PathUtils.h"
+#include "Core/Process/Process.h"
 #include "Core/Strings/AStackString.h"
 #include "Core/Tracing/Tracing.h"
 
@@ -250,6 +251,33 @@ void FBuildTest::CheckStatsTotal( size_t numSeen, size_t numBuilt ) const
         x ^= ( x << 17 );
         c = (char)( x >> 24 );
     }
+}
+
+// GetIdOfNoProcess
+//------------------------------------------------------------------------------
+/*static*/ uint32_t FBuildTest::GetIdOfNoProcess()
+{
+    // Far above what ids come to
+    for ( uint32_t id = 0x7FFFFFF0; id > 0x7F000000; id -= 4 )
+    {
+        if ( Process::IsProcessRunning( id ) == false )
+        {
+            return id;
+        }
+    }
+    return 0;
+}
+
+// GetIdOfAnotherProcess
+//------------------------------------------------------------------------------
+/*static*/ uint32_t FBuildTest::GetIdOfAnotherProcess()
+{
+    // The System process, and init: always there, and not ours to look at
+#if defined( __WINDOWS__ )
+    return 4;
+#else
+    return 1;
+#endif
 }
 
 // GetCodeDir

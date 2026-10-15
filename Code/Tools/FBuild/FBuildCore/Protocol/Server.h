@@ -132,7 +132,6 @@ private:
         uint64_t    lastWriteTime;
     };
     void ScanPchCache();
-    static void RemoveStaleTempPchFiles( const AString & basePath ); // Left by a crashed worker
     static void RemoveEmptyPchDirectories( const AString & basePath ); // Left by evicted PCHs
     bool FindCachedPch( uint64_t pchId, AString & outPath ); // refreshes LRU recency
 

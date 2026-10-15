@@ -43,7 +43,7 @@ public:
 
     // Records a PCH file (thread-safe). The first thread to ask for a path reads and hashes it,
     // in pieces. The others wait for that and use its result, so a file is read once.
-    // Returns false if it cannot be read.
+    // Returns false if it cannot be read or is too large to send.
     bool Record( const AString & filePath, Entry & outEntry );
 
     enum CompressedState
@@ -80,27 +80,32 @@ public:
     // Clear all cached entries and delete their compressed files (call at build end)
     void Clear();
 
-    // Where compressed files are written, by default the temporary directory. Set before any is.
-    void SetTempDir( const AString & dir );
+    // The directory compressed files are written to: one of this user's, inside the temporary
+    // directory. Files of crashed processes are removed from it when it is first used.
+    bool GetSendDirectory( AString & outDir );
 
-    // Compressed files left by a crashed process (not this one) are deleted once they are old
-    static void RemoveStaleTempFiles( const AString & dir );
+    // Test knobs: the temporary directory to use, and a function called by the thread that reads a
+    // file to record it, after it has the right to. Set before the first compression or record.
+    void SetTempDir( const AString & dir );
+    typedef void ( *HashHook )( void * userData );
+    void SetHashHook( HashHook hook, void * userData );
+    uint32_t GetNumFilesHashed() const { return m_NumFilesHashed.Load(); }
 
     static const uint32_t kMaxCompressAttempts = 3;
     static const uint32_t kRetryDelayMS = 200;
-    static const uint64_t kStaleTempFileSeconds = ( 60 * 60 );
 
-    // Name of a compressed file: <prefix><process id>.<number>.zst
+    // The name of a compressed file is <prefix><process id>.<number><extension>
     static const char * const kTempFilePrefix;
+    static const char * const kTempFileExtension;
 
 private:
     class CompressedPch;
-    class HashInFlight;
-
-    bool MakeTempPath( AString & outPath );
 
     // PCHs compress one at a time to bound memory and CPU
     Mutex m_CompressMutex;
+
+    // Held while a file is read to record it, so a file is read once
+    Mutex m_RecordMutex;
 
     const uint32_t m_MaxCompressAttempts;
     const uint32_t m_RetryDelayMS;
@@ -108,9 +113,11 @@ private:
     mutable Mutex m_Mutex;
     Array<Entry> m_Entries;
     Array<CompressedPch *> m_Compressed;
-    Array<HashInFlight *> m_Hashing;
     AString m_TempDir;
-    Atomic<bool> m_StaleFilesRemoved{ false };
+    bool m_StaleFilesRemoved = false; // Under m_CompressMutex
+    HashHook m_HashHook = nullptr;
+    void * m_HashHookData = nullptr;
+    Atomic<uint32_t> m_NumFilesHashed{ 0 };
 };
 
 //------------------------------------------------------------------------------

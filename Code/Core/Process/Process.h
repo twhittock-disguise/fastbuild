@@ -43,6 +43,10 @@ public:
     [[nodiscard]] bool HasAborted() const;
     [[nodiscard]] static uint32_t GetCurrentId();
 
+    // Is there a running process with this id? One this user may not inspect counts as running.
+    // Ids are reused, so a true answer can be about another process that now has the id.
+    [[nodiscard]] static bool IsProcessRunning( uint32_t processId );
+
     // Copies not allowed
     explicit Process( Process & other ) = delete;
     Process & operator=( Process & other ) = delete;

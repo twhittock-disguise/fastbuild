@@ -953,6 +953,26 @@ void Process::ReadCommon( int32_t handle, AString & buffer )
 #endif
 }
 
+// IsProcessRunning
+//------------------------------------------------------------------------------
+/*static*/ bool Process::IsProcessRunning( uint32_t processId )
+{
+#if defined( __WINDOWS__ )
+    HANDLE process = ::OpenProcess( PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId );
+    if ( process == nullptr )
+    {
+        // Not allowed to look at it means it is there. Anything else means it is not.
+        return ( ::GetLastError() == ERROR_ACCESS_DENIED );
+    }
+    DWORD exitCode = 0;
+    const bool running = ( ::GetExitCodeProcess( process, &exitCode ) && ( exitCode == STILL_ACTIVE ) );
+    ::CloseHandle( process );
+    return running;
+#else
+    return ( ( ::kill( static_cast<pid_t>( processId ), 0 ) == 0 ) || ( errno == EPERM ) );
+#endif
+}
+
 // HasAborted
 //------------------------------------------------------------------------------
 bool Process::HasAborted() const

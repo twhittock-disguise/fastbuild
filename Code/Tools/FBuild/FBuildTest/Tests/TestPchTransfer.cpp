@@ -33,7 +33,6 @@ private:
     void ReceiverRejectsMalformedChunks() const;
     void ReceiverAcceptsTheLimits() const;
     void ReceiverDropsAPartialPch() const;
-    void ReceiverNamesItsTemporaryFiles() const;
     void ReceiversOfTheSamePchDoNotMeet() const;
     void ReceiverKeepsACachedPch() const;
     void ReceiverReplacesAPchOfTheWrongSize() const;
@@ -81,7 +80,6 @@ REGISTER_TESTS_BEGIN( TestPchTransfer )
     REGISTER_TEST( ReceiverRejectsMalformedChunks )
     REGISTER_TEST( ReceiverAcceptsTheLimits )
     REGISTER_TEST( ReceiverDropsAPartialPch )
-    REGISTER_TEST( ReceiverNamesItsTemporaryFiles )
     REGISTER_TEST( ReceiversOfTheSamePchDoNotMeet )
     REGISTER_TEST( ReceiverKeepsACachedPch )
     REGISTER_TEST( ReceiverReplacesAPchOfTheWrongSize )
@@ -385,36 +383,6 @@ void TestPchTransfer::ReceiverDropsAPartialPch() const
         TEST_ASSERT( FeedAll( receiver, pch, file, alreadyCached ) == PchReceiver::COMPLETE );
         TEST_ASSERT( CountFiles( dir ) == 1 );
     }
-}
-
-// ReceiverNamesItsTemporaryFiles
-//------------------------------------------------------------------------------
-void TestPchTransfer::ReceiverNamesItsTemporaryFiles() const
-{
-    AStackString<> pchFile;
-    pchFile.Format( "../tmp/Test/PchTransfer/Names/pch.0000000000000001%cpch.pch", (char)NATIVE_SLASH );
-    AStackString<> a;
-    AStackString<> b;
-    PchReceiver::MakeTempFileName( pchFile, a );
-    PchReceiver::MakeTempFileName( pchFile, b );
-
-    // Never the same, next to the PCH, and the process that wrote them can be told
-    TEST_ASSERT( a != b );
-    AStackString<> dir;
-    GetDirOf( pchFile, dir );
-    TEST_ASSERT( a.BeginsWith( dir ) );
-    uint32_t processId = 0;
-    TEST_ASSERT( PchReceiver::IsTempFileName( a.Get(), processId ) );
-    TEST_ASSERT( processId == Process::GetCurrentId() );
-    TEST_ASSERT( PchReceiver::IsTempFileName( "incoming.1234.5.pch", processId ) );
-    TEST_ASSERT( processId == 1234 );
-
-    // Other files are not
-    TEST_ASSERT( PchReceiver::IsTempFileName( pchFile.Get(), processId ) == false );
-    TEST_ASSERT( PchReceiver::IsTempFileName( "incoming.pch", processId ) == false );
-    TEST_ASSERT( PchReceiver::IsTempFileName( "incoming.12.pch", processId ) == false );
-    TEST_ASSERT( PchReceiver::IsTempFileName( "incoming.12.3.pch.zst", processId ) == false );
-    TEST_ASSERT( PchReceiver::IsTempFileName( "xincoming.12.3.pch", processId ) == false );
 }
 
 // ReceiversOfTheSamePchDoNotMeet

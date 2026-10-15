@@ -6,6 +6,10 @@
 //------------------------------------------------------------------------------
 #include "Core/Env/Types.h"
 
+// Forward Declarations
+//------------------------------------------------------------------------------
+template <class T> class Atomic;
+
 // Compressor
 //------------------------------------------------------------------------------
 class Compressor
@@ -32,10 +36,29 @@ public:
     // Decompress (handled all formats including uncompressed)
     bool Decompress( const void * data );
 
-    // Data compressed in pieces by other code is a header followed by a single zstd frame that
-    // states its content size, or by the data itself when compression did not help
+    // Sees the content of a file as CompressZstdFile reads it
+    class FileObserver
+    {
+    public:
+        virtual ~FileObserver() = default;
+        virtual void OnPass() = 0; // The file is about to be read again from its start
+        virtual void OnPiece( const void * data, size_t size ) = 0;
+    };
+
+    // Compresses a file into another without holding either in memory. The result is in the format
+    // Decompress reads: a header and one zstd frame, or the file itself behind a header when the frame is
+    // not smaller. The file is read once, and twice when it does not compress; the observer sees every
+    // pass. The source must be sourceSize bytes: the size is part of the format, and of at most
+    // kMaxFileSize. outSize is the size of the file written.
     static constexpr size_t kHeaderSize = 12;
-    static void WriteHeader( void * dest, bool zstd, uint32_t uncompressedSize, uint32_t compressedSize );
+    static constexpr uint64_t kMaxFileSize = ( 0xFFFFFFFFull - kHeaderSize );
+    [[nodiscard]] static bool CompressZstdFile( const char * sourcePath,
+                                                uint64_t sourceSize,
+                                                const char * destPath,
+                                                int32_t compressionLevel,
+                                                const Atomic<bool> * abort,
+                                                FileObserver & observer,
+                                                uint64_t & outSize );
 
     const void * GetResult() const { return m_Result; }
     size_t GetResultSize() const { return m_ResultSize; }
@@ -61,6 +84,7 @@ private:
         uint32_t m_UncompressedSize;
         uint32_t m_CompressedSize;
     };
+    static void WriteHeader( void * dest, bool zstd, uint32_t uncompressedSize, uint32_t compressedSize );
     void * m_Result;
     size_t m_ResultSize;
 };

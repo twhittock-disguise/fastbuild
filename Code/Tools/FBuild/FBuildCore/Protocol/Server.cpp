@@ -32,6 +32,7 @@
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/TempFiles.h"
 
 // Defines
 //------------------------------------------------------------------------------
@@ -45,10 +46,6 @@ namespace
     constexpr uint32_t kMaxCachedPchEntries = 20;
 
     const char * const kPchFileName = "pch.pch";
-
-    // A temporary PCH file another process left is only removed once it has not been written to
-    // for this long, as that process may be receiving a PCH
-    constexpr uint64_t kStaleTempPchFileSeconds = ( 60 * 60 );
 
     // Collects the directories found while listing files
     class DirectoryCollector : public GetFilesHelper
@@ -926,7 +923,7 @@ void Server::ScanPchCache()
         }
     }
 
-    RemoveStaleTempPchFiles( basePath );
+    TempFiles::RemoveStale( basePath, PchReceiver::kTempFilePrefix, PchReceiver::kTempFileExtension, true );
     RemoveEmptyPchDirectories( basePath );
 
     if ( scannedEntries.IsEmpty() )
@@ -948,37 +945,6 @@ void Server::ScanPchCache()
 
     FLOG_OUTPUT( "PCH inventory: %u entries scanned from disk cache\n",
                  (uint32_t)m_PchCache.GetSize() );
-}
-
-// RemoveStaleTempPchFiles
-//------------------------------------------------------------------------------
-/*static*/ void Server::RemoveStaleTempPchFiles( const AString & basePath )
-{
-    Array<FileIO::FileInfo> files;
-    Array<AString> patterns;
-    patterns.Append( AStackString<>( "incoming.*" ) );
-    if ( FileIO::GetFilesEx( basePath, &patterns, true /*recurse*/, &files ) == false )
-    {
-        return;
-    }
-
-    // Those of this process are being written to, and those of another may be as well
-    const uint64_t now = Time::FileTimeToSeconds( Time::GetCurrentFileTime() );
-    const uint32_t thisProcess = Process::GetCurrentId();
-    for ( const FileIO::FileInfo & file : files )
-    {
-        uint32_t processId = 0;
-        if ( ( PchReceiver::IsTempFileName( file.m_Name.Get(), processId ) == false ) ||
-             ( processId == thisProcess ) )
-        {
-            continue;
-        }
-        const uint64_t lastWritten = Time::FileTimeToSeconds( file.m_LastWriteTime );
-        if ( ( now > lastWritten ) && ( ( now - lastWritten ) >= kStaleTempPchFileSeconds ) )
-        {
-            FileIO::FileDelete( file.m_Name.Get() );
-        }
-    }
 }
 
 // RemoveEmptyPchDirectories

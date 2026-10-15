@@ -46,11 +46,10 @@ public:
 
     uint32_t GetNumChunksReceived() const { return m_NumChunksReceived.Load(); }
 
-    // The temporary file a PCH is written to before it is moved into place, next to pchFile. It is
-    // named incoming.<process id>.<number>.pch: no two are the same, and what a crashed worker
-    // left can be recognised.
-    static void MakeTempFileName( const AString & pchFile, AString & outFile );
-    static bool IsTempFileName( const char * fileName, uint32_t & outProcessId );
+    // The temporary file a PCH is written to before it is moved into place, next to pchFile, is named
+    // as TempFiles does
+    inline static const char * const kTempFilePrefix = "incoming.";
+    inline static const char * const kTempFileExtension = ".pch";
 
     // The largest PCH a sender may announce
     inline static const uint32_t kMaxUncompressedSize = ( 2u * 1024 * 1024 * 1024 );

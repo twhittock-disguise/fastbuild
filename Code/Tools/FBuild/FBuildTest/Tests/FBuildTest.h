@@ -62,6 +62,10 @@ protected:
     // Data that does not compress, the same for the same seed
     static void MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes );
 
+    // Ids of processes: one that no process has, and one that is running that is not this process
+    static uint32_t GetIdOfNoProcess();
+    static uint32_t GetIdOfAnotherProcess();
+
     const AString & GetRecordedOutput() const { return s_RecordedOutput; }
 
 private:

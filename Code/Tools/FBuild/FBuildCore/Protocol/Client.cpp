@@ -1088,7 +1088,7 @@ void ClientToWorkerConnection::SendPendingPchs()
     }
 
     Array<PchDataCache::ReadyPch> ready;
-    const bool allOk = PchDataCache::Get().TakeReadyPchs( m_PendingPchIds, m_PchState.GetOnWorker(), ready );
+    bool allOk = PchDataCache::Get().TakeReadyPchs( m_PendingPchIds, m_PchState.GetOnWorker(), ready );
     const uint32_t chunkSize = Math::Clamp( FBuild::Get().GetOptions().m_DistributionPchChunkSize,
                                             Protocol::kMinPchChunkSize,
                                             Protocol::kMaxPchChunkSize );
@@ -1096,7 +1096,12 @@ void ClientToWorkerConnection::SendPendingPchs()
     {
         // One message per chunk, so that jobs can go out between them. The PCH counts as sent
         // once its last chunk has.
-        ASSERT( pch.dataSize <= UINT32_MAX );
+        if ( pch.dataSize > 0xFFFFFFFFull ) // PchDataCache::Record refuses files that would come to this
+        {
+            FLOG_ERROR( "PCH distribution: the compressed PCH 0x%016" PRIx64 " is too large to send\n", pch.pchId );
+            allOk = false;
+            continue;
+        }
         const uint32_t compressedSize = (uint32_t)pch.dataSize;
         const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( compressedSize, chunkSize );
         for ( uint32_t i = 0; i < numChunks; ++i )

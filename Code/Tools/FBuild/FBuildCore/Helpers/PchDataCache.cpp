@@ -10,89 +10,40 @@
 #include "Tools/FBuild/FBuildCore/FLog.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
+#include "Tools/FBuild/FBuildCore/Helpers/TempFiles.h"
 
 // Core
-#include "Core/Containers/UniquePtr.h"
 #include "Core/FileIO/FileIO.h"
-#include "Core/FileIO/FileStream.h"
 #include "Core/FileIO/PathUtils.h"
-#include "Core/Math/Conversions.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Process/Atomic.h"
 #include "Core/Process/Mutex.h"
-#include "Core/Process/Process.h"
 #include "Core/Process/Thread.h"
 #include "Core/Strings/AStackString.h"
-#include "Core/Time/Time.h"
-
-// External
-#include "zstd.h"
-
-#include <stdlib.h>
-#include <string.h>
 
 // Static
 //------------------------------------------------------------------------------
 static PchDataCache s_PchDataCache;
 
 /*static*/ const char * const PchDataCache::kTempFilePrefix = "fbuild-pch-send.";
+/*static*/ const char * const PchDataCache::kTempFileExtension = ".zst";
 
 namespace
 {
-    const char * const kSendTempExtension = ".zst";
-
-    // <prefix><process id>.<number>.zst
-    bool ParseTempFileName( const char * fileName, uint32_t & outProcessId )
+    // The id the data read so far hashes to
+    PRAGMA_DISABLE_PUSH_MSVC( 4324 ) // structure was padded due to alignment specifier
+    class HashObserver : public Compressor::FileObserver
     {
-        const AStackString<> path( fileName );
-        const char * lastSlash = path.FindLast( NATIVE_SLASH );
-        if ( lastSlash == nullptr )
-        {
-            lastSlash = path.FindLast( '/' );
-        }
-        const char * name = lastSlash ? ( lastSlash + 1 ) : path.Get();
+    public:
+        virtual void OnPass() override { m_Hash = PchId::Accumulator(); }
+        virtual void OnPiece( const void * data, size_t size ) override { PchId::AddData( m_Hash, data, size ); }
+        uint64_t GetId() { return PchId::Finalize( m_Hash ); }
 
-        const size_t prefixLength = strlen( PchDataCache::kTempFilePrefix );
-        if ( strncmp( name, PchDataCache::kTempFilePrefix, prefixLength ) != 0 )
-        {
-            return false;
-        }
-        const char * p = ( name + prefixLength );
-        char * end = nullptr;
-        const unsigned long processId = strtoul( p, &end, 10 );
-        if ( ( end == p ) || ( *end != '.' ) )
-        {
-            return false;
-        }
-        p = ( end + 1 );
-        strtoul( p, &end, 10 );
-        if ( ( end == p ) || ( strcmp( end, kSendTempExtension ) != 0 ) )
-        {
-            return false;
-        }
-        outProcessId = static_cast<uint32_t>( processId );
-        return true;
-    }
-
-    struct ZstdContext
-    {
-        ZstdContext() : m_Context( ZSTD_createCCtx() ) {}
-        ~ZstdContext() { ZSTD_freeCCtx( m_Context ); }
-        ZSTD_CCtx * m_Context;
+    private:
+        PchId::Accumulator m_Hash;
     };
+    PRAGMA_DISABLE_POP_MSVC // 4324
 }
-
-// HashInFlight
-//------------------------------------------------------------------------------
-class PchDataCache::HashInFlight
-{
-public:
-    explicit HashInFlight( const AString & path ) : m_Path( path ) {}
-
-    AString m_Path;
-    Mutex   m_Mutex;    // Held while the file is read
-    uint32_t m_Users = 0; // Under the cache's mutex
-};
 
 // CompressedPch
 //------------------------------------------------------------------------------
@@ -175,165 +126,39 @@ private:
             return false;
         }
 
-        FileStream source;
-        if ( source.Open( m_Entry.filePath.Get(), FileStream::READ_ONLY ) == false )
-        {
-            FLOG_WARN( "PCH distribution: failed to open '%s' for sending\n", m_Entry.filePath.Get() );
-            return false;
-        }
-
-        // Reading past the end of a file that changed since it was recorded does not stop on Windows
-        const uint64_t fileSize = m_Entry.uncompressedSize;
-        if ( ( fileSize == 0 ) || ( source.GetFileSize() != fileSize ) )
-        {
-            FLOG_WARN( "PCH distribution: '%s' is not the recorded size\n", m_Entry.filePath.Get() );
-            return false;
-        }
-
-        AStackString<> tempPath;
-        if ( ( m_Owner.MakeTempPath( tempPath ) == false ) || ( FileIO::EnsurePathExistsForFile( tempPath ) == false ) )
+        AStackString<> dir;
+        if ( m_Owner.GetSendDirectory( dir ) == false )
         {
             FLOG_WARN( "PCH distribution: no place to write the compressed '%s'\n", m_Entry.filePath.Get() );
             return false;
         }
-
-        uint64_t compressedFileSize = 0;
-        if ( CompressToFile( source, fileSize, tempPath, compressedFileSize ) == false )
+        if ( m_Owner.m_StaleFilesRemoved == false )
         {
-            FileIO::FileDelete( tempPath.Get() ); // All the files are closed by now
+            m_Owner.m_StaleFilesRemoved = true;
+            TempFiles::RemoveStale( dir, kTempFilePrefix, kTempFileExtension, false );
+        }
+        AStackString<> tempPath;
+        TempFiles::MakeName( dir, kTempFilePrefix, kTempFileExtension, tempPath );
+
+        // The file is read in pieces and must hash to the id it was recorded with: a worker rejects
+        // data that does not, and would be disconnected and sent the same data again
+        HashObserver observer;
+        uint64_t compressedFileSize = 0;
+        if ( Compressor::CompressZstdFile( m_Entry.filePath.Get(), m_Entry.uncompressedSize, tempPath.Get(),
+                                           Compressor::kZstdTransferLevel, &m_Cancel, observer, compressedFileSize ) == false )
+        {
+            FLOG_WARN( "PCH distribution: failed to read and compress '%s' to '%s'\n", m_Entry.filePath.Get(), tempPath.Get() );
+            FileIO::FileDelete( tempPath.Get() );
+            return false;
+        }
+        if ( observer.GetId() != m_Entry.pchId )
+        {
+            FLOG_WARN( "PCH distribution: '%s' changed since it was recorded\n", m_Entry.filePath.Get() );
+            FileIO::FileDelete( tempPath.Get() );
             return false;
         }
         m_FilePath = tempPath;
         m_FileSize = compressedFileSize;
-        return true;
-    }
-
-    // Writes a header and one zstd frame, or the data itself if that is not smaller. The file is
-    // read and written in pieces, and its content must hash to the id it was recorded with: a
-    // worker rejects data that does not, and would be disconnected and sent the same data again.
-    bool CompressToFile( FileStream & source, uint64_t fileSize, const AString & tempPath, uint64_t & outFileSize )
-    {
-        if ( fileSize > UINT32_MAX )
-        {
-            FLOG_WARN( "PCH distribution: '%s' is too large to send\n", m_Entry.filePath.Get() );
-            return false;
-        }
-
-        uint64_t frameSize = 0;
-        {
-            FileStream out;
-            char header[ Compressor::kHeaderSize ] = {};
-            if ( ( out.Open( tempPath.Get(), FileStream::WRITE_ONLY ) == false ) ||
-                 ( out.Write( header, sizeof( header ) ) != sizeof( header ) ) )
-            {
-                FLOG_WARN( "PCH distribution: failed to write '%s'\n", tempPath.Get() );
-                return false;
-            }
-
-            ZstdContext zstd;
-            if ( ( zstd.m_Context == nullptr ) ||
-                 ZSTD_isError( ZSTD_CCtx_setParameter( zstd.m_Context, ZSTD_c_compressionLevel, Compressor::kZstdTransferLevel ) ) ||
-                 ZSTD_isError( ZSTD_CCtx_setPledgedSrcSize( zstd.m_Context, fileSize ) ) )
-            {
-                return false;
-            }
-
-            UniquePtr<char, FreeDeletor> input( static_cast<char *>( ALLOC( PchId::kReadChunkSize ) ) );
-            const size_t outputSize = ZSTD_CStreamOutSize();
-            UniquePtr<char, FreeDeletor> output( static_cast<char *>( ALLOC( outputSize ) ) );
-
-            PchId::Accumulator hash;
-            for ( uint64_t read = 0; read < fileSize; )
-            {
-                if ( m_Cancel.Load() )
-                {
-                    return false;
-                }
-                const uint32_t chunk = static_cast<uint32_t>( Math::Min<uint64_t>( fileSize - read, PchId::kReadChunkSize ) );
-                if ( ( source.GetFileSize() != fileSize ) || ( source.Read( input.Get(), chunk ) != chunk ) )
-                {
-                    FLOG_WARN( "PCH distribution: failed to read '%s' for sending\n", m_Entry.filePath.Get() );
-                    return false;
-                }
-                PchId::AddData( hash, input.Get(), chunk );
-                read += chunk;
-
-                const bool last = ( read == fileSize );
-                ZSTD_inBuffer in = { input.Get(), chunk, 0 };
-                size_t remaining;
-                do
-                {
-                    ZSTD_outBuffer produced = { output.Get(), outputSize, 0 };
-                    remaining = ZSTD_compressStream2( zstd.m_Context, &produced, &in, last ? ZSTD_e_end : ZSTD_e_continue );
-                    if ( ZSTD_isError( remaining ) ||
-                         ( out.Write( output.Get(), (uint32_t)produced.pos ) != produced.pos ) )
-                    {
-                        FLOG_WARN( "PCH distribution: failed to compress '%s'\n", m_Entry.filePath.Get() );
-                        return false;
-                    }
-                    frameSize += produced.pos;
-                } while ( last ? ( remaining != 0 ) : ( in.pos < in.size ) );
-            }
-
-            if ( PchId::Finalize( hash ) != m_Entry.pchId )
-            {
-                FLOG_WARN( "PCH distribution: '%s' changed since it was recorded\n", m_Entry.filePath.Get() );
-                return false;
-            }
-
-            if ( frameSize < fileSize )
-            {
-                // The header says how long the frame turned out to be
-                Compressor::WriteHeader( header, true, static_cast<uint32_t>( fileSize ), static_cast<uint32_t>( frameSize ) );
-                if ( ( out.Seek( 0 ) == false ) || ( out.Write( header, sizeof( header ) ) != sizeof( header ) ) )
-                {
-                    FLOG_WARN( "PCH distribution: failed to write '%s'\n", tempPath.Get() );
-                    return false;
-                }
-                outFileSize = ( sizeof( header ) + frameSize );
-                return true;
-            }
-        }
-
-        return WriteUncompressed( fileSize, tempPath, outFileSize );
-    }
-
-    // Data that does not compress is sent as it is, with a header
-    bool WriteUncompressed( uint64_t fileSize, const AString & tempPath, uint64_t & outFileSize )
-    {
-        FileStream source;
-        FileStream out;
-        char header[ Compressor::kHeaderSize ];
-        Compressor::WriteHeader( header, false, static_cast<uint32_t>( fileSize ), static_cast<uint32_t>( fileSize ) );
-        if ( ( source.Open( m_Entry.filePath.Get(), FileStream::READ_ONLY ) == false ) ||
-             ( out.Open( tempPath.Get(), FileStream::WRITE_ONLY ) == false ) ||
-             ( out.Write( header, sizeof( header ) ) != sizeof( header ) ) )
-        {
-            FLOG_WARN( "PCH distribution: failed to write '%s'\n", tempPath.Get() );
-            return false;
-        }
-
-        UniquePtr<char, FreeDeletor> buffer( static_cast<char *>( ALLOC( PchId::kReadChunkSize ) ) );
-        PchId::Accumulator hash;
-        for ( uint64_t copied = 0; copied < fileSize; )
-        {
-            const uint32_t chunk = static_cast<uint32_t>( Math::Min<uint64_t>( fileSize - copied, PchId::kReadChunkSize ) );
-            if ( ( source.GetFileSize() != fileSize ) ||
-                 ( source.Read( buffer.Get(), chunk ) != chunk ) ||
-                 ( out.Write( buffer.Get(), chunk ) != chunk ) )
-            {
-                FLOG_WARN( "PCH distribution: failed to copy '%s'\n", m_Entry.filePath.Get() );
-                return false;
-            }
-            PchId::AddData( hash, buffer.Get(), chunk );
-            copied += chunk;
-        }
-        if ( PchId::Finalize( hash ) != m_Entry.pchId )
-        {
-            FLOG_WARN( "PCH distribution: '%s' changed since it was recorded\n", m_Entry.filePath.Get() );
-            return false;
-        }
-        outFileSize = ( sizeof( header ) + fileSize );
         return true;
     }
 
@@ -425,59 +250,37 @@ bool PchDataCache::FindByPath( const AString & filePath, Entry & outEntry ) cons
 //------------------------------------------------------------------------------
 bool PchDataCache::Record( const AString & filePath, Entry & outEntry )
 {
+    // Only one thread reads a file. The others wait here, then find what it recorded.
+    MutexHolder recordHolder( m_RecordMutex );
     if ( FindByPath( filePath, outEntry ) )
     {
         return true;
     }
 
-    HashInFlight * hashing = nullptr;
+    if ( m_HashHook )
     {
-        MutexHolder mh( m_Mutex );
-        for ( HashInFlight * h : m_Hashing )
-        {
-            if ( h->m_Path == filePath )
-            {
-                hashing = h;
-                break;
-            }
-        }
-        if ( hashing == nullptr )
-        {
-            hashing = FNEW( HashInFlight( filePath ) );
-            m_Hashing.Append( hashing );
-        }
-        ++hashing->m_Users;
+        m_HashHook( m_HashHookData );
+    }
+    m_NumFilesHashed.Increment();
+
+    uint64_t pchId = 0;
+    uint64_t fileSize = 0;
+    if ( PchId::CalcFile( filePath, pchId, fileSize ) == false )
+    {
+        FLOG_WARN( "PCH distribution: failed to read '%s'\n", filePath.Get() );
+        return false;
+    }
+    if ( ( fileSize == 0 ) || ( fileSize > Compressor::kMaxFileSize ) )
+    {
+        FLOG_WARN( "PCH distribution: '%s' cannot be sent: it is %" PRIu64 " bytes\n", filePath.Get(), fileSize );
+        return false;
     }
 
-    bool ok;
-    {
-        // Only one thread reads the file. The others wait here, then find what it recorded.
-        MutexHolder fileHolder( hashing->m_Mutex );
-        ok = FindByPath( filePath, outEntry );
-        if ( ok == false )
-        {
-            uint64_t pchId = 0;
-            uint64_t fileSize = 0;
-            if ( PchId::CalcFile( filePath, pchId, fileSize ) && ( fileSize > 0 ) && ( fileSize <= UINT32_MAX ) )
-            {
-                outEntry.pchId = pchId;
-                outEntry.uncompressedSize = static_cast<uint32_t>( fileSize );
-                outEntry.filePath = filePath;
-                Store( outEntry );
-                ok = true;
-            }
-        }
-    }
-
-    {
-        MutexHolder mh( m_Mutex );
-        if ( --hashing->m_Users == 0 )
-        {
-            m_Hashing.FindAndErase( hashing );
-            FDELETE hashing;
-        }
-    }
-    return ok;
+    outEntry.pchId = pchId;
+    outEntry.uncompressedSize = static_cast<uint32_t>( fileSize );
+    outEntry.filePath = filePath;
+    Store( outEntry );
+    return true;
 }
 
 // GetCompressed
@@ -610,6 +413,23 @@ void PchDataCache::Clear()
     m_Compressed.Clear();
 }
 
+// GetSendDirectory
+//------------------------------------------------------------------------------
+bool PchDataCache::GetSendDirectory( AString & outDir )
+{
+    AStackString<> parent;
+    {
+        MutexHolder mh( m_Mutex );
+        parent = m_TempDir;
+    }
+    if ( ( parent.IsEmpty() ) && ( FBuild::GetTempDir( parent ) == false ) )
+    {
+        return false;
+    }
+    PathUtils::EnsureTrailingSlash( parent );
+    return TempFiles::GetPrivateDirectory( parent, "fbuild-pch-send", outDir );
+}
+
 // SetTempDir
 //------------------------------------------------------------------------------
 void PchDataCache::SetTempDir( const AString & dir )
@@ -618,64 +438,12 @@ void PchDataCache::SetTempDir( const AString & dir )
     m_TempDir = dir;
 }
 
-// MakeTempPath
+// SetHashHook
 //------------------------------------------------------------------------------
-bool PchDataCache::MakeTempPath( AString & outPath )
+void PchDataCache::SetHashHook( HashHook hook, void * userData )
 {
-    AStackString<> dir;
-    {
-        MutexHolder mh( m_Mutex );
-        dir = m_TempDir;
-    }
-    if ( ( dir.IsEmpty() ) && ( FBuild::GetTempDir( dir ) == false ) )
-    {
-        return false;
-    }
-    PathUtils::EnsureTrailingSlash( dir );
-
-    // Compressions run one at a time, so this is not raced
-    if ( m_StaleFilesRemoved.Load() == false )
-    {
-        m_StaleFilesRemoved.Store( true );
-        RemoveStaleTempFiles( dir );
-    }
-
-    static Atomic<uint32_t> s_Counter{ 0 };
-    outPath = dir;
-    outPath.AppendFormat( "%s%u.%u%s", kTempFilePrefix, Process::GetCurrentId(), s_Counter.Increment(), kSendTempExtension );
-    return true;
-}
-
-// RemoveStaleTempFiles
-//------------------------------------------------------------------------------
-/*static*/ void PchDataCache::RemoveStaleTempFiles( const AString & dir )
-{
-    Array<FileIO::FileInfo> files;
-    Array<AString> patterns;
-    AStackString<> pattern( kTempFilePrefix );
-    pattern += '*';
-    patterns.Append( pattern );
-    if ( FileIO::GetFilesEx( dir, &patterns, false /*recurse*/, &files ) == false )
-    {
-        return;
-    }
-
-    // Those of this process are in use, and those of another may be
-    const uint64_t now = Time::FileTimeToSeconds( Time::GetCurrentFileTime() );
-    const uint32_t thisProcess = Process::GetCurrentId();
-    for ( const FileIO::FileInfo & file : files )
-    {
-        uint32_t processId = 0;
-        if ( ( ParseTempFileName( file.m_Name.Get(), processId ) == false ) || ( processId == thisProcess ) )
-        {
-            continue;
-        }
-        const uint64_t lastWritten = Time::FileTimeToSeconds( file.m_LastWriteTime );
-        if ( ( now > lastWritten ) && ( ( now - lastWritten ) >= kStaleTempFileSeconds ) )
-        {
-            FileIO::FileDelete( file.m_Name.Get() );
-        }
-    }
+    m_HashHook = hook;
+    m_HashHookData = userData;
 }
 
 //------------------------------------------------------------------------------
