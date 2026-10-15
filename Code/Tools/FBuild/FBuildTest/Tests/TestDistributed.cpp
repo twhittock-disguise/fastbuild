@@ -55,7 +55,9 @@
 namespace
 {
     class NoCapacityWorker;
+    class PchSender;
     struct CapturedJob;
+    struct CompressedPch;
 }
 
 class TestDistributed : public FBuildTest
@@ -84,16 +86,21 @@ private:
     void PchIsStoredCompressed() const;
     void PchIsUnpackedWhenAJobNeedsIt() const;
     void PchThatCannotBeUnpackedIsDropped() const;
+    void PchThatCannotBeWrittenIsKept() const;
+    void PchThatCannotBeWrittenReturnsItsJobs() const;
     void CorruptPchIsAskedForAgain() const;
+    void CorruptPchIsReturnedToAClientThatCannotAsk() const;
     void PchUnpackIsSingleFlight() const;
     void UnpackedCopyLivesWithItsJobs() const;
     void UnusedCopiesAreKeptToABudget() const;
     void UnusedCopiesGoWhenIdle() const;
     void LeasedPchIsNotEvicted() const;
     void PchsAreEvictedByRecency() const;
-    void CompressedBytesCountTowardsTheBudget() const;
+    void UnusedCopyGoesWhenTheFreeSpaceIsUnknown() const;
+    void PchOfAnotherCompressionIsNotStoredAgain() const;
     void PchStartupScanKeepsTheCompressedStore() const;
     void PchStoreIsUsedThroughTheBuild() const;
+    void PchLeasesAreReleasedByEveryEnd() const;
     void PchCompressedCache() const;
     void PchCompressRetry() const;
     void PchTakeReadyPchs() const;
@@ -259,7 +266,13 @@ private:
     static bool IsPchUnpacked( Server & server, uint64_t pchId );
     static bool HasRawEntry( Server & server, uint64_t pchId );
     static uint32_t NumLeases( Server & server, uint64_t pchId );
-    static uint32_t CountFilesIn( const AString & dir );
+    static void CompressPch( CompressedPch & pch ); // Of its content
+    static void MakeCompressedPch( uint32_t size, uint32_t seed, CompressedPch & outPch );
+    static bool SendPch( PchSender & sender, const CompressedPch & pch );
+    static uint32_t TotalLeases( Server & server );
+    static bool IsPchBeingUnpacked( Server & server, uint64_t pchId );
+    static uint32_t NumWaitingJobsWithAPch( Server & server );
+    static void SetPchRecency( Server & server, uint64_t pchId, uint64_t fileTime ); // Of the compressed PCH
     struct ResolveRequest
     {
         Server *        m_Server = nullptr;
@@ -310,14 +323,16 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchIsStoredCompressed )
     REGISTER_TEST( PchIsUnpackedWhenAJobNeedsIt )
     REGISTER_TEST( PchThatCannotBeUnpackedIsDropped )
+    REGISTER_TEST( PchThatCannotBeWrittenIsKept )
     REGISTER_TEST( PchUnpackIsSingleFlight )
     REGISTER_TEST( UnpackedCopyLivesWithItsJobs )
     REGISTER_TEST( UnusedCopiesAreKeptToABudget )
     REGISTER_TEST( UnusedCopiesGoWhenIdle )
     REGISTER_TEST( LeasedPchIsNotEvicted )
     REGISTER_TEST( PchsAreEvictedByRecency )
-    REGISTER_TEST( CompressedBytesCountTowardsTheBudget )
+    REGISTER_TEST( UnusedCopyGoesWhenTheFreeSpaceIsUnknown )
     REGISTER_TEST( PchStartupScanKeepsTheCompressedStore )
+    REGISTER_TEST( PchOfAnotherCompressionIsNotStoredAgain )
     REGISTER_TEST( PchCompressedCache )
     REGISTER_TEST( PchCompressRetry )
     REGISTER_TEST( PchTakeReadyPchs )
@@ -373,8 +388,11 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ClientGivesUpOnAWorkerThatKeepsLosingAPch )
     REGISTER_TEST( ClientGivesUpOnAWorkerThatAsksForAnUnknownPch )
     REGISTER_TEST( EvictedPchIsSentAgain )
+    REGISTER_TEST( PchThatCannotBeWrittenReturnsItsJobs )
     REGISTER_TEST( CorruptPchIsAskedForAgain )
+    REGISTER_TEST( CorruptPchIsReturnedToAClientThatCannotAsk )
     REGISTER_TEST( PchStoreIsUsedThroughTheBuild )
+    REGISTER_TEST( PchLeasesAreReleasedByEveryEnd )
     REGISTER_TEST( MSVCFailureOfARemoteJobIsASystemError )
 #endif
     REGISTER_TEST( MSVCWorkerFailuresAreRetriedElsewhere )
@@ -551,7 +569,6 @@ void TestDistributed::PchCacheBudget() const
     TEST_ASSERT( isAbout( Server::CalculatePchCacheBudget( 4 * GiB, 0 ), 2 * GiB ) );
 
     // The most it keeps is 8 GiB
-    TEST_ASSERT( Server::kMaxPchCacheBytes == ( 8 * GiB ) );
     TEST_ASSERT( isAbout( Server::CalculatePchCacheBudget( 16 * GiB, 0 ), 8 * GiB ) );
     TEST_ASSERT( Server::CalculatePchCacheBudget( 20 * GiB, 0 ) == ( 8 * GiB ) );
 
@@ -585,7 +602,6 @@ void TestDistributed::PchRawBudget() const
     };
 
     // What is kept for the next jobs is 2 GiB at most, however large the disk
-    TEST_ASSERT( Server::kMaxRawPchBytes == ( 2 * GiB ) );
     TEST_ASSERT( Server::CalculateRawPchBudget( 1800 * GiB, 0 ) == Server::kMaxRawPchBytes );
     TEST_ASSERT( Server::CalculateRawPchBudget( kNoLimit, kNoLimit ) == Server::kMaxRawPchBytes );
     TEST_ASSERT( Server::CalculateRawPchBudget( 12 * GiB, 0 ) == Server::kMaxRawPchBytes );
@@ -1495,6 +1511,7 @@ void TestDistributed::PchBudgetFollowsTheFreeSpace() const
         limits = s.GetPchCacheLimits( 5 * GiB );
         TEST_ASSERT( limits.m_Bytes == Server::kMinPchCacheBytes );
         TEST_ASSERT( limits.m_MinEntries == Server::kMinCachedPchEntries );
+        TEST_ASSERT( limits.m_RawBytes == 0 ); // Nothing is kept unpacked for later
     }
 
     // The disk of the cache is read when nothing replaces it
@@ -1504,6 +1521,7 @@ void TestDistributed::PchBudgetFollowsTheFreeSpace() const
         TEST_ASSERT( limits.m_Bytes >= Server::kMinPchCacheBytes );
         TEST_ASSERT( limits.m_Bytes <= Server::kMaxPchCacheBytes );
         TEST_ASSERT( limits.m_MinEntries == Server::kMinCachedPchEntries );
+        TEST_ASSERT( limits.m_RawBytes <= Server::kMaxRawPchBytes );
     }
 
     // The bytes the cache holds count towards what it may keep: 6 PCHs of 1.5 GiB on a volume with 10 GiB
@@ -1760,6 +1778,19 @@ namespace
 
     private:
         const ConnectionInfo * m_Connection = nullptr;
+    };
+
+    // A PCH as a client sends it
+    struct CompressedPch
+    {
+        CompressedPch() = default;
+        explicit CompressedPch( const CompressedPch & other ) = delete;
+        CompressedPch & operator=( const CompressedPch & other ) = delete;
+
+        Array<char>     m_Content;
+        Compressor      m_Compressed;
+        uint32_t        m_CompressedSize = 0;
+        uint64_t        m_Id = 0;
     };
 
     // Where a worker keeps a PCH
@@ -4302,16 +4333,13 @@ void TestDistributed::WorkerAsksAgainWhenAPchItHadIsNeededAgain() const
     // A job for a PCH of our own
     CapturedJob captured;
     CapturePchJob( captured );
-    Array<char> contents[ 2 ];
-    uint64_t pchIds[ 2 ];
-    Compressor compressed[ 2 ];
+    CompressedPch pchs[ 2 ];
     for ( uint32_t i = 0; i < 2; ++i )
     {
-        MakeRandomBytes( 100000, ( 31 + i ), contents[ i ] );
-        compressed[ i ].CompressZstd( contents[ i ].Begin(), contents[ i ].GetSize(), Compressor::kZstdTransferLevel );
-        pchIds[ i ] = PchId::Calc( contents[ i ].Begin(), contents[ i ].GetSize() );
+        MakeRandomBytes( 100000, ( 31 + i ), pchs[ i ].m_Content );
+        CompressPch( pchs[ i ] );
     }
-    const CapturedJob job = WithPch( captured, pchIds[ 0 ] );
+    const CapturedJob job = WithPch( captured, pchs[ 0 ].m_Id );
 
     Server s( 1 );
     SetPchCacheLimits( s, 1, 0 ); // Room for the PCH that has just arrived only
@@ -4324,31 +4352,27 @@ void TestDistributed::WorkerAsksAgainWhenAPchItHadIsNeededAgain() const
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
     TEST_ASSERT( WaitUntil( [ &client ]() { return ( client.GetNumPchNeeded() >= 1 ); } ) );
-    TEST_ASSERT( client.GetPchNeededId( 0 ) == pchIds[ 0 ] );
+    TEST_ASSERT( client.GetPchNeededId( 0 ) == pchs[ 0 ].m_Id );
 
     // and sent, over another connection. The job waits for its toolchain, which never comes.
     PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
-    auto sendPch = [ & ]( uint32_t i )
-    {
-        const uint32_t compressedSize = (uint32_t)compressed[ i ].GetResultSize();
-        return sender.SendChunks( pchIds[ i ], (uint32_t)contents[ i ].GetSize(), compressed[ i ].GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) );
-    };
-    TEST_ASSERT( sendPch( 0 ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 0 ] ); } ) );
+    TEST_ASSERT( SendPch( sender, pchs[ 0 ] ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
 
-    // The job is gone (as one that has been built is). Another PCH arrives and pushes the first out.
-    TEST_ASSERT( WaitUntil( [ & ]() { return IsPchUnpacked( s, pchIds[ 0 ] ); } ) ); // A PCH that is being unpacked is not pushed out
+    // The job is gone (as one that has been built is). Another PCH arrives and pushes the first out, once
+    // it is not being unpacked: a PCH that is is not pushed out.
+    TEST_ASSERT( WaitUntil( [ & ]() { return IsPchUnpacked( s, pchs[ 0 ].m_Id ); } ) );
     DropWaitingJobs( s );
-    TEST_ASSERT( sendPch( 1 ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 1 ] ) && ( s.IsPchCached( pchIds[ 0 ] ) == false ); } ) );
+    TEST_ASSERT( SendPch( sender, pchs[ 1 ] ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ) && ( s.IsPchCached( pchs[ 0 ].m_Id ) == false ); } ) );
 
     // A job for the first one again: the worker asks again, as the PCH has arrived since it asked
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
     TEST_ASSERT( WaitUntil( [ &client ]() { return ( client.GetNumPchNeeded() >= 2 ); } ) );
     TEST_ASSERT( Handshake( client, ci, Protocol::kCapabilities, kWaitTimeoutSeconds ) ); // Answered after the job
     TEST_ASSERT( client.GetNumPchNeeded() == 2 );
-    TEST_ASSERT( client.GetPchNeededId( 1 ) == pchIds[ 0 ] );
+    TEST_ASSERT( client.GetPchNeededId( 1 ) == pchs[ 0 ].m_Id );
     client.ShutdownAllConnections();
 }
 
@@ -4800,37 +4824,31 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
 {
     // PCHs that compress well: what the cache counts is what is on disk, which is the compressed PCH
     const uint32_t kSize = 100000;
-    Array<char> contents[ 2 ];
-    uint64_t pchIds[ 2 ];
-    Compressor compressed[ 2 ];
+    CompressedPch pchs[ 2 ];
     for ( uint32_t i = 0; i < 2; ++i )
     {
-        contents[ i ].SetSize( kSize );
-        memset( contents[ i ].Begin(), (int)( 'a' + i ), kSize );
-        compressed[ i ].CompressZstd( contents[ i ].Begin(), kSize, Compressor::kZstdTransferLevel );
-        pchIds[ i ] = PchId::Calc( contents[ i ].Begin(), kSize );
-        TEST_ASSERT( compressed[ i ].GetResultSize() < ( kSize / 10 ) );
+        pchs[ i ].m_Content.SetSize( kSize );
+        memset( pchs[ i ].m_Content.Begin(), (int)( 'a' + i ), kSize );
+        CompressPch( pchs[ i ] );
+        TEST_ASSERT( pchs[ i ].m_CompressedSize < ( kSize / 10 ) );
     }
 
-    // Room for one and a half of them: a second one only fits if the first goes
-    const uint64_t kStoredSize = compressed[ 0 ].GetResultSize();
-    TEST_ASSERT( compressed[ 1 ].GetResultSize() == kStoredSize );
+    // Room for one and a half of them, which is less than one unpacked: a PCH that is not
+    // counted as it is stored would not fit. A second one only fits if the first goes.
+    const uint64_t kStoredSize = pchs[ 0 ].m_CompressedSize;
+    TEST_ASSERT( pchs[ 1 ].m_CompressedSize == kStoredSize );
+    TEST_ASSERT( ( ( kStoredSize * 3 ) / 2 ) < kSize );
     Server s( 1 );
     SetPchCacheLimits( s, ( kStoredSize * 3 ) / 2, 0 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
     PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
-    auto sendPch = [ & ]( uint32_t i )
-    {
-        const uint32_t compressedSize = (uint32_t)compressed[ i ].GetResultSize();
-        return sender.SendChunks( pchIds[ i ], kSize, compressed[ i ].GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) );
-    };
 
     // The first is cached as what is on disk, which is what the cache is counted by
-    TEST_ASSERT( sendPch( 0 ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 0 ] ); } ) );
+    TEST_ASSERT( SendPch( sender, pchs[ 0 ] ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
     AStackString<> path;
-    TEST_ASSERT( s.FindCachedPch( pchIds[ 0 ], path ) );
+    TEST_ASSERT( s.FindCachedPch( pchs[ 0 ].m_Id, path ) );
     FileStream file;
     TEST_ASSERT( file.Open( path.Get() ) );
     TEST_ASSERT( file.GetFileSize() == kStoredSize );
@@ -4843,18 +4861,19 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
     TEST_ASSERT( s_LastCacheBytes.Load() == kStoredSize ); // The one that arrived
 
     // A second makes twice that, which is over: the first, which is the older, goes
-    TEST_ASSERT( sendPch( 1 ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 1 ] ); } ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return ( s.IsPchCached( pchIds[ 0 ] ) == false ); } ) );
+    SetPchRecency( s, pchs[ 0 ].m_Id, 1 );
+    TEST_ASSERT( SendPch( sender, pchs[ 1 ] ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ); } ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return ( s.IsPchCached( pchs[ 0 ].m_Id ) == false ); } ) );
     TEST_ASSERT( s_LastCacheBytes.Load() == ( 2 * kStoredSize ) );
-    TEST_ASSERT( s.IsPchCached( pchIds[ 1 ] ) );
+    TEST_ASSERT( s.IsPchCached( pchs[ 1 ].m_Id ) );
 
     // A scan of the directory finds the sizes the inserts counted
     SetPchCacheLimits( s, ( 4 * kStoredSize ), 0 );
     s.m_PchCache.Clear();
     s.m_PchCacheScanned = false;
     s.ScanPchCache();
-    TEST_ASSERT( s.IsPchCached( pchIds[ 1 ] ) );
+    TEST_ASSERT( s.IsPchCached( pchs[ 1 ].m_Id ) );
     {
         MutexHolder mh( s.m_PchCacheMutex );
         TEST_ASSERT( s.m_PchCache.GetSize() == 1 );
@@ -4935,11 +4954,71 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
     return raw ? raw->numLeases : 0;
 }
 
-/*static*/ uint32_t TestDistributed::CountFilesIn( const AString & dir )
+/*static*/ void TestDistributed::CompressPch( CompressedPch & pch )
 {
-    Array<AString> files;
-    FileIO::GetFiles( dir, AStackString( "*" ), true, &files );
-    return (uint32_t)files.GetSize();
+    pch.m_Compressed.CompressZstd( pch.m_Content.Begin(), pch.m_Content.GetSize(), Compressor::kZstdTransferLevel );
+    pch.m_CompressedSize = (uint32_t)pch.m_Compressed.GetResultSize();
+    pch.m_Id = PchId::Calc( pch.m_Content.Begin(), pch.m_Content.GetSize() );
+}
+
+/*static*/ void TestDistributed::MakeCompressedPch( uint32_t size, uint32_t seed, CompressedPch & outPch )
+{
+    MakeTestContent( size, seed, outPch.m_Content );
+    CompressPch( outPch );
+}
+
+/*static*/ bool TestDistributed::SendPch( PchSender & sender, const CompressedPch & pch )
+{
+    return sender.SendChunks( pch.m_Id,
+                              (uint32_t)pch.m_Content.GetSize(),
+                              pch.m_Compressed.GetResult(),
+                              pch.m_CompressedSize,
+                              Protocol::kPchChunkSize,
+                              0,
+                              Protocol::MsgPchFile::GetNumChunks( pch.m_CompressedSize, Protocol::kPchChunkSize ) );
+}
+
+/*static*/ uint32_t TestDistributed::TotalLeases( Server & server )
+{
+    MutexHolder mh( server.m_PchCacheMutex );
+    uint32_t numLeases = 0;
+    for ( const Server::PchRawEntry & raw : server.m_PchRaw )
+    {
+        numLeases += raw.numLeases;
+    }
+    return numLeases;
+}
+
+/*static*/ bool TestDistributed::IsPchBeingUnpacked( Server & server, uint64_t pchId )
+{
+    MutexHolder mh( server.m_PchCacheMutex );
+    const Server::PchRawEntry * raw = server.FindRawPch( pchId );
+    return ( raw && ( raw->state == Server::PchRawEntry::UNPACKING ) );
+}
+
+// The jobs waiting on the connections of a worker that have been given their PCH
+/*static*/ uint32_t TestDistributed::NumWaitingJobsWithAPch( Server & server )
+{
+    uint32_t numJobs = 0;
+    MutexHolder mh( server.m_ClientListMutex );
+    for ( Server::ClientState * cs : server.m_ClientList )
+    {
+        MutexHolder mh2( cs->m_Mutex );
+        for ( const Job * job : cs->m_WaitingJobs )
+        {
+            numJobs += job->GetPchCachePath().IsEmpty() ? 0 : 1;
+        }
+    }
+    return numJobs;
+}
+
+// Makes a PCH the least recently used, or any other place in the order, without waiting for the clock
+/*static*/ void TestDistributed::SetPchRecency( Server & server, uint64_t pchId, uint64_t fileTime )
+{
+    MutexHolder mh( server.m_PchCacheMutex );
+    Server::PchCacheEntry * stored = server.FindStoredPch( pchId );
+    TEST_ASSERT( stored );
+    stored->lastWriteTime = fileTime;
 }
 
 // Resolves the PCH of jobs, as the threads that serve connections do
@@ -4948,7 +5027,7 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
     ResolveRequest * request = static_cast<ResolveRequest *>( param );
     while ( request->m_Go->Load() == false )
     {
-        Thread::Sleep( 0 );
+        Thread::Sleep( 1 );
     }
     const Timer timer;
     for ( ;; )
@@ -4979,44 +5058,41 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
 //------------------------------------------------------------------------------
 void TestDistributed::PchIsStoredCompressed() const
 {
-    Array<char> content;
-    MakeTestContent( ( 3 * MEGABYTE ) + 5, 1, content );
-    Compressor compressed;
-    compressed.CompressZstd( content.Begin(), content.GetSize(), Compressor::kZstdTransferLevel );
-    const uint32_t compressedSize = (uint32_t)compressed.GetResultSize();
-    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
-    TEST_ASSERT( compressedSize < ( content.GetSize() / 4 ) );
+    CompressedPch pch;
+    MakeCompressedPch( ( 3 * MEGABYTE ) + 5, 1, pch );
+    TEST_ASSERT( pch.m_CompressedSize < ( pch.m_Content.GetSize() / 4 ) );
 
     Server worker( 1 );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
     PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
-    TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) ) );
+    TEST_ASSERT( SendPch( sender, pch ) );
     AStackString<> storedFile;
-    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, storedFile ); } ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pch.m_Id, storedFile ); } ) );
 
     // What is kept is what was sent, in a file that says how it is stored
     TEST_ASSERT( storedFile.EndsWith( PchBlob::kStoredFileName ) );
     Array<char> onDisk;
     TEST_ASSERT( LoadFile( storedFile, onDisk ) );
-    TEST_ASSERT( onDisk.GetSize() == compressedSize );
-    TEST_ASSERT( memcmp( onDisk.Begin(), compressed.GetResult(), compressedSize ) == 0 );
+    TEST_ASSERT( onDisk.GetSize() == pch.m_CompressedSize );
+    TEST_ASSERT( memcmp( onDisk.Begin(), pch.m_Compressed.GetResult(), pch.m_CompressedSize ) == 0 );
     {
         MutexHolder mh( worker.m_PchCacheMutex );
         TEST_ASSERT( worker.m_PchCache.GetSize() == 1 );
-        TEST_ASSERT( worker.m_PchCache[ 0 ].size == compressedSize );
-    }
+        TEST_ASSERT( worker.m_PchCache[ 0 ].size == pch.m_CompressedSize );
 
-    // No working copy is made until a job needs one, and nothing else is on disk
+        // A working copy is made for a job, and no job has asked: none is made or asked for
+        TEST_ASSERT( worker.m_PchRaw.IsEmpty() );
+        TEST_ASSERT( worker.m_PchUnpackQueue.IsEmpty() );
+    }
     AStackString<> rawFile;
     TEST_ASSERT( Server::GetRawPchPath( storedFile, rawFile ) );
-    AStackString<> dir;
-    GetWorkerPchDir( pchId, dir );
-    Thread::Sleep( 100 ); // Time for one to be made, were it going to be
     TEST_ASSERT( FileIO::FileExists( rawFile.Get() ) == false );
+    AStackString<> dir;
+    GetWorkerPchDir( pch.m_Id, dir );
     TEST_ASSERT( CountFilesIn( dir ) == 1 );
     TEST_ASSERT( worker.m_NumPchsUnpacked.Load() == 0 );
-    TEST_ASSERT( HasRawEntry( worker, pchId ) == false );
+    TEST_ASSERT( worker.m_NumPchUnpackAttempts.Load() == 0 );
 }
 
 // PchIsUnpackedWhenAJobNeedsIt
@@ -5047,13 +5123,12 @@ void TestDistributed::PchIsUnpackedWhenAJobNeedsIt() const
     AStackString<> dir( pch.m_StoredFile.Get(), pch.m_StoredFile.FindLast( NATIVE_SLASH ) + 1 );
     TEST_ASSERT( CountFilesIn( dir ) == 2 );
 
-    // A copy that was removed is made again
-    FileIO::FileDelete( pch.m_RawFile.Get() );
+    // The next job is given the copy that is there, and nothing is unpacked for it
     Job * another = MakePchJob( s, pch.m_Id );
-    TEST_ASSERT( s.TryResolvePch( *another ) == false );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *another ); } ) );
-    TEST_ASSERT( FileIO::FileExists( pch.m_RawFile.Get() ) );
-    TEST_ASSERT( s.m_NumPchsUnpacked.Load() == 2 );
+    TEST_ASSERT( s.TryResolvePch( *another ) );
+    TEST_ASSERT( another->GetPchCachePath() == pch.m_RawFile );
+    TEST_ASSERT( s.m_NumPchsUnpacked.Load() == 1 );
+    TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 1 );
 
     FDELETE another;
     FDELETE job;
@@ -5063,27 +5138,34 @@ void TestDistributed::PchIsUnpackedWhenAJobNeedsIt() const
 //------------------------------------------------------------------------------
 void TestDistributed::PchThatCannotBeUnpackedIsDropped() const
 {
-    Array<char> content;
-    MakeTestContent( ( 2 * MEGABYTE ) + 3, 3, content );
-    Compressor compressed;
-    compressed.CompressZstd( content.Begin(), content.GetSize(), Compressor::kZstdTransferLevel );
-    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
-    Array<char> other;
-    MakeTestContent( ( 2 * MEGABYTE ) + 3, 4, other );
-    Compressor otherCompressed;
-    otherCompressed.CompressZstd( other.Begin(), other.GetSize(), Compressor::kZstdTransferLevel );
+    CompressedPch pch;
+    MakeCompressedPch( ( 2 * MEGABYTE ) + 3, 3, pch );
+    CompressedPch other;
+    MakeCompressedPch( ( 2 * MEGABYTE ) + 3, 4, other );
+    Compressor lz4;
+    lz4.Compress( pch.m_Content.Begin(), pch.m_Content.GetSize(), 1 );
 
-    enum Case { OTHER_PCH, DAMAGED, TRUNCATED, MISSING, CANNOT_WRITE, NUM_CASES };
+    // What is stored under the id of the PCH, and indexed, that is not it
+    enum Case { OTHER_PCH, DAMAGED, TRUNCATED, EMPTY, LZ4, MISSING, NUM_CASES };
     for ( uint32_t which = 0; which < NUM_CASES; ++which )
     {
         Server s( 1 );
-        const uint64_t id = ( pchId + which );
 
-        // What is on disk, that is indexed as a PCH
         Array<char> blob;
-        const Compressor & source = ( which == OTHER_PCH ) ? otherCompressed : compressed;
-        blob.SetSize( source.GetResultSize() );
-        memcpy( blob.Begin(), source.GetResult(), blob.GetSize() );
+        const void * source = pch.m_Compressed.GetResult();
+        size_t sourceSize = pch.m_CompressedSize;
+        if ( which == OTHER_PCH )
+        {
+            source = other.m_Compressed.GetResult();
+            sourceSize = other.m_CompressedSize;
+        }
+        else if ( which == LZ4 )
+        {
+            source = lz4.GetResult();
+            sourceSize = lz4.GetResultSize();
+        }
+        blob.SetSize( sourceSize );
+        memcpy( blob.Begin(), source, sourceSize );
         if ( which == DAMAGED )
         {
             for ( size_t i = ( Compressor::kHeaderSize + 100 ); i < blob.GetSize(); i += ( blob.GetSize() / 9 ) )
@@ -5095,45 +5177,127 @@ void TestDistributed::PchThatCannotBeUnpackedIsDropped() const
         {
             blob.SetSize( blob.GetSize() / 2 );
         }
+        else if ( which == EMPTY )
+        {
+            blob.SetSize( 0 );
+        }
         AStackString<> storedFile;
-        AddStoredBlob( s, id, blob.Begin(), blob.GetSize(), ( which != MISSING ), storedFile );
+        AddStoredBlob( s, pch.m_Id, blob.Begin(), blob.GetSize(), ( which != MISSING ), storedFile );
         AStackString<> rawFile;
         TEST_ASSERT( Server::GetRawPchPath( storedFile, rawFile ) );
         AStackString<> dir( storedFile.Get(), storedFile.FindLast( NATIVE_SLASH ) + 1 );
-        if ( which == CANNOT_WRITE )
-        {
-            TEST_ASSERT( FileIO::EnsurePathExists( rawFile ) ); // A directory where the copy goes
-        }
 
         // The job waits, as it does for a PCH that is not there, and is not given a copy
-        Job * job = MakePchJob( s, id );
+        Job * job = MakePchJob( s, pch.m_Id );
         TEST_ASSERT( s.TryResolvePch( *job ) == false );
-        TEST_ASSERT( WaitUntil( [ & ]() { return ( s.IsPchCached( id ) == false ); } ) );
-        TEST_ASSERT( WaitUntil( [ & ]() { return ( s.m_PchUnpackQueue.IsEmpty() && ( IsPchUnpacked( s, id ) == false ) ); } ) );
+        TEST_ASSERT( WaitUntil( [ & ]() { return ( s.IsPchCached( pch.m_Id ) == false ); } ) );
+        TEST_ASSERT( WaitUntil( [ & ]() { return ( s.m_PchUnpackQueue.IsEmpty() && ( IsPchBeingUnpacked( s, pch.m_Id ) == false ) ); } ) );
         TEST_ASSERT( s.TryResolvePch( *job ) == false );
         TEST_ASSERT( job->GetPchCachePath().IsEmpty() );
         TEST_ASSERT( s.m_NumPchsUnpacked.Load() == 0 );
 
+        // A damaged PCH is not unpacked again, as it would be no better
+        TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 1 );
+
         // It is not kept, nor are pieces of it: the PCH can be sent again
         TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) == false );
-        Array<AString> left;
-        FileIO::GetFiles( dir, AStackString( "unpack.*" ), true, &left );
-        TEST_ASSERT( left.IsEmpty() );
-        if ( which != CANNOT_WRITE )
-        {
-            TEST_ASSERT( FileIO::FileExists( rawFile.Get() ) == false );
-            TEST_ASSERT( FileIO::DirectoryExists( dir ) == false );
-        }
-        else
-        {
-            TEST_ASSERT( FileIO::DirectoryDelete( rawFile ) );
-        }
+        TEST_ASSERT( FileIO::FileExists( rawFile.Get() ) == false );
+        TEST_ASSERT( FileIO::DirectoryExists( dir ) == false );
 
         // The job still holds its PCH, until it is gone
-        TEST_ASSERT( NumLeases( s, id ) == 1 );
+        TEST_ASSERT( NumLeases( s, pch.m_Id ) == 1 );
         FDELETE job;
-        TEST_ASSERT( HasRawEntry( s, id ) == false );
+        TEST_ASSERT( HasRawEntry( s, pch.m_Id ) == false );
     }
+}
+
+// PchThatCannotBeWrittenIsKept
+//------------------------------------------------------------------------------
+void TestDistributed::PchThatCannotBeWrittenIsKept() const
+{
+    Server s( 1 );
+
+    // A working copy nothing uses, which makes room when there is none
+    StoredPch idle;
+    AddStoredPch( s, 100000, 14, idle );
+    {
+        Job * job = MakePchJob( s, idle.m_Id );
+        TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
+        FDELETE job;
+    }
+    TEST_ASSERT( FileIO::FileExists( idle.m_RawFile.Get() ) );
+    TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 1 );
+
+    // The PCH of a job that is good, but its working copy cannot be written: a directory is where it goes
+    StoredPch pch;
+    AddStoredPch( s, ( 2 * MEGABYTE ) + 3, 15, pch );
+    TEST_ASSERT( FileIO::EnsurePathExists( pch.m_RawFile ) );
+    Job * job = MakePchJob( s, pch.m_Id );
+    TEST_ASSERT( s.TryResolvePch( *job ) == false );
+    TEST_ASSERT( WaitUntil( [ & ]() { return ( s.m_PchUnpackQueue.IsEmpty() && ( IsPchBeingUnpacked( s, pch.m_Id ) == false ) ); } ) );
+
+    // It was tried again once the copies nothing uses were gone
+    TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 3 );
+    TEST_ASSERT( FileIO::FileExists( idle.m_RawFile.Get() ) == false );
+    TEST_ASSERT( HasRawEntry( s, idle.m_Id ) == false );
+    TEST_ASSERT( s.m_NumPchsUnpacked.Load() == 1 );
+
+    // The PCH is good, so it is kept, and nothing is left of the attempts. Sending it again would not help.
+    TEST_ASSERT( s.IsPchCached( pch.m_Id ) );
+    TEST_ASSERT( FileIO::FileExists( pch.m_StoredFile.Get() ) );
+    AStackString<> dir( pch.m_StoredFile.Get(), pch.m_StoredFile.FindLast( NATIVE_SLASH ) + 1 );
+    Array<AString> left;
+    FileIO::GetFiles( dir, AStackString( "unpack.*" ), true, &left );
+    TEST_ASSERT( left.IsEmpty() );
+    TEST_ASSERT( job->GetPchCachePath().IsEmpty() );
+    TEST_ASSERT( NumLeases( s, pch.m_Id ) == 1 );
+    FDELETE job;
+    TEST_ASSERT( HasRawEntry( s, pch.m_Id ) == false );
+
+    // With room, the next job is given its copy
+    TEST_ASSERT( FileIO::DirectoryDelete( pch.m_RawFile ) );
+    Job * next = MakePchJob( s, pch.m_Id );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *next ); } ) );
+    TEST_ASSERT( FileIO::FileExists( pch.m_RawFile.Get() ) );
+    FDELETE next;
+}
+
+// PchThatCannotBeWrittenReturnsItsJobs
+//------------------------------------------------------------------------------
+void TestDistributed::PchThatCannotBeWrittenReturnsItsJobs() const
+{
+    CapturedJob captured;
+    CapturePchJob( captured );
+    CompressedPch pch;
+    MakeCompressedPch( 200000, 8, pch );
+    const CapturedJob job = WithPch( captured, pch.m_Id );
+
+    // The worker has the PCH, but cannot write a working copy of it: a directory is where it goes
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+    AStackString<> storedFile;
+    AddStoredBlob( s, pch.m_Id, pch.m_Compressed.GetResult(), pch.m_CompressedSize, true, storedFile );
+    AStackString<> rawFile;
+    TEST_ASSERT( Server::GetRawPchPath( storedFile, rawFile ) );
+    TEST_ASSERT( FileIO::EnsurePathExists( rawFile ) );
+
+    // A job for it cannot be built here, so the client has it back: a PCH the client sends again would
+    // be as good as the one the worker has, and no better
+    HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectAndHandshake( probe, Protocol::kCapabilities, ci, kWaitTimeoutSeconds ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
+    TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 2 ); // Once more, with the unused copies gone
+    TEST_ASSERT( s.IsPchCached( pch.m_Id ) );
+    TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) );
+
+    // Its jobs went with it, and their hold on the PCH
+    TEST_ASSERT( WaitUntil( [ & ]() { return ( CountWaitingJobs( s ) == 0 ) && ( TotalLeases( s ) == 0 ); } ) );
+    TEST_ASSERT( HasRawEntry( s, pch.m_Id ) == false );
+    TEST_ASSERT( FileIO::DirectoryDelete( rawFile ) );
 }
 
 // CorruptPchIsAskedForAgain
@@ -5142,27 +5306,22 @@ void TestDistributed::CorruptPchIsAskedForAgain() const
 {
     CapturedJob captured;
     CapturePchJob( captured );
-
-    Array<char> content;
-    MakeTestContent( 200000, 5, content );
-    Compressor compressed;
-    compressed.CompressZstd( content.Begin(), content.GetSize(), Compressor::kZstdTransferLevel );
-    const uint32_t compressedSize = (uint32_t)compressed.GetResultSize();
-    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
-    const CapturedJob job = WithPch( captured, pchId );
+    CompressedPch pch;
+    MakeCompressedPch( 200000, 5, pch );
+    const CapturedJob job = WithPch( captured, pch.m_Id );
 
     // The worker has a file that is not the PCH, as it indexed it
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
     Array<char> damaged;
-    damaged.SetSize( compressedSize );
-    memcpy( damaged.Begin(), compressed.GetResult(), compressedSize );
+    damaged.SetSize( pch.m_CompressedSize );
+    memcpy( damaged.Begin(), pch.m_Compressed.GetResult(), pch.m_CompressedSize );
     for ( size_t i = ( Compressor::kHeaderSize + 50 ); i < damaged.GetSize(); i += ( damaged.GetSize() / 7 ) )
     {
         damaged[ i ] = (char)( damaged[ i ] ^ 0x33 );
     }
     AStackString<> storedFile;
-    AddStoredBlob( s, pchId, damaged.Begin(), damaged.GetSize(), true, storedFile );
+    AddStoredBlob( s, pch.m_Id, damaged.Begin(), damaged.GetSize(), true, storedFile );
 
     // A job for it finds out, and the client is asked for the PCH
     HandshakeProbe probe;
@@ -5171,21 +5330,65 @@ void TestDistributed::CorruptPchIsAskedForAgain() const
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
     TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() >= 1 ); } ) );
-    TEST_ASSERT( probe.GetPchNeededId( 0 ) == pchId );
-    TEST_ASSERT( s.IsPchCached( pchId ) == false );
+    TEST_ASSERT( probe.GetPchNeededId( 0 ) == pch.m_Id );
+    TEST_ASSERT( s.IsPchCached( pch.m_Id ) == false );
     TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) == false );
     TEST_ASSERT( CountWaitingJobs( s ) == 1 );
-    TEST_ASSERT( IsPchUnpacked( s, pchId ) == false );
+    TEST_ASSERT( NumWaitingJobsWithAPch( s ) == 0 );
+    TEST_ASSERT( IsPchUnpacked( s, pch.m_Id ) == false );
 
-    // Sent again, it is unpacked for the job that is waiting, and the client is not asked again
+    // Sent again, it is unpacked for the job that is waiting
     PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
-    TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return IsPchUnpacked( s, pchId ); } ) );
+    TEST_ASSERT( SendPch( sender, pch ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return ( NumWaitingJobsWithAPch( s ) == 1 ); } ) );
+    TEST_ASSERT( IsPchUnpacked( s, pch.m_Id ) );
     TEST_ASSERT( CountWaitingJobs( s ) == 1 ); // For its toolchain, which never comes
+    TEST_ASSERT( s.IsPchCached( pch.m_Id ) );
+
+    // and the client is not asked again: whatever the worker sent before it answers this was sent by then
+    TEST_ASSERT( Handshake( probe, ci, Protocol::kCapabilities, kWaitTimeoutSeconds ) );
     TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
-    TEST_ASSERT( s.IsPchCached( pchId ) );
     probe.ShutdownAllConnections();
+}
+
+// CorruptPchIsReturnedToAClientThatCannotAsk
+//------------------------------------------------------------------------------
+void TestDistributed::CorruptPchIsReturnedToAClientThatCannotAsk() const
+{
+    CapturedJob captured;
+    CapturePchJob( captured );
+    CompressedPch pch;
+    MakeCompressedPch( 200000, 9, pch );
+    const CapturedJob job = WithPch( captured, pch.m_Id );
+
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+    Array<char> damaged;
+    damaged.SetSize( pch.m_CompressedSize );
+    memcpy( damaged.Begin(), pch.m_Compressed.GetResult(), pch.m_CompressedSize );
+    for ( size_t i = ( Compressor::kHeaderSize + 50 ); i < damaged.GetSize(); i += ( damaged.GetSize() / 7 ) )
+    {
+        damaged[ i ] = (char)( damaged[ i ] ^ 0x33 );
+    }
+    AStackString<> storedFile;
+    AddStoredBlob( s, pch.m_Id, damaged.Begin(), damaged.GetSize(), true, storedFile );
+
+    // A client of 24.0 cannot be asked for the PCH, so it would wait for ever: its jobs are given back
+    HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    const uint32_t capabilities24_0 = ( Protocol::CAP_PCH_INVENTORY | Protocol::CAP_TOOLCHAIN_INVENTORY );
+    TEST_ASSERT( ConnectAndHandshake( probe, capabilities24_0, ci, kWaitTimeoutSeconds ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
+
+    // The PCH that is not good is gone, and the jobs and their hold on it with the connection
+    TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 1 );
+    TEST_ASSERT( s.IsPchCached( pch.m_Id ) == false );
+    TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) == false );
+    TEST_ASSERT( WaitUntil( [ & ]() { return ( CountWaitingJobs( s ) == 0 ) && ( TotalLeases( s ) == 0 ); } ) );
 }
 
 // PchUnpackIsSingleFlight
@@ -5290,18 +5493,34 @@ void TestDistributed::UnpackedCopyLivesWithItsJobs() const
     FDELETE d;
 }
 
+// FileTimeOfSeconds
+//------------------------------------------------------------------------------
+namespace
+{
+    // File time ticks in some seconds
+    uint64_t FileTimeOfSeconds( uint32_t seconds )
+    {
+        uint64_t ticksPerSecond = 1;
+        while ( Time::FileTimeToSeconds( ticksPerSecond ) == 0 )
+        {
+            ticksPerSecond *= 10;
+        }
+        return ( ticksPerSecond * seconds );
+    }
+}
+
 // UnusedCopiesAreKeptToABudget
 //------------------------------------------------------------------------------
 void TestDistributed::UnusedCopiesAreKeptToABudget() const
 {
-    auto makeEntry = []( uint64_t id, Server::PchRawEntry::State state, uint32_t numLeases, uint64_t lastUsed )
+    auto makeEntry = []( uint64_t id, Server::PchRawEntry::State state, uint32_t numLeases, uint32_t lastUsedSeconds )
     {
         Server::PchRawEntry e;
         e.pchId = id;
         e.state = state;
         e.numLeases = numLeases;
         e.size = 100;
-        e.lastUsed = lastUsed;
+        e.lastUsed = FileTimeOfSeconds( lastUsedSeconds );
         return e;
     };
     Array<Server::PchRawEntry> entries;
@@ -5315,35 +5534,35 @@ void TestDistributed::UnusedCopiesAreKeptToABudget() const
     auto trimmedId = [ & ]( size_t n ) { return entries[ trims[ n ] ].pchId; };
 
     // Room for all three that nothing uses: nothing goes
-    Server::SelectRawPchTrims( entries, 300, 0, trims );
+    Server::SelectRawPchTrims( entries, 300, 0, 0, trims );
     TEST_ASSERT( trims.IsEmpty() );
 
     // Room for two: the one used longest ago goes
-    Server::SelectRawPchTrims( entries, 200, 0, trims );
+    Server::SelectRawPchTrims( entries, 200, 0, 0, trims );
     TEST_ASSERT( trims.GetSize() == 1 );
     TEST_ASSERT( trimmedId( 0 ) == 2 );
 
     // Room for one: the two used longest ago go, the older first
-    Server::SelectRawPchTrims( entries, 100, 0, trims );
+    Server::SelectRawPchTrims( entries, 100, 0, 0, trims );
     TEST_ASSERT( trims.GetSize() == 2 );
     TEST_ASSERT( trimmedId( 0 ) == 2 );
     TEST_ASSERT( trimmedId( 1 ) == 3 );
 
     // Room for none: all that nothing uses go, and what is used or not a copy never does
-    Server::SelectRawPchTrims( entries, 0, 0, trims );
+    Server::SelectRawPchTrims( entries, 0, 0, 0, trims );
     TEST_ASSERT( trims.GetSize() == 3 );
     for ( size_t n = 0; n < trims.GetSize(); ++n )
     {
         TEST_ASSERT( ( trimmedId( n ) == 1 ) || ( trimmedId( n ) == 2 ) || ( trimmedId( n ) == 3 ) );
     }
 
-    // Those not used since before a time go, however much room there is
-    Server::SelectRawPchTrims( entries, 1000, 250, trims );
-    TEST_ASSERT( trims.GetSize() == 2 );
+    // Those not used for more than a time go, however much room there is
+    Server::SelectRawPchTrims( entries, 1000, FileTimeOfSeconds( 330 ), 60, trims );
+    TEST_ASSERT( trims.GetSize() == 2 ); // Used 230 and 130 seconds ago, and not 30
     TEST_ASSERT( trimmedId( 0 ) == 2 );
     TEST_ASSERT( trimmedId( 1 ) == 3 );
-    Server::SelectRawPchTrims( entries, 1000, 100, trims );
-    TEST_ASSERT( trims.IsEmpty() ); // Used at 100 is not before 100
+    Server::SelectRawPchTrims( entries, 1000, FileTimeOfSeconds( 160 ), 60, trims );
+    TEST_ASSERT( trims.IsEmpty() ); // Used 60 seconds ago is not more than 60
 }
 
 // UnusedCopiesGoWhenIdle
@@ -5359,17 +5578,12 @@ void TestDistributed::UnusedCopiesGoWhenIdle() const
     FDELETE job;
 
     // Kept a while for the next job
-#if defined( __WINDOWS__ )
-    const uint64_t kSecond = 10000000ull;
-#else
-    const uint64_t kSecond = 1000000000ull;
-#endif
     const uint64_t now = Time::GetCurrentFileTime();
-    s.TrimRawPchs( now + ( ( Server::kRawPchIdleSeconds - 10 ) * kSecond ) );
+    s.TrimRawPchs( now + FileTimeOfSeconds( Server::kRawPchIdleSeconds - 10 ) );
     TEST_ASSERT( FileIO::FileExists( pch.m_RawFile.Get() ) );
 
     // And removed when it is not used for long: the disk is not held for builds that are over
-    s.TrimRawPchs( now + ( ( Server::kRawPchIdleSeconds + 10 ) * kSecond ) );
+    s.TrimRawPchs( now + FileTimeOfSeconds( Server::kRawPchIdleSeconds + 10 ) );
     TEST_ASSERT( FileIO::FileExists( pch.m_RawFile.Get() ) == false );
     TEST_ASSERT( HasRawEntry( s, pch.m_Id ) == false );
     TEST_ASSERT( s.IsPchCached( pch.m_Id ) );
@@ -5379,14 +5593,10 @@ void TestDistributed::UnusedCopiesGoWhenIdle() const
 //------------------------------------------------------------------------------
 void TestDistributed::LeasedPchIsNotEvicted() const
 {
-    Array<char> contents[ 3 ];
-    Compressor compressed[ 3 ];
-    uint64_t pchIds[ 3 ];
+    CompressedPch pchs[ 3 ];
     for ( uint32_t i = 0; i < 3; ++i )
     {
-        MakeTestContent( 100000, ( 51 + i ), contents[ i ] );
-        compressed[ i ].CompressZstd( contents[ i ].Begin(), contents[ i ].GetSize(), Compressor::kZstdTransferLevel );
-        pchIds[ i ] = PchId::Calc( contents[ i ].Begin(), contents[ i ].GetSize() );
+        MakeCompressedPch( 100000, ( 51 + i ), pchs[ i ] );
     }
 
     Server s( 1 );
@@ -5394,120 +5604,82 @@ void TestDistributed::LeasedPchIsNotEvicted() const
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
     PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
-    auto sendPch = [ & ]( uint32_t i )
-    {
-        const uint32_t compressedSize = (uint32_t)compressed[ i ].GetResultSize();
-        return sender.SendChunks( pchIds[ i ], (uint32_t)contents[ i ].GetSize(), compressed[ i ].GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) );
-    };
 
-    // A job needs the first. A second arrives, and there is room for one: the first stays, as a job needs it.
-    TEST_ASSERT( sendPch( 0 ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 0 ] ); } ) );
-    Job * job = MakePchJob( s, pchIds[ 0 ] );
-    Thread::Sleep( 20 ); // File times have a limited resolution
-    TEST_ASSERT( sendPch( 1 ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 1 ] ); } ) );
-    TEST_ASSERT( s.IsPchCached( pchIds[ 0 ] ) );
+    // A job needs the first, which is the least recently used. A second arrives, and there is room for one:
+    // the first is the only one that could go, and stays, as a job needs it.
+    TEST_ASSERT( SendPch( sender, pchs[ 0 ] ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
+    SetPchRecency( s, pchs[ 0 ].m_Id, 1 );
+    Job * job = MakePchJob( s, pchs[ 0 ].m_Id );
+    TEST_ASSERT( SendPch( sender, pchs[ 1 ] ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ); } ) );
+    TEST_ASSERT( s.IsPchCached( pchs[ 0 ].m_Id ) );
+    SetPchRecency( s, pchs[ 1 ].m_Id, 2 );
 
     // The job is gone. A third arrives, and the other two go, the first being the oldest.
     FDELETE job;
-    Thread::Sleep( 20 );
-    TEST_ASSERT( sendPch( 2 ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 2 ] ); } ) );
-    TEST_ASSERT( s.IsPchCached( pchIds[ 0 ] ) == false );
-    TEST_ASSERT( s.IsPchCached( pchIds[ 1 ] ) == false );
+    TEST_ASSERT( SendPch( sender, pchs[ 2 ] ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 2 ].m_Id ); } ) );
+    TEST_ASSERT( s.IsPchCached( pchs[ 0 ].m_Id ) == false );
+    TEST_ASSERT( s.IsPchCached( pchs[ 1 ].m_Id ) == false );
 }
 
 // PchsAreEvictedByRecency
 //------------------------------------------------------------------------------
 void TestDistributed::PchsAreEvictedByRecency() const
 {
-    Array<char> contents[ 3 ];
-    Compressor compressed[ 3 ];
-    uint64_t pchIds[ 3 ];
+    CompressedPch pchs[ 3 ];
     for ( uint32_t i = 0; i < 3; ++i )
     {
-        MakeTestContent( 100000, ( 61 + i ), contents[ i ] );
-        compressed[ i ].CompressZstd( contents[ i ].Begin(), contents[ i ].GetSize(), Compressor::kZstdTransferLevel );
-        pchIds[ i ] = PchId::Calc( contents[ i ].Begin(), contents[ i ].GetSize() );
+        MakeCompressedPch( 100000, ( 61 + i ), pchs[ i ] );
     }
     // Room for the first and either of the others, counted as they are stored, but not all three
-    const uint64_t budget = Math::Max( compressed[ 0 ].GetResultSize() + compressed[ 1 ].GetResultSize(),
-                                       compressed[ 0 ].GetResultSize() + compressed[ 2 ].GetResultSize() );
-    TEST_ASSERT( budget < ( compressed[ 0 ].GetResultSize() + compressed[ 1 ].GetResultSize() + compressed[ 2 ].GetResultSize() ) );
+    const uint64_t budget = Math::Max( pchs[ 0 ].m_CompressedSize + pchs[ 1 ].m_CompressedSize,
+                                       pchs[ 0 ].m_CompressedSize + pchs[ 2 ].m_CompressedSize );
+    TEST_ASSERT( budget < ( pchs[ 0 ].m_CompressedSize + pchs[ 1 ].m_CompressedSize + pchs[ 2 ].m_CompressedSize ) );
     Server s( 1 );
     SetPchCacheLimits( s, budget, 0 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
     PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
-    auto sendPch = [ & ]( uint32_t i )
-    {
-        const uint32_t compressedSize = (uint32_t)compressed[ i ].GetResultSize();
-        return sender.SendChunks( pchIds[ i ], (uint32_t)contents[ i ].GetSize(), compressed[ i ].GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) );
-    };
-    TEST_ASSERT( sendPch( 0 ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 0 ] ); } ) );
-    Thread::Sleep( 20 );
-    TEST_ASSERT( sendPch( 1 ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 1 ] ); } ) );
-    TEST_ASSERT( s.IsPchCached( pchIds[ 0 ] ) ); // Both fit
+    TEST_ASSERT( SendPch( sender, pchs[ 0 ] ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
+    SetPchRecency( s, pchs[ 0 ].m_Id, 1 );
+    TEST_ASSERT( SendPch( sender, pchs[ 1 ] ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ); } ) );
+    TEST_ASSERT( s.IsPchCached( pchs[ 0 ].m_Id ) ); // Both fit
+    SetPchRecency( s, pchs[ 1 ].m_Id, 2 );
 
     // The first is used again, so the second is the one that is not
-    Thread::Sleep( 20 );
     AStackString<> path;
-    TEST_ASSERT( s.FindCachedPch( pchIds[ 0 ], path ) );
-    Thread::Sleep( 20 );
-    TEST_ASSERT( sendPch( 2 ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ 2 ] ); } ) );
-    TEST_ASSERT( s.IsPchCached( pchIds[ 0 ] ) );
-    TEST_ASSERT( s.IsPchCached( pchIds[ 1 ] ) == false );
+    TEST_ASSERT( s.FindCachedPch( pchs[ 0 ].m_Id, path ) );
+    TEST_ASSERT( SendPch( sender, pchs[ 2 ] ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 2 ].m_Id ); } ) );
+    TEST_ASSERT( s.IsPchCached( pchs[ 0 ].m_Id ) );
+    TEST_ASSERT( s.IsPchCached( pchs[ 1 ].m_Id ) == false );
 }
 
-// CompressedBytesCountTowardsTheBudget
+// UnusedCopyGoesWhenTheFreeSpaceIsUnknown
 //------------------------------------------------------------------------------
-void TestDistributed::CompressedBytesCountTowardsTheBudget() const
+void TestDistributed::UnusedCopyGoesWhenTheFreeSpaceIsUnknown() const
 {
-    // PCHs that are large unpacked and small as they are stored
-    const uint32_t kNumPchs = 6;
-    const uint32_t kRawSize = ( 4 * MEGABYTE );
-    Array<char> contents[ kNumPchs ];
-    Compressor compressed[ kNumPchs ];
-    uint64_t pchIds[ kNumPchs ];
-    uint64_t totalStored = 0;
-    for ( uint32_t i = 0; i < kNumPchs; ++i )
-    {
-        contents[ i ].SetSize( kRawSize );
-        for ( uint32_t b = 0; b < kRawSize; ++b )
-        {
-            contents[ i ][ b ] = (char)( 'a' + ( ( b / 1024 ) % ( 3 + i ) ) );
-        }
-        compressed[ i ].CompressZstd( contents[ i ].Begin(), kRawSize, Compressor::kZstdTransferLevel );
-        pchIds[ i ] = PchId::Calc( contents[ i ].Begin(), kRawSize );
-        totalStored += compressed[ i ].GetResultSize();
-    }
-
-    // The budget is between what they take stored and what they would take unpacked
-    const uint64_t budget = ( 1 * MEGABYTE );
-    TEST_ASSERT( totalStored < budget );
-    TEST_ASSERT( ( (uint64_t)kNumPchs * kRawSize ) > ( 10 * budget ) );
     Server s( 1 );
-    SetPchCacheLimits( s, budget, 0 );
-    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-    PchSender sender;
-    TEST_ASSERT( sender.ConnectToWorker() );
-    for ( uint32_t i = 0; i < kNumPchs; ++i )
-    {
-        const uint32_t compressedSize = (uint32_t)compressed[ i ].GetResultSize();
-        TEST_ASSERT( sender.SendChunks( pchIds[ i ], kRawSize, compressed[ i ].GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) ) );
-        TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ i ] ); } ) );
-    }
+    SetPchCacheLimitsUnknown( s ); // Nothing is kept for later, to be safe
+    StoredPch pch;
+    AddStoredPch( s, ( 1 * MEGABYTE ), 16, pch );
+    Job * job = MakePchJob( s, pch.m_Id );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
 
-    // All of them are kept, and what the cache says it holds is what is on disk
-    for ( uint32_t i = 0; i < kNumPchs; ++i )
-    {
-        TEST_ASSERT( s.IsPchCached( pchIds[ i ] ) );
-    }
-    TEST_ASSERT( s_LastCacheBytes.Load() == totalStored );
+    // It stays for as long as the job needs it
+    s.TrimRawPchs( Time::GetCurrentFileTime() );
+    TEST_ASSERT( FileIO::FileExists( pch.m_RawFile.Get() ) );
+
+    // and goes with the last job
+    FDELETE job;
+    s.TrimRawPchs( Time::GetCurrentFileTime() );
+    TEST_ASSERT( FileIO::FileExists( pch.m_RawFile.Get() ) == false );
+    TEST_ASSERT( HasRawEntry( s, pch.m_Id ) == false );
+    TEST_ASSERT( s.IsPchCached( pch.m_Id ) );
 }
 
 // PchStartupScanKeepsTheCompressedStore
@@ -5516,15 +5688,30 @@ void TestDistributed::PchStartupScanKeepsTheCompressedStore() const
 {
     AStackString<> root;
     VERIFY( FBuild::GetWorkerCacheDir( root ) );
-    auto makeDir = [ & ]( uint64_t pchId, AString & outDir )
+    auto makeDirNamed = [ & ]( const char * name, AString & outDir )
     {
-        outDir.Format( "%spch.%016" PRIx64 "%c", root.Get(), pchId, (char)NATIVE_SLASH );
+        outDir.Format( "%s%s%c", root.Get(), name, (char)NATIVE_SLASH );
         Array<AString> old;
         FileIO::GetFiles( outDir, AStackString( "*" ), true, &old );
         for ( const AString & file : old )
         {
             FileIO::FileDelete( file.Get() );
         }
+    };
+    auto makeDir = [ & ]( uint64_t pchId, AString & outDir )
+    {
+        AStackString<> name;
+        name.Format( "pch.%016" PRIx64, pchId );
+        makeDirNamed( name.Get(), outDir );
+    };
+    auto makeFile = [ & ]( const AString & dir, const char * name, const void * data, size_t size, AString & outFile )
+    {
+        outFile = dir;
+        outFile += name;
+        FileStream f;
+        TEST_ASSERT( FileIO::EnsurePathExistsForFile( outFile ) );
+        TEST_ASSERT( f.Open( outFile.Get(), FileStream::WRITE_ONLY ) );
+        TEST_ASSERT( f.Write( data, size ) == size );
     };
 
     // A PCH with a working copy that was left, one with only the compressed file, one that a version
@@ -5548,23 +5735,56 @@ void TestDistributed::PchStartupScanKeepsTheCompressedStore() const
     name.Format( "unpack.%u.3.pch", Process::GetCurrentId() );
     TEST_ASSERT( MakeSmallFile( tempDir, name.Get(), own ) );
 
-    Server s( 1 );
+    // Compressed files that are not a PCH are indexed as the rest are: what a file holds is only found
+    // out when a job needs it
+    AStackString<> emptyDir, lz4Dir, emptyStored, lz4Stored;
+    makeDir( 0xB005, emptyDir );
+    makeDir( 0xB006, lz4Dir );
+    makeFile( emptyDir, PchBlob::kStoredFileName, nullptr, 0, emptyStored );
+    Array<char> content;
+    MakeTestContent( 5000, 1, content );
+    Compressor lz4;
+    lz4.Compress( content.Begin(), content.GetSize(), 1 );
+    makeFile( lz4Dir, PchBlob::kStoredFileName, lz4.GetResult(), lz4.GetResultSize(), lz4Stored );
+
+    // Files of those names that are not in the directory of a PCH are not the cache's
+    AStackString<> toolchainDir, namedDir, nestedParentDir, toolchainRaw, namedRaw, namedStored, nestedRaw;
+    makeDirNamed( "toolchain.00000000000000b7", toolchainDir );
+    makeDirNamed( "pch.notanid", namedDir );
+    makeDirNamed( "pch.00000000000000b8", nestedParentDir );
+    AStackString<> nestedDir( nestedParentDir );
+    nestedDir += "sub";
+    nestedDir += NATIVE_SLASH;
+    makeFile( toolchainDir, PchBlob::kRawFileName, "data", 5, toolchainRaw );
+    makeFile( namedDir, PchBlob::kRawFileName, "data", 5, namedRaw );
+    makeFile( namedDir, PchBlob::kStoredFileName, "data", 5, namedStored );
+    makeFile( nestedDir, PchBlob::kRawFileName, "data", 5, nestedRaw );
+
+    Server s( 1 ); // The scan is done by the time it is constructed
 
     // The compressed PCHs are in the cache, as their files say. Nothing else is.
     TEST_ASSERT( s.IsPchCached( 0xB001 ) );
     TEST_ASSERT( s.IsPchCached( 0xB002 ) );
     TEST_ASSERT( s.IsPchCached( 0xB003 ) == false );
     TEST_ASSERT( s.IsPchCached( 0xB004 ) );
+    TEST_ASSERT( s.IsPchCached( 0xB005 ) );
+    TEST_ASSERT( s.IsPchCached( 0xB006 ) );
+    TEST_ASSERT( s.IsPchCached( 0xB7 ) == false );
+    TEST_ASSERT( s.IsPchCached( 0xB8 ) == false );
     {
         MutexHolder mh( s.m_PchCacheMutex );
+        uint32_t numMatches = 0;
         for ( const Server::PchCacheEntry & e : s.m_PchCache )
         {
-            if ( ( e.pchId >= 0xB001 ) && ( e.pchId <= 0xB004 ) )
+            if ( ( e.pchId >= 0xB001 ) && ( e.pchId <= 0xB008 ) )
             {
-                TEST_ASSERT( e.size == 5 );
+                ++numMatches;
                 TEST_ASSERT( e.filePath.EndsWith( PchBlob::kStoredFileName ) );
+                const uint64_t expectedSize = ( e.pchId == 0xB005 ) ? 0 : ( e.pchId == 0xB006 ) ? lz4.GetResultSize() : 5;
+                TEST_ASSERT( e.size == expectedSize );
             }
         }
+        TEST_ASSERT( numMatches == 5 ); // Not the one with only a working copy
         TEST_ASSERT( s.m_PchRaw.IsEmpty() );
     }
 
@@ -5580,6 +5800,78 @@ void TestDistributed::PchStartupScanKeepsTheCompressedStore() const
     TEST_ASSERT( FileIO::FileExists( stale.Get() ) == false );
     TEST_ASSERT( FileIO::FileExists( running.Get() ) );
     TEST_ASSERT( FileIO::FileExists( own.Get() ) );
+
+    // What is not in a directory of a PCH is left alone
+    TEST_ASSERT( FileIO::FileExists( toolchainRaw.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( namedRaw.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( namedStored.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( nestedRaw.Get() ) );
+    FileIO::FileDelete( toolchainRaw.Get() );
+    FileIO::FileDelete( namedRaw.Get() );
+    FileIO::FileDelete( namedStored.Get() );
+    FileIO::FileDelete( nestedRaw.Get() );
+    auto removeDir = []( const AString & dir )
+    {
+        VERIFY( FileIO::DirectoryDelete( AStackString<>( dir.Get(), dir.Get() + dir.GetLength() - 1 ) ) ); // Without the slash
+    };
+    removeDir( toolchainDir );
+    removeDir( namedDir );
+    removeDir( nestedDir );
+    removeDir( nestedParentDir );
+}
+
+// PchOfAnotherCompressionIsNotStoredAgain
+//------------------------------------------------------------------------------
+void TestDistributed::PchOfAnotherCompressionIsNotStoredAgain() const
+{
+    CompressedPch pch;
+    MakeCompressedPch( ( 2 * MEGABYTE ) + 7, 17, pch );
+
+    // The same PCH, compressed harder: not the same file, as another coordinator may send it
+    Compressor harder;
+    harder.CompressZstd( pch.m_Content.Begin(), pch.m_Content.GetSize(), 19 );
+    const uint32_t harderSize = (uint32_t)harder.GetResultSize();
+    TEST_ASSERT( harderSize != pch.m_CompressedSize );
+
+    // A PCH sent after it on the same connection, which only arrives if the connection is still there
+    CompressedPch after;
+    MakeCompressedPch( 100000, 18, after );
+
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+    PchSender first;
+    TEST_ASSERT( first.ConnectToWorker() );
+    TEST_ASSERT( SendPch( first, pch ) );
+    AStackString<> storedFile;
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.FindCachedPch( pch.m_Id, storedFile ); } ) );
+
+    // A job is using it
+    Job * job = MakePchJob( s, pch.m_Id );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
+
+    PchSender second;
+    TEST_ASSERT( second.ConnectToWorker() );
+    TEST_ASSERT( second.SendChunks( pch.m_Id, (uint32_t)pch.m_Content.GetSize(), harder.GetResult(), harderSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( harderSize, Protocol::kPchChunkSize ) ) );
+    TEST_ASSERT( SendPch( second, after ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( after.m_Id ); } ) );
+
+    // It is the PCH it was: not replaced, and not counted as the size of the other
+    Array<char> onDisk;
+    TEST_ASSERT( LoadFile( storedFile, onDisk ) );
+    TEST_ASSERT( onDisk.GetSize() == pch.m_CompressedSize );
+    TEST_ASSERT( memcmp( onDisk.Begin(), pch.m_Compressed.GetResult(), pch.m_CompressedSize ) == 0 );
+    {
+        MutexHolder mh( s.m_PchCacheMutex );
+        TEST_ASSERT( s.m_PchCache.GetSize() == 2 );
+        const Server::PchCacheEntry * stored = s.FindStoredPch( pch.m_Id );
+        TEST_ASSERT( stored && ( stored->size == pch.m_CompressedSize ) );
+    }
+
+    // and what was sent is not left behind
+    AStackString<> dir;
+    GetWorkerPchDir( pch.m_Id, dir );
+    TEST_ASSERT( CountFilesIn( dir ) == 2 ); // The compressed PCH and its working copy
+    FDELETE job;
 }
 
 // PchStoreIsUsedThroughTheBuild
@@ -5642,6 +5934,7 @@ void TestDistributed::PchStoreIsUsedThroughTheBuild() const
         cleanOutput();
 
         Server worker( 1 );
+        SetPchCacheLimits( worker, ( 1ull << 30 ), 0, ( 1ull << 30 ) ); // Copies that nothing uses are kept: the check below is of one
         TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
         TEST_ASSERT( fBuild.Build( target ) );
         TEST_ASSERT( fBuild.SaveDependencyGraph( dbFile.Get() ) );
@@ -5694,8 +5987,9 @@ void TestDistributed::PchStoreIsUsedThroughTheBuild() const
         FileIO::FileDelete( target );
 
         Server worker( 1 );
+        SetPchCacheLimits( worker, ( 1ull << 30 ), 0, ( 1ull << 30 ) );
         TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
-        TEST_ASSERT( worker.IsPchCached( pchId ) );
+        TEST_ASSERT( worker.IsPchCached( pchId ) ); // The scan of the store is done by the time the worker is constructed
         TEST_ASSERT( fBuild.Build( target ) );
         TEST_ASSERT( worker.m_NumPchChunksReceived.Load() == 0 );
         TEST_ASSERT( worker.m_NumPchsUnpacked.Load() >= 1 ); // Made from the store, for the jobs
@@ -5706,6 +6000,89 @@ void TestDistributed::PchStoreIsUsedThroughTheBuild() const
             TEST_ASSERT( IsSameObject( built, first[ i ] ) );
         }
     }
+}
+
+// PchLeasesAreReleasedByEveryEnd
+//------------------------------------------------------------------------------
+void TestDistributed::PchLeasesAreReleasedByEveryEnd() const
+{
+    const char * target( "../tmp/Test/Distributed/distpch.lib" );
+    auto cleanOutput = []()
+    {
+        Array<AString> files;
+        FileIO::GetFiles( AStackString( "../tmp/Test/Distributed" ), AStackString( "*.*" ), true, &files );
+        for ( const AString & file : files )
+        {
+            FileIO::FileDelete( file.Get() );
+        }
+    };
+    auto noLeasesLeft = []( Server & server ) { return ( TotalLeases( server ) == 0 ); };
+
+    Server worker( 1 );
+    SetPchCacheLimits( worker, ( 1ull << 30 ), 0, ( 1ull << 30 ) );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    // A build that runs to its end
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_NoLocalConsumptionOfRemoteJobs = true; // The jobs need the PCH on the worker
+        options.m_AllowLocalRace = false;
+        options.m_ForceCleanBuild = true;
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+        cleanOutput();
+        TEST_ASSERT( fBuild.Build( target ) );
+    }
+    TEST_ASSERT( worker.m_NumPchUnpackAttempts.Load() >= 1 ); // The jobs did hold a PCH
+    TEST_ASSERT( WaitUntil( [ & ]() { return noLeasesLeft( worker ); } ) );
+
+    // A build whose connection is dropped under a job, which the coordinator builds again on a new one
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_NoLocalConsumptionOfRemoteJobs = true;
+        options.m_AllowLocalRace = false;
+        options.m_ForceCleanBuild = true;
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+        cleanOutput();
+
+        ConnectionDrop drop;
+        drop.m_Server = &worker;
+        Thread dropper;
+        dropper.Start( DropConnectionOnFirstJob, "DropConnection", &drop );
+        const bool built = fBuild.Build( target );
+        drop.m_Stop.Store( true );
+        dropper.Join();
+        TEST_ASSERT( drop.m_Dropped.Load() );
+        TEST_ASSERT( built );
+    }
+    TEST_ASSERT( WaitUntil( [ & ]() { return noLeasesLeft( worker ); } ) );
+
+    // A build that is stopped while a job is on the worker
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_NoLocalConsumptionOfRemoteJobs = true;
+        options.m_AllowLocalRace = false;
+        options.m_ForceCleanBuild = true;
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+        cleanOutput();
+
+        auto reached = [ &worker ]() { return WorkerIsBuildingAJob( worker ); };
+        BuildAborter aborter( reached, kWaitTimeoutSeconds );
+        fBuild.Build( target );
+        TEST_ASSERT( aborter.HasReached() );
+    }
+    TEST_ASSERT( WaitUntil( [ & ]() { return noLeasesLeft( worker ); } ) );
 }
 
 // RegressionTest_RemoteCrashOnErrorFormatting

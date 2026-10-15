@@ -32,6 +32,7 @@ private:
     void UnpackWritesTheCheckedPch() const;
     void UnpackRejectsAWrongIdOrAFileThatIsNotThere() const;
     void UnpackLeavesNothingWhenItCannotWrite() const;
+    void UnpackKeepsTheStoredFileWhenAWriteFails() const;
     void UnpackStopsWhenAborted() const;
     void VerifyChecksTheSizeAndTheId() const;
 
@@ -41,7 +42,6 @@ private:
     static void GetTestDir( const char * testName, AString & outDir );
     static bool WriteFile( const AString & path, const Array<char> & content );
     static bool ReadFile( const AString & path, Array<char> & outContent );
-    static uint32_t CountFiles( const AString & dir );
 };
 
 // Register Tests
@@ -53,6 +53,7 @@ REGISTER_TESTS_BEGIN( TestPchBlob )
     REGISTER_TEST( UnpackWritesTheCheckedPch )
     REGISTER_TEST( UnpackRejectsAWrongIdOrAFileThatIsNotThere )
     REGISTER_TEST( UnpackLeavesNothingWhenItCannotWrite )
+    REGISTER_TEST( UnpackKeepsTheStoredFileWhenAWriteFails )
     REGISTER_TEST( UnpackStopsWhenAborted )
     REGISTER_TEST( VerifyChecksTheSizeAndTheId )
 REGISTER_TESTS_END
@@ -81,6 +82,36 @@ namespace
     public:
         virtual bool OnPiece( const void *, size_t ) override { return ( ++m_NumPieces <= 1 ); }
         uint32_t m_NumPieces = 0;
+    };
+
+    // A file that is written to the same, up to a number of writes, and then does something else
+    class FaultyFileStream : public FileStream
+    {
+    public:
+        FaultyFileStream( uint32_t numGoodWrites, Atomic<bool> * abortAfterThem )
+            : m_NumGoodWrites( numGoodWrites )
+            , m_Abort( abortAfterThem )
+        {
+        }
+        virtual uint64_t WriteBuffer( const void * buffer, uint64_t bytesToWrite ) override
+        {
+            ++m_NumWrites;
+            if ( m_NumWrites > m_NumGoodWrites )
+            {
+                return 0; // As when there is no room
+            }
+            const uint64_t written = FileStream::WriteBuffer( buffer, bytesToWrite );
+            if ( ( m_NumWrites == m_NumGoodWrites ) && m_Abort )
+            {
+                m_Abort->Store( true );
+            }
+            return written;
+        }
+        uint32_t m_NumWrites = 0;
+
+    private:
+        uint32_t m_NumGoodWrites;
+        Atomic<bool> * m_Abort;
     };
 }
 
@@ -145,15 +176,6 @@ namespace
     }
     outContent.SetSize( (size_t)f.GetFileSize() );
     return ( f.Read( outContent.Begin(), outContent.GetSize() ) == outContent.GetSize() );
-}
-
-// CountFiles
-//------------------------------------------------------------------------------
-/*static*/ uint32_t TestPchBlob::CountFiles( const AString & dir )
-{
-    Array<AString> files;
-    FileIO::GetFiles( dir, AStackString( "*" ), true, &files );
-    return (uint32_t)files.GetSize();
 }
 
 // DecompressesWhatCompressorWrote
@@ -284,16 +306,20 @@ void TestPchBlob::RejectsDataThatIsNotValid() const
         TEST_ASSERT( StreamDecompressor::DecompressMemory( longer.Begin(), longer.GetSize(), sink, size ) == false );
     }
 
-    // Damaged: what the frame holds is checked by the frame, or by the size it was to come to
+    // Damaged, wherever it is: what the frame holds is checked by the frame, or by the size and the id
     {
-        Array<char> damaged( blob );
-        for ( size_t i = Compressor::kHeaderSize + 20; i < damaged.GetSize(); i += ( damaged.GetSize() / 7 ) )
+        const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
+        TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId, (uint32_t)content.GetSize() ) );
+        const size_t step = Math::Max<size_t>( blob.GetSize() / 61, 1 );
+        for ( size_t position = 0; position < blob.GetSize(); position += ( ( position < 40 ) ? 1 : step ) )
         {
-            damaged[ i ] = (char)( damaged[ i ] ^ 0x55 );
+            Array<char> damaged( blob );
+            damaged[ position ] = (char)( damaged[ position ] ^ 0x55 );
+            TEST_ASSERT( PchBlob::Verify( damaged.Begin(), damaged.GetSize(), pchId, (uint32_t)content.GetSize() ) == false );
         }
-        CollectingSink sink;
-        const bool decoded = StreamDecompressor::DecompressMemory( damaged.Begin(), damaged.GetSize(), sink, size );
-        TEST_ASSERT( ( decoded == false ) || ( memcmp( sink.m_Data.Begin(), content.Begin(), content.GetSize() ) != 0 ) );
+        Array<char> lastDamaged( blob );
+        lastDamaged[ lastDamaged.GetSize() - 1 ] = (char)( lastDamaged[ lastDamaged.GetSize() - 1 ] ^ 0x01 );
+        TEST_ASSERT( PchBlob::Verify( lastDamaged.Begin(), lastDamaged.GetSize(), pchId, (uint32_t)content.GetSize() ) == false );
     }
 
     // A header that says it is another size
@@ -369,7 +395,7 @@ void TestPchBlob::UnpackWritesTheCheckedPch() const
     Array<char> storedAgain;
     TEST_ASSERT( ReadFile( stored, storedAgain ) );
     TEST_ASSERT( storedAgain.GetSize() == blob.GetSize() );
-    TEST_ASSERT( CountFiles( dir ) == 2 );
+    TEST_ASSERT( CountFilesIn( dir ) == 2 );
 
     // A copy that is there is replaced
     {
@@ -403,7 +429,7 @@ void TestPchBlob::UnpackRejectsAWrongIdOrAFileThatIsNotThere() const
 
     // Not there
     TEST_ASSERT( PchBlob::Unpack( stored, pchId, temp, raw, nullptr, size ) == PchBlob::UNPACK_CORRUPT );
-    TEST_ASSERT( CountFiles( dir ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 0 );
 
     // The data is a PCH, but not the one with this id
     TEST_ASSERT( WriteFile( stored, blob ) );
@@ -469,14 +495,14 @@ void TestPchBlob::UnpackLeavesNothingWhenItCannotWrite() const
     TEST_ASSERT( FileIO::FileExists( raw2.Get() ) == false );
 }
 
-// UnpackStopsWhenAborted
+// UnpackKeepsTheStoredFileWhenAWriteFails
 //------------------------------------------------------------------------------
-void TestPchBlob::UnpackStopsWhenAborted() const
+void TestPchBlob::UnpackKeepsTheStoredFileWhenAWriteFails() const
 {
     AStackString<> dir;
-    GetTestDir( "UnpackAborted", dir );
+    GetTestDir( "UnpackWriteFails", dir );
     Array<char> content;
-    MakeContent( 500000, 17, content );
+    MakeContent( ( 3 * 1024 * 1024 ) + 77, 21, content ); // Written in several pieces
     Array<char> blob;
     Compress( content, blob );
     const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
@@ -488,10 +514,57 @@ void TestPchBlob::UnpackStopsWhenAborted() const
     temp += "unpack.1.1.pch";
     TEST_ASSERT( WriteFile( stored, blob ) );
 
-    const Atomic<bool> abort{ true };
+    // The second piece cannot be written: the first was, so there is a file to remove
+    FaultyFileStream writer( 1, nullptr );
     uint64_t size = 0;
-    TEST_ASSERT( PchBlob::Unpack( stored, pchId, temp, raw, &abort, size ) == PchBlob::UNPACK_ABORTED );
-    TEST_ASSERT( CountFiles( dir ) == 1 ); // The stored file stays: the PCH is not at fault
+    TEST_ASSERT( PchBlob::Unpack( stored, pchId, temp, raw, nullptr, size, &writer ) == PchBlob::UNPACK_CANNOT_WRITE );
+    TEST_ASSERT( writer.m_NumWrites == 2 );
+    TEST_ASSERT( FileIO::FileExists( temp.Get() ) == false );
+    TEST_ASSERT( FileIO::FileExists( raw.Get() ) == false );
+
+    // The PCH is not at fault, so it is as it was
+    Array<char> storedAgain;
+    TEST_ASSERT( ReadFile( stored, storedAgain ) );
+    TEST_ASSERT( storedAgain.GetSize() == blob.GetSize() );
+    TEST_ASSERT( memcmp( storedAgain.Begin(), blob.Begin(), blob.GetSize() ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 1 );
+}
+
+// UnpackStopsWhenAborted
+//------------------------------------------------------------------------------
+void TestPchBlob::UnpackStopsWhenAborted() const
+{
+    AStackString<> dir;
+    GetTestDir( "UnpackAborted", dir );
+
+    // Data that does not compress is in several pieces as it is stored, and the flag is looked at between them
+    Array<char> content;
+    MakeRandomBytes( ( 3 * 1024 * 1024 ) + 321, 17, content );
+    Array<char> blob;
+    Compress( content, blob );
+    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
+    AStackString<> stored( dir );
+    stored += PchBlob::kStoredFileName;
+    AStackString<> raw( dir );
+    raw += PchBlob::kRawFileName;
+    AStackString<> temp( dir );
+    temp += "unpack.1.1.pch";
+    TEST_ASSERT( WriteFile( stored, blob ) );
+
+    // Aborted after the first piece was written
+    Atomic<bool> abort{ false };
+    FaultyFileStream writer( 1, &abort );
+    uint64_t size = 0;
+    TEST_ASSERT( PchBlob::Unpack( stored, pchId, temp, raw, &abort, size, &writer ) == PchBlob::UNPACK_ABORTED );
+    TEST_ASSERT( writer.m_NumWrites == 1 );
+    TEST_ASSERT( FileIO::FileExists( temp.Get() ) == false );
+    TEST_ASSERT( FileIO::FileExists( raw.Get() ) == false );
+    TEST_ASSERT( CountFilesIn( dir ) == 1 ); // The stored file stays: the PCH is not at fault
+
+    // Before the first
+    const Atomic<bool> aborted{ true };
+    TEST_ASSERT( PchBlob::Unpack( stored, pchId, temp, raw, &aborted, size ) == PchBlob::UNPACK_ABORTED );
+    TEST_ASSERT( CountFilesIn( dir ) == 1 );
 }
 
 // VerifyChecksTheSizeAndTheId

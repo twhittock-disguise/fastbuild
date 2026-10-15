@@ -36,7 +36,7 @@ private:
     void ReceiverDropsAPartialPch() const;
     void ReceiversOfTheSamePchDoNotMeet() const;
     void ReceiverKeepsACachedPch() const;
-    void ReceiverReplacesAPchOfTheWrongSize() const;
+    void ReceiverKeepsAStoredPchWhateverItsSize() const;
     void ReceiverCleansUpWhenItCannotPublish() const;
     void SendQueueSendsBulkDataLast() const;
     void SendQueueDoesNotStarveBulkData() const;
@@ -69,7 +69,6 @@ private:
     // Where a test keeps a PCH, with what an earlier run left removed
     static void GetCleanPchFile( const char * testName, uint64_t pchId, AString & outPchFile );
     static void GetDirOf( const AString & file, AString & outDir );
-    static uint32_t CountFiles( const AString & dir );
     static bool ReadFile( const AString & file, Array<char> & outContent );
 };
 
@@ -84,7 +83,7 @@ REGISTER_TESTS_BEGIN( TestPchTransfer )
     REGISTER_TEST( ReceiverDropsAPartialPch )
     REGISTER_TEST( ReceiversOfTheSamePchDoNotMeet )
     REGISTER_TEST( ReceiverKeepsACachedPch )
-    REGISTER_TEST( ReceiverReplacesAPchOfTheWrongSize )
+    REGISTER_TEST( ReceiverKeepsAStoredPchWhateverItsSize )
     REGISTER_TEST( ReceiverCleansUpWhenItCannotPublish )
     REGISTER_TEST( SendQueueSendsBulkDataLast )
     REGISTER_TEST( SendQueueDoesNotStarveBulkData )
@@ -170,15 +169,6 @@ TestPchTransfer::TestChunk::TestChunk( const TestPch & pch, uint32_t chunkSize, 
     outDir.Assign( file.Get(), lastSlash + 1 );
 }
 
-// CountFiles
-//------------------------------------------------------------------------------
-/*static*/ uint32_t TestPchTransfer::CountFiles( const AString & dir )
-{
-    Array<AString> files;
-    FileIO::GetFiles( dir, AStackString( "*" ), true, &files );
-    return (uint32_t)files.GetSize();
-}
-
 // ReadFile
 //------------------------------------------------------------------------------
 /*static*/ bool TestPchTransfer::ReadFile( const AString & file, Array<char> & outContent )
@@ -227,7 +217,7 @@ void TestPchTransfer::ReceiverReassemblesChunks() const
         TEST_ASSERT( memcmp( content.Begin(), pch.m_Compressed.Begin(), content.GetSize() ) == 0 );
 
         // Only the PCH is left
-        TEST_ASSERT( CountFiles( dir ) == 1 );
+        TEST_ASSERT( CountFilesIn( dir ) == 1 );
     }
 }
 
@@ -252,7 +242,7 @@ void TestPchTransfer::ReceiverRejectsAWrongId() const
         const PchReceiver::Result result = Feed( receiver, TestChunk( pch, kChunkSize, i ), file, alreadyCached );
         TEST_ASSERT( result == ( ( i + 1 ) == numChunks ? PchReceiver::FAILED : PchReceiver::CONTINUE ) );
     }
-    TEST_ASSERT( CountFiles( dir ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 0 );
 }
 
 // ReceiverRejectsAWrongSize
@@ -278,7 +268,7 @@ void TestPchTransfer::ReceiverRejectsAWrongSize() const
             const PchReceiver::Result result = Feed( receiver, TestChunk( pch, kChunkSize, i ), file, alreadyCached );
             TEST_ASSERT( result == ( ( i + 1 ) == numChunks ? PchReceiver::FAILED : PchReceiver::CONTINUE ) );
         }
-        TEST_ASSERT( CountFiles( dir ) == 0 );
+        TEST_ASSERT( CountFilesIn( dir ) == 0 );
     }
 }
 
@@ -362,7 +352,7 @@ void TestPchTransfer::ReceiverRejectsMalformedChunks() const
     }
 
     // Nothing was written by any of it
-    TEST_ASSERT( CountFiles( dir ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 0 );
 }
 
 // ReceiverAcceptsTheLimits
@@ -402,7 +392,7 @@ void TestPchTransfer::ReceiverDropsAPartialPch() const
         TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 0 ), file, alreadyCached ) == PchReceiver::CONTINUE );
         TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 1 ), file, alreadyCached ) == PchReceiver::CONTINUE );
     }
-    TEST_ASSERT( CountFiles( dir ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 0 );
 
     // A receiver that is told to drop it can take the PCH from the start
     {
@@ -410,7 +400,7 @@ void TestPchTransfer::ReceiverDropsAPartialPch() const
         TEST_ASSERT( Feed( receiver, TestChunk( pch, kChunkSize, 0 ), file, alreadyCached ) == PchReceiver::CONTINUE );
         receiver.Abort();
         TEST_ASSERT( FeedAll( receiver, pch, file, alreadyCached ) == PchReceiver::COMPLETE );
-        TEST_ASSERT( CountFiles( dir ) == 1 );
+        TEST_ASSERT( CountFilesIn( dir ) == 1 );
     }
 }
 
@@ -448,7 +438,7 @@ void TestPchTransfer::ReceiversOfTheSamePchDoNotMeet() const
     TEST_ASSERT( ReadFile( file, content ) );
     TEST_ASSERT( content.GetSize() == pch.m_Compressed.GetSize() );
     TEST_ASSERT( memcmp( content.Begin(), pch.m_Compressed.Begin(), content.GetSize() ) == 0 );
-    TEST_ASSERT( CountFiles( dir ) == 1 ); // No temporary file is left
+    TEST_ASSERT( CountFilesIn( dir ) == 1 ); // No temporary file is left
 }
 
 // ReceiverKeepsACachedPch
@@ -467,7 +457,7 @@ void TestPchTransfer::ReceiverKeepsACachedPch() const
         PchReceiver receiver;
         TEST_ASSERT( FeedAll( receiver, pch, file, alreadyCached ) == PchReceiver::COMPLETE );
     }
-    TEST_ASSERT( CountFiles( dir ) == 1 );
+    TEST_ASSERT( CountFilesIn( dir ) == 1 );
 
     // Give it a time that nothing writing the file now would give it
 #if defined( __WINDOWS__ )
@@ -485,7 +475,7 @@ void TestPchTransfer::ReceiverKeepsACachedPch() const
     PchReceiver receiver;
     TEST_ASSERT( FeedAll( receiver, pch, file, alreadyCached ) == PchReceiver::COMPLETE );
     TEST_ASSERT( alreadyCached );
-    TEST_ASSERT( CountFiles( dir ) == 1 );
+    TEST_ASSERT( CountFilesIn( dir ) == 1 );
     TEST_ASSERT( FileIO::GetFileLastWriteTime( file ) == timeBefore );
     Array<char> contentAfter;
     TEST_ASSERT( ReadFile( file, contentAfter ) );
@@ -493,31 +483,35 @@ void TestPchTransfer::ReceiverKeepsACachedPch() const
     TEST_ASSERT( memcmp( contentAfter.Begin(), contentBefore.Begin(), contentAfter.GetSize() ) == 0 );
 }
 
-// ReceiverReplacesAPchOfTheWrongSize
+// ReceiverKeepsAStoredPchWhateverItsSize
 //------------------------------------------------------------------------------
-void TestPchTransfer::ReceiverReplacesAPchOfTheWrongSize() const
+void TestPchTransfer::ReceiverKeepsAStoredPchWhateverItsSize() const
 {
-    // What an interrupted write left is not the PCH
+    // The id identifies the content, not how it is compressed, and a file that is stored is not replaced:
+    // a worker may be unpacking it. One that is not a PCH is found out when it is unpacked.
     TestPch pch;
     MakePch( ( 3 * kChunkSize ) + 5, 800, pch );
     AStackString<> file;
-    GetCleanPchFile( "WrongSize", pch.m_Id, file );
+    GetCleanPchFile( "OtherSize", pch.m_Id, file );
+    AStackString<> dir;
+    GetDirOf( file, dir );
     TEST_ASSERT( FileIO::EnsurePathExistsForFile( file ) );
+    const char stored[] = "stored in another way";
     {
         FileStream f;
         TEST_ASSERT( f.Open( file.Get(), FileStream::WRITE_ONLY ) );
-        const char partial[] = "not the whole PCH";
-        TEST_ASSERT( f.Write( partial, sizeof( partial ) ) == sizeof( partial ) );
+        TEST_ASSERT( f.Write( stored, sizeof( stored ) ) == sizeof( stored ) );
     }
 
     PchReceiver receiver;
     bool alreadyCached = false;
     TEST_ASSERT( FeedAll( receiver, pch, file, alreadyCached ) == PchReceiver::COMPLETE );
-    TEST_ASSERT( alreadyCached == false );
+    TEST_ASSERT( alreadyCached );
     Array<char> content;
     TEST_ASSERT( ReadFile( file, content ) );
-    TEST_ASSERT( content.GetSize() == pch.m_Compressed.GetSize() );
-    TEST_ASSERT( memcmp( content.Begin(), pch.m_Compressed.Begin(), content.GetSize() ) == 0 );
+    TEST_ASSERT( content.GetSize() == sizeof( stored ) );
+    TEST_ASSERT( memcmp( content.Begin(), stored, sizeof( stored ) ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 1 );
 }
 
 // ReceiverCleansUpWhenItCannotPublish

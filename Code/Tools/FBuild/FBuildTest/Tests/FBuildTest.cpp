@@ -238,6 +238,15 @@ void FBuildTest::CheckStatsTotal( size_t numSeen, size_t numBuilt ) const
     CheckStatsTotal( stats, numSeen, numBuilt );
 }
 
+// CountFilesIn
+//------------------------------------------------------------------------------
+/*static*/ uint32_t FBuildTest::CountFilesIn( const AString & dir )
+{
+    Array<AString> files;
+    FileIO::GetFiles( dir, AStackString( "*" ), true, &files );
+    return (uint32_t)files.GetSize();
+}
+
 // MakeRandomBytes
 //------------------------------------------------------------------------------
 /*static*/ void FBuildTest::MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes )

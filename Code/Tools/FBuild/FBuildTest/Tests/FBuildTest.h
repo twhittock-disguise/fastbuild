@@ -59,6 +59,9 @@ protected:
     // other helpers
     static void GetCodeDir( AString & codeDir );
 
+    // The files in a directory and below
+    static uint32_t CountFilesIn( const AString & dir );
+
     // Data that does not compress, the same for the same seed
     static void MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes );
 
