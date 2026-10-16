@@ -104,7 +104,8 @@ Compressor::~Compressor()
                                               FileObserver & observer,
                                               uint64_t & outSize,
                                               PchTransform::Encoder * transform,
-                                              bool * outTransformed )
+                                              bool * outTransformed,
+                                              int32_t windowLog )
 {
     if ( outTransformed )
     {
@@ -135,6 +136,7 @@ Compressor::~Compressor()
     } zstd;
     if ( ( zstd.m_Context == nullptr ) ||
          ZSTD_isError( ZSTD_CCtx_setParameter( zstd.m_Context, ZSTD_c_compressionLevel, compressionLevel ) ) ||
+         ( ( windowLog != 0 ) && ZSTD_isError( ZSTD_CCtx_setParameter( zstd.m_Context, ZSTD_c_windowLog, windowLog ) ) ) ||
          ( ( transform == nullptr ) && ZSTD_isError( ZSTD_CCtx_setPledgedSrcSize( zstd.m_Context, sourceSize ) ) ) ) // A transform makes data of another size
     {
         return false;

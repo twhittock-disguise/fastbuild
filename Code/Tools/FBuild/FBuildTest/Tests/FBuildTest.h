@@ -73,6 +73,8 @@ protected:
 
     // The blob a client makes of a PCH (Compressor::CompressZstdFile, through a file as it does), with the PCH
     // transform of this base applied, or none if the base is 0. outTransformed says whether it was.
+    // The window of the zstd frame of a blob (log 2 of its size), or 0 if it has none because the data fits in one segment
+    static uint32_t GetBlobWindowLog( const Array<char> & blob );
     static bool MakePchBlob( const Array<char> & pch, uint32_t transformBase, Array<char> & outBlob, bool * outTransformed = nullptr );
 
     // Ids of processes: one that no process has, and one that is running that is not this process

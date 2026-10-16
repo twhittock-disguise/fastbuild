@@ -187,7 +187,7 @@ private:
     {
         HashObserver observer;
         if ( Compressor::CompressZstdFile( m_Entry.filePath.Get(), m_Entry.uncompressedSize, tempPath.Get(),
-                                           Compressor::kZstdTransferLevel, &m_Cancel, observer, outSize, transform, &outTransformed ) == false )
+                                           Compressor::kZstdPchLevel, &m_Cancel, observer, outSize, transform, &outTransformed, Compressor::kZstdPchWindowLog ) == false )
         {
             FLOG_WARN( "PCH distribution: failed to read and compress '%s' to '%s'\n", m_Entry.filePath.Get(), tempPath.Get() );
             FileIO::FileDelete( tempPath.Get() );

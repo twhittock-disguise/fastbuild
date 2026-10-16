@@ -41,6 +41,7 @@ private:
     void RejectsTransformedBlobsThatAreNotValid() const;
     void TransformFallsBackToThePlainBlob() const;
     void TransformedFrameIsBounded() const;
+    void PchBlobsUseTheWideWindow() const;
 
     // The header of a blob, as words
     static uint32_t GetHeaderWord( const Array<char> & blob, uint32_t index );
@@ -72,6 +73,7 @@ REGISTER_TESTS_BEGIN( TestPchBlob )
     REGISTER_TEST( RejectsTransformedBlobsThatAreNotValid )
     REGISTER_TEST( TransformFallsBackToThePlainBlob )
     REGISTER_TEST( TransformedFrameIsBounded )
+    REGISTER_TEST( PchBlobsUseTheWideWindow )
 REGISTER_TESTS_END
 
 // Helpers
@@ -925,6 +927,55 @@ void TestPchBlob::TransformedFrameIsBounded() const
         const bool isRead = StreamDecompressor::DecompressMemory( bad.Begin(), bad.GetSize(), sink, size );
         TEST_ASSERT( isRead == false );
         TEST_ASSERT( sink.m_Data.GetSize() <= claim ); // Nothing more than it said was handed on
+    }
+}
+
+// PchBlobsUseTheWideWindow
+//------------------------------------------------------------------------------
+void TestPchBlob::PchBlobsUseTheWideWindow() const
+{
+    // A PCH larger than the window, so that the window the frame says is the one that was asked for
+    Array<char> content;
+    MakePchLikeBytes( ( 70 * 1024 * 1024 ) + 3, 31, content );
+    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
+    const uint32_t size = (uint32_t)content.GetSize();
+
+    for ( uint32_t transform = 0; transform < 2; ++transform )
+    {
+        Array<char> blob;
+        bool transformed = false;
+        TEST_ASSERT( MakePchBlob( content, transform ? kPchLikeBase : 0, blob, &transformed ) );
+        TEST_ASSERT( transformed == ( transform != 0 ) );
+
+        // The frame has the window of the PCH parameters, not that of the level
+        TEST_ASSERT( GetBlobWindowLog( blob ) == 26 );
+
+        // It is read as any other: verified, and unpacked
+        TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId, size ) );
+        AStackString<> dir;
+        GetTestDir( "WideWindow", dir );
+        AStackString<> stored( dir );
+        stored += "pch.zst";
+        TEST_ASSERT( WriteFile( stored, blob ) );
+        AStackString<> temp( dir );
+        temp += "pch.tmp";
+        AStackString<> raw( dir );
+        raw += "pch.pch";
+        uint64_t rawSize = 0;
+        TEST_ASSERT( PchBlob::Unpack( stored, pchId, temp, raw, nullptr, rawSize ) == PchBlob::UNPACK_OK );
+        TEST_ASSERT( rawSize == size );
+        TEST_ASSERT( FileIO::FileDelete( raw.Get() ) );
+
+        // A worker of 24.0 reads the plain one with the decoder it has
+        if ( transform == 0 )
+        {
+            Compressor decompressor;
+            TEST_ASSERT( Compressor::IsValidData( blob.Begin(), blob.GetSize() ) );
+            TEST_ASSERT( decompressor.Decompress( blob.Begin() ) );
+            TEST_ASSERT( decompressor.GetResultSize() == content.GetSize() );
+            TEST_ASSERT( memcmp( decompressor.GetResult(), content.Begin(), content.GetSize() ) == 0 );
+        }
+        FileIO::FileDelete( stored.Get() );
     }
 }
 

@@ -345,6 +345,19 @@ void FBuildTest::CheckStatsTotal( size_t numSeen, size_t numBuilt ) const
     }
 }
 
+// GetBlobWindowLog
+//------------------------------------------------------------------------------
+/*static*/ uint32_t FBuildTest::GetBlobWindowLog( const Array<char> & blob )
+{
+    // After the header of the blob: the magic number of a frame, then its descriptor and the byte of the window
+    const size_t frame = Compressor::kHeaderSize;
+    TEST_ASSERT( blob.GetSize() > ( frame + 6 ) );
+    const uint8_t * bytes = reinterpret_cast<const uint8_t *>( blob.Begin() + frame );
+    TEST_ASSERT( ( bytes[ 0 ] == 0x28 ) && ( bytes[ 1 ] == 0xB5 ) && ( bytes[ 2 ] == 0x2F ) && ( bytes[ 3 ] == 0xFD ) );
+    const bool singleSegment = ( ( bytes[ 4 ] & 0x20 ) != 0 );
+    return singleSegment ? 0 : ( (uint32_t)( bytes[ 5 ] >> 3 ) + 10 );
+}
+
 // MakePchBlob
 //------------------------------------------------------------------------------
 /*static*/ bool FBuildTest::MakePchBlob( const Array<char> & pch, uint32_t transformBase, Array<char> & outBlob, bool * outTransformed )
@@ -372,8 +385,8 @@ void FBuildTest::CheckStatsTotal( size_t numSeen, size_t numBuilt ) const
     uint64_t blobSize = 0;
     bool transformed = false;
     PchTransform::Encoder encoder( transformBase );
-    bool ok = Compressor::CompressZstdFile( source.Get(), pch.GetSize(), blob.Get(), Compressor::kZstdTransferLevel, nullptr, observer, blobSize,
-                                            ( transformBase != 0 ) ? &encoder : nullptr, &transformed );
+    bool ok = Compressor::CompressZstdFile( source.Get(), pch.GetSize(), blob.Get(), Compressor::kZstdPchLevel, nullptr, observer, blobSize,
+                                            ( transformBase != 0 ) ? &encoder : nullptr, &transformed, Compressor::kZstdPchWindowLog );
     FileStream f;
     ok = ok && f.Open( blob.Get(), FileStream::READ_ONLY ) && ( f.GetFileSize() == blobSize );
     if ( ok )

@@ -52,6 +52,11 @@ public:
     // Zstd level for data sent between coordinator and workers: toolchain and PCH files, and job results
     inline static const int32_t kZstdTransferLevel = 3;
 
+    // Zstd parameters for a PCH, which is compressed once for many workers and is large and repetitive: a higher level
+    // and a window of 64 MiB (the decoders accept up to 128 MiB by default, so a reader needs no setting)
+    inline static const int32_t kZstdPchLevel = 9;
+    inline static const int32_t kZstdPchWindowLog = 26;
+
     // compressionLevel:
     //   < 0 : use LZ4, with values directly mapping to "acceleration level"
     //  == 0 : disable compression
@@ -81,7 +86,8 @@ public:
     static constexpr uint64_t kMaxFileSize = ( 0xFFFFFFFFull - kHeaderSize );
     // With a transform, what is compressed is what it makes of the file (the observer still sees the file), and
     // the header says so. That is not so if it is not smaller than the file: the file is what is written then
-    // and outTransformed is false. The transform is used up by the call.
+    // and outTransformed is false. The transform is used up by the call. windowLog is that of the frame, or the
+    // default of the level if it is 0.
     [[nodiscard]] static bool CompressZstdFile( const char * sourcePath,
                                                 uint64_t sourceSize,
                                                 const char * destPath,
@@ -90,7 +96,8 @@ public:
                                                 FileObserver & observer,
                                                 uint64_t & outSize,
                                                 PchTransform::Encoder * transform = nullptr,
-                                                bool * outTransformed = nullptr );
+                                                bool * outTransformed = nullptr,
+                                                int32_t windowLog = 0 );
 
     const void * GetResult() const { return m_Result; }
     size_t GetResultSize() const { return m_ResultSize; }

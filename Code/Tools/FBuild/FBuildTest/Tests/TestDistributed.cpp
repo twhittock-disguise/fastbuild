@@ -169,6 +169,7 @@ private:
     void PchTransformCapabilityIsNegotiated() const;
     void PchIsCompressedInTheFormsWorkersRead() const;
     void PchTransformThatDoesNotInvertIsNotSent() const;
+    void PchIsCompressedWithTheWideWindow() const;
     void WorkerStoresATransformedPch() const;
     void WorkerAcceptsAPlainPchFromAnOldClient() const;
     void WorkerRejectsATransformedPchThatIsNotValid() const;
@@ -433,6 +434,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchTransformCapabilityIsNegotiated )
     REGISTER_TEST( PchIsCompressedInTheFormsWorkersRead )
     REGISTER_TEST( PchTransformThatDoesNotInvertIsNotSent )
+    REGISTER_TEST( PchIsCompressedWithTheWideWindow )
     REGISTER_TEST( WorkerStoresATransformedPch )
     REGISTER_TEST( WorkerAcceptsAPlainPchFromAnOldClient )
     REGISTER_TEST( WorkerRejectsATransformedPchThatIsNotValid )
@@ -6935,6 +6937,36 @@ void TestDistributed::PchTransformThatDoesNotInvertIsNotSent() const
         bool isTransformed = false;
         TEST_ASSERT( WaitForForm( cache, entry, true, filePath, size, isTransformed ) == PchDataCache::READY );
         TEST_ASSERT( isTransformed );
+    }
+}
+
+// PchIsCompressedWithTheWideWindow
+//------------------------------------------------------------------------------
+void TestDistributed::PchIsCompressedWithTheWideWindow() const
+{
+    // What a client sends is compressed with the window of Compressor::kZstdPchWindowLog, in both forms. The PCH is
+    // larger than the window, as the window of a frame is no larger than the data.
+    PchDataCache cache;
+    Array<char> content;
+    const AStackString<> path( "../tmp/Test/Distributed/PchWideWindow/pchlike.pch" );
+    const uint32_t fileSize = ( 70 * MEGABYTE ) + 3;
+    TEST_ASSERT( WritePchLikeFile( path.Get(), fileSize, 5, content ) );
+    PchDataCache::Entry entry;
+    entry.pchId = PchId::Calc( content.Begin(), fileSize );
+    entry.uncompressedSize = fileSize;
+    entry.filePath = path;
+    cache.Store( entry );
+    for ( uint32_t allow = 0; allow < 2; ++allow )
+    {
+        AStackString<> filePath;
+        uint64_t size = 0;
+        bool isTransformed = false;
+        TEST_ASSERT( WaitForForm( cache, entry, ( allow != 0 ), filePath, size, isTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( isTransformed == ( allow != 0 ) );
+        Array<char> blob;
+        TEST_ASSERT( LoadFile( filePath, blob ) );
+        TEST_ASSERT( GetBlobWindowLog( blob ) == 26 );
+        TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), entry.pchId, fileSize ) );
     }
 }
 

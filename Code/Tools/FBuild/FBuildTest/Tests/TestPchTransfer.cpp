@@ -42,6 +42,7 @@ private:
     void ReceiverStoresATransformedPchAsItCame() const;
     void ReceiverRejectsATransformedPchThatIsNotValid() const;
     void ReceiverAcceptsAPlainPchFromAnOldClient() const;
+    void ReceiverAcceptsTheWideWindow() const;
     void SendQueueSendsBulkDataLast() const;
     void SendQueueDoesNotStarveBulkData() const;
     void BulkSendKinds() const;
@@ -96,6 +97,7 @@ REGISTER_TESTS_BEGIN( TestPchTransfer )
     REGISTER_TEST( ReceiverStoresATransformedPchAsItCame )
     REGISTER_TEST( ReceiverRejectsATransformedPchThatIsNotValid )
     REGISTER_TEST( ReceiverAcceptsAPlainPchFromAnOldClient )
+    REGISTER_TEST( ReceiverAcceptsTheWideWindow )
     REGISTER_TEST( SendQueueSendsBulkDataLast )
     REGISTER_TEST( SendQueueDoesNotStarveBulkData )
     REGISTER_TEST( BulkSendKinds )
@@ -762,6 +764,34 @@ void TestPchTransfer::ReceiverAcceptsAPlainPchFromAnOldClient() const
     TEST_ASSERT( ReadFile( file, content ) );
     TEST_ASSERT( content.GetSize() == pch.m_Compressed.GetSize() );
     TEST_ASSERT( memcmp( content.Begin(), pch.m_Compressed.Begin(), content.GetSize() ) == 0 );
+}
+
+// ReceiverAcceptsTheWideWindow
+//------------------------------------------------------------------------------
+void TestPchTransfer::ReceiverAcceptsTheWideWindow() const
+{
+    // A PCH larger than the window of a blob (see Compressor::kZstdPchWindowLog), plain and transformed
+    for ( uint32_t transform = 0; transform < 2; ++transform )
+    {
+        TestPch pch;
+        MakeCompressiblePch( ( 70 * 1024 * 1024 ) + 3, 41, ( transform != 0 ), pch );
+        AStackString<> file;
+        GetCleanPchFile( "WideWindow", pch.m_Id, file );
+        PchReceiver receiver;
+        bool alreadyCached = false;
+        const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)pch.m_Compressed.GetSize(), Protocol::kPchChunkSize );
+        PchReceiver::Result result = PchReceiver::CONTINUE;
+        for ( uint32_t i = 0; i < numChunks; ++i )
+        {
+            result = receiver.OnChunk( Protocol::MsgPchFile( pch.m_Id, pch.m_UncompressedSize, (uint32_t)pch.m_Compressed.GetSize(), Protocol::kPchChunkSize, i ),
+                                       pch.m_Compressed.Begin() + ( (size_t)i * Protocol::kPchChunkSize ),
+                                       Protocol::MsgPchFile::GetChunkLength( (uint32_t)pch.m_Compressed.GetSize(), Protocol::kPchChunkSize, i ),
+                                       file, alreadyCached );
+            TEST_ASSERT( result != PchReceiver::FAILED );
+        }
+        TEST_ASSERT( result == PchReceiver::COMPLETE );
+        FileIO::FileDelete( file.Get() );
+    }
 }
 
 //------------------------------------------------------------------------------
