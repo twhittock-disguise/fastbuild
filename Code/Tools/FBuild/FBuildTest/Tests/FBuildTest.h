@@ -9,6 +9,7 @@
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/FBuildOptions.h"
 #include "Tools/FBuild/FBuildCore/Graph/Node.h"
+#include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 
 #include "Core/Containers/Array.h"
 #include "Core/Process/Mutex.h"
@@ -16,6 +17,36 @@
 // Forward Declarations
 //------------------------------------------------------------------------------
 struct FBuildStats;
+
+// XorShift64
+//------------------------------------------------------------------------------
+// The same numbers for the same seed
+class XorShift64
+{
+public:
+    explicit XorShift64( uint64_t seed ) : m_State( seed | 1 ) {}
+    uint64_t Next()
+    {
+        m_State ^= ( m_State << 13 );
+        m_State ^= ( m_State >> 7 );
+        m_State ^= ( m_State << 17 );
+        return m_State;
+    }
+    uint32_t Below( uint32_t limit ) { return (uint32_t)( Next() % limit ); }
+
+private:
+    uint64_t m_State;
+};
+
+// NullFileObserver
+//------------------------------------------------------------------------------
+// What Compressor::CompressZstdFile is given by a caller that has no use for the data it reads
+class NullFileObserver : public Compressor::FileObserver
+{
+public:
+    virtual void OnPass() override {}
+    virtual void OnPiece( const void *, size_t ) override {}
+};
 
 // FBuildTest
 //------------------------------------------------------------------------------
@@ -71,11 +102,18 @@ protected:
     static constexpr uint32_t kPchLikeBase = 0x6BB;
     static void MakePchLikeBytes( uint32_t size, uint64_t seed, Array<char> & outBytes );
 
-    // The blob a client makes of a PCH (Compressor::CompressZstdFile, through a file as it does), with the PCH
-    // transform of this base applied, or none if the base is 0. outTransformed says whether it was.
     // The window of the zstd frame of a blob (log 2 of its size), or 0 if it has none because the data fits in one segment
     static uint32_t GetBlobWindowLog( const Array<char> & blob );
+
+    // The blob a client makes of a PCH (Compressor::CompressZstdFile, through a file as it does), with the PCH
+    // transform of this base applied, or none if the base is kNoTransform (a base can be 0). outTransformed says
+    // whether it was: it is not if the transform does not make the PCH smaller.
+    static constexpr uint32_t kNoTransform = 0xFFFFFFFFu;
     static bool MakePchBlob( const Array<char> & pch, uint32_t transformBase, Array<char> & outBlob, bool * outTransformed = nullptr );
+
+    // Files as they are written and read by tests: the whole of the content, in a directory that is made if it is not there
+    static bool WriteFile( const AString & path, const Array<char> & content );
+    static bool ReadFile( const AString & path, Array<char> & outContent );
 
     // Ids of processes: one that no process has, and one that is running that is not this process
     static uint32_t GetIdOfNoProcess();

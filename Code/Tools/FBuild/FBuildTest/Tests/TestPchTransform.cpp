@@ -38,12 +38,24 @@ private:
     void FindsTheBase() const;
     void ChoosesOnlyWhatItHelps() const;
     void CacheOrdersByUse() const;
+    void FormatIsFrozen() const;
+    void WorthItIsDecidedByTheRatio() const;
+    void ChoosesFromWhereItSamples() const;
+
+    static constexpr uint32_t kMiB = ( 1024 * 1024 );
 
     // The words of a kind of data, with the high halves a transform with this base gives a meaning to
     static constexpr uint32_t kNumKinds = 9;
     static void MakeData( uint32_t kind, uint32_t size, uint64_t seed, uint32_t base, Array<char> & outData );
-    static void RoundTrip( const Array<char> & data, uint32_t base, uint64_t seed, uint64_t * outTransformedSize = nullptr );
-    static bool WriteFile( const AString & path, const Array<char> & content );
+
+    // The inverse of the transform gives the data back, whatever the sizes of the pieces either is fed (the largest
+    // piece, which is a byte if it is 1: 0 is for a size picked from the seed). kind is for what a failure says.
+    static constexpr uint32_t kUnknownKind = 0xFFFFFFFFu;
+    static void RoundTrip( const Array<char> & data, uint32_t base, uint64_t seed, uint64_t * outTransformedSize = nullptr,
+                           uint32_t kind = kUnknownKind, uint32_t encodePiece = 0, uint32_t decodePiece = 0 );
+
+    static void GetTestDir( const char * testName, AString & outDir );
+    static void MakeSegments( uint32_t numSegments, uint32_t numRandom, uint64_t seed, Array<char> & outData );
 };
 
 // Register Tests
@@ -60,30 +72,15 @@ REGISTER_TESTS_BEGIN( TestPchTransform )
     REGISTER_TEST( FindsTheBase )
     REGISTER_TEST( ChoosesOnlyWhatItHelps )
     REGISTER_TEST( CacheOrdersByUse )
+    REGISTER_TEST( FormatIsFrozen )
+    REGISTER_TEST( WorthItIsDecidedByTheRatio )
+    REGISTER_TEST( ChoosesFromWhereItSamples )
 REGISTER_TESTS_END
 
 // Helpers
 //------------------------------------------------------------------------------
 namespace
 {
-    // The same numbers for the same seed
-    class XfRandom
-    {
-    public:
-        explicit XfRandom( uint64_t seed ) : m_State( seed | 1 ) {}
-        uint64_t Next()
-        {
-            m_State ^= ( m_State << 13 );
-            m_State ^= ( m_State >> 7 );
-            m_State ^= ( m_State << 17 );
-            return m_State;
-        }
-        uint32_t Below( uint32_t limit ) { return (uint32_t)( Next() % limit ); }
-
-    private:
-        uint64_t m_State;
-    };
-
     // Collects what a transform makes
     class XfCollectSink : public PchTransform::Sink
     {
@@ -121,7 +118,7 @@ namespace
 
     // Feeds in pieces of random sizes, up to maxPiece (which can be 1)
     template <class TRANSFORM>
-    bool XfFeedInPieces( TRANSFORM & transform, const void * data, size_t size, uint32_t maxPiece, XfRandom & random, PchTransform::Sink & sink )
+    bool XfFeedInPieces( TRANSFORM & transform, const void * data, size_t size, uint32_t maxPiece, XorShift64 & random, PchTransform::Sink & sink )
     {
         const char * bytes = static_cast<const char *>( data );
         for ( size_t done = 0; done < size; )
@@ -140,7 +137,7 @@ namespace
     {
         Array<char> out;
         out.SetSize( ZSTD_compressBound( data.GetSize() ) );
-        return ZSTD_compress( out.Begin(), out.GetSize(), data.Begin(), data.GetSize(), 3 );
+        return ZSTD_compress( out.Begin(), out.GetSize(), data.Begin(), data.GetSize(), Compressor::kZstdTransferLevel );
     }
 }
 
@@ -148,7 +145,7 @@ namespace
 //------------------------------------------------------------------------------
 /*static*/ void TestPchTransform::MakeData( uint32_t kind, uint32_t size, uint64_t seed, uint32_t base, Array<char> & outData )
 {
-    XfRandom random( seed );
+    XorShift64 random( seed );
     const uint32_t f1 = ( base | 0x80000000u );
     const uint32_t f2 = ( base | 0x40000000u );
     const uint32_t f3 = ( base | 0x20000000u );
@@ -162,7 +159,7 @@ namespace
         uint64_t word = 0;
         switch ( kind )
         {
-            case 0: word = random.Next(); break;                                        // XfRandom
+            case 0: word = random.Next(); break;                                        // XorShift64
             case 1: word = 0; break;                                                    // Zeros
             case 2: word = ( ( (uint64_t)base << 32 ) | recent[ random.Below( 8 ) ] ); break; // Pointers that repeat
             case 3:                                                                     // Pointers nearest each other, and far
@@ -225,46 +222,80 @@ namespace
 
 // RoundTrip
 //------------------------------------------------------------------------------
-// The inverse of the transform gives the data back, whatever the sizes of the pieces either is fed
-/*static*/ void TestPchTransform::RoundTrip( const Array<char> & data, uint32_t base, uint64_t seed, uint64_t * outTransformedSize )
+/*static*/ void TestPchTransform::RoundTrip( const Array<char> & data, uint32_t base, uint64_t seed, uint64_t * outTransformedSize,
+                                              uint32_t kind, uint32_t encodePiece, uint32_t decodePiece )
 {
-    XfRandom random( seed );
+    XorShift64 random( seed );
     const uint32_t maxPieces[] = { 1, 3, 8, 13, 4096, 1000000 };
     const bool isLarge = ( data.GetSize() > 70000 ); // A piece of a byte or so would take long
-    const uint32_t encodePiece = maxPieces[ ( isLarge ? 4 : 0 ) + random.Below( isLarge ? 2 : 6 ) ];
-    const uint32_t decodePiece = maxPieces[ ( isLarge ? 4 : 0 ) + random.Below( isLarge ? 2 : 6 ) ];
+    if ( encodePiece == 0 )
+    {
+        encodePiece = maxPieces[ ( isLarge ? 4 : 0 ) + random.Below( isLarge ? 2 : 6 ) ];
+    }
+    if ( decodePiece == 0 )
+    {
+        decodePiece = maxPieces[ ( isLarge ? 4 : 0 ) + random.Below( isLarge ? 2 : 6 ) ];
+    }
+#define ROUND_TRIP_ASSERT( condition ) \
+    TEST_ASSERTM( condition, "kind %u size %zu base 0x%x seed %" PRIu64 " pieces of at most %u (encode) and %u (decode)", kind, data.GetSize(), base, seed, encodePiece, decodePiece )
 
     XfCollectSink transformed;
     {
         PchTransform::Encoder encoder( base );
-        TEST_ASSERT( XfFeedInPieces( encoder, data.Begin(), data.GetSize(), encodePiece, random, transformed ) );
-        TEST_ASSERT( encoder.Finish( transformed ) );
+        ROUND_TRIP_ASSERT( XfFeedInPieces( encoder, data.Begin(), data.GetSize(), encodePiece, random, transformed ) );
+        ROUND_TRIP_ASSERT( encoder.Finish( transformed ) );
     }
-    TEST_ASSERT( transformed.m_Data.GetSize() >= 4 );
-    TEST_ASSERT( transformed.m_Data.GetSize() <= PchTransform::GetMaxTransformedSize( data.GetSize() ) );
+    ROUND_TRIP_ASSERT( transformed.m_Data.GetSize() >= 4 );
+    ROUND_TRIP_ASSERT( transformed.m_Data.GetSize() <= PchTransform::GetMaxTransformedSize( data.GetSize() ) );
 
     XfCollectSink restored;
     {
         PchTransform::Decoder decoder;
-        TEST_ASSERT( XfFeedInPieces( decoder, transformed.m_Data.Begin(), transformed.m_Data.GetSize(), decodePiece, random, restored ) );
-        TEST_ASSERT( decoder.Finish( restored ) );
+        ROUND_TRIP_ASSERT( XfFeedInPieces( decoder, transformed.m_Data.Begin(), transformed.m_Data.GetSize(), decodePiece, random, restored ) );
+        ROUND_TRIP_ASSERT( decoder.Finish( restored ) );
     }
-    TEST_ASSERT( restored.m_Data.GetSize() == data.GetSize() );
-    TEST_ASSERT( ( data.GetSize() == 0 ) || ( memcmp( restored.m_Data.Begin(), data.Begin(), data.GetSize() ) == 0 ) );
+    ROUND_TRIP_ASSERT( restored.m_Data.GetSize() == data.GetSize() );
+    ROUND_TRIP_ASSERT( ( data.GetSize() == 0 ) || ( memcmp( restored.m_Data.Begin(), data.Begin(), data.GetSize() ) == 0 ) );
+#undef ROUND_TRIP_ASSERT
     if ( outTransformedSize )
     {
         *outTransformedSize = transformed.m_Data.GetSize();
     }
 }
 
-// WriteFile
+// GetTestDir
 //------------------------------------------------------------------------------
-/*static*/ bool TestPchTransform::WriteFile( const AString & path, const Array<char> & content )
+/*static*/ void TestPchTransform::GetTestDir( const char * testName, AString & outDir )
 {
-    FileStream f;
-    return ( FileIO::EnsurePathExistsForFile( path ) &&
-             f.Open( path.Get(), FileStream::WRITE_ONLY ) &&
-             ( f.Write( content.Begin(), content.GetSize() ) == content.GetSize() ) );
+    outDir.Format( "../tmp/Test/PchTransform/%s/", testName );
+    Array<AString> old;
+    FileIO::GetFiles( outDir, AStackString( "*" ), true, &old );
+    for ( const AString & file : old )
+    {
+        FileIO::FileDelete( file.Get() );
+    }
+    TEST_ASSERT( FileIO::EnsurePathExists( outDir ) );
+}
+
+// MakeSegments
+//------------------------------------------------------------------------------
+// A MiB each: the first numRandom are random bytes, which no transform helps, and the others are like a PCH
+/*static*/ void TestPchTransform::MakeSegments( uint32_t numSegments, uint32_t numRandom, uint64_t seed, Array<char> & outData )
+{
+    outData.Clear();
+    for ( uint32_t i = 0; i < numSegments; ++i )
+    {
+        Array<char> segment;
+        if ( i < numRandom )
+        {
+            MakeRandomBytes( kMiB, seed + i, segment );
+        }
+        else
+        {
+            MakePchLikeBytes( kMiB, seed + i, segment );
+        }
+        outData.Append( segment );
+    }
 }
 
 // RoundTripsAnyBytes
@@ -282,7 +313,30 @@ void TestPchTransform::RoundTripsAnyBytes() const
             {
                 Array<char> data;
                 MakeData( kind, size, ++seed, base, data );
-                RoundTrip( data, base, seed * 7 );
+                RoundTrip( data, base, seed * 7, nullptr, kind );
+            }
+        }
+    }
+
+    // Every size of pieces that is smaller than a word and a little more, for the encoder and the decoder each. A byte
+    // at a time is a split inside the base, a word, an escape and the word it is for, and the tail, wherever they are.
+    const uint32_t maxPieces[] = { 1, 3, 8, 13 };
+    const uint32_t sweepBases[] = { 0x6BB, PchTransform::kMaxBase };
+    for ( uint32_t size = 0; size <= 80; ++size )
+    {
+        for ( uint32_t kind = 0; kind < kNumKinds; ++kind )
+        {
+            for ( const uint32_t base : sweepBases )
+            {
+                Array<char> data;
+                MakeData( kind, size, ++seed, base, data );
+                for ( const uint32_t encodePiece : maxPieces )
+                {
+                    for ( const uint32_t decodePiece : maxPieces )
+                    {
+                        RoundTrip( data, base, seed, nullptr, kind, encodePiece, decodePiece );
+                    }
+                }
             }
         }
     }
@@ -295,7 +349,7 @@ void TestPchTransform::RoundTripsAnyBytes() const
         {
             Array<char> data;
             MakeData( kind, size, ++seed, 0x6BB, data );
-            RoundTrip( data, 0x6BB, seed * 11 );
+            RoundTrip( data, 0x6BB, seed * 11, nullptr, kind );
         }
     }
 }
@@ -386,7 +440,7 @@ void TestPchTransform::ShrinksWhatHasPointers() const
 //------------------------------------------------------------------------------
 void TestPchTransform::GrowthIsBounded() const
 {
-    // XfRandom bytes have no pointers: the base and nothing else is added
+    // XorShift64 bytes have no pointers: the base and nothing else is added
     {
         Array<char> data;
         MakeRandomBytes( 100000, 3, data );
@@ -508,9 +562,12 @@ void TestPchTransform::DecoderRejectsInvalidStreams() const
 //------------------------------------------------------------------------------
 void TestPchTransform::DecoderSurvivesGarbage() const
 {
-    // Whatever is fed is a failure or data, and never more than a stream of its size can make
-    XfRandom random( 77 );
-    for ( uint32_t i = 0; i < 400; ++i )
+    // Whatever is fed is a failure or data, and never more than a stream of its size can make. What it is does not depend
+    // on how the stream is cut into pieces.
+    XorShift64 random( 77 );
+    uint32_t numValid = 0;
+    uint32_t numInvalid = 0;
+    for ( uint32_t i = 0; i < 2000; ++i )
     {
         Array<char> stream;
         stream.SetSize( 4 + random.Below( 600 ) );
@@ -524,13 +581,24 @@ void TestPchTransform::DecoderSurvivesGarbage() const
             stream[ b ] = (char)( base >> ( 8 * b ) );
         }
 
-        // Words that name entries of the cache, so that some of them are valid
+        // Words that are pointers, which fill the cache, and words that are references: to an entry that may be in the
+        // cache or not, with a distance of the range or beyond it. Some streams have few references, so that they are valid.
+        const uint32_t referenceShare = ( random.Below( 2 ) == 0 ) ? 2 : 12; // One word in this many
         for ( size_t w = 4; ( w + 8 ) <= stream.GetSize(); w += 8 )
         {
-            if ( random.Below( 2 ) )
+            if ( random.Below( 3 ) == 0 )
+            {
+                for ( uint32_t b = 0; b < 4; ++b )
+                {
+                    stream[ w + 4 + b ] = (char)( base >> ( 8 * b ) );
+                }
+            }
+            else if ( random.Below( referenceShare ) == 0 )
             {
                 const uint32_t high = base | ( random.Below( 2 ) ? 0x80000000u : 0x40000000u ) | ( random.Below( 4 ) ? 0 : 0x20000000u );
-                const uint32_t low = random.Below( 36 ) | ( random.Below( 2 ) ? ( random.Below( 5 ) << 16 ) : 0 );
+                const uint32_t index = ( random.Below( 4 ) ? random.Below( 36 ) : random.Below( 80 ) );  // The cache has 32 entries
+                const uint32_t distances[] = { random.Below( 36 ), 4095, 4096, 4097, 0xFFFF, ( 1 + random.Below( 0xFFFF ) ) };
+                const uint32_t low = ( high & 0x40000000u ) ? ( ( index << 16 ) | distances[ random.Below( 6 ) ] ) : index;
                 for ( uint32_t b = 0; b < 4; ++b )
                 {
                     stream[ w + b ] = (char)( low >> ( 8 * b ) );
@@ -539,11 +607,42 @@ void TestPchTransform::DecoderSurvivesGarbage() const
             }
         }
 
-        XfCollectSink sink;
-        PchTransform::Decoder decoder;
-        XfFeedInPieces( decoder, stream.Begin(), stream.GetSize(), 1 + random.Below( 50 ), random, sink ); // Either way
-        TEST_ASSERT( sink.m_Data.GetSize() <= stream.GetSize() );
+        // The whole of it, and in pieces
+        XfCollectSink whole;
+        PchTransform::Decoder wholeDecoder;
+        const bool wholeIsValid = wholeDecoder.Feed( stream.Begin(), stream.GetSize(), whole ) && wholeDecoder.Finish( whole );
+        XfCollectSink pieces;
+        PchTransform::Decoder pieceDecoder;
+        const bool piecesWereFed = XfFeedInPieces( pieceDecoder, stream.Begin(), stream.GetSize(), 1 + random.Below( 50 ), random, pieces );
+        const bool piecesAreValid = ( piecesWereFed && pieceDecoder.Finish( pieces ) );
+        TEST_ASSERTM( wholeIsValid == piecesAreValid, "stream %u of %zu bytes: valid as a whole %d, in pieces %d", i, stream.GetSize(), wholeIsValid, piecesAreValid );
+        TEST_ASSERT( whole.m_Data.GetSize() <= stream.GetSize() );
+        TEST_ASSERT( pieces.m_Data.GetSize() <= stream.GetSize() );
+        if ( wholeIsValid )
+        {
+            ++numValid;
+            TEST_ASSERTM( whole.m_Data.GetSize() == pieces.m_Data.GetSize(), "stream %u", i );
+            TEST_ASSERTM( memcmp( whole.m_Data.Begin(), pieces.m_Data.Begin(), whole.m_Data.GetSize() ) == 0, "stream %u", i );
+        }
+        else
+        {
+            ++numInvalid;
+            if ( piecesWereFed == false )
+            {
+                // A decoder that failed stays failed, and makes nothing more
+                const size_t before = pieces.m_Data.GetSize();
+                const char more[ 16 ] = {};
+                TEST_ASSERT( pieceDecoder.Feed( more, sizeof( more ), pieces ) == false );
+                TEST_ASSERT( pieceDecoder.Finish( pieces ) == false );
+                TEST_ASSERT( pieces.m_Data.GetSize() == before );
+            }
+        }
     }
+
+    // Both kinds were met
+    OUTPUT( "DecoderSurvivesGarbage: %u valid, %u not\n", numValid, numInvalid );
+    TEST_ASSERT( numValid > 100 );
+    TEST_ASSERT( numInvalid > 100 );
 }
 
 // SinksThatRefuseStopThePieces
@@ -618,12 +717,29 @@ void TestPchTransform::FindsTheBase() const
     {
         // One word in twenty has the high half
         Array<char> data;
-        XfRandom random( 3 );
+        XorShift64 random( 3 );
         for ( uint32_t i = 0; i < 20000; ++i )
         {
             XfPutWord( data, ( ( i % 20 ) == 0 ) ? ( ( (uint64_t)0x6BB << 32 ) | random.Below( 1000 ) ) : random.Next() );
         }
         TEST_ASSERT( PchTransform::FindBase( data.Begin(), data.GetSize(), base ) == false );
+    }
+
+    // The least share that is a base is one word in eight
+    {
+        const uint32_t numWords = 7200;
+        const struct { uint32_t m_Every; bool m_IsBase; } shares[] = { { 6, true }, { 8, true }, { 9, false } };
+        for ( const auto & share : shares )
+        {
+            Array<char> data;
+            XorShift64 random( 5 );
+            for ( uint32_t i = 0; i < numWords; ++i )
+            {
+                XfPutWord( data, ( ( i % share.m_Every ) == 0 ) ? ( ( (uint64_t)0x6BB << 32 ) | random.Below( 1000 ) ) : random.Next() );
+            }
+            TEST_ASSERTM( PchTransform::FindBase( data.Begin(), data.GetSize(), base ) == share.m_IsBase, "one word in %u", share.m_Every );
+            TEST_ASSERT( ( share.m_IsBase == false ) || ( base == 0x6BB ) );
+        }
     }
 
     // A base the transform cannot use: it has a bit that marks a reference
@@ -641,11 +757,12 @@ void TestPchTransform::FindsTheBase() const
 //------------------------------------------------------------------------------
 void TestPchTransform::ChoosesOnlyWhatItHelps() const
 {
-    AStackString<> dir( "../tmp/Test/PchTransform/Choose/" );
-    TEST_ASSERT( FileIO::EnsurePathExists( dir ) );
+    AStackString<> dir;
+    GetTestDir( "Choose", dir );
     AStackString<> path( dir );
     path += "data.bin";
     uint32_t base = 0;
+    const int32_t level = Compressor::kZstdPchLevel; // What a PCH is sent with
 
     // A file of pointers that repeat and are nearest each other: in a megabyte and in more
     const uint32_t sizes[] = { ( 100 * 1024 ), ( 3 * 1024 * 1024 ) + 1, ( 10 * 1024 * 1024 ) + 3 };
@@ -655,19 +772,27 @@ void TestPchTransform::ChoosesOnlyWhatItHelps() const
         MakePchLikeBytes( size, size, data );
         TEST_ASSERT( WriteFile( path, data ) );
         base = 0;
-        TEST_ASSERT( PchTransform::Choose( path.Get(), size, 3, nullptr, base ) );
+        TEST_ASSERTM( PchTransform::Choose( path.Get(), size, level, nullptr, base ), "size %u", size );
         TEST_ASSERT( base == kPchLikeBase );
     }
 
-    // Not a file that is what it was said to be, or that is asked to stop
+    // A file that is as it was said to be is chosen, and is not if it is not, or if it is asked to stop
     {
         Array<char> data;
         MakePchLikeBytes( 500000, 1, data );
         TEST_ASSERT( WriteFile( path, data ) );
-        TEST_ASSERT( PchTransform::Choose( path.Get(), 499999, 3, nullptr, base ) == false );
+        base = 0;
+        TEST_ASSERT( PchTransform::Choose( path.Get(), 500000, level, nullptr, base ) ); // The control of what follows
+        TEST_ASSERT( base == kPchLikeBase );
+        const Atomic<bool> notAborted{ false };
+        TEST_ASSERT( PchTransform::Choose( path.Get(), 500000, level, &notAborted, base ) );
+        TEST_ASSERT( PchTransform::Choose( path.Get(), 499999, level, nullptr, base ) == false );
+        TEST_ASSERT( PchTransform::Choose( path.Get(), 500001, level, nullptr, base ) == false );
         const Atomic<bool> aborted{ true };
-        TEST_ASSERT( PchTransform::Choose( path.Get(), 500000, 3, &aborted, base ) == false );
-        TEST_ASSERT( PchTransform::Choose( "../tmp/Test/PchTransform/Choose/not-there", 500000, 3, nullptr, base ) == false );
+        TEST_ASSERT( PchTransform::Choose( path.Get(), 500000, level, &aborted, base ) == false );
+        AStackString<> missing( dir );
+        missing += "not-there";
+        TEST_ASSERT( PchTransform::Choose( missing.Get(), 500000, level, nullptr, base ) == false );
     }
 
     // Data it does not help: there is no base, or there is one and pointers do not repeat or come nearest each other
@@ -685,7 +810,7 @@ void TestPchTransform::ChoosesOnlyWhatItHelps() const
         if ( c.m_Kind == 10 )
         {
             // The same high half and a low half that is anything
-            XfRandom random( 6 );
+            XorShift64 random( 6 );
             for ( uint32_t i = 0; i < ( c.m_Size / 8 ); ++i )
             {
                 XfPutWord( data, ( (uint64_t)0x6BB << 32 ) | (uint32_t)random.Next() );
@@ -696,8 +821,166 @@ void TestPchTransform::ChoosesOnlyWhatItHelps() const
             MakeData( c.m_Kind, c.m_Size, 1, 0x6BB, data );
         }
         TEST_ASSERT( WriteFile( path, data ) );
-        TEST_ASSERTM( PchTransform::Choose( path.Get(), data.GetSize(), 3, nullptr, base ) == false, "%s", c.m_Name );
+        TEST_ASSERTM( PchTransform::Choose( path.Get(), data.GetSize(), level, nullptr, base ) == false, "%s", c.m_Name );
     }
+}
+
+// WorthItIsDecidedByTheRatio
+//------------------------------------------------------------------------------
+void TestPchTransform::WorthItIsDecidedByTheRatio() const
+{
+    // At most 95% of the size without the transform
+    TEST_ASSERT( PchTransform::IsWorthIt( 1000, 900 ) );
+    TEST_ASSERT( PchTransform::IsWorthIt( 1000, 940 ) );
+    TEST_ASSERT( PchTransform::IsWorthIt( 1000, 950 ) );
+    TEST_ASSERT( PchTransform::IsWorthIt( 1000, 951 ) == false );
+    TEST_ASSERT( PchTransform::IsWorthIt( 1000, 960 ) == false );
+    TEST_ASSERT( PchTransform::IsWorthIt( 1000, 1000 ) == false );
+    TEST_ASSERT( PchTransform::IsWorthIt( 1000, 1500 ) == false );
+    TEST_ASSERT( PchTransform::IsWorthIt( 1ull << 40, ( ( 1ull << 40 ) / 100 ) * 95 ) ); // Sizes of files, not of pieces
+
+    // What is decided of a file is what the sizes it is judged by say, which come out as the share of it that is
+    // like a PCH grows: a file is of eight MiB, of which some are random bytes, which no transform helps
+    AStackString<> dir;
+    GetTestDir( "Ratio", dir );
+    AStackString<> path( dir );
+    path += "data.bin";
+    double previousRatio = 0.0;
+    uint32_t numWorth = 0;
+    uint32_t numNotWorth = 0;
+    const uint32_t numRandoms[] = { 0, 2, 3, 4, 5, 6, 7 };
+    for ( const uint32_t numRandom : numRandoms )
+    {
+        Array<char> data;
+        MakeSegments( 8, numRandom, 100, data );
+        TEST_ASSERT( WriteFile( path, data ) );
+        uint32_t base = 0;
+        uint64_t plainSize = 0;
+        uint64_t transformedSize = 0;
+        TEST_ASSERT( PchTransform::Estimate( path.Get(), data.GetSize(), Compressor::kZstdPchLevel, nullptr, base, plainSize, transformedSize ) );
+        const double ratio = ( 100.0 * (double)transformedSize ) / (double)plainSize;
+        OUTPUT( "WorthItIsDecidedByTheRatio: %u of 8 MiB random: %" PRIu64 " -> %" PRIu64 " bytes (%.1f%%)\n", numRandom, plainSize, transformedSize, ratio );
+        TEST_ASSERT( ratio > previousRatio ); // Less of it is helped
+        previousRatio = ratio;
+        const bool isChosen = PchTransform::Choose( path.Get(), data.GetSize(), Compressor::kZstdPchLevel, nullptr, base );
+        TEST_ASSERTM( isChosen == PchTransform::IsWorthIt( plainSize, transformedSize ), "%u random", numRandom );
+        TEST_ASSERTM( isChosen == ( ratio <= 95.0 ), "%u random: %.2f%%", numRandom, ratio );
+        ( isChosen ? numWorth : numNotWorth )++;
+    }
+
+    // Some of them are on either side of the limit
+    TEST_ASSERT( numWorth >= 2 );
+    TEST_ASSERT( numNotWorth >= 1 );
+
+    // It is judged at the level that is asked for: the higher level finds more of what the transform removes, as well as the rest
+    {
+        Array<char> data;
+        MakeSegments( 8, 0, 100, data );
+        TEST_ASSERT( WriteFile( path, data ) );
+        uint32_t base = 0;
+        uint64_t plainSizes[ 2 ] = {};
+        uint64_t transformedSizes[ 2 ] = {};
+        const int32_t levels[ 2 ] = { Compressor::kZstdTransferLevel, Compressor::kZstdPchLevel };
+        for ( uint32_t i = 0; i < 2; ++i )
+        {
+            TEST_ASSERT( PchTransform::Estimate( path.Get(), data.GetSize(), levels[ i ], nullptr, base, plainSizes[ i ], transformedSizes[ i ] ) );
+        }
+        TEST_ASSERT( plainSizes[ 1 ] < plainSizes[ 0 ] );
+        TEST_ASSERT( transformedSizes[ 1 ] < transformedSizes[ 0 ] );
+    }
+}
+
+// ChoosesFromWhereItSamples
+//------------------------------------------------------------------------------
+void TestPchTransform::ChoosesFromWhereItSamples() const
+{
+    // A file that is larger than the pieces that are tried (eight, of a MiB, the first at its start and the last at
+    // its end, at word boundaries): what is in a piece counts, and what is not in one does not. The rest of the file
+    // is zeros, which compress to nothing whether or not they are transformed.
+    const uint32_t size = ( 40 * kMiB ) + 5;
+    constexpr uint32_t kNumProbes = 8;
+    auto probeOffset = [ size ]( uint32_t index ) { return (uint32_t)( ( ( ( size - kMiB ) / ( kNumProbes - 1 ) ) * index ) & ~7u ); };
+    TEST_ASSERT( ( probeOffset( 3 ) % 8 ) == 0 );
+    TEST_ASSERT( ( ( ( size - kMiB ) / ( kNumProbes - 1 ) ) % 8 ) != 0 ); // So that the alignment has an effect
+
+    AStackString<> dir;
+    GetTestDir( "Samples", dir );
+    AStackString<> path( dir );
+    path += "data.bin";
+    Array<char> pchLike;
+    MakePchLikeBytes( kMiB, 9, pchLike );
+
+    struct Case { const char * m_Name; uint32_t m_Offset; bool m_IsChosen; };
+    const Case cases[] = {
+        { "the first piece",        probeOffset( 0 ),               true },
+        { "the middle piece",       probeOffset( kNumProbes / 2 ),  true },
+        { "the last piece",         probeOffset( kNumProbes - 1 ),  true },
+        { "the end of the file",    size - kMiB - 3,                false }, // Not a probe: the last one is before this
+        { "between the pieces",     2 * kMiB,                       false }, // What is not looked at is not known
+    };
+    for ( const Case & c : cases )
+    {
+        Array<char> data;
+        data.SetSize( size );
+        memset( data.Begin(), 0, data.GetSize() );
+        memcpy( data.Begin() + c.m_Offset, pchLike.Begin(), pchLike.GetSize() );
+        TEST_ASSERT( WriteFile( path, data ) );
+        uint32_t base = 0;
+        TEST_ASSERTM( PchTransform::Choose( path.Get(), size, Compressor::kZstdPchLevel, nullptr, base ) == c.m_IsChosen, "%s", c.m_Name );
+        TEST_ASSERTM( ( c.m_IsChosen == false ) || ( base == kPchLikeBase ), "%s", c.m_Name );
+    }
+}
+
+// FormatIsFrozen
+//------------------------------------------------------------------------------
+void TestPchTransform::FormatIsFrozen() const
+{
+    // The bytes that version 1 of the transform makes of some data, written out: a change to the constants or to how a
+    // word is rewritten changes them, and the workers that have read PCHs of this version can no longer read them
+    const uint32_t base = 0x6BB;
+    Array<char> data;
+    XfPutWord( data, ( (uint64_t)base << 32 ) | 0x1000u );                  // A pointer that is new: as it is
+    XfPutWord( data, ( (uint64_t)base << 32 ) | 0x1000u );                  // The same one: entry 0
+    XfPutWord( data, ( (uint64_t)base << 32 ) | 0x1010u );                  // 16 past entry 0
+    XfPutWord( data, 0x123456789ABCDEF0ull );                               // Not a pointer
+    XfPutWord( data, ( (uint64_t)( base | 0x80000000u ) << 32 ) | 0x12345678u ); // Looks like a reference: escaped
+    XfPutWord( data, ( (uint64_t)base << 32 ) | 0x1000u );                  // Entry 1 now, after the pointer that was near
+    data.Append( 'A' );
+    data.Append( 'B' );
+    data.Append( 'C' );
+    const uint8_t golden[] = {
+        0xBB, 0x06, 0x00, 0x00,                                         // The base
+        0x00, 0x10, 0x00, 0x00, 0xBB, 0x06, 0x00, 0x00,                 // 0x1000, as it is
+        0x00, 0x00, 0x00, 0x00, 0xBB, 0x06, 0x00, 0x80,                 // F1, entry 0
+        0x10, 0x08, 0x00, 0x00, 0xBB, 0x06, 0x00, 0x40,                 // F2, entry 0, 16 + 2048
+        0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12,                 // As it is
+        0x00, 0x00, 0x00, 0x00, 0xBB, 0x06, 0x00, 0x20,                 // F3, the escape
+        0x78, 0x56, 0x34, 0x12, 0xBB, 0x06, 0x00, 0x80,                 // The word it is for
+        0x01, 0x00, 0x00, 0x00, 0xBB, 0x06, 0x00, 0x80,                 // F1, entry 1
+        0x41, 0x42, 0x43,                                               // The tail
+    };
+
+    XfCollectSink transformed;
+    PchTransform::Encoder encoder( base );
+    TEST_ASSERT( encoder.Feed( data.Begin(), data.GetSize(), transformed ) );
+    TEST_ASSERT( encoder.Finish( transformed ) );
+    TEST_ASSERT( transformed.m_Data.GetSize() == sizeof( golden ) );
+    TEST_ASSERT( memcmp( transformed.m_Data.Begin(), golden, sizeof( golden ) ) == 0 );
+
+    // And it is read as it was
+    XfCollectSink restored;
+    PchTransform::Decoder decoder;
+    TEST_ASSERT( decoder.Feed( golden, sizeof( golden ), restored ) );
+    TEST_ASSERT( decoder.Finish( restored ) );
+    TEST_ASSERT( restored.m_Data.GetSize() == data.GetSize() );
+    TEST_ASSERT( memcmp( restored.m_Data.Begin(), data.Begin(), data.GetSize() ) == 0 );
+
+    // The cache is what it is
+    TEST_ASSERT( PchTransform::kCacheSize == 32 );
+    TEST_ASSERT( PchTransform::kNearRange == 2048 );
+    TEST_ASSERT( PchTransform::kMaxBase == 0x1FFFFFFF );
+    TEST_ASSERT( PchTransform::kPtrXfId == 1 );
+    TEST_ASSERT( PchTransform::kPtrXfVersion == 1 );
 }
 
 // CacheOrdersByUse

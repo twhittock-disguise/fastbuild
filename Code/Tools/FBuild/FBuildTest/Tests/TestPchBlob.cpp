@@ -18,6 +18,9 @@
 #include "Core/Process/Atomic.h"
 #include "Core/Strings/AStackString.h"
 
+// External
+#include "zstd.h"
+
 #include <string.h>
 
 // TestPchBlob
@@ -42,18 +45,19 @@ private:
     void TransformFallsBackToThePlainBlob() const;
     void TransformedFrameIsBounded() const;
     void PchBlobsUseTheWideWindow() const;
+    void PchBlobWindowsFollowTheirSize() const;
+    void HostileTransformedFramesAreRejected() const;
 
     // The header of a blob, as words
     static uint32_t GetHeaderWord( const Array<char> & blob, uint32_t index );
     static void SetHeaderWord( Array<char> & blob, uint32_t index, uint32_t value );
     static constexpr uint32_t kTransformedType = ( Compressor::eZstd | ( (uint32_t)PchTransform::kPtrXfId << 8 ) | ( (uint32_t)PchTransform::kPtrXfVersion << 16 ) );
+    static_assert( kTransformedType == 0x00010102, "The type word of a blob of the transform (zstd, id 1, version 1) is on the wire" );
 
     // Compressible content with some variation
     static void MakeContent( uint32_t size, uint32_t seed, Array<char> & outContent );
     static void Compress( const Array<char> & content, Array<char> & outBlob );
     static void GetTestDir( const char * testName, AString & outDir );
-    static bool WriteFile( const AString & path, const Array<char> & content );
-    static bool ReadFile( const AString & path, Array<char> & outContent );
 };
 
 // Register Tests
@@ -74,6 +78,8 @@ REGISTER_TESTS_BEGIN( TestPchBlob )
     REGISTER_TEST( TransformFallsBackToThePlainBlob )
     REGISTER_TEST( TransformedFrameIsBounded )
     REGISTER_TEST( PchBlobsUseTheWideWindow )
+    REGISTER_TEST( PchBlobWindowsFollowTheirSize )
+    REGISTER_TEST( HostileTransformedFramesAreRejected )
 REGISTER_TESTS_END
 
 // Helpers
@@ -173,29 +179,6 @@ namespace
     TEST_ASSERT( FileIO::EnsurePathExists( outDir ) );
 }
 
-// WriteFile
-//------------------------------------------------------------------------------
-/*static*/ bool TestPchBlob::WriteFile( const AString & path, const Array<char> & content )
-{
-    FileStream f;
-    return ( FileIO::EnsurePathExistsForFile( path ) &&
-             f.Open( path.Get(), FileStream::WRITE_ONLY ) &&
-             ( f.Write( content.Begin(), content.GetSize() ) == content.GetSize() ) );
-}
-
-// ReadFile
-//------------------------------------------------------------------------------
-/*static*/ bool TestPchBlob::ReadFile( const AString & path, Array<char> & outContent )
-{
-    FileStream f;
-    if ( f.Open( path.Get() ) == false )
-    {
-        return false;
-    }
-    outContent.SetSize( (size_t)f.GetFileSize() );
-    return ( f.Read( outContent.Begin(), outContent.GetSize() ) == outContent.GetSize() );
-}
-
 // DecompressesWhatCompressorWrote
 //------------------------------------------------------------------------------
 void TestPchBlob::DecompressesWhatCompressorWrote() const
@@ -239,11 +222,7 @@ void TestPchBlob::DecompressesWhatCompressorWrote() const
         compressed += "source.zst";
         TEST_ASSERT( WriteFile( source, content ) );
 
-        struct NoObserver : public Compressor::FileObserver
-        {
-            virtual void OnPass() override {}
-            virtual void OnPiece( const void *, size_t ) override {}
-        } observer;
+        NullFileObserver observer;
         uint64_t compressedSize = 0;
         TEST_ASSERT( Compressor::CompressZstdFile( source.Get(), content.GetSize(), compressed.Get(), Compressor::kZstdTransferLevel, nullptr, observer, compressedSize ) );
 
@@ -627,7 +606,7 @@ void TestPchBlob::TransformedBlobIsReadLikeAPlainOne() const
     Array<char> plain;
     Array<char> blob;
     bool transformed = true;
-    TEST_ASSERT( MakePchBlob( content, 0, plain, &transformed ) );
+    TEST_ASSERT( MakePchBlob( content, kNoTransform, plain, &transformed ) );
     TEST_ASSERT( transformed == false );
     TEST_ASSERT( MakePchBlob( content, kPchLikeBase, blob, &transformed ) );
     TEST_ASSERT( transformed );
@@ -829,7 +808,7 @@ void TestPchBlob::RejectsTransformedBlobsThatAreNotValid() const
         Array<char> random;
         MakeRandomBytes( 100000, 22, random );
         Array<char> copy;
-        TEST_ASSERT( MakePchBlob( random, 0, copy ) );
+        TEST_ASSERT( MakePchBlob( random, kNoTransform, copy ) );
         TEST_ASSERT( GetHeaderWord( copy, 0 ) == Compressor::eUncompressed );
         const uint64_t randomId = PchId::Calc( random.Begin(), random.GetSize() );
         TEST_ASSERT( PchBlob::Verify( copy.Begin(), copy.GetSize(), randomId, (uint32_t)random.GetSize() ) );
@@ -875,7 +854,7 @@ void TestPchBlob::TransformFallsBackToThePlainBlob() const
     bool transformed = true;
     TEST_ASSERT( MakePchBlob( content, kPchLikeBase, blob, &transformed ) );
     TEST_ASSERT( transformed == false );
-    TEST_ASSERT( MakePchBlob( content, 0, plain, nullptr ) );
+    TEST_ASSERT( MakePchBlob( content, kNoTransform, plain, nullptr ) );
     TEST_ASSERT( blob.GetSize() == plain.GetSize() );
     TEST_ASSERT( memcmp( blob.Begin(), plain.Begin(), blob.GetSize() ) == 0 );
     TEST_ASSERT( GetHeaderWord( blob, 0 ) == Compressor::eUncompressed );
@@ -934,24 +913,28 @@ void TestPchBlob::TransformedFrameIsBounded() const
 //------------------------------------------------------------------------------
 void TestPchBlob::PchBlobsUseTheWideWindow() const
 {
-    // A PCH larger than the window, so that the window the frame says is the one that was asked for
-    Array<char> content;
-    MakePchLikeBytes( ( 70 * 1024 * 1024 ) + 3, 31, content );
-    const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
-    const uint32_t size = (uint32_t)content.GetSize();
-
-    for ( uint32_t transform = 0; transform < 2; ++transform )
+    // The window of a PCH that is larger than it is: the one of the PCH parameters (see Compressor::kZstdPchWindowLog),
+    // which a decoder takes with no setting up. The transformed form is told no size, so it says the window it was given,
+    // as long as that holds the PCH. The plain form is told its size: it is a single segment, and so says no window,
+    // until the PCH is larger than the window. That is why the plain one is of more than 64 MiB, and the other is not.
+    struct Case { uint32_t m_Size; bool m_Transform; };
+    const Case cases[] = {
+        { ( 65 * 1024 * 1024 ) + 3, false },
+        { ( 33 * 1024 * 1024 ) + 3, true },
+    };
+    for ( const Case & c : cases )
     {
+        Array<char> content;
+        MakePchLikeBytes( c.m_Size, 31, content );
+        const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
         Array<char> blob;
         bool transformed = false;
-        TEST_ASSERT( MakePchBlob( content, transform ? kPchLikeBase : 0, blob, &transformed ) );
-        TEST_ASSERT( transformed == ( transform != 0 ) );
-
-        // The frame has the window of the PCH parameters, not that of the level
-        TEST_ASSERT( GetBlobWindowLog( blob ) == 26 );
+        TEST_ASSERT( MakePchBlob( content, c.m_Transform ? kPchLikeBase : kNoTransform, blob, &transformed ) );
+        TEST_ASSERT( transformed == c.m_Transform );
+        TEST_ASSERT( GetBlobWindowLog( blob ) == Compressor::kZstdPchWindowLog );
 
         // It is read as any other: verified, and unpacked
-        TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId, size ) );
+        TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId, c.m_Size ) );
         AStackString<> dir;
         GetTestDir( "WideWindow", dir );
         AStackString<> stored( dir );
@@ -963,11 +946,11 @@ void TestPchBlob::PchBlobsUseTheWideWindow() const
         raw += "pch.pch";
         uint64_t rawSize = 0;
         TEST_ASSERT( PchBlob::Unpack( stored, pchId, temp, raw, nullptr, rawSize ) == PchBlob::UNPACK_OK );
-        TEST_ASSERT( rawSize == size );
+        TEST_ASSERT( rawSize == c.m_Size );
         TEST_ASSERT( FileIO::FileDelete( raw.Get() ) );
 
         // A worker of 24.0 reads the plain one with the decoder it has
-        if ( transform == 0 )
+        if ( c.m_Transform == false )
         {
             Compressor decompressor;
             TEST_ASSERT( Compressor::IsValidData( blob.Begin(), blob.GetSize() ) );
@@ -976,6 +959,191 @@ void TestPchBlob::PchBlobsUseTheWideWindow() const
             TEST_ASSERT( memcmp( decompressor.GetResult(), content.Begin(), content.GetSize() ) == 0 );
         }
         FileIO::FileDelete( stored.Get() );
+    }
+}
+
+// PchBlobWindowsFollowTheirSize
+//------------------------------------------------------------------------------
+void TestPchBlob::PchBlobWindowsFollowTheirSize() const
+{
+    // The window of a frame is what a worker allocates to read it: that of a PCH of a few MiB is not that of a large one,
+    // whichever the form. (A frame that is a single segment has the size of its data for a window.)
+    const uint32_t sizes[] = { 100000, ( 1024 * 1024 ) + 5, ( 5 * 1024 * 1024 ) + 7 };
+    for ( const uint32_t size : sizes )
+    {
+        uint32_t expectedLog = 10; // The smallest window there is
+        while ( ( 1ull << expectedLog ) < size )
+        {
+            ++expectedLog;
+        }
+        TEST_ASSERT( expectedLog < Compressor::kZstdPchWindowLog );
+
+        Array<char> content;
+        MakePchLikeBytes( size, size, content );
+        Array<char> plain;
+        Array<char> blob;
+        bool transformed = false;
+        TEST_ASSERT( MakePchBlob( content, kNoTransform, plain ) );
+        TEST_ASSERT( MakePchBlob( content, kPchLikeBase, blob, &transformed ) );
+        TEST_ASSERT( transformed );
+        const uint32_t plainLog = GetBlobWindowLog( plain );
+        const uint32_t transformedLog = GetBlobWindowLog( blob );
+        OUTPUT( "PchBlobWindowsFollowTheirSize: %u bytes: window log %u plain, %u transformed\n", size, plainLog, transformedLog );
+        TEST_ASSERTM( ( plainLog == 0 ) || ( plainLog <= expectedLog ), "%u bytes", size );
+        TEST_ASSERTM( transformedLog == expectedLog, "%u bytes", size );
+        const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
+        TEST_ASSERT( PchBlob::Verify( blob.Begin(), blob.GetSize(), pchId, size ) );
+    }
+}
+
+// HostileTransformedFramesAreRejected
+//------------------------------------------------------------------------------
+void TestPchBlob::HostileTransformedFramesAreRejected() const
+{
+    // Frames of transformed data that a client of ours does not make, whatever they hold. Each is a valid zstd frame, so it
+    // is the transform that fails, and none makes more than the size its header claims.
+    const uint32_t base = kPchLikeBase;
+    const uint32_t f1 = ( base | 0x80000000u );
+    const uint32_t f2 = ( base | 0x40000000u );
+    const uint32_t f3 = ( base | 0x20000000u );
+    const uint32_t kNumPadWords = 300; // Words that are not pointers, so that what follows the base compresses to a frame
+    auto putWord = [ & ]( Array<char> & stream, uint64_t word )
+    {
+        for ( uint32_t b = 0; b < 8; ++b )
+        {
+            stream.Append( (char)( word >> ( 8 * b ) ) );
+        }
+    };
+    auto makeStream = [ & ]( Array<char> & stream )
+    {
+        for ( uint32_t b = 0; b < 4; ++b )
+        {
+            stream.Append( (char)( base >> ( 8 * b ) ) );
+        }
+        for ( uint32_t i = 0; i < kNumPadWords; ++i )
+        {
+            putWord( stream, 0 );
+        }
+    };
+    auto makeBlob = [ & ]( const Array<char> & stream, uint32_t numWords, Array<char> & outBlob )
+    {
+        Compress( stream, outBlob );
+        TEST_ASSERT( GetHeaderWord( outBlob, 0 ) == Compressor::eZstd ); // It is a frame
+        SetHeaderWord( outBlob, 0, kTransformedType );
+        SetHeaderWord( outBlob, 1, ( kNumPadWords + numWords ) * 8 ); // What the data would be if it were valid
+    };
+    auto isRead = [ & ]( const Array<char> & blob )
+    {
+        const uint32_t claimedSize = GetHeaderWord( blob, 1 );
+
+        // Whole, and in pieces
+        CollectingSink sink;
+        uint32_t size = 0;
+        const bool result = StreamDecompressor::DecompressMemory( blob.Begin(), blob.GetSize(), sink, size );
+        TEST_ASSERT( sink.m_Data.GetSize() <= claimedSize );
+        StreamDecompressor decompressor;
+        CollectingSink pieces;
+        bool fed = true;
+        for ( size_t done = 0; ( done < blob.GetSize() ) && fed; done += 7 )
+        {
+            fed = decompressor.Feed( blob.Begin() + done, Math::Min<size_t>( 7, blob.GetSize() - done ), pieces );
+        }
+        TEST_ASSERT( pieces.m_Data.GetSize() <= claimedSize );
+        TEST_ASSERT( ( fed && decompressor.Finish() ) == result );
+        return result;
+    };
+
+    // The control: a stream that is valid is read
+    {
+        Array<char> stream;
+        makeStream( stream );
+        putWord( stream, ( (uint64_t)base << 32 ) | 0x1000u );
+        putWord( stream, ( (uint64_t)f1 << 32 ) );
+        Array<char> blob;
+        makeBlob( stream, 2, blob );
+        TEST_ASSERT( isRead( blob ) );
+    }
+
+    // An escape at the end of the data, that is not followed by the word it is for
+    {
+        Array<char> stream;
+        makeStream( stream );
+        putWord( stream, ( (uint64_t)base << 32 ) | 0x1000u );
+        putWord( stream, ( (uint64_t)f3 << 32 ) );
+        Array<char> blob;
+        makeBlob( stream, 2, blob );
+        TEST_ASSERT( isRead( blob ) == false );
+    }
+
+    // References to entries of the cache, which holds as many as there were pointers before them: those it holds are read,
+    // and those it does not, when it is empty, past what is in it and past what it can hold, are not
+    struct Reference { uint64_t m_Word; uint32_t m_NumEntriesNeeded; };
+    const Reference references[] = {
+        { ( (uint64_t)f1 << 32 ),                                   1 },
+        { ( (uint64_t)f1 << 32 ) | 1,                               2 },
+        { ( (uint64_t)f1 << 32 ) | 32,                              33 },
+        { ( (uint64_t)f1 << 32 ) | 0xFFFFFFFFu,                     0xFFFFFFFFu },
+        { ( (uint64_t)f2 << 32 ) | ( 1u << 16 ) | 2048,             2 },
+        { ( (uint64_t)f2 << 32 ) | ( 40u << 16 ) | 2048,            41 },
+        { ( (uint64_t)f2 << 32 ) | ( 0xFFFFu << 16 ) | 0xFFFFu,     0x10000 },
+    };
+    uint32_t numRejected = 0;
+    for ( uint32_t i = 0; i < ( sizeof( references ) / sizeof( references[ 0 ] ) ); ++i )
+    {
+        for ( uint32_t numPointers = 0; numPointers < 3; ++numPointers )
+        {
+            Array<char> stream;
+            makeStream( stream );
+            for ( uint32_t p = 0; p < numPointers; ++p )
+            {
+                putWord( stream, ( (uint64_t)base << 32 ) | ( 0x1000u + p ) );
+            }
+            putWord( stream, references[ i ].m_Word );
+            putWord( stream, 0 );
+            Array<char> blob;
+            makeBlob( stream, numPointers + 2, blob );
+            const bool isValid = ( references[ i ].m_NumEntriesNeeded <= numPointers );
+            TEST_ASSERTM( isRead( blob ) == isValid, "reference %u after %u pointers", i, numPointers );
+            numRejected += ( isValid ? 0 : 1 );
+        }
+    }
+    TEST_ASSERT( numRejected >= 15 );
+
+    // A frame that holds less than the base the transform begins with: 1 to 3 bytes, which is not what Compress makes a frame of
+    for ( uint32_t numBytes = 1; numBytes < 4; ++numBytes )
+    {
+        const char bytes[ 3 ] = { 0x40, 0x41, 0x42 };
+        Array<char> blob;
+        blob.SetSize( Compressor::kHeaderSize + ZSTD_compressBound( numBytes ) );
+        const size_t frameSize = ZSTD_compress( blob.Begin() + Compressor::kHeaderSize, blob.GetSize() - Compressor::kHeaderSize, bytes, numBytes, 3 );
+        TEST_ASSERT( ZSTD_isError( frameSize ) == false );
+        blob.SetSize( Compressor::kHeaderSize + frameSize );
+        SetHeaderWord( blob, 0, kTransformedType );
+        SetHeaderWord( blob, 1, 64 ); // At least the size of the frame, so that the header is one
+        SetHeaderWord( blob, 2, (uint32_t)frameSize );
+        TEST_ASSERTM( isRead( blob ) == false, "%u bytes", numBytes );
+    }
+
+    // A frame that is followed by more
+    {
+        Array<char> stream;
+        makeStream( stream );
+        putWord( stream, ( (uint64_t)base << 32 ) | 0x1000u );
+        putWord( stream, ( (uint64_t)f1 << 32 ) );
+        Array<char> blob;
+        makeBlob( stream, 2, blob );
+        TEST_ASSERT( isRead( blob ) );
+        const uint32_t numTrailings[] = { 1, 4, 12, 100 };
+        for ( const uint32_t numTrailing : numTrailings )
+        {
+            Array<char> longer;
+            longer = blob;
+            for ( uint32_t i = 0; i < numTrailing; ++i )
+            {
+                longer.Append( (char)( 0x28 + i ) ); // Not the start of another frame either
+            }
+            TEST_ASSERTM( isRead( longer ) == false, "%u bytes after the frame", numTrailing );
+        }
     }
 }
 

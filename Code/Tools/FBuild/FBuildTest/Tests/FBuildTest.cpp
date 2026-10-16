@@ -257,13 +257,10 @@ void FBuildTest::CheckStatsTotal( size_t numSeen, size_t numBuilt ) const
 /*static*/ void FBuildTest::MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes )
 {
     outBytes.SetSize( size );
-    uint64_t x = ( seed | 1 );
+    XorShift64 random( seed );
     for ( char & c : outBytes )
     {
-        x ^= ( x << 13 );
-        x ^= ( x >> 7 );
-        x ^= ( x << 17 );
-        c = (char)( x >> 24 );
+        c = (char)( random.Next() >> 24 );
     }
 }
 
@@ -272,14 +269,8 @@ void FBuildTest::CheckStatsTotal( size_t numSeen, size_t numBuilt ) const
 /*static*/ void FBuildTest::MakePchLikeBytes( uint32_t size, uint64_t seed, Array<char> & outBytes )
 {
     outBytes.SetSize( size );
-    uint64_t x = ( seed | 1 );
-    auto next = [ &x ]()
-    {
-        x ^= ( x << 13 );
-        x ^= ( x >> 7 );
-        x ^= ( x << 17 );
-        return x;
-    };
+    XorShift64 random( seed );
+    auto next = [ &random ]() { return random.Next(); };
     auto geometric = [ &next ]( uint32_t limit ) // 0 half of the time, 1 a quarter...
     {
         uint32_t k = 0;
@@ -377,16 +368,12 @@ void FBuildTest::CheckStatsTotal( size_t numSeen, size_t numBuilt ) const
         }
     }
 
-    struct NoObserver : public Compressor::FileObserver
-    {
-        virtual void OnPass() override {}
-        virtual void OnPiece( const void *, size_t ) override {}
-    } observer;
+    NullFileObserver observer;
     uint64_t blobSize = 0;
     bool transformed = false;
-    PchTransform::Encoder encoder( transformBase );
+    PchTransform::Encoder encoder( ( transformBase == kNoTransform ) ? 0 : transformBase );
     bool ok = Compressor::CompressZstdFile( source.Get(), pch.GetSize(), blob.Get(), Compressor::kZstdPchLevel, nullptr, observer, blobSize,
-                                            ( transformBase != 0 ) ? &encoder : nullptr, &transformed, Compressor::kZstdPchWindowLog );
+                                            ( transformBase != kNoTransform ) ? &encoder : nullptr, &transformed, Compressor::kZstdPchWindowLog );
     FileStream f;
     ok = ok && f.Open( blob.Get(), FileStream::READ_ONLY ) && ( f.GetFileSize() == blobSize );
     if ( ok )
@@ -402,6 +389,29 @@ void FBuildTest::CheckStatsTotal( size_t numSeen, size_t numBuilt ) const
         *outTransformed = transformed;
     }
     return ok;
+}
+
+// WriteFile
+//------------------------------------------------------------------------------
+/*static*/ bool FBuildTest::WriteFile( const AString & path, const Array<char> & content )
+{
+    FileStream f;
+    return ( FileIO::EnsurePathExistsForFile( path ) &&
+             f.Open( path.Get(), FileStream::WRITE_ONLY ) &&
+             ( f.Write( content.Begin(), content.GetSize() ) == content.GetSize() ) );
+}
+
+// ReadFile
+//------------------------------------------------------------------------------
+/*static*/ bool FBuildTest::ReadFile( const AString & path, Array<char> & outContent )
+{
+    FileStream f;
+    if ( f.Open( path.Get() ) == false )
+    {
+        return false;
+    }
+    outContent.SetSize( (size_t)f.GetFileSize() );
+    return ( f.Read( outContent.Begin(), outContent.GetSize() ) == outContent.GetSize() );
 }
 
 // GetIdOfNoProcess
