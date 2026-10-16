@@ -1064,14 +1064,15 @@ void TestPchBlob::HostileTransformedFramesAreRejected() const
         TEST_ASSERT( isRead( blob ) );
     }
 
-    // An escape at the end of the data, that is not followed by the word it is for
+    // An escape at the end of the data, that is not followed by the word it is for. The header says the size of what
+    // comes before it, so that it is the escape that is at fault and not the size.
     {
         Array<char> stream;
         makeStream( stream );
         putWord( stream, ( (uint64_t)base << 32 ) | 0x1000u );
         putWord( stream, ( (uint64_t)f3 << 32 ) );
         Array<char> blob;
-        makeBlob( stream, 2, blob );
+        makeBlob( stream, 1, blob );
         TEST_ASSERT( isRead( blob ) == false );
     }
 
