@@ -104,9 +104,13 @@ namespace
         // What zstd makes of data, in bytes
         bool GetSize( const void * data, size_t size, uint64_t & outSize )
         {
+            if ( m_IsValid == false )
+            {
+                return false;
+            }
             const size_t result = ZSTD_compress2( m_Context, m_Scratch.Get(), m_ScratchSize, data, size );
             outSize = result;
-            return ( m_IsValid && ( ZSTD_isError( result ) == false ) );
+            return ( ZSTD_isError( result ) == false );
         }
 
     private:
