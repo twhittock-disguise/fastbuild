@@ -1104,6 +1104,7 @@ void ClientToWorkerConnection::PushJobsToWorker()
         // Track and send job. Not if the connection ended since the check above: OnDisconnected has returned the
         // jobs it had, and one added now would not be.
         bool isTracked = false;
+        Client::RunTestHook( Client::BEFORE_JOB_TRACKED, m_SendThreadQuit );
         {
             MutexHolder mh( m_Mutex );
             if ( m_SendThreadQuit.Load() == false )
@@ -1946,6 +1947,7 @@ bool ClientToWorkerConnection::SendItem( const ConnectionInfo * ci, const Client
     // again as soon as it has it, which can be before this thread returns from the send
     if ( item.m_PchId != 0 )
     {
+        Client::RunTestHook( Client::BEFORE_PCH_DELIVERED, m_SendThreadQuit );
         MutexHolder mh( m_Mutex );
         m_PchState.OnDelivered( item.m_PchId );
     }

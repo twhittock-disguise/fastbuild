@@ -58,7 +58,26 @@ public:
     void GetToolchains( Array<const ToolManifest *> & outManifests ) const;
     uint32_t GetToolchainsGeneration() const { return m_ToolchainsGeneration.Load(); } // Changes when one is added
 
+    // Test seam: points of a connection where the order of two of its threads matters, so that a test can hold the
+    // thread that reaches one until the other has come as far as it needs. The hook runs on the thread that reached
+    // the point, and is given whether the connection has ended.
+    enum HookPoint
+    {
+        BEFORE_PCH_DELIVERED,   // The send thread, before it counts the last chunk of a PCH as delivered
+        BEFORE_JOB_TRACKED,     // The thread that pushes jobs, before it adds a job it took to those of the connection
+    };
+    typedef void ( *TestHook )( HookPoint point, const Atomic<bool> & connectionEnded );
+    static void SetTestHook( TestHook hook ) { s_TestHook = hook; }
+    static void RunTestHook( HookPoint point, const Atomic<bool> & connectionEnded )
+    {
+        if ( s_TestHook )
+        {
+            s_TestHook( point, connectionEnded );
+        }
+    }
+
 private:
+    inline static TestHook s_TestHook = nullptr;
     Client & operator=( const Client & other ) = delete;
 
     static uint32_t ThreadFuncStatic( void * param );
