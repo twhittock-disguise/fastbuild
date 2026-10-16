@@ -37,8 +37,6 @@ namespace Protocol
     // Capabilities: optional features negotiated for each connection. One is used only if both sides
     //   advertise its bit, and a bit is added together with the feature (and the fallback) it stands for.
     // A receiver ignores the trailing bytes of a message it knows and the capability bits it does not.
-    // 24.1 has not been released (24.0 is the last that was), so what it adds, capabilities included, is
-    //   part of 24.1: a capability added before it is released does not raise the minor again.
     inline static const uint32_t kVersionMajor = 24;
     inline static const uint8_t kVersionMinor = 1;
 

@@ -87,13 +87,37 @@ namespace
         size_t m_Size = 0;
     };
 
-    // What zstd makes of data, in bytes
-    bool CompressedSize( const void * data, size_t size, int32_t level, char * scratch, size_t scratchSize, uint64_t & outSize )
+    // Compresses pieces of data with one context, at the level it was made for
+    class SizeCompressor
     {
-        const size_t result = ZSTD_compress( scratch, scratchSize, data, size, level );
-        outSize = result;
-        return ( ZSTD_isError( result ) == false );
-    }
+    public:
+        explicit SizeCompressor( int32_t level, size_t maxInput )
+            : m_Context( ZSTD_createCCtx() )
+            , m_ScratchSize( ZSTD_compressBound( maxInput ) )
+            , m_Scratch( static_cast<char *>( ALLOC( m_ScratchSize ) ) )
+        {
+            m_IsValid = ( m_Context != nullptr ) &&
+                        ( ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_compressionLevel, level ) ) == false );
+        }
+        ~SizeCompressor() { ZSTD_freeCCtx( m_Context ); }
+
+        // What zstd makes of data, in bytes
+        bool GetSize( const void * data, size_t size, uint64_t & outSize )
+        {
+            const size_t result = ZSTD_compress2( m_Context, m_Scratch.Get(), m_ScratchSize, data, size );
+            outSize = result;
+            return ( m_IsValid && ( ZSTD_isError( result ) == false ) );
+        }
+
+    private:
+        explicit SizeCompressor( const SizeCompressor & other ) = delete;
+        SizeCompressor & operator=( const SizeCompressor & other ) = delete;
+
+        ZSTD_CCtx * m_Context;
+        size_t m_ScratchSize;
+        UniquePtr<char, FreeDeletor> m_Scratch;
+        bool m_IsValid = false;
+    };
 }
 
 // PointerCache
@@ -278,10 +302,14 @@ bool PchTransform::Encoder::Flush( Sink & sink )
     {
         return true;
     }
-    if ( m_Damage && ( m_OutSize > 16 ) )
+    if ( m_Fault == FAULT_REFUSE )
+    {
+        return false;
+    }
+    if ( ( m_Fault == FAULT_DAMAGE ) && ( m_OutSize > 16 ) )
     {
         m_Out[ m_OutSize - 1 ] ^= 1;
-        m_Damage = false;
+        m_Fault = FAULT_NONE;
     }
     const size_t size = m_OutSize;
     m_OutSize = 0;
@@ -518,6 +546,22 @@ bool PchTransform::Decoder::Flush( Sink & sink )
 //------------------------------------------------------------------------------
 /*static*/ bool PchTransform::Choose( const char * path, uint64_t size, int32_t compressionLevel, const Atomic<bool> * abort, uint32_t & outBase )
 {
+    uint32_t base = 0;
+    uint64_t plainSize = 0;
+    uint64_t transformedSize = 0;
+    if ( ( Estimate( path, size, compressionLevel, abort, base, plainSize, transformedSize ) == false ) || ( IsWorthIt( plainSize, transformedSize ) == false ) )
+    {
+        return false;
+    }
+    outBase = base;
+    return true;
+}
+
+// Estimate
+//------------------------------------------------------------------------------
+/*static*/ bool PchTransform::Estimate( const char * path, uint64_t size, int32_t compressionLevel, const Atomic<bool> * abort,
+                                        uint32_t & outBase, uint64_t & outPlainSize, uint64_t & outTransformedSize )
+{
     // The pieces to try: the file if it is short, else some from along it, the first and the last among them
     uint64_t offsets[ kProbeCount ];
     size_t lengths[ kProbeCount ];
@@ -551,8 +595,7 @@ bool PchTransform::Decoder::Flush( Sink & sink )
         return false;
     }
     UniquePtr<char, FreeDeletor> data( static_cast<char *>( ALLOC( kProbeLength ) ) );
-    const size_t scratchSize = ZSTD_compressBound( (size_t)GetMaxTransformedSize( kProbeLength ) );
-    UniquePtr<char, FreeDeletor> scratch( static_cast<char *>( ALLOC( scratchSize ) ) );
+    SizeCompressor compressor( compressionLevel, (size_t)GetMaxTransformedSize( kProbeLength ) );
     auto readProbe = [ & ]( uint32_t index )
     {
         return ( abort == nullptr || ( abort->Load() == false ) ) &&
@@ -587,10 +630,10 @@ bool PchTransform::Decoder::Flush( Sink & sink )
         uint64_t size2 = 0;
         CollectSink transformed( (size_t)GetMaxTransformedSize( kProbeLength ) );
         if ( ( readProbe( i ) == false ) ||
-             ( CompressedSize( data.Get(), lengths[ i ], compressionLevel, scratch.Get(), scratchSize, size1 ) == false ) ||
+             ( compressor.GetSize( data.Get(), lengths[ i ], size1 ) == false ) ||
              ( encoder.Feed( data.Get(), lengths[ i ], transformed ) == false ) ||
              ( ( ( i + 1 ) == numProbes ) && ( encoder.Finish( transformed ) == false ) ) ||
-             ( CompressedSize( transformed.GetData(), transformed.GetSize(), compressionLevel, scratch.Get(), scratchSize, size2 ) == false ) )
+             ( compressor.GetSize( transformed.GetData(), transformed.GetSize(), size2 ) == false ) )
         {
             return false;
         }
@@ -598,12 +641,9 @@ bool PchTransform::Decoder::Flush( Sink & sink )
         transformedSize += size2;
     }
 
-    // At most 95% of the size without it: a smaller gain does not make up for the time the transform takes
-    if ( ( transformedSize * 100 ) > ( plainSize * 95 ) )
-    {
-        return false;
-    }
     outBase = base;
+    outPlainSize = plainSize;
+    outTransformedSize = transformedSize;
     return true;
 }
 

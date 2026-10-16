@@ -4,6 +4,7 @@
 
 // Includes
 //------------------------------------------------------------------------------
+#include "Core/Env/Assert.h"
 #include "Core/Env/Types.h"
 
 // Forward Declarations
@@ -71,7 +72,7 @@ public:
         int32_t FindNear( uint32_t offset, int32_t & outDelta ) const;
 
         uint32_t GetCount() const { return m_Count; }
-        uint32_t Get( uint32_t index ) const { return m_Offsets[ index ]; }
+        uint32_t Get( uint32_t index ) const { ASSERT( index < m_Count ); return m_Offsets[ index ]; }
 
         void MoveToFront( uint32_t index );
         void InsertAtFront( uint32_t offset ); // The oldest entry leaves when it is full
@@ -98,8 +99,15 @@ public:
         // After the last byte: the tail, and what is held back. False if the sink refused it.
         [[nodiscard]] bool Finish( Sink & sink );
 
-        // For tests: what is made from here on is damaged, as a transform that did not invert would
-        void DamageOutput() { m_Damage = true; }
+        // Test seam: a fault made on purpose, to reach what a transform that is wrong leads to
+        enum Fault : uint32_t
+        {
+            FAULT_NONE,
+            FAULT_DAMAGE,   // The last byte of the first piece of more than 16 bytes is flipped, as if the transform did not invert.
+                            // A piece of the base and a word or so is left alone so that it is the data that is wrong and not the base.
+            FAULT_REFUSE,   // The sink is not given what is made, and the encoder reports that it was refused
+        };
+        void SetFault( Fault fault ) { m_Fault = fault; }
 
     private:
         void EncodeWord( uint64_t word );
@@ -111,7 +119,7 @@ public:
         uint32_t        m_CarrySize = 0;
         uint8_t *       m_Out = nullptr;
         size_t          m_OutSize = 0;
-        bool            m_Damage = false;
+        Fault           m_Fault = FAULT_NONE;
     };
 
     // Decoder: the transformed data in, the data to the sink
@@ -147,12 +155,19 @@ public:
         size_t          m_OutSize = 0;
     };
 
-    // Whether to transform the PCH in the file, and with which base. The base is the high half most words
-    // have. The file is judged by compressing pieces of it the way it is sent, with and without the transform
-    // (all of it up to 8 MiB, else eight pieces of a MiB along it, the first and last included): it is only
-    // worth it if they come to at most 95% of what they did, so a PCH of another layout, or another compiler,
-    // is sent as it is. The time this takes is that of compressing 8 MiB twice, whatever the size of the file.
-    // False if it is not worth it, or the file cannot be read.
+    // What zstd makes of the PCH in the file with and without the transform, and the base the transform has. The base
+    // is the high half most words have. The file is judged by compressing pieces of it, at compressionLevel (the one
+    // the file is sent with, which finds part of what the transform removes): all of it up to 8 MiB, else eight pieces
+    // of a MiB along it, the first and last included. The time this takes is that of compressing 8 MiB twice, whatever
+    // the size of the file. False if there is no base, or the file cannot be read.
+    [[nodiscard]] static bool Estimate( const char * path, uint64_t size, int32_t compressionLevel, const Atomic<bool> * abort,
+                                        uint32_t & outBase, uint64_t & outPlainSize, uint64_t & outTransformedSize );
+
+    // Whether the transform is worth it: at most 95% of the size without it. A smaller gain does not make up for the
+    // time the transform takes, and a PCH of another layout, or another compiler, is sent as it is.
+    static constexpr bool IsWorthIt( uint64_t plainSize, uint64_t transformedSize ) { return ( ( transformedSize * 100 ) <= ( plainSize * 95 ) ); }
+
+    // Whether to transform the PCH in the file, and with which base: Estimate, and IsWorthIt of what it finds
     [[nodiscard]] static bool Choose( const char * path, uint64_t size, int32_t compressionLevel, const Atomic<bool> * abort, uint32_t & outBase );
 
     // The base most words of a piece of data have, if enough have one for the transform to help

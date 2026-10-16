@@ -79,8 +79,16 @@ public:
     void RequestCancel() { m_Cancel.Store( true ); }
 
     uint64_t GetPchId() const { return m_Entry.pchId; }
-    bool WantsTransform() const { return m_WantTransform; }
     bool IsTransformed() const { return m_Transformed; } // Known when READY
+
+    // Whether this copy is what a worker that does (allowTransform) or does not read a transformed PCH is given:
+    // one made for the same kind of worker, or one made for a worker that reads it and that is the plain form
+    // because the transform was not worth it or did not give the PCH back
+    bool IsFormFor( bool allowTransform ) const
+    {
+        return ( ( m_WantTransform == allowTransform ) ||
+                 ( ( allowTransform == false ) && ( GetState() == READY ) && ( m_Transformed == false ) ) );
+    }
     CompressedState GetState() const { return static_cast<CompressedState>( m_State.Load() ); }
     uint32_t GetFailedAttempts() const { return m_FailedAttempts.Load(); }
     const AString & GetFilePath() const { return m_FilePath; }
@@ -146,30 +154,13 @@ private:
         AStackString<> tempPath;
         TempFiles::MakeName( dir, kTempFilePrefix, kTempFileExtension, tempPath );
 
-        // The transformed form if it is wanted and is worth it. It is checked to give the PCH back before it is used.
+        // The transformed form if it is wanted and works out, else the plain one. Only a failure of the plain
+        // one is a failure of the PCH: a worker that cannot read the transformed one is sent the plain one.
         uint64_t compressedFileSize = 0;
-        bool transformed = false;
-        if ( m_WantTransform )
+        bool transformed = ( m_WantTransform && WriteTransformed( tempPath, compressedFileSize ) );
+        if ( m_Cancel.Load() )
         {
-            uint32_t base = 0;
-            if ( PchTransform::Choose( m_Entry.filePath.Get(), m_Entry.uncompressedSize, Compressor::kZstdTransferLevel, &m_Cancel, base ) )
-            {
-                PchTransform::Encoder encoder( base );
-                if ( m_Owner.m_DamageTransform.Load() )
-                {
-                    encoder.DamageOutput();
-                }
-                if ( WriteBlob( tempPath, &encoder, compressedFileSize, transformed ) == false )
-                {
-                    return false;
-                }
-                if ( transformed && ( PchBlob::VerifyFile( tempPath.Get(), m_Entry.pchId, m_Entry.uncompressedSize, &m_Cancel ) == false ) )
-                {
-                    FLOG_WARN( "PCH distribution: the transformed '%s' is not the PCH, so it is sent as it is\n", m_Entry.filePath.Get() );
-                    FileIO::FileDelete( tempPath.Get() );
-                    transformed = false;
-                }
-            }
+            return false;
         }
         if ( ( transformed == false ) && ( WriteBlob( tempPath, nullptr, compressedFileSize, transformed ) == false ) )
         {
@@ -178,6 +169,34 @@ private:
         m_FilePath = tempPath;
         m_FileSize = compressedFileSize;
         m_Transformed = transformed;
+        return true;
+    }
+
+    // The transformed form, which is checked to give the PCH back before it is used. False if it is not worth it, was
+    // not made or is not right, with no file left that is not the plain form.
+    bool WriteTransformed( const AString & tempPath, uint64_t & outSize )
+    {
+        uint32_t base = 0;
+        if ( PchTransform::Choose( m_Entry.filePath.Get(), m_Entry.uncompressedSize, Compressor::kZstdPchLevel, &m_Cancel, base ) == false )
+        {
+            return false;
+        }
+        PchTransform::Encoder encoder( base );
+        encoder.SetFault( static_cast<PchTransform::Encoder::Fault>( m_Owner.m_TransformFault.Load() ) );
+        bool transformed = false;
+        if ( ( WriteBlob( tempPath, &encoder, outSize, transformed ) == false ) || ( transformed == false ) )
+        {
+            return false;
+        }
+        if ( PchBlob::VerifyFile( tempPath.Get(), m_Entry.pchId, m_Entry.uncompressedSize, &m_Cancel ) == false )
+        {
+            if ( m_Cancel.Load() == false ) // A check that was stopped found nothing
+            {
+                FLOG_WARN( "PCH distribution: the transformed '%s' is not the PCH, so it is sent as it is\n", m_Entry.filePath.Get() );
+            }
+            FileIO::FileDelete( tempPath.Get() );
+            return false;
+        }
         return true;
     }
 
@@ -337,11 +356,9 @@ PchDataCache::CompressedState PchDataCache::GetCompressed( const Entry & entry,
 
     for ( const CompressedPch * c : m_Compressed )
     {
-        // The form that was asked for, or what was made when the other was asked for and was not worth it
-        const bool isWanted = ( c->GetPchId() == entry.pchId ) &&
-                              ( ( c->WantsTransform() == allowTransform ) ||
-                                ( ( allowTransform == false ) && ( c->GetState() == READY ) && ( c->IsTransformed() == false ) ) );
-        if ( isWanted )
+        // There is a copy for each kind of worker. One that asks while the copy of the other kind is being made
+        // is not made to wait for it: that is likely to be transformed, which it cannot read, so its own starts at once.
+        if ( ( c->GetPchId() == entry.pchId ) && c->IsFormFor( allowTransform ) )
         {
             const CompressedState state = c->GetState();
             if ( state == READY )
@@ -453,20 +470,24 @@ bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
 //------------------------------------------------------------------------------
 void PchDataCache::Clear()
 {
-    MutexHolder mh( m_Mutex );
-    m_Entries.Clear();
+    Array<CompressedPch *> compressed;
+    {
+        MutexHolder mh( m_Mutex );
+        m_Entries.Clear();
+        compressed.Swap( m_Compressed );
+    }
 
-    // Stop queued compressions before waiting on any of them. One already running
-    // finishes the piece it is on, then stops. Each deletes its file.
-    for ( CompressedPch * c : m_Compressed )
+    // Stop queued compressions before waiting on any of them. One already running finishes the piece it is
+    // on, then stops. Each deletes its file. The lock is not held while waiting: a compression takes it to
+    // find where to write.
+    for ( CompressedPch * c : compressed )
     {
         c->RequestCancel();
     }
-    for ( CompressedPch * c : m_Compressed )
+    for ( CompressedPch * c : compressed )
     {
         FDELETE c;
     }
-    m_Compressed.Clear();
 }
 
 // GetSendDirectory

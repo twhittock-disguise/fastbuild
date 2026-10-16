@@ -6633,8 +6633,8 @@ namespace
     class DamagedTransform
     {
     public:
-        DamagedTransform() { PchDataCache::Get().SetDamageTransform( true ); }
-        ~DamagedTransform() { PchDataCache::Get().SetDamageTransform( false ); }
+        DamagedTransform() { PchDataCache::Get().SetTransformFault( PchTransform::Encoder::FAULT_DAMAGE ); }
+        ~DamagedTransform() { PchDataCache::Get().SetTransformFault( PchTransform::Encoder::FAULT_NONE ); }
         explicit DamagedTransform( const DamagedTransform & other ) = delete;
         DamagedTransform & operator=( const DamagedTransform & other ) = delete;
     };
@@ -6905,7 +6905,7 @@ void TestDistributed::PchTransformThatDoesNotInvertIsNotSent() const
     // Nothing is wrong with the PCH: the transform is
     {
         PchDataCache cache;
-        cache.SetDamageTransform( true );
+        cache.SetTransformFault( PchTransform::Encoder::FAULT_DAMAGE );
         cache.Store( entry );
         AStackString<> filePath;
         uint64_t size = 0;

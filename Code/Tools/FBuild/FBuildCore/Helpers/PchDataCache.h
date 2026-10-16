@@ -4,6 +4,8 @@
 
 // Includes
 //------------------------------------------------------------------------------
+#include "Tools/FBuild/FBuildCore/Helpers/PchTransform.h"
+
 #include "Core/Containers/Array.h"
 #include "Core/Env/Types.h"
 #include "Core/Process/Atomic.h"
@@ -98,7 +100,8 @@ public:
     void SetTempDir( const AString & dir );
     typedef void ( *HashHook )( void * userData );
     void SetHashHook( HashHook hook, void * userData );
-    void SetDamageTransform( bool damage ) { m_DamageTransform.Store( damage ); } // What a transform makes is damaged, as if it did not invert
+    // Test seam: a fault the encoder makes of every transformed form (see PchTransform::Encoder::Fault)
+    void SetTransformFault( PchTransform::Encoder::Fault fault ) { m_TransformFault.Store( fault ); }
     uint32_t GetNumFilesHashed() const { return m_NumFilesHashed.Load(); }
 
     static const uint32_t kMaxCompressAttempts = 3;
@@ -128,7 +131,7 @@ private:
     HashHook m_HashHook = nullptr;
     void * m_HashHookData = nullptr;
     Atomic<uint32_t> m_NumFilesHashed{ 0 };
-    Atomic<bool> m_DamageTransform{ false };
+    Atomic<uint32_t> m_TransformFault{ PchTransform::Encoder::FAULT_NONE };
 };
 
 //------------------------------------------------------------------------------

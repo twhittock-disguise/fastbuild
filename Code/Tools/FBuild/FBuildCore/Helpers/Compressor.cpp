@@ -134,6 +134,21 @@ Compressor::~Compressor()
         ~ZstdContext() { ZSTD_freeCCtx( m_Context ); }
         ZSTD_CCtx * m_Context;
     } zstd;
+
+    // A transform makes data of another size, so no size is pledged and the frame would declare the whole window,
+    // which a reader allocates however small the file is. A window that holds the file is enough: a transform
+    // replaces words with words of the same size and escapes only the rare one that looks like a reference, so
+    // what it makes is as large as the file. Where it is larger the window falls a little short of all of it,
+    // which can only cost some ratio.
+    if ( transform && ( windowLog != 0 ) )
+    {
+        int32_t fileLog = ZSTD_cParam_getBounds( ZSTD_c_windowLog ).lowerBound;
+        while ( ( fileLog < windowLog ) && ( ( 1ull << fileLog ) < sourceSize ) )
+        {
+            ++fileLog;
+        }
+        windowLog = Math::Min( windowLog, fileLog );
+    }
     if ( ( zstd.m_Context == nullptr ) ||
          ZSTD_isError( ZSTD_CCtx_setParameter( zstd.m_Context, ZSTD_c_compressionLevel, compressionLevel ) ) ||
          ( ( windowLog != 0 ) && ZSTD_isError( ZSTD_CCtx_setParameter( zstd.m_Context, ZSTD_c_windowLog, windowLog ) ) ) ||
@@ -312,7 +327,7 @@ bool Compressor::Decompress( const void * data )
 
     const Header * header = (const Header *)data;
 
-    // Not a codec read here (the type of data a transform was applied to is not)
+    // Only a codec is read here: a transform is not known to this, so data it was applied to is refused
     if ( header->m_CompressionType > eZstd )
     {
         return false;

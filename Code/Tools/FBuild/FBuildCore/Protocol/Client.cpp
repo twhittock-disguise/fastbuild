@@ -98,7 +98,8 @@ public:
                                   uint32_t payloadLength,
                                   SendKind kind,
                                   uint64_t rawBytes,
-                                  uint64_t pchId )
+                                  uint64_t pchId,
+                                  bool pchTransformed )
         : m_Message( msg.GetSize() ) // Prealloc exact size needed
         , m_HasPayload( true )
         , m_PayloadFile( payloadFile )
@@ -107,6 +108,7 @@ public:
         , m_Kind( kind )
         , m_RawBytes( rawBytes )
         , m_PchId( pchId )
+        , m_PchTransformed( pchTransformed )
     {
         VERIFY( m_Message.WriteBuffer( &msg, msg.GetSize() ) == msg.GetSize() );
     }
@@ -131,6 +133,7 @@ public:
     uint64_t m_RawBytes = 0; // Size before compression, for stats
     bool m_StreamCompress = false; // Payload is compressed by the send thread, against the jobs sent before it
     uint64_t m_PchId = 0; // The PCH the payload completes, if it is the last chunk of one
+    bool m_PchTransformed = false; // Of that PCH: it is the form that a transform makes (see PchTransform)
     Timer m_Enqueued; // For how long it waited to be sent
 };
 
@@ -171,7 +174,8 @@ public:
                           uint32_t payloadLength,
                           SendKind kind,
                           uint64_t rawBytes,
-                          uint64_t pchId );
+                          uint64_t pchId,
+                          bool pchTransformed );
     void EnqueueJob( const Protocol::MsgJob & msg, ConstMemoryStream && payload );
 
 private:
@@ -231,7 +235,7 @@ private:
     Array<uint64_t> m_SentToolchains; // Protected by m_Mutex
     Array<uint64_t> m_CachedToolchains; // Reported by the worker and not used yet. Protected by m_Mutex
     Atomic<uint32_t> m_NumSkippedToolchains{ 0 }; // Toolchains the worker had, so we did not send them
-    Atomic<uint32_t> m_NumTransformedPchs{ 0 };   // PCHs sent in the form that a transform makes (see PchTransform)
+    Atomic<uint32_t> m_NumTransformedPchs{ 0 };   // PCHs delivered in the form that a transform makes (see PchTransform)
     PchSendState m_PchState;          // Protected by m_Mutex
     Array<uint64_t> m_PendingPchIds;  // Needed by this worker, not yet queued. Protected by m_Mutex
     uint32_t m_ToolchainsGeneration = 0; // Client thread only: the toolchains pushed so far
@@ -323,6 +327,9 @@ void Client::DenyListWorker( ClientWorkerInfo & worker )
     {
         MutexHolder mh( m_Mutex );
         DIST_INFO( "Disconnected: %s\n", m_Worker->m_Address.Get() );
+
+        // Before the jobs are returned: a job that is added after that sees it (PushJobsToWorker) and is returned by whoever added it
+        m_SendThreadQuit.Store( true );
         if ( ( m_HandshakeDone.Load() == false ) && ( m_ShuttingDown.Load() == false ) && ( m_Worker->m_ReportedHandshakeFailure.Load() == false ) && ( m_Worker->m_DenyListed.Load() == false ) )
         {
             m_Worker->m_ReportedHandshakeFailure.Store( true );
@@ -347,7 +354,6 @@ void Client::DenyListWorker( ClientWorkerInfo & worker )
     m_CurrentMessage = nullptr;
 
     // Signal send thread to exit
-    m_SendThreadQuit.Store( true );
     m_SendThreadWakeSemaphore.Signal();
 
     // Wait for send thread to exit so that TCPConnectionPool can safely
@@ -1095,10 +1101,21 @@ void ClientToWorkerConnection::PushJobsToWorker()
             }
         }
 
-        // Track and send job
+        // Track and send job. Not if the connection ended since the check above: OnDisconnected has returned the
+        // jobs it had, and one added now would not be.
+        bool isTracked = false;
         {
             MutexHolder mh( m_Mutex );
-            m_Jobs.Append( job );
+            if ( m_SendThreadQuit.Load() == false )
+            {
+                m_Jobs.Append( job );
+                isTracked = true;
+            }
+        }
+        if ( isTracked == false )
+        {
+            JobQueue::Get().ReturnUnfinishedDistributableJob( job );
+            break;
         }
         m_JobsInFlight.Increment();
 
@@ -1173,13 +1190,10 @@ void ClientToWorkerConnection::SendPendingPchs()
                              Protocol::MsgPchFile::GetChunkLength( compressedSize, chunkSize, i ),
                              SendKind::Pch,
                              ( i == 0 ) ? pch.uncompressedSize : 0,
-                             isLast ? pch.pchId : 0 );
+                             isLast ? pch.pchId : 0,
+                             pch.transformed );
         }
 
-        if ( pch.transformed )
-        {
-            m_NumTransformedPchs.Increment();
-        }
         DIST_INFO( " - Sent PCH 0x%016" PRIx64 " to %s (%u bytes, %zu bytes compressed%s, %u chunks)\n",
                    pch.pchId, m_Worker->m_Address.Get(), pch.uncompressedSize, pch.dataSize,
                    pch.transformed ? " with the PCH transform" : "", numChunks );
@@ -1741,9 +1755,10 @@ void ClientToWorkerConnection::EnqueueFileSend( const Protocol::IMessage & msg,
                                                 uint32_t payloadLength,
                                                 SendKind kind,
                                                 uint64_t rawBytes,
-                                                uint64_t pchId )
+                                                uint64_t pchId,
+                                                bool pchTransformed )
 {
-    ClientSendQueueItem item( msg, payloadFile, payloadOffset, payloadLength, kind, rawBytes, pchId );
+    ClientSendQueueItem item( msg, payloadFile, payloadOffset, payloadLength, kind, rawBytes, pchId, pchTransformed );
     {
         MutexHolder lock( m_SendQueueMutex );
         m_SendQueue.Push( Move( item ) );
@@ -1955,6 +1970,10 @@ bool ClientToWorkerConnection::SendItem( const ConnectionInfo * ci, const Client
 
     if ( sendOk )
     {
+        if ( item.m_PchTransformed && ( item.m_PchId != 0 ) )
+        {
+            m_NumTransformedPchs.Increment(); // Delivered
+        }
         DistributionSendStats & stats = m_SendStats[ (size_t)item.m_Kind ];
         stats.m_Messages++;
         stats.m_RawBytes += item.m_RawBytes;
