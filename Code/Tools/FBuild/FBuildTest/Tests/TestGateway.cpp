@@ -405,6 +405,9 @@ private:
     void GatewayResultReachesOnlyALiveClient() const;
     void PureGatewayNeverTouchesTheJobQueue() const;
     void AskingASlowClientForAPchDoesNotHoldBackAnother() const;
+#if defined( __WINDOWS__ )
+    void WorkerAskingASlowClientDoesNotHoldBackAnother() const;
+#endif
     void StashKeepsWhatTheClientSent() const;
     void StashSurvivesARestart() const;
     void PartialStashIsDroppedAtStart() const;
@@ -591,6 +594,9 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( GatewayResultReachesOnlyALiveClient )
     REGISTER_TEST( PureGatewayNeverTouchesTheJobQueue )
     REGISTER_TEST( AskingASlowClientForAPchDoesNotHoldBackAnother )
+#if defined( __WINDOWS__ )
+    REGISTER_TEST( WorkerAskingASlowClientDoesNotHoldBackAnother )
+#endif
     REGISTER_TEST( StashKeepsWhatTheClientSent )
     REGISTER_TEST( StashSurvivesARestart )
     REGISTER_TEST( PartialStashIsDroppedAtStart )
@@ -1679,6 +1685,149 @@ void TestGateway::AskingASlowClientForAPchDoesNotHoldBackAnother() const
     a.ShutdownAllConnections();
     b.ShutdownAllConnections();
 }
+
+#if defined( __WINDOWS__ )
+// WorkerAskingASlowClientDoesNotHoldBackAnother
+//------------------------------------------------------------------------------
+void TestGateway::WorkerAskingASlowClientDoesNotHoldBackAnother() const
+{
+    // A real job for a PCH, sent for a toolchain made up here
+    DistributedTest::CapturedJob captured;
+    TEST_ASSERT( DistributedTest::CapturePchJob( captured, kWaitTimeoutSeconds ) );
+    MemoryStream job;
+    job.WriteBuffer( captured.m_Data.Begin(), captured.m_Data.GetSize() );
+    const uint64_t toolId = 0x5107;
+
+    const DistributedTest::RemoteCpusForTest cpus( 8 );
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+    DistributedTest::HandshakeProbe a; // Reads slowly
+    DistributedTest::HandshakeProbe b;
+    DistributedTest::HandshakeProbe c; // Starts sending the toolchain, then leaves
+    const ConnectionInfo * ciA = nullptr;
+    const ConnectionInfo * ciB = nullptr;
+    const ConnectionInfo * ciC = nullptr;
+    const uint32_t idA = ConnectProbe( s, a, &ciA );
+    const uint32_t idB = ConnectProbe( s, b, &ciB );
+    TEST_ASSERT( ( idA != 0 ) && ( idB != 0 ) && ( ConnectProbe( s, c, &ciC ) != 0 ) );
+    AddActiveJobs( s, idB, 2 );
+
+    // The toolchain is synchronized from C: its manifest has come, none of its files
+    AStackString<> root;
+    SyntheticToolchain::GetRootPath( root );
+    AStackString<> fileName( root );
+    fileName += "tool.exe";
+    MemoryStream manifest;
+    SyntheticToolchain::WriteManifest( manifest, toolId, root, fileName, "synthetic" );
+    TEST_ASSERT( c.SendMessage( ciC, Protocol::MsgManifest( toolId ), manifest.GetData(), manifest.GetSize() ) );
+    TEST_ASSERT( WaitUntil( [ & ]()
+    {
+        MutexHolder mh( s.m_ToolManifestsMutex );
+        ToolManifest * const * found = s.m_Tools.FindDeref( toolId );
+        return found && ( ( *found )->GetUserData() != nullptr );
+    } ) );
+
+    // More than the socket buffers hold, so A's outbox is held in a send
+    a.StallReading( true );
+    const uint32_t kNumLargeResults = 4;
+    Array<char> large;
+    large.SetSize( 64 * MEGABYTE );
+    memset( large.Begin(), 0x5A, large.GetSize() );
+    AddActiveJobs( s, idA, kNumLargeResults );
+    for ( uint32_t i = 0; i < kNumLargeResults; ++i )
+    {
+        MemoryStream payload( large.GetSize() );
+        payload.WriteBuffer( large.Begin(), large.GetSize() );
+        TEST_ASSERT( s.QueueResult( idA, false, Move( payload ) ) );
+    }
+    TEST_ASSERT( WaitUntil( [ & ]()
+    {
+        MutexHolder mh( s.m_ClientListMutex );
+        for ( Server::ClientState * cs : s.m_ClientList )
+        {
+            if ( cs->m_Id == idA )
+            {
+                const TryMutexHolder held( cs->m_SendMutex );
+                return ( held.IsLocked() == false );
+            }
+        }
+        return false;
+    } ) );
+
+    // Queues a result for B once the server has this many clients
+    struct Queuer
+    {
+        Server *    m_Server;
+        uint32_t    m_ClientId;
+        size_t      m_NumClients;
+    };
+    const Thread::ThreadEntryFunction queueOnceClientsAre = []( void * param ) -> uint32_t
+    {
+        const Queuer & q = *static_cast<const Queuer *>( param );
+        for ( ;; )
+        {
+            {
+                MutexHolder mh( q.m_Server->m_ClientListMutex );
+                if ( q.m_Server->m_ClientList.GetSize() == q.m_NumClients )
+                {
+                    break;
+                }
+            }
+            Thread::Sleep( 1 );
+        }
+        MemoryStream payload;
+        payload.Write( (uint32_t)1 );
+        q.m_Server->QueueResult( q.m_ClientId, false, Move( payload ) );
+        return 0;
+    };
+
+    // A's job needs a PCH the worker lacks: A is asked for it (the log says so first), and B is served meanwhile
+    const AStackString<> logPath( s.GetLogPath() );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( a.SendJob( ciA, encoder, toolId, 0, job ) );
+    TEST_ASSERT( WaitUntil( [ & ]()
+    {
+        uint32_t numAsked = 0;
+        return DistributedTest::CountInStatsLogSince( logPath, 0, "pch needed id=", numAsked ) && ( numAsked == 1 );
+    } ) );
+    Queuer first{ &s, idB, 3 };
+    Thread firstThread;
+    firstThread.Start( queueOnceClientsAre, "Queuer", &first );
+    const bool resultFlowed = WaitUntil( [ &b ]() { return ( CountMessages( b, Protocol::MSG_JOB_RESULT ) == 1 ); } );
+    const bool capacityFlowed = resultFlowed &&
+                                b.SendDemand( ciB, 0 ) &&
+                                WaitUntil( [ &b ]() { return ( b.GetLastAllowance() == 0 ); } );
+
+    // C leaves before sending the files, so A, whose job waits for them, is asked for them: B is still served
+    bool flowedAfterLeaving = false;
+    Queuer second{ &s, idB, 2 };
+    Thread secondThread;
+    if ( capacityFlowed )
+    {
+        c.ShutdownAllConnections();
+        secondThread.Start( queueOnceClientsAre, "Queuer", &second );
+        flowedAfterLeaving = WaitUntil( [ &b ]() { return ( CountMessages( b, Protocol::MSG_JOB_RESULT ) == 2 ); } );
+    }
+
+    a.StallReading( false );
+    firstThread.Join();
+    if ( capacityFlowed )
+    {
+        secondThread.Join();
+    }
+    TEST_ASSERT( resultFlowed );
+    TEST_ASSERT( capacityFlowed );
+    TEST_ASSERT( flowedAfterLeaving );
+
+    // A has it all, after the results queued before
+    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetNumPchNeeded() == 1 ) && ( CountMessages( a, Protocol::MSG_REQUEST_FILE ) == 1 ); } ) );
+    TEST_ASSERT( CountMessages( a, Protocol::MSG_JOB_RESULT ) == kNumLargeResults );
+    TEST_ASSERT( a.GetPchNeededId( 0 ) == captured.m_PchId );
+
+    a.ShutdownAllConnections();
+    b.ShutdownAllConnections();
+}
+#endif
 
 // Toolchain stash helpers
 //------------------------------------------------------------------------------

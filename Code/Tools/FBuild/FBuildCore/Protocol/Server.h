@@ -238,18 +238,17 @@ private:
     };
     uint32_t m_NextClientId = 1; // Under m_ClientListMutex
 
-    // Messages for one connection come from the server thread (results), the connection's
-    // receive thread (ack, inventories) and OnDisconnected (file requests), so every send
-    // goes through here. Lock order: m_ClientListMutex, cs.m_Mutex, m_ToolManifestsMutex, m_SendMutex.
+    // A connection is sent its ack and inventories by its receive thread, and everything else by its outbox,
+    // so every send goes through here holding cs.m_SendMutex alone: no other lock waits for a client to read.
     static bool SendTo( ClientState & cs, const Protocol::IMessage & msg );
     static bool SendTo( ClientState & cs, const Protocol::IMessage & msg, const MemoryStream & payload );
     template <class MSG>
     static void SendIdInventory( ClientState & cs, const Array<uint64_t> & ids );
-    void RequestMissingFiles( ClientState & cs, ToolManifest * manifest ) const;
+    void RequestMissingFiles( ClientState & cs, ToolManifest * manifest ) const; // Caller holds m_ClientListMutex. Sent by the outbox.
     static void MarkCapacityChanged( ClientState & cs ); // Caller holds m_ClientListMutex. Wakes its outbox to send the allowance.
 
-    // A job needs a PCH that is not cached. Asks the client for it, once until it arrives, unless
-    // the client cannot be asked or the PCH is already being received. The caller holds
+    // A job needs a PCH that is not cached. Asks the client for it by its outbox, once until it arrives,
+    // unless the client cannot be asked or the PCH is already being received. The caller holds
     // m_ClientListMutex and cs.m_Mutex.
     void RequestPchIfMissing( ClientState & cs, uint64_t pchId );
     bool MarkPchNeeded( ClientState & cs, uint64_t pchId ); // True if the client is to be asked. Same locks.

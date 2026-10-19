@@ -724,10 +724,7 @@ void Server::AskClientForPch( uint32_t clientId, uint64_t pchId )
         if ( cs->m_Id == clientId )
         {
             MutexHolder mh2( cs->m_Mutex );
-            if ( cs->m_Outbox && MarkPchNeeded( *cs, pchId ) )
-            {
-                cs->m_Outbox->PushMessage( Protocol::MsgPchNeeded( pchId ) );
-            }
+            RequestPchIfMissing( *cs, pchId );
             return;
         }
     }
@@ -1566,10 +1563,9 @@ void Server::EndLocalJobsWaitingForPch( uint64_t pchId )
 //------------------------------------------------------------------------------
 void Server::RequestPchIfMissing( ClientState & cs, uint64_t pchId )
 {
-    if ( MarkPchNeeded( cs, pchId ) )
+    if ( cs.m_Outbox && MarkPchNeeded( cs, pchId ) )
     {
-        const Protocol::MsgPchNeeded msg( pchId );
-        SendTo( cs, msg );
+        cs.m_Outbox->PushMessage( Protocol::MsgPchNeeded( pchId ) );
     }
 }
 
@@ -2797,6 +2793,10 @@ void Server::TouchToolchains()
 //------------------------------------------------------------------------------
 void Server::RequestMissingFiles( ClientState & cs, ToolManifest * manifest ) const
 {
+    if ( cs.m_Outbox == nullptr )
+    {
+        return; // It is going
+    }
     MutexHolder manifestMH( m_ToolManifestsMutex );
 
     const Array<ToolManifestFile> & files = manifest->GetFiles();
@@ -2807,8 +2807,7 @@ void Server::RequestMissingFiles( ClientState & cs, ToolManifest * manifest ) co
         if ( f.GetSyncState() == ToolManifestFile::NOT_SYNCHRONIZED )
         {
             // request this file
-            const Protocol::MsgRequestFile reqFileMsg( manifest->GetToolId(), (uint32_t)i );
-            SendTo( cs, reqFileMsg );
+            cs.m_Outbox->PushMessage( Protocol::MsgRequestFile( manifest->GetToolId(), (uint32_t)i ) );
 
             // prevent it being requested again
             manifest->MarkFileAsSynchronizing( i );
