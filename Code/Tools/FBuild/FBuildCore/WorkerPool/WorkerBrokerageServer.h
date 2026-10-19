@@ -22,11 +22,13 @@ public:
     ~WorkerBrokerageServer();
 
     void SetAvailability( bool available );
+    void Withdraw(); // Remove the file an earlier run may have left, without ever becoming available
 
     const AString & GetHostName() const { return m_HostName; }
 
 protected:
     void UpdateBrokerageFilePath();
+    bool RefreshIdentity(); // Resolve host, domain and IP. True if any changed.
 
     Timer m_TimerLastUpdate; // Throttle network access
     Timer m_TimerLastIPUpdate; // Throttle dns access

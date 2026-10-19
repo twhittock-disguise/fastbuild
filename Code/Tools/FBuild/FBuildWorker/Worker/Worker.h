@@ -16,6 +16,7 @@
 
 // Forward Declarations
 //------------------------------------------------------------------------------
+class Gateway;
 class Server;
 class WorkerWindow;
 class JobQueueRemote;
@@ -27,7 +28,8 @@ class WorkerSettings;
 class Worker : public Singleton<Worker>
 {
 public:
-    explicit Worker( const AString & args, bool consoleMode, bool periodicRestart, uint32_t numThreadsInJobQueue = 0, uint32_t prefetchBuffer = 0 );
+    explicit Worker( const AString & args, bool consoleMode, bool periodicRestart, uint32_t numThreadsInJobQueue = 0, uint32_t prefetchBuffer = 0,
+            const AString & gatewayConfigFile = AString::GetEmpty(), bool noBrokerage = false );
     ~Worker();
 
     int32_t Work();
@@ -43,6 +45,7 @@ private:
     void UpdateAvailability();
     void UpdateUI();
     void CheckIfRestartNeeded();
+    void SignalStopWorkers();
     bool HasEnoughDiskSpace();
     bool HasEnoughMemory();
 
@@ -54,7 +57,10 @@ private:
     const bool m_ConsoleMode;
     const bool m_PeriodicRestart;
     WorkerWindow * m_MainWindow = nullptr;
-    Server * m_ConnectionPool = nullptr;
+    Server * m_ConnectionPool = nullptr;    // The gateway's when there is one
+    Gateway * m_Gateway = nullptr;
+    AString m_GatewayConfigError;
+    const bool m_UseBrokerage;
     NetworkStartupHelper * m_NetworkStartupHelper = nullptr;
     WorkerSettings * m_WorkerSettings = nullptr;
     IdleDetection m_IdleDetection;

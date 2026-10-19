@@ -16,6 +16,7 @@
 // FBuild
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/FBuildVersion.h"
+#include "Tools/FBuild/FBuildCore/Gateway/Gateway.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
@@ -41,15 +42,38 @@
 
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
-Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart, uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
+Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart, uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer,
+                const AString & gatewayConfigFile, bool noBrokerage )
     : m_ConsoleMode( consoleMode )
     , m_PeriodicRestart( periodicRestart )
+    , m_UseBrokerage( !noBrokerage && gatewayConfigFile.IsEmpty() )
     , m_BaseArgs( args )
 {
     m_WorkerSettings = FNEW( WorkerSettings );
     m_NetworkStartupHelper = FNEW( NetworkStartupHelper );
-    m_ConnectionPool = FNEW( Server( numThreadsInJobQueue, prefetchBuffer ) );
-    OUTPUT( "Log: %s\n", m_ConnectionPool->GetLogPath().Get() );
+    if ( gatewayConfigFile.IsEmpty() )
+    {
+        m_ConnectionPool = FNEW( Server( numThreadsInJobQueue, prefetchBuffer ) );
+    }
+    else
+    {
+        GatewayConfig config;
+        if ( GatewayConfig::Load( gatewayConfigFile, config, m_GatewayConfigError ) )
+        {
+            m_Gateway = FNEW( Gateway( config ) );
+            m_ConnectionPool = &m_Gateway->GetServer();
+        }
+    }
+    if ( m_ConnectionPool )
+    {
+        OUTPUT( "Log: %s\n", m_ConnectionPool->GetLogPath().Get() );
+    }
+
+    // A file left by an earlier run must not advertise this machine
+    if ( !m_UseBrokerage )
+    {
+        m_WorkerBrokerage.Withdraw();
+    }
 
     Env::GetExePath( m_BaseExeName );
 #if defined( __WINDOWS__ )
@@ -66,7 +90,14 @@ Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart, ui
 Worker::~Worker()
 {
     FDELETE m_NetworkStartupHelper;
-    FDELETE m_ConnectionPool;
+    if ( m_Gateway )
+    {
+        FDELETE m_Gateway; // Owns its Server
+    }
+    else
+    {
+        FDELETE m_ConnectionPool;
+    }
     FDELETE m_MainWindow;
     FDELETE m_WorkerSettings;
 
@@ -124,6 +155,12 @@ int32_t Worker::Work()
         m_MainWindow->SetStatus( m_WorkerBrokerage.GetHostName(), AStackString( "Idle" ) );
     }
 
+    if ( !m_GatewayConfigError.IsEmpty() )
+    {
+        ErrorMessage( "Failed to load the gateway config. %s", m_GatewayConfigError.Get() );
+        return -4;
+    }
+
     // spawn work thread
     Thread workThread;
     workThread.Start( &WorkThreadWrapper, "WorkerThread", this, ( 256 * KILOBYTE ) );
@@ -161,7 +198,9 @@ uint32_t Worker::WorkThread()
 
     // start listening
     StatusMessage( "Listening on port %u\n", Protocol::kPort );
-    if ( m_ConnectionPool->Listen( Protocol::kPort ) == false )
+    const bool listening = m_Gateway ? m_Gateway->Listen( Protocol::kPort )
+                                     : m_ConnectionPool->Listen( Protocol::kPort );
+    if ( listening == false )
     {
         ErrorMessage( "Failed to listen on port %u.  Check port is not in use.", Protocol::kPort );
         return (uint32_t)-1;
@@ -221,7 +260,10 @@ uint32_t Worker::WorkThread()
     // Now that we will no longer interact with the UI, we can stop the message pump
     m_MainWindow->StopMessagePump();
 
-    m_WorkerBrokerage.SetAvailability( false );
+    if ( m_UseBrokerage )
+    {
+        m_WorkerBrokerage.SetAvailability( false );
+    }
 
     return 0;
 }
@@ -351,7 +393,10 @@ void Worker::UpdateAvailability()
 
     WorkerThreadRemote::SetNumCPUsToUse( numCPUsToUse );
 
-    m_WorkerBrokerage.SetAvailability( numCPUsToUse > 0 );
+    if ( m_UseBrokerage )
+    {
+        m_WorkerBrokerage.SetAvailability( numCPUsToUse > 0 );
+    }
 }
 
 // UpdateUI
@@ -370,6 +415,13 @@ void Worker::UpdateUI()
     const size_t numConnections = m_ConnectionPool->GetNumConnections();
     AStackString status;
     status.Format( "%u Connections", (uint32_t)numConnections );
+    if ( m_Gateway )
+    {
+        Gateway::Stats stats;
+        m_Gateway->GetStats( stats );
+        status.AppendFormat( "\nGateway: %u of %u workers, %u slots, %u clients",
+                             stats.m_ReadyWorkers, stats.m_Workers, stats.m_PoolSlots, stats.m_Clients );
+    }
     if ( m_RestartNeeded )
     {
         status += " (Restart Pending)";
@@ -390,7 +442,7 @@ void Worker::UpdateUI()
         m_MainWindow->SetStatus( m_WorkerBrokerage.GetHostName(), status );
     }
 
-    if ( InConsoleMode() == false )
+    if ( ( InConsoleMode() == false ) && ( m_Gateway == nullptr ) )
     {
         // thread output
         const JobQueueRemote & jqr = JobQueueRemote::Get();
@@ -422,6 +474,16 @@ void Worker::UpdateUI()
     m_UIUpdateTimer.Restart();
 }
 
+// SignalStopWorkers
+//------------------------------------------------------------------------------
+void Worker::SignalStopWorkers()
+{
+    if ( m_Gateway == nullptr ) // A gateway runs no jobs itself
+    {
+        JobQueueRemote::Get().SignalStopWorkers();
+    }
+}
+
 // CheckIfRestartNeeded
 //------------------------------------------------------------------------------
 void Worker::CheckIfRestartNeeded()
@@ -432,7 +494,7 @@ void Worker::CheckIfRestartNeeded()
     if ( m_RestartNeeded )
     {
         // can we restart yet?
-        if ( JobQueueRemote::Get().HaveWorkersStopped() )
+        if ( ( m_Gateway != nullptr ) || JobQueueRemote::Get().HaveWorkersStopped() )
         {
             m_WantToQuit = true;
         }
@@ -452,7 +514,7 @@ void Worker::CheckIfRestartNeeded()
         if ( m_PeriodicRestartTimer.GetElapsed() > periodicRestartSecs )
         {
             m_RestartNeeded = true;
-            JobQueueRemote::Get().SignalStopWorkers();
+            SignalStopWorkers();
             return;
         }
     }
@@ -478,7 +540,7 @@ void Worker::CheckIfRestartNeeded()
     if ( lastWriteTime != m_LastWriteTime )
     {
         m_RestartNeeded = true;
-        JobQueueRemote::Get().SignalStopWorkers();
+        SignalStopWorkers();
     }
 }
 

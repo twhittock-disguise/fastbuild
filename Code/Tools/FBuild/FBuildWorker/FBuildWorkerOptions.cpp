@@ -115,6 +115,20 @@ bool FBuildWorkerOptions::ProcessCommandLine( const AString & commandLine )
             }
             // problem... fall through
         }
+        else if ( token.BeginsWith( "-gateway=" ) )
+        {
+            m_GatewayConfigFile.Assign( token.Get() + 9, token.GetEnd() );
+            if ( !m_GatewayConfigFile.IsEmpty() )
+            {
+                continue;
+            }
+            // problem... fall through
+        }
+        else if ( token == "-nobrokerage" )
+        {
+            m_NoBrokerage = true;
+            continue;
+        }
         else if ( token == "-periodicrestart" )
         {
             m_PeriodicRestart = true;
@@ -185,6 +199,11 @@ void FBuildWorkerOptions::ShowUsageError()
                 " -prefetch=<n>\n"
                 "        Extra jobs to buffer locally for gapless execution.\n"
                 "        Default: ceil(cpus/2). Use 0 to disable.\n"
+                " -gateway=<file>\n"
+                "        Run as a gateway for the workers listed in <file>, one host[:port]\n"
+                "        per line, instead of running jobs here.\n"
+                " -nobrokerage\n"
+                "        Don't register in the worker brokerage (for workers behind a gateway).\n"
                 " -nosubprocess\n"
                 "        (Windows) Don't spawn a sub-process worker copy.\n"
                 " -periodicrestart\n"

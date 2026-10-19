@@ -77,27 +77,8 @@ void WorkerBrokerageServer::SetAvailability( bool available )
                  m_IPAddress.IsEmpty() ||
                  ( m_TimerLastIPUpdate.GetElapsed() >= sBrokerageIPAddressUpdateTime ) )
             {
-                AStackString hostName;
-                AStackString domainName;
-                AStackString ipAddress;
-
-                // Get host and domain name as FQDN could have changed
-                Network::GetHostName( hostName );
-                Network::GetDomainName( domainName );
-
-                // Resolve host name to ip address
-                const uint32_t ip = Network::GetHostIPFromName( hostName );
-                if ( ( ip != 0 ) && ( ip != 0x0100007f ) )
+                if ( RefreshIdentity() )
                 {
-                    TCPConnectionPool::GetAddressAsString( ip, ipAddress );
-                }
-
-                if ( ( hostName != m_HostName ) || ( domainName != m_DomainName ) || ( ipAddress != m_IPAddress ) )
-                {
-                    m_HostName = hostName;
-                    m_DomainName = domainName;
-                    m_IPAddress = ipAddress;
-
                     // Remove existing brokerage file, as filename is being updated
                     FileIO::FileDelete( m_BrokerageFilePath.Get() );
 
@@ -107,9 +88,6 @@ void WorkerBrokerageServer::SetAvailability( bool available )
                     // Host name, domain name, or IP address changed - create the file
                     createBrokerageFile = true;
                 }
-
-                // Restart the IP timer
-                m_TimerLastIPUpdate.Restart();
             }
 
             if ( createBrokerageFile == false )
@@ -223,6 +201,54 @@ void WorkerBrokerageServer::SetAvailability( bool available )
         // Restart the timer
         m_TimerLastCleanBroker.Restart();
     }
+}
+
+// Withdraw
+//------------------------------------------------------------------------------
+void WorkerBrokerageServer::Withdraw()
+{
+    InitBrokerage();
+    if ( m_BrokerageRoots.IsEmpty() )
+    {
+        return;
+    }
+
+    // The path is only known once the identity is
+    RefreshIdentity();
+    UpdateBrokerageFilePath();
+    FileIO::FileDelete( m_BrokerageFilePath.Get() );
+}
+
+// RefreshIdentity
+//------------------------------------------------------------------------------
+bool WorkerBrokerageServer::RefreshIdentity()
+{
+    AStackString hostName;
+    AStackString domainName;
+    AStackString ipAddress;
+
+    // Get host and domain name as FQDN could have changed
+    Network::GetHostName( hostName );
+    Network::GetDomainName( domainName );
+
+    // Resolve host name to ip address
+    const uint32_t ip = Network::GetHostIPFromName( hostName );
+    if ( ( ip != 0 ) && ( ip != 0x0100007f ) )
+    {
+        TCPConnectionPool::GetAddressAsString( ip, ipAddress );
+    }
+
+    const bool changed = ( hostName != m_HostName ) || ( domainName != m_DomainName ) || ( ipAddress != m_IPAddress );
+    if ( changed )
+    {
+        m_HostName = hostName;
+        m_DomainName = domainName;
+        m_IPAddress = ipAddress;
+    }
+
+    // Restart the IP timer
+    m_TimerLastIPUpdate.Restart();
+    return changed;
 }
 
 // UpdateBrokerageFilePath

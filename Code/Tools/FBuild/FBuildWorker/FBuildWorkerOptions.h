@@ -9,10 +9,7 @@
 
 // Core
 #include "Core/Env/Types.h"
-
-// Forward Declaration
-//------------------------------------------------------------------------------
-class AString;
+#include "Core/Strings/AString.h"
 
 // FBuildWorkerOptions
 //------------------------------------------------------------------------------
@@ -40,6 +37,10 @@ public:
 
     // Console mode
     bool m_ConsoleMode = false;
+
+    // Gateway
+    AString m_GatewayConfigFile;        // Non-empty: run as a gateway for the workers listed in this file
+    bool m_NoBrokerage = false;         // Don't register in the worker brokerage
 
     // Other
     bool m_PeriodicRestart = false;
