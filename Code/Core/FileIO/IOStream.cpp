@@ -14,6 +14,10 @@ bool IOStream::Read( AString & string )
     uint32_t len;
     if ( Read( len ) )
     {
+        if ( len > ( GetFileSize() - Tell() ) )
+        {
+            return false; // More than the stream holds
+        }
         string.SetLength( len );
         return ( Read( string.Get(), len ) == len );
     }

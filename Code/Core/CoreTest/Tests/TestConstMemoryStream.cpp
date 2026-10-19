@@ -8,6 +8,7 @@
 // Core
 #include "Core/FileIO/ConstMemoryStream.h"
 #include "Core/FileIO/MemoryStream.h"
+#include "Core/Strings/AString.h"
 
 // TestConstMemoryStream
 //------------------------------------------------------------------------------
@@ -21,6 +22,7 @@ private:
     void MemoryOwned() const;
     void MoveConstructor() const;
     void MoveAssignment() const;
+    void ReadStringLongerThanStream() const;
 };
 
 // Register Tests
@@ -31,6 +33,7 @@ REGISTER_TESTS_BEGIN( TestConstMemoryStream )
     REGISTER_TEST( MemoryOwned )
     REGISTER_TEST( MoveConstructor )
     REGISTER_TEST( MoveAssignment )
+    REGISTER_TEST( ReadStringLongerThanStream )
 REGISTER_TESTS_END
 
 // Empty
@@ -197,6 +200,24 @@ void TestConstMemoryStream::MoveAssignment() const
         TEST_ASSERT( ms2.GetSize() == bufferSize );
         TEST_ASSERT( ms2.Tell() == 0 );
         TEST_ASSERT( ms2.GetSize() == ms2.GetFileSize() );
+    }
+}
+
+// ReadStringLongerThanStream
+//------------------------------------------------------------------------------
+void TestConstMemoryStream::ReadStringLongerThanStream() const
+{
+    const uint32_t lengths[] = { 1024 * 1024, 0xFFFFFFFF };
+    for ( const uint32_t length : lengths )
+    {
+        MemoryStream ms;
+        ms.Write( length );
+        ms.Write( static_cast<uint32_t>( 0x41414141 ) );
+        ConstMemoryStream cms( ms.GetData(), ms.GetSize() );
+
+        AString string;
+        TEST_ASSERT( cms.Read( string ) == false );
+        TEST_ASSERT( string.GetReserved() < 1024 ); // Nothing allocated for a length the stream cannot hold
     }
 }
 

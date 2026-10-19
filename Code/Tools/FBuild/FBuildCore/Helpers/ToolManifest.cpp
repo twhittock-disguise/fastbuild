@@ -391,8 +391,8 @@ void ToolManifest::SerializeForRemote( IOStream & ms ) const
 
     // Custom env vars
     uint32_t numEnvVars( 0 );
-    ms.Read( numEnvVars );
-    if ( numEnvVars > ( ( ms.GetFileSize() - ms.Tell() ) / sizeof( uint32_t ) ) ) // Each takes at least its length
+    if ( !ms.Read( numEnvVars ) ||
+         ( numEnvVars > ( ( ms.GetFileSize() - ms.Tell() ) / sizeof( uint32_t ) ) ) ) // Each takes at least its length
     {
         return false;
     }

@@ -15,6 +15,7 @@
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
 #include "Tools/FBuild/FBuildCore/Gateway/ToolchainStash.h"
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
+#include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
@@ -456,6 +457,7 @@ private:
     void HousekeepingRunsWhileStoredPchsAreMeasured() const;
     void StoredPchsThatJobsWaitForAreMeasuredFirst() const;
     void StashRejectsAManifestAWorkerWouldRefuse() const;
+    void StashRejectsAManifestOfLengthsItCannotHold() const;
     void GiveUpDoesNotDenyListTheGateway() const;
     void JobOfALostWorkerIsRetriedElsewhere() const;
     void SystemErrorIsRetriedAndNotPassedOn() const;
@@ -641,6 +643,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( HousekeepingRunsWhileStoredPchsAreMeasured )
     REGISTER_TEST( StoredPchsThatJobsWaitForAreMeasuredFirst )
     REGISTER_TEST( StashRejectsAManifestAWorkerWouldRefuse )
+    REGISTER_TEST( StashRejectsAManifestOfLengthsItCannotHold )
     REGISTER_TEST( GiveUpDoesNotDenyListTheGateway )
     REGISTER_TEST( JobOfALostWorkerIsRetriedElsewhere )
     REGISTER_TEST( SystemErrorIsRetriedAndNotPassedOn )
@@ -2014,6 +2017,63 @@ void TestGateway::StashRejectsAManifestAWorkerWouldRefuse() const
     // Nothing of them is kept, and a sound one is
     TEST_ASSERT( CountFilesUnder( dir ) == 0 );
     TEST_ASSERT( stash.AddManifest( toolId, cut.GetData(), cut.GetSize() ) == ToolchainStash::STASH_INCOMPLETE );
+}
+
+// StashRejectsAManifestOfLengthsItCannotHold
+//------------------------------------------------------------------------------
+void TestGateway::StashRejectsAManifestOfLengthsItCannotHold() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+
+    // No count of environment variables
+    MemoryStream noVariables;
+    MakeStashManifest( noVariables, 0x30, 1 );
+    TEST_ASSERT( stash.AddManifest( 0x30, noVariables.GetData(), noVariables.GetSize() - sizeof( uint32_t ) ) == ToolchainStash::STASH_INVALID );
+
+    // A string length beyond the payload, where each string of a manifest is
+    enum Where { MAIN_EXECUTABLE, FILE_NAME, ENVIRONMENT_VARIABLE };
+    const Where kWhere[] = { MAIN_EXECUTABLE, FILE_NAME, ENVIRONMENT_VARIABLE };
+    uint64_t toolId = 0x31;
+    for ( const Where where : kWhere )
+    {
+        MemoryStream ms;
+        ms.Write( toolId );
+        if ( where == MAIN_EXECUTABLE )
+        {
+            ms.Write( (uint32_t)0xFFFFFFFF );
+        }
+        else
+        {
+            ms.Write( AStackString( "C:\\toolchain\\" ) );
+            ms.Write( (uint32_t)1 );
+            if ( where == FILE_NAME )
+            {
+                ms.Write( (uint32_t)0xFFFFFFFF );
+            }
+            else
+            {
+                ms.Write( AStackString( "C:\\toolchain\\cl.exe" ) );
+                ms.Write( (uint64_t)1 );
+                ms.Write( (uint64_t)100 );
+                ms.Write( (uint32_t)10 );
+                ms.Write( (uint32_t)1 );
+                ms.Write( (uint32_t)0xFFFFFFFF );
+            }
+        }
+        ms.Write( (uint64_t)0 ); // Some bytes follow, far fewer than claimed
+
+        ConstMemoryStream cms( ms.GetData(), ms.GetSize() );
+        AStackString<> mainExecutablePath;
+        Array<ToolManifestFile> files;
+        Array<AString> customEnvironmentVariables;
+        TEST_ASSERT( ToolManifest::ReadRemote( cms, toolId, mainExecutablePath, files, customEnvironmentVariables ) == false );
+        TEST_ASSERT( stash.AddManifest( toolId, ms.GetData(), ms.GetSize() ) == ToolchainStash::STASH_INVALID );
+        ++toolId;
+    }
+
+    TEST_ASSERT( CountFilesUnder( dir ) == 0 );
 }
 
 // DuplicateUploadsAreIgnored
