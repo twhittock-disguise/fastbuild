@@ -612,7 +612,7 @@ void Server::LogWarning( const char * fmtString, ... )
 
 // QueueResult
 //------------------------------------------------------------------------------
-bool Server::QueueResult( uint32_t clientId, bool compressed, MemoryStream && payload )
+bool Server::QueueResult( uint32_t clientId, bool compressed, MemoryStream && payload, uint8_t flags )
 {
     MutexHolder mh( m_ClientListMutex );
     for ( ClientState * cs : m_ClientList )
@@ -623,7 +623,7 @@ bool Server::QueueResult( uint32_t clientId, bool compressed, MemoryStream && pa
             {
                 return false; // It is going
             }
-            cs->m_Outbox->PushResult( compressed, Move( payload ) );
+            cs->m_Outbox->PushResult( compressed, Move( payload ), flags );
             return true;
         }
     }
@@ -716,11 +716,11 @@ Server::ClientOutbox::~ClientOutbox()
 
 // PushResult
 //------------------------------------------------------------------------------
-void Server::ClientOutbox::PushResult( bool compressed, MemoryStream && payload )
+void Server::ClientOutbox::PushResult( bool compressed, MemoryStream && payload, uint8_t flags )
 {
     QueuedResult result;
     result.m_Payload = FNEW( MemoryStream( Move( payload ) ) );
-    result.m_AllocatedCapacity = m_ClientState.m_AllocatedCapacity;
+    result.m_Flags = flags;
     result.m_Compressed = compressed;
     result.m_IsMessage = false;
     {
@@ -738,7 +738,7 @@ void Server::ClientOutbox::PushMessage( const Protocol::IMessage & msg )
     QueuedResult request;
     request.m_Payload = FNEW( MemoryStream( msg.GetSize() ) );
     request.m_Payload->WriteBuffer( &msg, msg.GetSize() );
-    request.m_AllocatedCapacity = 0;
+    request.m_Flags = 0;
     request.m_Compressed = false;
     request.m_IsMessage = true;
     {
@@ -805,18 +805,14 @@ void Server::ClientOutbox::Send( const QueuedResult & result )
     ASSERT( cs.m_NumJobsActive.Load() > 0 );
     cs.m_NumJobsActive.Decrement();
 
-    const uint32_t active = cs.m_NumJobsActive.Load();
-    const uint32_t allocated = result.m_AllocatedCapacity;
-    const uint8_t remaining = (uint8_t)( allocated > active ? allocated - active : 0 );
-
     if ( result.m_Compressed )
     {
-        const Protocol::MsgJobResultCompressed msg( remaining );
+        const Protocol::MsgJobResultCompressed msg( result.m_Flags );
         SendTo( cs, msg, *result.m_Payload );
     }
     else
     {
-        const Protocol::MsgJobResult msg( remaining );
+        const Protocol::MsgJobResult msg( result.m_Flags );
         SendTo( cs, msg, *result.m_Payload );
     }
 }
@@ -2367,7 +2363,7 @@ void Server::FinalizeCompletedJobs()
                 MutexHolder mh( m_ClientListMutex );
                 if ( ( m_ClientList.Find( cs ) != nullptr ) && cs->m_Outbox )
                 {
-                    cs->m_Outbox->PushResult( job->GetResultCompressionLevel() != 0, Move( ms ) );
+                    cs->m_Outbox->PushResult( job->GetResultCompressionLevel() != 0, Move( ms ), 0 ); // A worker's result has no flags
                 }
             }
         }

@@ -336,30 +336,34 @@ void ToolManifest::SerializeForRemote( IOStream & ms ) const
     }
 }
 
-// DeserializeFromRemote
+// ReadRemote
 //------------------------------------------------------------------------------
-bool ToolManifest::DeserializeFromRemote( IOStream & ms )
+/*static*/ bool ToolManifest::ReadRemote( IOStream & ms,
+                                          uint64_t toolId,
+                                          AString & outMainExecutablePath,
+                                          Array<ToolManifestFile> & outFiles,
+                                          Array<AString> & outCustomEnvironmentVariables )
 {
-    // The first manifest received for a toolchain wins. A later one describes the same
-    // files (the toolId covers their contents), and the files may already be in use.
-    if ( m_Files.IsEmpty() == false )
-    {
-        return true;
-    }
-    ASSERT( m_CustomEnvironmentVariables.IsEmpty() );
-
     // Read header info
-    uint64_t toolId;
+    uint64_t readToolId;
     AStackString mainExecutablePath;
     uint32_t numFiles( 0 );
-    if ( !ms.Read( toolId ) ||
+    if ( !ms.Read( readToolId ) ||
          !ms.Read( mainExecutablePath ) ||
          !ms.Read( numFiles ) ||
          ( AString::StrLen( mainExecutablePath.Get() ) != mainExecutablePath.GetLength() ) ||
          ( numFiles == 0 ) ||        // Must have at least 1 file
-         ( toolId != m_ToolId ) )    // Must have correct toolId
+         ( readToolId != toolId ) )  // Must have correct toolId
     {
-        return false; // Corrupt stream (likely old broken worker)
+        return false;
+    }
+
+    // Each entry takes at least a name's length, a time stamp, a hash and a size, so a count the
+    // stream cannot hold is refused before anything is allocated for it
+    const uint64_t kMinFileEntrySize = ( sizeof( uint32_t ) + sizeof( uint64_t ) + sizeof( uint64_t ) + sizeof( uint32_t ) );
+    if ( numFiles > ( ( ms.GetFileSize() - ms.Tell() ) / kMinFileEntrySize ) )
+    {
+        return false;
     }
 
     // Read file info
@@ -380,7 +384,7 @@ bool ToolManifest::DeserializeFromRemote( IOStream & ms )
              ( hash == 0 ) ||
              EscapesToolchainDirectory( mainExecutablePath, name ) )
         {
-            return false; // Corrupt stream (likely old broken worker)
+            return false;
         }
         files.EmplaceBack( name, timeStamp, hash, uncompressedContentSize );
     }
@@ -388,6 +392,10 @@ bool ToolManifest::DeserializeFromRemote( IOStream & ms )
     // Custom env vars
     uint32_t numEnvVars( 0 );
     ms.Read( numEnvVars );
+    if ( numEnvVars > ( ( ms.GetFileSize() - ms.Tell() ) / sizeof( uint32_t ) ) ) // Each takes at least its length
+    {
+        return false;
+    }
     Array<AString> customEnvironmentVariables;
     customEnvironmentVariables.SetCapacity( numEnvVars );
     for ( size_t i = 0; i < (size_t)numEnvVars; ++i )
@@ -396,12 +404,40 @@ bool ToolManifest::DeserializeFromRemote( IOStream & ms )
         if ( !ms.Read( envVar ) ||
              ( AString::StrLen( envVar.Get() ) != envVar.GetLength() ) )
         {
-            return false; // Corrupt stream (likely old broken worker)
+            return false;
         }
         customEnvironmentVariables.EmplaceBack( Move( envVar ) );
     }
 
+    outMainExecutablePath = mainExecutablePath;
+    outFiles = Move( files );
+    outCustomEnvironmentVariables = Move( customEnvironmentVariables );
+    return true;
+}
+
+// DeserializeFromRemote
+//------------------------------------------------------------------------------
+bool ToolManifest::DeserializeFromRemote( IOStream & ms )
+{
+    // The first manifest received for a toolchain wins. A later one describes the same
+    // files (the toolId covers their contents), and the files may already be in use.
+    if ( m_Files.IsEmpty() == false )
+    {
+        return true;
+    }
+    ASSERT( m_CustomEnvironmentVariables.IsEmpty() );
+
+    AStackString mainExecutablePath;
+    Array<ToolManifestFile> files;
+    Array<AString> customEnvironmentVariables;
+    if ( ReadRemote( ms, m_ToolId, mainExecutablePath, files, customEnvironmentVariables ) == false )
+    {
+        return false; // Corrupt stream (likely old broken worker)
+    }
+
     // Deserialization is complete so we can keep what we've read
+    const uint32_t numFiles = (uint32_t)files.GetSize();
+    const size_t numEnvVars = customEnvironmentVariables.GetSize();
     m_MainExecutableRootPath = mainExecutablePath;
     m_Files = Move( files );
     m_CustomEnvironmentVariables = Move( customEnvironmentVariables );

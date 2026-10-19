@@ -26,6 +26,11 @@
 // the job's result has come back from a downstream worker, and sends that result to the client
 // that sent the job, with the client's job id restored and the thread index moved to the worker's lane.
 //
+// A worker's faults are the gateway's to retry: a job that fails, is lost with its worker or outlives
+// the watchdog is tried again elsewhere, at most GatewayScheduler::kMaxAttempts times in all. Only then
+// does the client get a failed result, flagged Protocol::kResultReturnedByGateway, so it requeues the
+// job and keeps the gateway. A lost worker is connected again after GatewayConfig::m_ReconnectSeconds.
+//
 // Locking: m_Mutex guards everything below it. Under it the gateway only pushes to queues, calls
 // the scheduler, reads connection state and takes the Server's PCH cache lock. Sends to clients,
 // disk access (the stash's, the log's) and the Server's client list come after it is released.
@@ -35,6 +40,9 @@ class Gateway : private Server::Forwarder, private DownstreamConnection::Owner
     friend class TestGateway;
 public:
     static constexpr uint32_t kLocalWorkerIndex = 0;   // Used from Task 18
+    // A client that holds more jobs at the gateway than this many per slot it was offered does not keep
+    // to its capacity, and is disconnected: each job is held in memory with a toolchain pin
+    static constexpr uint32_t kMaxHeldJobsPerSlot = 4;
     explicit Gateway( const GatewayConfig & config );  // Phase A: a pure forwarder
     virtual ~Gateway();
 
@@ -97,6 +105,7 @@ private:
         void *      m_Data = nullptr;           // As decoded, with the client's job id
         size_t      m_DataSize = 0;
         PchLease    m_PchLease;                 // From its arrival, so the PCH is not evicted while it is held
+        uint32_t    m_NumAttempts = 0;          // Dispatched so far
         bool        m_Parked = false;           // Waiting for its toolchain or PCH, and not yet in the scheduler
     };
 
@@ -107,18 +116,22 @@ private:
         uint32_t    m_JobId = 0;
         uint32_t    m_WorkerIndex = 0;
         Timer       m_Started;
-        bool        m_Expired = false;
+        bool        m_Expired = false;          // Failed by the watchdog: kept only so its late result frees the slot
     };
 
     struct Worker
     {
         DownstreamConnection *  m_Connection = nullptr;
         bool                    m_Ready = false;    // In the scheduler and the pool
+        bool                    m_Lost = false;     // Its connection has ended, and is replaced once m_LostTimer passes m_ReconnectSeconds
+        Timer                   m_LostTimer;
     };
 
     struct Client
     {
         uint32_t        m_Id = 0;
+        uint32_t        m_OfferedSlots = 0;     // The pool when it was taken on
+        uint32_t        m_NumJobs = 0;          // Held for it
         Array<uint64_t> m_Pins;     // The toolchains it was advertised
     };
 
@@ -145,6 +158,12 @@ private:
     {
         struct PchAsk { uint32_t m_ClientId; uint64_t m_PchId; };
         struct ToolchainRequest { uint32_t m_ClientId; uint64_t m_ToolId; uint32_t m_FileId; }; // kManifestFileId: the manifest
+        struct GivenUp { uint32_t m_ClientId; bool m_Compressed; MemoryStream * m_Payload; }; // Sent flagged kResultReturnedByGateway
+
+        Actions() = default;
+        ~Actions();
+        explicit Actions( const Actions & other ) = delete;
+        Actions & operator=( const Actions & other ) = delete;
 
         Array<uint64_t>         m_DropIncomplete;
         Array<uint64_t>         m_ReleaseUses;
@@ -153,6 +172,7 @@ private:
         Array<uint32_t>         m_Disconnects;
         Array<PchAsk>           m_PchAsks;
         Array<ToolchainRequest> m_ToolchainRequests;
+        Array<GivenUp>          m_GivenUp;
         Array<AString>          m_LogLines;
     };
     void Run( Actions & actions );
@@ -172,7 +192,13 @@ private:
     void OnToolchainPayload( uint32_t clientId, uint64_t toolId, Actions & actions );
     bool IsUploaded( uint64_t toolId ) const; // Some live client is sending it
     void RemoveJob( GatewayJob * job, Actions & actions );
+    // An attempt ended without a usable result. Retries the job, or gives it up: true if the client is then
+    // to get the job's failed result (it is still connected), and the job is removed either way.
+    bool FailAttempt( GatewayJob & job, uint32_t workerIndex, const char * reason, Actions & actions );
+    void GiveUpWithoutResult( GatewayJob & job, Actions & actions ); // After FailAttempt: a lost-job result goes up
+    void ExpireHungAttempts( Actions & actions );
     void UpdatePool();
+    Client * FindClient( uint32_t clientId );
     Client & FindOrAddClient( uint32_t clientId );
     GatewayJob * FindJob( uint32_t jobId ) const;
     Worker * FindWorker( const DownstreamConnection & connection );
@@ -183,6 +209,7 @@ private:
     static uint32_t HousekeepingThreadFuncStatic( void * param );
     void HousekeepingThreadFunc();
     void MeasureStoredPchs(); // Those found at start
+    void ReconnectLostWorkers();
 
     const GatewayConfig     m_Config;
     ToolchainStash          m_Stash;

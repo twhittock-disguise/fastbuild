@@ -70,8 +70,9 @@ public:
 
     const AString & GetLogPath() const { return m_Log.GetPath(); }
 
-    // A result for the client's outbox (see ClientState::m_Id). False if the client has gone.
-    bool QueueResult( uint32_t clientId, bool compressed, MemoryStream && payload );
+    // A result for the client's outbox (see ClientState::m_Id), sent with the given Protocol result flags.
+    // False if the client has gone.
+    bool QueueResult( uint32_t clientId, bool compressed, MemoryStream && payload, uint8_t flags = 0 );
     // A message without a payload, sent by the client's outbox after what is queued before it, so it never
     // waits for a client that reads slowly. False if the client has gone.
     bool SendToClient( uint32_t clientId, const Protocol::IMessage & msg );
@@ -158,7 +159,7 @@ private:
         ~ClientOutbox(); // Stops and joins; what is queued is dropped
 
         // Caller holds m_ClientListMutex. A result counts in cs.m_NumJobsActive until it is sent.
-        void PushResult( bool compressed, MemoryStream && payload );
+        void PushResult( bool compressed, MemoryStream && payload, uint8_t flags );
         void PushMessage( const Protocol::IMessage & msg ); // Without a payload. Sent after what is queued before it.
         void Wake();
 
@@ -169,7 +170,7 @@ private:
         struct QueuedResult
         {
             MemoryStream *  m_Payload;              // A result's payload, or the bytes of a message
-            uint32_t        m_AllocatedCapacity;    // Of the client when the result was queued
+            uint8_t         m_Flags;                // Protocol result flags
             bool            m_Compressed;
             bool            m_IsMessage;            // m_Payload is a whole message, sent as it is
         };

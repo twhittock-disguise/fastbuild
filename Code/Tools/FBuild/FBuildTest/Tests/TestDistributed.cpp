@@ -157,6 +157,8 @@ private:
     void JobStreamAcrossReconnect() const;
     void ResultsAreCompressed() const;
     void CorruptResultIsRejected() const;
+    void ClientRequeuesAGatewayReturnedResultWithoutDenyListing() const;
+    void ClientStillDenyListsAPlainSystemError() const;
     void SendMutexHoldsBackResults() const;
     void ToolchainIsSentBeforeAnyJob() const;
     void PchIsNotSentToAWorkerWithoutAFreeSlot() const;
@@ -410,6 +412,8 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( JobStreamAcrossReconnect )
     REGISTER_TEST( ResultsAreCompressed )
     REGISTER_TEST( CorruptResultIsRejected )
+    REGISTER_TEST( ClientRequeuesAGatewayReturnedResultWithoutDenyListing )
+    REGISTER_TEST( ClientStillDenyListsAPlainSystemError )
     REGISTER_TEST( SendMutexHoldsBackResults )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( ToolchainIsSentBeforeAnyJob )
@@ -2787,7 +2791,7 @@ namespace
             memset( garbage, 0xFF, sizeof( garbage ) );
             ms.Write( (uint32_t)sizeof( garbage ) );
             ms.WriteBuffer( garbage, sizeof( garbage ) );
-            const Protocol::MsgJobResultCompressed msg( 4 );
+            const Protocol::MsgJobResultCompressed msg( 0 );
             msg.Send( connection, ms );
             m_NumResultsSent.Increment();
         }
@@ -2795,6 +2799,157 @@ namespace
         JobStreamDecoder m_Decoder;
         Atomic<uint32_t> m_NumResultsSent{ 0 };
     };
+
+    // A worker with one slot that answers every job with a system error, sent with the given result flags
+    class GiveUpWorker : public FakeWorker
+    {
+    public:
+        explicit GiveUpWorker( uint8_t flags ) : FakeWorker( 1 ), m_Flags( flags ) {}
+        explicit GiveUpWorker( const GiveUpWorker & other ) = delete;
+        GiveUpWorker & operator=( const GiveUpWorker & other ) = delete;
+
+        uint32_t GetNumJobs() const { return m_NumJobs.Load(); }
+        uint32_t GetMostReceivesOfOneJob() const // How often the job received most often was received
+        {
+            MutexHolder mh( m_Mutex );
+            uint32_t most = 0;
+            for ( const uint32_t jobId : m_JobIds )
+            {
+                uint32_t count = 0;
+                for ( const uint32_t other : m_JobIds )
+                {
+                    count += ( other == jobId ) ? 1 : 0;
+                }
+                most = ( count > most ) ? count : most;
+            }
+            return most;
+        }
+
+    private:
+        virtual void OnMessage( const ConnectionInfo * connection,
+                                const Protocol::IMessage & message,
+                                void * payload,
+                                uint32_t payloadSize ) override
+        {
+            if ( message.GetType() != Protocol::MSG_JOB )
+            {
+                return;
+            }
+            void * job = nullptr;
+            size_t jobSize = 0;
+            if ( m_Decoder.Decode( payload, payloadSize, job, jobSize ) == false )
+            {
+                return;
+            }
+            uint32_t jobId = 0; // The first thing a job holds
+            ConstMemoryStream js( job, jobSize );
+            js.Read( jobId );
+            FREE( job );
+            {
+                MutexHolder mh( m_Mutex );
+                m_JobIds.Append( jobId );
+            }
+            m_NumJobs.Increment();
+
+            // Laid out as Server::FinalizeCompletedJobs writes it
+            MemoryStream ms;
+            ms.Write( jobId );
+            ms.Write( AStackString( "given up" ) );
+            ms.Write( false ); // Not built
+            ms.Write( true );  // A system error
+            Array<AString> messages;
+            messages.EmplaceBack( "no result after 3 attempts" );
+            ms.Write( messages );
+            ms.Write( (uint32_t)0 ); // Build time
+            ms.Write( (uint16_t)0 ); // Thread
+            ms.Write( (uint32_t)0 ); // No data
+            const Protocol::MsgJobResultCompressed msg( m_Flags );
+            msg.Send( connection, ms );
+        }
+
+        const uint8_t m_Flags;
+        JobStreamDecoder m_Decoder;
+        mutable Mutex m_Mutex;
+        Array<uint32_t> m_JobIds; // In the order they arrived
+        Atomic<uint32_t> m_NumJobs{ 0 };
+    };
+}
+
+// ClientRequeuesAGatewayReturnedResultWithoutDenyListing
+//------------------------------------------------------------------------------
+void TestDistributed::ClientRequeuesAGatewayReturnedResultWithoutDenyListing() const
+{
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true; // Only the worker takes the requeued job
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    GiveUpWorker worker( Protocol::kResultReturnedByGateway );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    bool built = true;
+    {
+        DenyListPoller poller( fBuild );
+        auto never = []() { return false; };
+        BuildAborter aborter( never, kWaitTimeoutSeconds );
+        built = fBuild.Build( "../tmp/Test/Distributed/dist.lib" );
+        worker.ShutdownAllConnections();
+        TEST_ASSERT( aborter.HasTimedOut() == false );
+        TEST_ASSERT( poller.GetMax() == 0 );
+    }
+
+    // The job came back to the same connection each time, and failed as a job that fails everywhere does
+    TEST_ASSERT( built == false );
+    TEST_ASSERT( worker.GetMostReceivesOfOneJob() == 3 ); // The client's SYSTEM_ERROR_ATTEMPT_COUNT
+    TEST_ASSERT( GetRecordedOutput().Find( "Task failed on 3 different workers" ) );
+}
+
+// ClientStillDenyListsAPlainSystemError
+//------------------------------------------------------------------------------
+void TestDistributed::ClientStillDenyListsAPlainSystemError() const
+{
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true;
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    GiveUpWorker worker( 0 );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    // Once the only worker is deny-listed, nothing takes the requeued job, so the build is stopped
+    DenyListPoller poller( fBuild );
+    Atomic<bool> denyListed( false );
+    Timer sinceDenyListed;
+    auto settled = [ &poller, &denyListed, &sinceDenyListed ]()
+    {
+        if ( denyListed.Load() == false )
+        {
+            if ( poller.GetMax() < 1 )
+            {
+                return false;
+            }
+            denyListed.Store( true );
+            sinceDenyListed.Restart();
+        }
+        return ( sinceDenyListed.GetElapsed() >= 1.0f );
+    };
+    {
+        BuildAborter aborter( settled, kWaitTimeoutSeconds );
+        const bool built = fBuild.Build( "../tmp/Test/Distributed/dist.lib" );
+        worker.ShutdownAllConnections();
+        TEST_ASSERT( aborter.HasReached() );
+        TEST_ASSERT( built == false );
+    }
+    TEST_ASSERT( worker.GetNumJobs() == 1 );
+    TEST_ASSERT( poller.GetMax() == 1 );
 }
 
 // CorruptResultIsRejected
@@ -4588,7 +4743,7 @@ namespace
             memset( garbage, 0xFF, sizeof( garbage ) );
             ms.Write( (uint32_t)sizeof( garbage ) );
             ms.WriteBuffer( garbage, sizeof( garbage ) );
-            const Protocol::MsgJobResultCompressed msg( 4 );
+            const Protocol::MsgJobResultCompressed msg( 0 );
             msg.Send( connection, ms );
             m_NumResultsSent.Increment();
         }

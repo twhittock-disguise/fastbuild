@@ -429,10 +429,15 @@ void DownstreamConnection::Process( const Protocol::MsgPchNeeded * msg )
 //------------------------------------------------------------------------------
 void DownstreamConnection::ProcessToolchainRequest( uint64_t toolId, uint32_t fileId )
 {
-    if ( ( toolId == 0 ) || ( QueueToolchainFile( toolId, fileId ) == false ) )
+    if ( toolId == 0 )
     {
-        Close( "toolchain" );
+        Close( "protocol" );
+        return;
     }
+
+    // A toolchain the owner no longer holds (evicted once its jobs ended) is not answered: a job
+    // still waiting for it on the worker ends by the owner's watchdog
+    QueueToolchainFile( toolId, fileId );
 }
 
 // QueueToolchainFile

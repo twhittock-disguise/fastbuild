@@ -462,6 +462,12 @@ namespace DistributedTest
             MutexHolder mh( m_Mutex );
             out = m_Results;
         }
+        // The flags of the results received, in the same order
+        void GetResultFlags( Array<uint8_t> & out ) const
+        {
+            MutexHolder mh( m_Mutex );
+            out = m_ResultFlags;
+        }
         // The MSG_REQUEST_MANIFEST and MSG_REQUEST_FILE received, in order
         struct ToolchainRequest
         {
@@ -554,6 +560,7 @@ namespace DistributedTest
                     if ( GatewayWire::ReadResultHeader( payload, size, header ) )
                     {
                         m_Results.Append( header );
+                        m_ResultFlags.Append( static_cast<const Protocol::MsgJobResult *>( m_CurrentMessage )->GetFlags() );
                     }
                 }
                 if ( ( m_CurrentMessage->GetType() == Protocol::MSG_JOB_RESULT_COMPRESSED ) && payload )
@@ -563,6 +570,7 @@ namespace DistributedTest
                     if ( GatewayWire::ReadResultHeader( payload, size, header ) )
                     {
                         m_Results.Append( header );
+                        m_ResultFlags.Append( static_cast<const Protocol::MsgJobResultCompressed *>( m_CurrentMessage )->GetFlags() );
                     }
                 }
                 if ( m_CurrentMessage->GetType() == Protocol::MSG_REQUEST_MANIFEST )
@@ -592,6 +600,7 @@ namespace DistributedTest
         Array<uint64_t> m_PchInventoryIds;
         Array<uint64_t> m_PchNeededIds;
         Array<GatewayWire::ResultHeader> m_Results;
+        Array<uint8_t> m_ResultFlags;
         Array<ToolchainRequest> m_ToolchainRequests;
         Atomic<bool> m_Disconnected{ false };
         Atomic<uint32_t> m_RefusedMajor{ 0 };

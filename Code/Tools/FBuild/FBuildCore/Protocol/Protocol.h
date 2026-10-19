@@ -205,17 +205,20 @@ namespace Protocol
     };
     static_assert( sizeof( MsgJob ) == sizeof( IMessage ) + 4 /*alignment*/ + 8, "MsgJob message has incorrect size" );
 
+    // Result flags
+    static constexpr uint8_t kResultReturnedByGateway = 0x01; // A gateway gave up on the job: the job failed, the connection did not
+
     // MsgJobResult
     //------------------------------------------------------------------------------
     class MsgJobResult : public IMessage
     {
     public:
-        explicit MsgJobResult( uint8_t remainingCapacity );
+        explicit MsgJobResult( uint8_t flags = 0 );
 
-        uint8_t GetRemainingCapacity() const { return m_RemainingCapacity; }
+        uint8_t GetFlags() const { return m_Flags; }
 
     private:
-        uint8_t m_RemainingCapacity;
+        uint8_t m_Flags;
     };
     static_assert( sizeof( MsgJobResult ) == sizeof( IMessage ) + 1, "MsgJobResult message has incorrect size" );
 
@@ -224,12 +227,12 @@ namespace Protocol
     class MsgJobResultCompressed : public IMessage
     {
     public:
-        explicit MsgJobResultCompressed( uint8_t remainingCapacity );
+        explicit MsgJobResultCompressed( uint8_t flags = 0 );
 
-        uint8_t GetRemainingCapacity() const { return m_RemainingCapacity; }
+        uint8_t GetFlags() const { return m_Flags; }
 
     private:
-        uint8_t m_RemainingCapacity;
+        uint8_t m_Flags;
     };
     static_assert( sizeof( MsgJobResultCompressed ) == sizeof( IMessage ) + 1, "MsgJobResultCompressed message has incorrect size" );
 

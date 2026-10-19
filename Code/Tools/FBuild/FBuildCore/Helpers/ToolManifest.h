@@ -91,6 +91,12 @@ public:
 
     void SerializeForRemote( IOStream & ms ) const;
     bool DeserializeFromRemote( IOStream & ms );
+    // What DeserializeFromRemote reads, checked as it checks it, with nothing touched on disk
+    static bool ReadRemote( IOStream & ms,
+                            uint64_t toolId,
+                            AString & outMainExecutablePath,
+                            Array<ToolManifestFile> & outFiles,
+                            Array<AString> & outCustomEnvironmentVariables );
 
     // Worker-side persistence, so a toolchain survives a worker restart
     static constexpr const char * kPersistedFileName = "fbuild_toolchain.manifest";

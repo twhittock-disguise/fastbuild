@@ -121,7 +121,7 @@ private:
     void Process( const Protocol::MsgToolchainInventory * msg, const void * payload, size_t payloadSize );
     void Process( const Protocol::MsgPchNeeded * msg );
 
-    void ProcessJobResultCommon( bool isCompressed, const void * payload, size_t payloadSize );
+    void ProcessJobResultCommon( bool isCompressed, uint8_t flags, const void * payload, size_t payloadSize );
     void Refuse( const ConnectionInfo * connection, uint32_t workerMajor, uint32_t workerMinor );
     void OnInventoriesComplete();
 
@@ -632,24 +632,24 @@ void Client::CommunicateJobAvailability()
 
 // Process( MsgJobResult )
 //------------------------------------------------------------------------------
-void ClientToWorkerConnection::Process( const Protocol::MsgJobResult * /*msg*/,
+void ClientToWorkerConnection::Process( const Protocol::MsgJobResult * msg,
                                         const void * payload,
                                         size_t payloadSize )
 {
     PROFILE_SECTION( "MsgJobResult" );
     const bool compressed = false;
-    ProcessJobResultCommon( compressed, payload, payloadSize );
+    ProcessJobResultCommon( compressed, msg->GetFlags(), payload, payloadSize );
 }
 
 // Process( MsgJobResultCompressed )
 //------------------------------------------------------------------------------
-void ClientToWorkerConnection::Process( const Protocol::MsgJobResultCompressed * /*msg*/,
+void ClientToWorkerConnection::Process( const Protocol::MsgJobResultCompressed * msg,
                                         const void * payload,
                                         size_t payloadSize )
 {
     PROFILE_SECTION( "MsgJobResultCompressed" );
     const bool compressed = true;
-    ProcessJobResultCommon( compressed, payload, payloadSize );
+    ProcessJobResultCommon( compressed, msg->GetFlags(), payload, payloadSize );
 }
 
 // Process( MsgConnectionAck )
@@ -1137,6 +1137,7 @@ void ClientToWorkerConnection::SendPendingPchs()
 // ProcessJobResultCommon
 //------------------------------------------------------------------------------
 void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
+                                                       uint8_t flags,
                                                        const void * payload,
                                                        size_t payloadSize )
 {
@@ -1237,8 +1238,14 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
         }
     }
 
+    // A gateway that gave up on the job after its own retries: the job failed, not the connection, so the
+    // job is counted and requeued as below, and the gateway keeps its other jobs
+    if ( systemError && ( ( flags & Protocol::kResultReturnedByGateway ) != 0 ) )
+    {
+        DIST_INFO( " - Gateway %s returned %s after its retries\n", m_Worker->m_Address.Get(), node->GetName().Get() );
+    }
     // For system failures, mark worker so no more jobs are scheduled to it
-    if ( systemError )
+    else if ( systemError )
     {
         m_Client->DenyListWorker( *m_Worker );
 

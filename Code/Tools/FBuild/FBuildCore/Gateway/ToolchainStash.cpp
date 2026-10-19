@@ -5,6 +5,9 @@
 //------------------------------------------------------------------------------
 #include "ToolchainStash.h"
 
+// FBuildCore
+#include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
+
 // Core
 #include "Core/Env/Assert.h"
 #include "Core/Process/Thread.h"
@@ -31,24 +34,19 @@ namespace
     // How long a manifest waits for the directory of the same toolchain to finish being deleted
     constexpr uint32_t kMaxDeleteWaitMs = 30000;
 
-    // The part of a manifest the stash reads (ToolManifest::DeserializeFromRemote)
-    bool ReadManifestHeader( const void * payload, size_t payloadSize, uint64_t toolId, uint32_t & outNumFiles )
+    // The whole manifest, as a worker reads it (ToolManifest::DeserializeFromRemote), so a worker is never sent one it refuses
+    bool ReadManifest( const void * payload, size_t payloadSize, uint64_t toolId, uint32_t & outNumFiles )
     {
         ConstMemoryStream ms( payload, payloadSize );
-        uint64_t id;
         AStackString mainExecutablePath;
-        uint32_t numFiles( 0 );
-        if ( !ms.Read( id ) ||
-             !ms.Read( mainExecutablePath ) ||
-             !ms.Read( numFiles ) ||
-             ( AString::StrLen( mainExecutablePath.Get() ) != mainExecutablePath.GetLength() ) ||
-             ( numFiles == 0 ) ||
-             ( numFiles > kMaxFilesPerToolchain ) ||
-             ( id != toolId ) )
+        Array<ToolManifestFile> files;
+        Array<AString> customEnvironmentVariables;
+        if ( ( ToolManifest::ReadRemote( ms, toolId, mainExecutablePath, files, customEnvironmentVariables ) == false ) ||
+             ( files.GetSize() > kMaxFilesPerToolchain ) )
         {
             return false;
         }
-        outNumFiles = numFiles;
+        outNumFiles = (uint32_t)files.GetSize();
         return true;
     }
 
@@ -151,7 +149,7 @@ ToolchainStash::~ToolchainStash() = default;
 ToolchainStash::Result ToolchainStash::AddManifest( uint64_t toolId, const void * payload, size_t payloadSize )
 {
     uint32_t numFiles;
-    if ( ReadManifestHeader( payload, payloadSize, toolId, numFiles ) == false )
+    if ( ReadManifest( payload, payloadSize, toolId, numFiles ) == false )
     {
         return STASH_INVALID;
     }
@@ -676,7 +674,7 @@ void ToolchainStash::Scan()
                 }
             }
             complete = ( bytes.IsEmpty() == false ) &&
-                       ReadManifestHeader( bytes.Begin(), bytes.GetSize(), toolchain.m_ToolId, numFiles );
+                       ReadManifest( bytes.Begin(), bytes.GetSize(), toolchain.m_ToolId, numFiles );
         }
         if ( complete )
         {

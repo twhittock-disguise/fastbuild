@@ -182,17 +182,17 @@ Protocol::MsgJob::MsgJob( uint64_t toolId, int16_t resultCompressionLevel )
 
 // MsgJobResult
 //------------------------------------------------------------------------------
-Protocol::MsgJobResult::MsgJobResult( uint8_t remainingCapacity )
+Protocol::MsgJobResult::MsgJobResult( uint8_t flags )
     : Protocol::IMessage( Protocol::MSG_JOB_RESULT, sizeof( MsgJobResult ), true )
-    , m_RemainingCapacity( remainingCapacity )
+    , m_Flags( flags )
 {
 }
 
 // MsgJobResultCompressed
 //------------------------------------------------------------------------------
-Protocol::MsgJobResultCompressed::MsgJobResultCompressed( uint8_t remainingCapacity )
+Protocol::MsgJobResultCompressed::MsgJobResultCompressed( uint8_t flags )
     : Protocol::IMessage( Protocol::MSG_JOB_RESULT_COMPRESSED, sizeof( MsgJobResultCompressed ), true )
-    , m_RemainingCapacity( remainingCapacity )
+    , m_Flags( flags )
 {
 }
 
