@@ -8,6 +8,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchReceiver.h"
 #include "Tools/FBuild/FBuildCore/Helpers/WorkerLog.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/FairShareAllocator.h"
 
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
@@ -23,6 +24,7 @@ namespace Protocol
 {
     class IMessage;
     class MsgConnection;
+    class MsgDemand;
     class MsgJob;
     class MsgManifest;
     class MsgPchFile;
@@ -100,6 +102,7 @@ private:
     void Process( const ConnectionInfo * connection, const Protocol::MsgManifest * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgFile * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgPchFile * msg, const void * payload, size_t payloadSize );
+    void Process( const ConnectionInfo * connection, const Protocol::MsgDemand * msg );
 
     static uint32_t ThreadFuncStatic( void * param );
     void ThreadFunc();
@@ -111,8 +114,13 @@ private:
     void TouchToolchains();
     void ReleaseReadyWaitingJobs();
 
-    void RecalculateCapacity();        // Takes m_ClientListMutex
-    void RecalculateCapacityLocked();  // Caller must hold m_ClientListMutex
+    // Slot sharing (not in gateway mode). Every client's allowance is its share of the pool by demand
+    // (m_Allocator). A client whose allowance changes is sent it by its outbox (MarkCapacityChanged); the
+    // ack is a new client's first allowance.
+    uint32_t GetPoolSlots() const;
+    void ShareSlotsLocked( uint32_t unmarkedClientId = 0 ); // Caller holds m_ClientListMutex. Marks those that changed but that one.
+    void ShareSlotsOnTick(); // When the pool changes, and every kRotateSeconds while slots are scarce, so they rotate
+    static constexpr float kRotateSeconds = 1.0f;
 
     class ClientOutbox;
     struct ClientState
@@ -133,7 +141,10 @@ private:
         const Protocol::IMessage * m_CurrentMessage = nullptr;
         const ConnectionInfo * m_Connection = nullptr;
         Atomic<uint32_t> m_NumJobsActive;
-        uint32_t m_AllocatedCapacity = 0;
+        uint32_t m_AllocatedCapacity = 0; // The allowance. Under m_ClientListMutex.
+        uint32_t m_Demand = FairShareAllocator::kInitialDemand; // The last reported. Under m_ClientListMutex.
+        Atomic<bool> m_CapacityChanged{ false }; // The outbox is to send the allowance
+        Atomic<bool> m_HandshakeDone{ false };   // The ack and the inventories have been sent: allowances may follow
 
         AString m_HostName;
 
@@ -152,10 +163,11 @@ private:
 
     // A thread per client that sends what is queued for it, so a client that reads slowly holds back only itself.
     // Lock order: m_ClientListMutex, then the outbox's own mutex; the thread sends holding only cs.m_SendMutex.
+    // An allowance marked as changed goes ahead of the results queued when the thread wakes for it.
     class ClientOutbox
     {
     public:
-        explicit ClientOutbox( ClientState & cs );
+        ClientOutbox( Server & server, ClientState & cs );
         ~ClientOutbox(); // Stops and joins; what is queued is dropped
 
         // Caller holds m_ClientListMutex. A result counts in cs.m_NumJobsActive until it is sent.
@@ -178,7 +190,9 @@ private:
         static uint32_t ThreadFuncStatic( void * param );
         void ThreadFunc();
         void Send( const QueuedResult & result );
+        void SendCapacityIfChanged(); // Reads the allowance under m_ClientListMutex, sends with none held
 
+        Server & m_Server;
         ClientState & m_ClientState;
         Mutex m_Mutex;
         Array<QueuedResult> m_Results; // Under m_Mutex
@@ -196,6 +210,7 @@ private:
     template <class MSG>
     static void SendIdInventory( ClientState & cs, const Array<uint64_t> & ids );
     void RequestMissingFiles( ClientState & cs, ToolManifest * manifest ) const;
+    static void MarkCapacityChanged( ClientState & cs ); // Caller holds m_ClientListMutex. Wakes its outbox to send the allowance.
 
     // A job needs a PCH that is not cached. Asks the client for it, once until it arrives, unless
     // the client cannot be asked or the PCH is already being received. The caller holds
@@ -215,6 +230,8 @@ private:
     Thread m_Thread; // the thread to manage workload
     mutable Mutex m_ClientListMutex;
     Array<ClientState *> m_ClientList;
+    FairShareAllocator m_Allocator; // Under m_ClientListMutex. Of the clients whose handshake has been accepted.
+    Timer m_ShareTimer;             // Under m_ClientListMutex. Since the last Recompute.
 
     mutable Mutex m_ToolManifestsMutex;
     Array<ToolManifest *> m_Tools;

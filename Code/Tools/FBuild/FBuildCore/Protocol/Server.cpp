@@ -384,7 +384,7 @@ void Server::LogWarning( const char * fmtString, ... )
     TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
     m_Log.Write( "connect addr=%s", remoteAddr.Get() );
 
-    ClientOutbox * outbox = FNEW( ClientOutbox( *cs ) );
+    ClientOutbox * outbox = FNEW( ClientOutbox( *this, *cs ) );
 
     MutexHolder mh( m_ClientListMutex );
     cs->m_Id = m_NextClientId++;
@@ -483,8 +483,12 @@ void Server::LogWarning( const char * fmtString, ... )
 
         FDELETE cs;
 
-        // Redistribute capacity among remaining coordinators
-        RecalculateCapacityLocked();
+        // Its slots go to the clients that remain
+        if ( m_Forwarder == nullptr )
+        {
+            m_Allocator.RemoveClient( clientId );
+            ShareSlotsLocked();
+        }
     }
 
     // Once the client has left the list, with no lock held
@@ -574,6 +578,12 @@ void Server::LogWarning( const char * fmtString, ... )
         {
             const Protocol::MsgPchFile * msg = static_cast<const Protocol::MsgPchFile *>( imsg );
             Process( connection, msg, payload, payloadSize );
+            break;
+        }
+        case Protocol::MSG_DEMAND:
+        {
+            const Protocol::MsgDemand * msg = static_cast<const Protocol::MsgDemand *>( imsg );
+            Process( connection, msg );
             break;
         }
         default:
@@ -693,8 +703,9 @@ void Server::DisconnectClient( uint32_t clientId )
 
 // ClientOutbox
 //------------------------------------------------------------------------------
-Server::ClientOutbox::ClientOutbox( ClientState & cs )
-    : m_ClientState( cs )
+Server::ClientOutbox::ClientOutbox( Server & server, ClientState & cs )
+    : m_Server( server )
+    , m_ClientState( cs )
     , m_Quit( false )
 {
     m_Thread.Start( ThreadFuncStatic, "ClientOutbox", this );
@@ -773,6 +784,10 @@ void Server::ClientOutbox::ThreadFunc()
     while ( m_Quit.Load() == false )
     {
         m_WakeSemaphore.Wait();
+        if ( m_Quit.Load() == false )
+        {
+            SendCapacityIfChanged();
+        }
 
         {
             MutexHolder mh( m_Mutex );
@@ -815,6 +830,29 @@ void Server::ClientOutbox::Send( const QueuedResult & result )
         const Protocol::MsgJobResult msg( result.m_Flags );
         SendTo( cs, msg, *result.m_Payload );
     }
+}
+
+// SendCapacityIfChanged
+//------------------------------------------------------------------------------
+void Server::ClientOutbox::SendCapacityIfChanged()
+{
+    // Not ahead of the ack and the inventories: the outbox is woken once they have gone
+    ClientState & cs = m_ClientState;
+    if ( ( cs.m_HandshakeDone.Load() == false ) || ( cs.m_CapacityChanged.Load() == false ) )
+    {
+        return;
+    }
+
+    // Cleared before the allowance is read, so a change after the read is sent too
+    cs.m_CapacityChanged.Store( false );
+    uint32_t allowance = 0;
+    uint32_t poolSlots = 0;
+    {
+        MutexHolder mh( m_Server.m_ClientListMutex );
+        allowance = cs.m_AllocatedCapacity;
+        poolSlots = m_Server.m_Allocator.GetPoolSlots();
+    }
+    SendTo( cs, Protocol::MsgCapacity( allowance, poolSlots ) );
 }
 
 // SendIdInventory
@@ -902,12 +940,12 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
 
     m_Log.Write( "handshake addr=%s host=%s", remoteAddr.Get(), hostName.Get() );
 
+    // The new client's share of the demand it is assumed to have. The ack carries it, so it is not sent again.
     if ( m_Forwarder == nullptr )
     {
-        // Recalculate capacity across all connected coordinators
-        // (takes m_ClientListMutex, so cs->m_Mutex must not be held)
-        RecalculateCapacity();
         MutexHolder mh( m_ClientListMutex );
+        m_Allocator.AddClient( cs->m_Id );
+        ShareSlotsLocked( cs->m_Id );
         capacity = cs->m_AllocatedCapacity;
     }
 
@@ -927,9 +965,44 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
         Array<uint64_t> toolIds;
         m_Forwarder->GetToolchainInventory( cs->m_Id, toolIds );
         SendIdInventory<Protocol::MsgToolchainInventory>( *cs, toolIds );
+    }
+    else
+    {
+        SendToolchainInventory( *cs );
+    }
+
+    // An allowance that changed meanwhile follows
+    cs->m_HandshakeDone.Store( true );
+    MutexHolder mh( m_ClientListMutex );
+    if ( cs->m_CapacityChanged.Load() && cs->m_Outbox )
+    {
+        cs->m_Outbox->Wake();
+    }
+}
+
+// Process( MsgDemand )
+//------------------------------------------------------------------------------
+void Server::Process( const ConnectionInfo * connection, const Protocol::MsgDemand * msg )
+{
+    // A gateway offers every client its whole pool
+    ClientState * cs = (ClientState *)connection->GetUserData();
+    if ( ( m_Forwarder != nullptr ) || ( cs->m_HandshakeDone.Load() == false ) )
+    {
         return;
     }
-    SendToolchainInventory( *cs );
+
+    uint32_t allowance = 0;
+    uint32_t poolSlots = 0;
+    {
+        MutexHolder mh( m_ClientListMutex );
+        cs->m_Demand = msg->GetDemand();
+        m_Allocator.SetDemand( cs->m_Id, cs->m_Demand );
+        ShareSlotsLocked();
+        MarkCapacityChanged( *cs ); // Whether or not its allowance changed, so that it learns the pool
+        allowance = cs->m_AllocatedCapacity;
+        poolSlots = m_Allocator.GetPoolSlots();
+    }
+    m_Log.Write( "demand host=%s demand=%u allowance=%u pool=%u", cs->m_HostName.Get(), msg->GetDemand(), allowance, poolSlots );
 }
 
 // Process( MsgJob )
@@ -2286,6 +2359,11 @@ void Server::ThreadFunc()
             FinalizeCompletedJobs();
         }
 
+        if ( m_Forwarder == nullptr )
+        {
+            ShareSlotsOnTick();
+        }
+
         TouchToolchains();
 
         // Working copies nothing uses are dropped when they are too many or have not been used lately
@@ -2372,33 +2450,57 @@ void Server::FinalizeCompletedJobs()
     }
 }
 
-// RecalculateCapacity
+// GetPoolSlots
 //------------------------------------------------------------------------------
-void Server::RecalculateCapacity()
+uint32_t Server::GetPoolSlots() const
 {
-    MutexHolder mh( m_ClientListMutex );
-    RecalculateCapacityLocked();
+    return WorkerThreadRemote::GetNumCPUsToUse() + m_PrefetchBuffer;
 }
 
-// RecalculateCapacityLocked
+// ShareSlotsLocked
 //------------------------------------------------------------------------------
-void Server::RecalculateCapacityLocked()
+void Server::ShareSlotsLocked( uint32_t unmarkedClientId )
 {
-    // Caller must hold m_ClientListMutex
-    const uint32_t numClients = (uint32_t)m_ClientList.GetSize();
-    if ( ( numClients == 0 ) || m_Forwarder ) // A gateway offers every client its whole pool
-    {
-        return;
-    }
-    const uint32_t totalCores = WorkerThreadRemote::GetNumCPUsToUse();
-    const uint32_t totalCapacity = totalCores + m_PrefetchBuffer;
-    const uint32_t perClient = totalCapacity / numClients;
-    const uint32_t remainder = totalCapacity % numClients;
-    uint32_t i = 0;
+    ASSERT( m_Forwarder == nullptr );
+    m_Allocator.SetPoolSlots( GetPoolSlots() );
+    Array<uint32_t> changed;
+    m_Allocator.Recompute( changed );
+    m_ShareTimer.Restart();
+
     for ( ClientState * cs : m_ClientList )
     {
-        cs->m_AllocatedCapacity = perClient + ( i < remainder ? 1 : 0 );
-        i++;
+        if ( changed.Find( cs->m_Id ) )
+        {
+            cs->m_AllocatedCapacity = m_Allocator.GetAllowance( cs->m_Id );
+            if ( cs->m_Id != unmarkedClientId )
+            {
+                MarkCapacityChanged( *cs );
+            }
+        }
+    }
+}
+
+// ShareSlotsOnTick
+//------------------------------------------------------------------------------
+void Server::ShareSlotsOnTick()
+{
+    const uint32_t poolSlots = GetPoolSlots();
+    MutexHolder mh( m_ClientListMutex );
+    if ( ( poolSlots != m_Allocator.GetPoolSlots() ) ||
+         ( m_Allocator.IsScarce() && ( m_ShareTimer.GetElapsed() >= kRotateSeconds ) ) )
+    {
+        ShareSlotsLocked();
+    }
+}
+
+// MarkCapacityChanged
+//------------------------------------------------------------------------------
+/*static*/ void Server::MarkCapacityChanged( ClientState & cs )
+{
+    cs.m_CapacityChanged.Store( true );
+    if ( cs.m_Outbox )
+    {
+        cs.m_Outbox->Wake();
     }
 }
 

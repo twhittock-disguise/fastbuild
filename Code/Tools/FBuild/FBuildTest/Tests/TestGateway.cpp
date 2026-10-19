@@ -361,6 +361,7 @@ private:
     virtual void PostTest() const override;
 
     void SlowClientDoesNotHoldBackAnother() const;
+    void SlowClientDoesNotHoldBackCapacityUpdates() const;
     void SendQueueSendsQueuedMessagesBeforePchChunks() const;
     void SendQueueReadsFileSlicesAtSendTime() const;
     void SendQueueStreamCompressesJobs() const;
@@ -516,6 +517,7 @@ private:
 //------------------------------------------------------------------------------
 REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( SlowClientDoesNotHoldBackAnother )
+    REGISTER_TEST( SlowClientDoesNotHoldBackCapacityUpdates )
     REGISTER_TEST( SendQueueSendsQueuedMessagesBeforePchChunks )
     REGISTER_TEST( SendQueueReadsFileSlicesAtSendTime )
     REGISTER_TEST( SendQueueStreamCompressesJobs )
@@ -786,6 +788,54 @@ void TestGateway::SlowClientDoesNotHoldBackAnother() const
 
     a.StallReading( false );
     TEST_ASSERT( WaitUntil( [ &a ]() { return ( CountMessages( a, Protocol::MSG_JOB_RESULT ) == kNumLargeResults ); } ) );
+
+    a.ShutdownAllConnections();
+    b.ShutdownAllConnections();
+}
+
+// SlowClientDoesNotHoldBackCapacityUpdates
+//------------------------------------------------------------------------------
+void TestGateway::SlowClientDoesNotHoldBackCapacityUpdates() const
+{
+    const DistributedTest::RemoteCpusForTest cpus( 8 );
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    // A has the whole pool, until B's first share is taken from it
+    DistributedTest::HandshakeProbe a;
+    DistributedTest::HandshakeProbe b;
+    const ConnectionInfo * ciA = nullptr;
+    const ConnectionInfo * ciB = nullptr;
+    const uint32_t idA = ConnectProbe( s, a, &ciA );
+    TEST_ASSERT( idA != 0 );
+    TEST_ASSERT( a.SendDemand( ciA, 8 ) );
+    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 8 ); } ) );
+    TEST_ASSERT( ConnectProbe( s, b, &ciB ) != 0 );
+    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 4 ); } ) );
+    a.StallReading( true );
+
+    // More than the socket buffers hold, so the sends to A back up
+    const uint32_t kNumLargeResults = 4;
+    Array<char> large;
+    large.SetSize( 64 * MEGABYTE );
+    memset( large.Begin(), 0x5A, large.GetSize() );
+    AddActiveJobs( s, idA, kNumLargeResults );
+    for ( uint32_t i = 0; i < kNumLargeResults; ++i )
+    {
+        MemoryStream payload( large.GetSize() );
+        payload.WriteBuffer( large.Begin(), large.GetSize() );
+        TEST_ASSERT( s.QueueResult( idA, false, Move( payload ) ) );
+    }
+    const size_t numCapacityMessagesA = CountMessages( a, Protocol::MSG_CAPACITY );
+
+    // B wants nothing, so A's allowance changes too: B's update arrives while A's waits behind its results
+    TEST_ASSERT( b.SendDemand( ciB, 0 ) );
+    TEST_ASSERT( WaitUntil( [ &b ]() { return ( b.GetLastAllowance() == 0 ); }, 2.0f ) );
+    TEST_ASSERT( CountMessages( a, Protocol::MSG_JOB_RESULT ) == 0 );
+    TEST_ASSERT( CountMessages( a, Protocol::MSG_CAPACITY ) == numCapacityMessagesA );
+
+    a.StallReading( false );
+    TEST_ASSERT( WaitUntil( [ &a ]() { return ( CountMessages( a, Protocol::MSG_JOB_RESULT ) == kNumLargeResults ) && ( a.GetLastAllowance() == 8 ); } ) );
 
     a.ShutdownAllConnections();
     b.ShutdownAllConnections();
@@ -5155,19 +5205,6 @@ void TestGateway::GatewayLogsFailures() const
 //------------------------------------------------------------------------------
 namespace
 {
-    // The slots a real Server offers, for the length of a test
-    class RemoteCpusForTest
-    {
-    public:
-        explicit RemoteCpusForTest( uint32_t numCpus ) : m_Original( WorkerThreadRemote::GetNumCPUsToUse() ) { WorkerThreadRemote::SetNumCPUsToUse( numCpus ); }
-        ~RemoteCpusForTest() { WorkerThreadRemote::SetNumCPUsToUse( m_Original ); }
-        explicit RemoteCpusForTest( const RemoteCpusForTest & other ) = delete;
-        RemoteCpusForTest & operator=( const RemoteCpusForTest & other ) = delete;
-
-    private:
-        const uint32_t m_Original;
-    };
-
     // Every job is built on a worker, as TestDistributed::TestHelper builds
     void MakeRemoteBuildOptions( FBuildTestOptions & options )
     {
@@ -5332,7 +5369,7 @@ void TestGateway::PchBuildThroughTheGatewaySendsEachPchOnce() const
     // The Server offers one slot, as the echo worker does, so the scheduler (more free slots, then
     // the lower index) gives the first job to the Server and the second to the echo worker. Each job
     // that fails there is retried on the Server.
-    const RemoteCpusForTest oneSlot( 1 );
+    const DistributedTest::RemoteCpusForTest oneSlot( 1 );
 
     FBuildTestOptions options;
     MakeRemoteBuildOptions( options );
@@ -5404,7 +5441,7 @@ void TestGateway::PchBuildThroughTheGatewaySendsEachPchOnce() const
 void TestGateway::GatewayRestartMidBuildCompletesTheBuild() const
 {
     // One slot downstream, so the gateway offers one and the three jobs are forwarded one at a time
-    const RemoteCpusForTest oneSlot( 1 );
+    const DistributedTest::RemoteCpusForTest oneSlot( 1 );
 
     FBuildTestOptions options;
     MakeRemoteBuildOptions( options );

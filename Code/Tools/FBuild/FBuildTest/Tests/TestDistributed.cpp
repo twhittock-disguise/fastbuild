@@ -25,6 +25,8 @@
 #include "Tools/FBuild/FBuildCore/Protocol/Client.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/DemandRamp.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/FairShareAllocator.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueue.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
@@ -77,6 +79,7 @@ using DistributedTest::CountInStatsLogSince;
 using DistributedTest::MakeDistributedPchOptions;
 using DistributedTest::ClearWorkerPchStore;
 using DistributedTest::ReadStats;
+using DistributedTest::RemoteCpusForTest;
 
 namespace
 {
@@ -171,6 +174,10 @@ private:
     void HandshakeLayoutIsFrozen() const;
     void AckCarriesACapacityAbove255() const;
     void ClientReadsACapacityAbove255() const;
+    void SharesMoveWithDemandBetweenTwoClients() const;
+    void ScarceSlotsRotateOnTheirOwn() const;
+    void ClientRampsUpItsDemand() const;
+    void ClientHonoursAReducedAllowance() const;
     void VersionIsShownWithTheProtocol() const;
     void ShortMessagesAreRejected() const;
     void HeadersWithTheWrongPayloadAreRejected() const;
@@ -234,6 +241,25 @@ private:
                      uint32_t numRemoteWorkers,
                      bool shouldFail = false,
                      bool allowRace = false ) const;
+
+    // Handshakes with the Server on the test port, and waits for the ack and the inventories
+    static const ConnectionInfo * ConnectProbe( HandshakeProbe & probe );
+
+    // Reduces the allowance of a Server's one client once it has kFullAllowance jobs, and records the most it
+    // has before, and once it has come down to kReducedAllowance (settled)
+    struct AllowanceReduction
+    {
+        static constexpr uint32_t kFullAllowance = 8;
+        static constexpr uint32_t kReducedAllowance = 2;
+        Server *            m_Server = nullptr;
+        Atomic<bool>        m_Stop{ false };
+        Atomic<bool>        m_Reduced{ false };
+        Atomic<bool>        m_Settled{ false };
+        Atomic<uint32_t>    m_MaxActive{ 0 };
+        Atomic<uint32_t>    m_MaxActiveSettled{ 0 };
+        Atomic<uint64_t>    m_LogSizeWhenSettled{ 0 };   // Of the Server's log
+    };
+    static uint32_t ReduceTheAllowanceWhenFull( void * param );
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -429,6 +455,10 @@ REGISTER_TESTS_BEGIN( TestDistributed )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( ClientReadsACapacityAbove255 )
 #endif
+    REGISTER_TEST( SharesMoveWithDemandBetweenTwoClients )
+    REGISTER_TEST( ScarceSlotsRotateOnTheirOwn )
+    REGISTER_TEST( ClientRampsUpItsDemand )
+    REGISTER_TEST( ClientHonoursAReducedAllowance )
     REGISTER_TEST( VersionIsShownWithTheProtocol )
     REGISTER_TEST( ShortMessagesAreRejected )
     REGISTER_TEST( HeadersWithTheWrongPayloadAreRejected )
@@ -3686,17 +3716,224 @@ void TestDistributed::AckCarriesACapacityAbove255() const
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     HandshakeProbe probe;
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    const ConnectionInfo * ci = ConnectProbe( probe );
     TEST_ASSERT( ci );
-    const Protocol::MsgConnection msg;
-    TEST_ASSERT( probe.Send( ci, &msg, sizeof( msg ) ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 1 ); } ) );
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
 
-    // A test worker uses every thread it is told to
-    TEST_ASSERT( probe.GetAckCapacity() == WorkerThreadRemote::GetNumCPUsToUse() );
-    TEST_ASSERT( probe.GetAckCapacity() > 255 );
+    // The ack is the share of the demand a new client is assumed to have; a demand reported gets the rest.
+    // A test worker uses every thread it is told to.
+    TEST_ASSERT( probe.GetAckCapacity() == FairShareAllocator::kInitialDemand );
+    TEST_ASSERT( WorkerThreadRemote::GetNumCPUsToUse() > 500 );
+    TEST_ASSERT( probe.SendDemand( ci, 500 ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetLastAllowance() == 500 ); } ) );
+    Array<HandshakeProbe::CapacityUpdate> updates;
+    probe.GetCapacityUpdates( updates );
+    TEST_ASSERT( updates.Top().m_PoolSlots == WorkerThreadRemote::GetNumCPUsToUse() );
     probe.ShutdownAllConnections();
+}
+
+// ConnectProbe
+//------------------------------------------------------------------------------
+/*static*/ const ConnectionInfo * TestDistributed::ConnectProbe( HandshakeProbe & probe )
+{
+    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    if ( ci == nullptr )
+    {
+        return nullptr;
+    }
+    const Protocol::MsgConnection msg;
+    if ( ( probe.Send( ci, &msg, sizeof( msg ) ) == false ) ||
+         ( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) == false ) )
+    {
+        return nullptr;
+    }
+    return ci;
+}
+
+// SharesMoveWithDemandBetweenTwoClients
+//------------------------------------------------------------------------------
+void TestDistributed::SharesMoveWithDemandBetweenTwoClients() const
+{
+    const RemoteCpusForTest cpus( 20 );
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    HandshakeProbe a;
+    const ConnectionInfo * ciA = ConnectProbe( a );
+    TEST_ASSERT( ciA );
+    TEST_ASSERT( a.SendDemand( ciA, 100 ) );
+    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 20 ); } ) );
+
+    // Only the final shares are known: A may pass through what is left once B's first share is taken
+    HandshakeProbe b;
+    const ConnectionInfo * ciB = ConnectProbe( b );
+    TEST_ASSERT( ciB );
+    TEST_ASSERT( b.SendDemand( ciB, 100 ) );
+    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 10 ) && ( b.GetLastAllowance() == 10 ); } ) );
+
+    TEST_ASSERT( b.SendDemand( ciB, 0 ) );
+    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 20 ) && ( b.GetLastAllowance() == 0 ); } ) );
+
+    b.ShutdownAllConnections();
+    TEST_ASSERT( WaitUntil( [ &s ]() { MutexHolder mh( s.m_ClientListMutex ); return ( s.m_ClientList.GetSize() == 1 ); } ) );
+    Thread::Sleep( 200 ); // An update would have come by now
+    TEST_ASSERT( a.GetLastAllowance() == 20 );
+    a.ShutdownAllConnections();
+}
+
+// ScarceSlotsRotateOnTheirOwn
+//------------------------------------------------------------------------------
+void TestDistributed::ScarceSlotsRotateOnTheirOwn() const
+{
+    // One slot for two clients that want it
+    const RemoteCpusForTest cpus( 1 );
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    HandshakeProbe a;
+    HandshakeProbe b;
+    const ConnectionInfo * ciA = ConnectProbe( a );
+    TEST_ASSERT( ciA );
+    TEST_ASSERT( a.SendDemand( ciA, 10 ) );
+    const ConnectionInfo * ciB = ConnectProbe( b );
+    TEST_ASSERT( ciB );
+    TEST_ASSERT( b.SendDemand( ciB, 10 ) );
+    TEST_ASSERT( WaitUntil( [ &b ]() { return ( b.GetLastAllowance() != 0xFFFFFFFF ); } ) );
+
+    // With nothing more sent, the slot keeps moving between them
+    Array<HandshakeProbe::CapacityUpdate> updates;
+    a.GetCapacityUpdates( updates );
+    const size_t numUpdatesA = updates.GetSize();
+    b.GetCapacityUpdates( updates );
+    const size_t numUpdatesB = updates.GetSize();
+    auto rotated = [ &a, &b, numUpdatesA, numUpdatesB ]()
+    {
+        Array<HandshakeProbe::CapacityUpdate> newUpdates;
+        a.GetCapacityUpdates( newUpdates );
+        const size_t newA = newUpdates.GetSize();
+        b.GetCapacityUpdates( newUpdates );
+        const size_t newB = newUpdates.GetSize();
+        return ( newA >= ( numUpdatesA + 2 ) ) && ( newB >= ( numUpdatesB + 2 ) );
+    };
+    TEST_ASSERT( WaitUntil( rotated, 5.0f * Server::kRotateSeconds ) );
+
+    a.ShutdownAllConnections();
+    b.ShutdownAllConnections();
+}
+
+// ClientRampsUpItsDemand
+//------------------------------------------------------------------------------
+void TestDistributed::ClientRampsUpItsDemand() const
+{
+    // The worker allows what a new client is given, and never answers, so the jobs wait
+    RecordingWorker worker( FairShareAllocator::kInitialDemand );
+    FBuildTestOptions options;
+    MakeDistributedPchOptions( options );
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    // The ramp grows past its start. What is reported of it can stop short of the doubled ramp: the jobs
+    // known when it grew can be fewer, and a change smaller than kSendMinDelta is not reported.
+    auto reached = [ &worker ]()
+    {
+        Array<uint32_t> demands;
+        worker.GetDemands( demands );
+        for ( const uint32_t demand : demands )
+        {
+            if ( demand > DemandRamp::kStartSlots )
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    BuildAborter aborter( reached, kWaitTimeoutSeconds );
+    const bool built = fBuild.Build( "../tmp/Test/Distributed/JobStream/JobStream.lib" );
+    worker.ShutdownAllConnections();
+
+    TEST_ASSERT( built == false ); // Aborted
+    TEST_ASSERT( aborter.HasReached() );
+    Array<uint32_t> demands;
+    worker.GetDemands( demands );
+    TEST_ASSERT( demands[ 0 ] <= DemandRamp::kStartSlots );
+
+    // The demand is what the client asks for; the allowance alone bounds what it sends
+    TEST_ASSERT( worker.GetNumJobs() <= FairShareAllocator::kInitialDemand );
+}
+
+// ClientHonoursAReducedAllowance
+//------------------------------------------------------------------------------
+/*static*/ uint32_t TestDistributed::ReduceTheAllowanceWhenFull( void * param )
+{
+    AllowanceReduction * reduction = static_cast<AllowanceReduction *>( param );
+    while ( reduction->m_Stop.Load() == false )
+    {
+        uint32_t active = 0;
+        {
+            MutexHolder mh( reduction->m_Server->m_ClientListMutex );
+            if ( reduction->m_Server->m_ClientList.GetSize() == 1 )
+            {
+                active = reduction->m_Server->m_ClientList[ 0 ]->m_NumJobsActive.Load();
+            }
+        }
+        reduction->m_MaxActive.Store( Math::Max( reduction->m_MaxActive.Load(), active ) );
+
+        if ( reduction->m_Reduced.Load() == false )
+        {
+            if ( active >= AllowanceReduction::kFullAllowance )
+            {
+                WorkerThreadRemote::SetNumCPUsToUse( AllowanceReduction::kReducedAllowance );
+                reduction->m_Reduced.Store( true );
+            }
+        }
+        else if ( reduction->m_Settled.Load() || ( active <= AllowanceReduction::kReducedAllowance ) )
+        {
+            if ( reduction->m_Settled.Load() == false )
+            {
+                reduction->m_LogSizeWhenSettled.Store( GetStatsLogSize( reduction->m_Server->GetLogPath() ) );
+                reduction->m_Settled.Store( true );
+            }
+            reduction->m_MaxActiveSettled.Store( Math::Max( reduction->m_MaxActiveSettled.Load(), active ) );
+        }
+        Thread::Sleep( 1 );
+    }
+    return 0;
+}
+
+void TestDistributed::ClientHonoursAReducedAllowance() const
+{
+    // Without prefetch, the allowance is every slot of the worker
+    const RemoteCpusForTest cpus( AllowanceReduction::kFullAllowance );
+    FBuildTestOptions options;
+    MakeDistributedPchOptions( options );
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    // The jobs in flight when the allowance falls are left to finish; no more are sent until they have
+    AllowanceReduction reduction;
+    reduction.m_Server = &s;
+    Thread watcher;
+    watcher.Start( ReduceTheAllowanceWhenFull, "ReduceTheAllowance", &reduction );
+    const bool built = fBuild.Build( "ManyJobs" );
+    reduction.m_Stop.Store( true );
+    watcher.Join();
+
+    TEST_ASSERT( built );
+    TEST_ASSERT( reduction.m_Reduced.Load() );
+    TEST_ASSERT( reduction.m_MaxActive.Load() <= AllowanceReduction::kFullAllowance );
+    TEST_ASSERT( reduction.m_Settled.Load() );
+    TEST_ASSERT( reduction.m_MaxActiveSettled.Load() <= AllowanceReduction::kReducedAllowance );
+
+    // Jobs were still to be sent when it settled, so the client held them back rather than running out of them
+    uint32_t numJobsReceivedSettled = 0;
+    TEST_ASSERT( CountInStatsLogSince( s.GetLogPath(), reduction.m_LogSizeWhenSettled.Load(), "] job received ", numJobsReceivedSettled ) );
+    TEST_ASSERT( numJobsReceivedSettled > 0 );
 }
 
 // ClientReadsACapacityAbove255

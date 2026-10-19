@@ -94,6 +94,21 @@ Library( "JobStream" )
     .LibrarianOutput    = '$Out$/Test/Distributed/JobStream/JobStream.lib'
 }
 
+// ManyJobs - The JobStream jobs three times over, so that a build has jobs waiting for a worker's slots
+.ManyJobsCopies = { '1', '2', '3' }
+ForEach( .Copy in .ManyJobsCopies )
+{
+    ObjectList( 'ManyJobs$Copy$' )
+    {
+        .CompilerInputPath  = 'Tools/FBuild/FBuildTest/Data/TestDistributed/JobStream/'
+        .CompilerOutputPath = '$Out$/Test/Distributed/ManyJobs/$Copy$/'
+    }
+}
+Alias( 'ManyJobs' )
+{
+    .Targets = { 'ManyJobs1', 'ManyJobs2', 'ManyJobs3' }
+}
+
 // ResultCompression - An object file that compresses well
 Library( "ResultCompression" )
 {

@@ -22,6 +22,7 @@
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/WorkerSendQueue.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/DemandRamp.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueue.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/PchDispatch.h"
@@ -88,6 +89,7 @@ public:
     void QueuePchsToWorker( PchDemand & demand );
     void PushJobsToWorker();
     void SendPendingPchs();
+    void UpdateDemand( uint32_t waiting ); // Client thread
 
     template <class T>
     void EnqueueSend( const T & msg );
@@ -120,6 +122,7 @@ private:
     void Process( const Protocol::MsgPchInventory * msg, const void * payload, size_t payloadSize );
     void Process( const Protocol::MsgToolchainInventory * msg, const void * payload, size_t payloadSize );
     void Process( const Protocol::MsgPchNeeded * msg );
+    void Process( const Protocol::MsgCapacity * msg );
 
     void ProcessJobResultCommon( bool isCompressed, uint8_t flags, const void * payload, size_t payloadSize );
     void Refuse( const ConnectionInfo * connection, uint32_t workerMajor, uint32_t workerMinor );
@@ -153,9 +156,12 @@ private:
     Atomic<bool> m_HandshakeDone{ false };
     Atomic<bool> m_ShuttingDown{ false };
 
-    // Push-based job tracking
+    // Push-based job tracking. The capacity is the allowance: of the ack, then of the last MSG_CAPACITY.
+    // Jobs in flight above it stay where they are; no more are sent until they are fewer.
     Atomic<uint32_t> m_WorkerCapacity{ 0 };
+    Atomic<uint32_t> m_WorkerPoolSlots{ 0 }; // The worker's whole pool, from the last MSG_CAPACITY
     Atomic<uint32_t> m_JobsInFlight{ 0 };
+    DemandRamp m_DemandRamp; // Client thread only. Its time is m_ConnectionTimer's.
     Atomic<bool> m_AwaitingInventory{ true }; // Jobs wait for the inventories the worker advertises, so they are not sent what it already has
     Array<uint64_t> m_SentToolchains; // Protected by m_Mutex
     Array<uint64_t> m_CachedToolchains; // Reported by the worker and not used yet. Protected by m_Mutex
@@ -503,8 +509,15 @@ void Client::CommunicateJobAvailability()
         ss->SendPendingPchs();
     }
 
+    // Every distributable job counts as waiting for every worker
+    const uint32_t numWaiting = (uint32_t)JobQueue::Get().GetNumDistributableJobsAvailable();
+    for ( UniquePtr<ClientToWorkerConnection> & ss : m_ActiveConnections )
+    {
+        ss->UpdateDemand( numWaiting );
+    }
+
     // Early out when there are no distributable jobs
-    if ( JobQueue::Get().GetNumDistributableJobsAvailable() == 0 )
+    if ( numWaiting == 0 )
     {
         return;
     }
@@ -611,6 +624,12 @@ void Client::CommunicateJobAvailability()
         case Protocol::MSG_PCH_NEEDED:
         {
             const Protocol::MsgPchNeeded * msg = static_cast<const Protocol::MsgPchNeeded *>( imsg );
+            Process( msg );
+            break;
+        }
+        case Protocol::MSG_CAPACITY:
+        {
+            const Protocol::MsgCapacity * msg = static_cast<const Protocol::MsgCapacity *>( imsg );
             Process( msg );
             break;
         }
@@ -825,6 +844,18 @@ void ClientToWorkerConnection::Process( const Protocol::MsgPchNeeded * msg )
             giveUp();
             break;
     }
+}
+
+// Process( MsgCapacity )
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::Process( const Protocol::MsgCapacity * msg )
+{
+    PROFILE_SECTION( "MsgCapacity" );
+
+    // An allowance of 0 is a wait, not a refusal: the demand is still reported
+    m_WorkerCapacity.Store( msg->GetAllowance() );
+    m_WorkerPoolSlots.Store( msg->GetPoolSlots() );
+    DIST_INFO( " - Worker %s allowance=%u pool=%u\n", m_Worker->m_Address.Get(), msg->GetAllowance(), msg->GetPoolSlots() );
 }
 
 // QueueToolchain
@@ -1077,6 +1108,25 @@ void ClientToWorkerConnection::PushJobsToWorker()
                     Move( ConstMemoryStream( Move( stream ) ) ) );
 
         toSend--;
+    }
+}
+
+// UpdateDemand
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::UpdateDemand( uint32_t waiting )
+{
+    // The first demand follows the inventories, as jobs do
+    if ( m_AwaitingInventory.Load() || m_SendQueue.IsQuitting() )
+    {
+        return;
+    }
+
+    const float now = m_ConnectionTimer.GetElapsed();
+    const uint32_t demand = m_DemandRamp.Update( waiting, m_JobsInFlight.Load(), now );
+    if ( m_DemandRamp.ShouldSend( demand, now ) )
+    {
+        EnqueueSend( Protocol::MsgDemand( demand ) );
+        m_DemandRamp.OnSent( demand, now );
     }
 }
 

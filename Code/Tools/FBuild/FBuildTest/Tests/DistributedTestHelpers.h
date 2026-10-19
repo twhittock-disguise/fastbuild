@@ -13,6 +13,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
 
 // Core
 #include "Core/Containers/Array.h"
@@ -302,6 +303,24 @@ namespace DistributedTest
             outTimes = m_ConnectionTimes;
         }
 
+        // The MSG_DEMAND received, in order. They do not reach OnMessage.
+        void GetDemands( Array<uint32_t> & outDemands ) const
+        {
+            MutexHolder mh( m_DemandsMutex );
+            outDemands = m_Demands;
+        }
+
+        // To every connection it has
+        void SendCapacity( uint32_t allowance, uint32_t poolSlots )
+        {
+            const Protocol::MsgCapacity msg( allowance, poolSlots );
+            MutexHolder mh( m_ConnectionsMutex );
+            for ( const ConnectionState & state : m_Connections )
+            {
+                msg.Send( state.m_Connection );
+            }
+        }
+
     protected:
         // The reply to the client's handshake: the ack, then the two inventories
         virtual void Handshake( const ConnectionInfo * connection )
@@ -384,6 +403,11 @@ namespace DistributedTest
                 m_NumConnections.Increment();
                 Handshake( connection );
             }
+            else if ( message->GetType() == Protocol::MSG_DEMAND )
+            {
+                MutexHolder mh( m_DemandsMutex );
+                m_Demands.Append( static_cast<const Protocol::MsgDemand *>( message )->GetDemand() );
+            }
             else
             {
                 OnMessage( connection, *message, payload, size );
@@ -407,6 +431,8 @@ namespace DistributedTest
         const Timer m_Timer;
         mutable Mutex m_ConnectionTimesMutex;
         Array<float> m_ConnectionTimes;
+        mutable Mutex m_DemandsMutex;
+        Array<uint32_t> m_Demands;
     };
 
     // Connects to a worker and records the messages it sends back, in order
@@ -480,6 +506,29 @@ namespace DistributedTest
             MutexHolder mh( m_Mutex );
             out = m_ToolchainRequests;
         }
+        // The MSG_CAPACITY received, in order
+        struct CapacityUpdate
+        {
+            uint32_t    m_Allowance = 0;
+            uint32_t    m_PoolSlots = 0;
+        };
+        void GetCapacityUpdates( Array<CapacityUpdate> & out ) const
+        {
+            MutexHolder mh( m_Mutex );
+            out = m_CapacityUpdates;
+        }
+        // The allowance of the last MSG_CAPACITY received, or allowanceIfNone
+        uint32_t GetLastAllowance( uint32_t allowanceIfNone = 0xFFFFFFFF ) const
+        {
+            MutexHolder mh( m_Mutex );
+            return m_CapacityUpdates.IsEmpty() ? allowanceIfNone : m_CapacityUpdates.Top().m_Allowance;
+        }
+
+        bool SendDemand( const ConnectionInfo * ci, uint32_t demand )
+        {
+            const Protocol::MsgDemand msg( demand );
+            return msg.Send( ci );
+        }
 
         // A job as a client sends it: the next chunk of the connection's job stream
         bool SendJob( const ConnectionInfo * ci, JobStreamEncoder & encoder, uint64_t toolId, int16_t level, const MemoryStream & job )
@@ -537,6 +586,13 @@ namespace DistributedTest
                 if ( m_CurrentMessage->GetType() == Protocol::MSG_PCH_NEEDED )
                 {
                     m_PchNeededIds.Append( static_cast<const Protocol::MsgPchNeeded *>( m_CurrentMessage )->GetPchId() );
+                }
+                if ( m_CurrentMessage->GetType() == Protocol::MSG_CAPACITY )
+                {
+                    const Protocol::MsgCapacity * capacity = static_cast<const Protocol::MsgCapacity *>( m_CurrentMessage );
+                    CapacityUpdate & update = m_CapacityUpdates.EmplaceBack();
+                    update.m_Allowance = capacity->GetAllowance();
+                    update.m_PoolSlots = capacity->GetPoolSlots();
                 }
                 if ( ( m_CurrentMessage->GetType() == Protocol::MSG_PCH_INVENTORY ) && payload )
                 {
@@ -602,6 +658,7 @@ namespace DistributedTest
         Array<GatewayWire::ResultHeader> m_Results;
         Array<uint8_t> m_ResultFlags;
         Array<ToolchainRequest> m_ToolchainRequests;
+        Array<CapacityUpdate> m_CapacityUpdates;
         Atomic<bool> m_Disconnected{ false };
         Atomic<uint32_t> m_RefusedMajor{ 0 };
         Atomic<uint32_t> m_RefusedMinor{ 0 };
@@ -609,6 +666,19 @@ namespace DistributedTest
         Atomic<bool> m_StallReading{ false };
         Semaphore m_StallSemaphore;
         const Protocol::IMessage * m_CurrentMessage = nullptr;
+    };
+
+    // The slots a real Server offers, for the length of a test
+    class RemoteCpusForTest
+    {
+    public:
+        explicit RemoteCpusForTest( uint32_t numCpus ) : m_Original( WorkerThreadRemote::GetNumCPUsToUse() ) { WorkerThreadRemote::SetNumCPUsToUse( numCpus ); }
+        ~RemoteCpusForTest() { WorkerThreadRemote::SetNumCPUsToUse( m_Original ); }
+        explicit RemoteCpusForTest( const RemoteCpusForTest & other ) = delete;
+        RemoteCpusForTest & operator=( const RemoteCpusForTest & other ) = delete;
+
+    private:
+        const uint32_t m_Original;
     };
 
     // Aborts the build once a condition holds, or after a timeout, so that a test fails instead of hanging.

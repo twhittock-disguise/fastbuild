@@ -329,6 +329,10 @@ void DownstreamConnection::OnJobCompleted( uint64_t pchId )
                 payload = nullptr; // The owner's
                 break;
             }
+            case Protocol::MSG_CAPACITY:
+            {
+                break; // The gateway keeps to the slots of the ack
+            }
             default:
             {
                 Close( "protocol" ); // Not something a worker sends
