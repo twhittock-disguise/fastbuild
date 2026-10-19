@@ -734,21 +734,15 @@ void Server::AskClientForPch( uint32_t clientId, uint64_t pchId )
 //------------------------------------------------------------------------------
 void Server::DisconnectClient( uint32_t clientId )
 {
-    const ConnectionInfo * connection = nullptr;
+    // Under the lock, as a connection outlives its client's place in the list
+    MutexHolder mh( m_ClientListMutex );
+    for ( const ClientState * cs : m_ClientList )
     {
-        MutexHolder mh( m_ClientListMutex );
-        for ( const ClientState * cs : m_ClientList )
+        if ( cs->m_Id == clientId )
         {
-            if ( cs->m_Id == clientId )
-            {
-                connection = cs->m_Connection;
-                break;
-            }
+            Disconnect( cs->m_Connection );
+            return;
         }
-    }
-    if ( connection )
-    {
-        Disconnect( connection ); // Does nothing if the connection has gone since
     }
 }
 
@@ -1149,7 +1143,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
             // Tool fully synchronized and PCH ready — queue immediately
             if ( manifest->IsSynchronized() && pchReady )
             {
-                JobQueueRemote::Get().QueueJob( job );
+                m_JobQueueRemote->QueueJob( job );
                 isJobWaiting = false;
             }
             else if ( manifest->GetUserData() == nullptr )
@@ -2478,26 +2472,20 @@ void Server::UnpackPch( uint64_t pchId )
 //------------------------------------------------------------------------------
 void Server::DisconnectClientsWaitingForPch( uint64_t pchId )
 {
-    // Their jobs are cancelled and so go back to the clients, to be built elsewhere
-    Array<const ConnectionInfo *> connections;
+    // Their jobs are cancelled and so go back to the clients, to be built elsewhere. Under the lock, as a
+    // connection outlives its client's place in the list.
+    MutexHolder mhC( m_ClientListMutex );
+    for ( ClientState * cs : m_ClientList )
     {
-        MutexHolder mhC( m_ClientListMutex );
-        for ( ClientState * cs : m_ClientList )
+        MutexHolder mh( cs->m_Mutex );
+        for ( const Job * job : cs->m_WaitingJobs )
         {
-            MutexHolder mh( cs->m_Mutex );
-            for ( const Job * job : cs->m_WaitingJobs )
+            if ( ( job->GetPchId() == pchId ) && job->GetPchCachePath().IsEmpty() )
             {
-                if ( ( job->GetPchId() == pchId ) && job->GetPchCachePath().IsEmpty() )
-                {
-                    connections.Append( cs->m_Connection );
-                    break;
-                }
+                Disconnect( cs->m_Connection );
+                break;
             }
         }
-    }
-    for ( const ConnectionInfo * connection : connections )
-    {
-        Disconnect( connection );
     }
 }
 
