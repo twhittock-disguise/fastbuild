@@ -7,6 +7,7 @@
 
 // Core
 #include "Core/Containers/Array.h"
+#include "Core/Env/Assert.h"
 #include "Core/FileIO/MemoryStream.h"
 #include "Core/Math/Conversions.h"
 #include "Core/Strings/AStackString.h"
@@ -88,6 +89,7 @@ bool GatewayWire::PeekJob( const void * job, size_t jobSize, uint32_t & outJobId
 //------------------------------------------------------------------------------
 void GatewayWire::SetJobId( void * job, size_t jobSize, uint32_t jobId )
 {
+    ASSERT( jobSize >= kMinJobSize ); // The caller checked it with PeekJob
     if ( jobSize >= sizeof( jobId ) )
     {
         memcpy( job, &jobId, sizeof( jobId ) );
@@ -139,6 +141,7 @@ bool GatewayWire::ReadResultHeader( const void * payload, size_t payloadSize, Re
 void GatewayWire::PatchResult( void * payload, size_t payloadSize, const ResultHeader & header, uint32_t jobId, uint16_t threadIndex )
 {
     char * bytes = static_cast<char *>( payload );
+    ASSERT( payloadSize >= ( (size_t)header.m_ThreadIndexOffset + sizeof( threadIndex ) ) ); // The caller read the header with ReadResultHeader
     if ( ( payloadSize >= sizeof( jobId ) ) && ( payloadSize >= ( (size_t)header.m_ThreadIndexOffset + sizeof( threadIndex ) ) ) )
     {
         memcpy( bytes, &jobId, sizeof( jobId ) );

@@ -7,7 +7,9 @@
 #include "Tools/FBuild/FBuildTest/Tests/FBuildTest.h"
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
+#include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
@@ -443,6 +445,28 @@ namespace DistributedTest
                 m_StallSemaphore.Signal();
             }
         }
+        // The results received, in order
+        void GetResults( Array<GatewayWire::ResultHeader> & out ) const
+        {
+            MutexHolder mh( m_Mutex );
+            out = m_Results;
+        }
+
+        // A job as a client sends it: the next chunk of the connection's job stream
+        bool SendJob( const ConnectionInfo * ci, JobStreamEncoder & encoder, uint64_t toolId, int16_t level, const MemoryStream & job )
+        {
+            if ( encoder.Encode( job.GetData(), job.GetSize() ) == false )
+            {
+                return false;
+            }
+            const Protocol::MsgJob msg( toolId, level );
+            return msg.Send( ci, ConstMemoryStream( encoder.GetResult(), encoder.GetResultSize() ) );
+        }
+        // Without a payload if payload is null
+        bool SendMessage( const ConnectionInfo * ci, const Protocol::IMessage & msg, const void * payload, size_t payloadSize )
+        {
+            return payload ? msg.Send( ci, ConstMemoryStream( payload, payloadSize ) ) : msg.Send( ci );
+        }
 
     private:
         virtual void OnReceive( const ConnectionInfo *, void * data, uint32_t size, bool & keepMemory ) override
@@ -493,6 +517,24 @@ namespace DistributedTest
                         m_ToolchainIds.Append( toolIds[ i ] );
                     }
                 }
+                if ( ( m_CurrentMessage->GetType() == Protocol::MSG_JOB_RESULT ) && payload )
+                {
+                    GatewayWire::ResultHeader header;
+                    if ( GatewayWire::ReadResultHeader( payload, size, header ) )
+                    {
+                        m_Results.Append( header );
+                    }
+                }
+                if ( ( m_CurrentMessage->GetType() == Protocol::MSG_JOB_RESULT_COMPRESSED ) && payload )
+                {
+                    Compressor c;
+                    GatewayWire::ResultHeader header;
+                    if ( Compressor::IsValidData( payload, size ) && c.Decompress( payload ) &&
+                         GatewayWire::ReadResultHeader( c.GetResult(), c.GetResultSize(), header ) )
+                    {
+                        m_Results.Append( header );
+                    }
+                }
             }
 
             FREE( (void *)m_CurrentMessage );
@@ -505,6 +547,7 @@ namespace DistributedTest
         Array<uint8_t> m_MessageTypes;
         Array<uint64_t> m_ToolchainIds;
         Array<uint64_t> m_PchNeededIds;
+        Array<GatewayWire::ResultHeader> m_Results;
         Atomic<bool> m_Disconnected{ false };
         Atomic<uint32_t> m_RefusedMajor{ 0 };
         Atomic<uint32_t> m_RefusedMinor{ 0 };

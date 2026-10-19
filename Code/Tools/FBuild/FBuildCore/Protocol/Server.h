@@ -38,8 +38,29 @@ class Server : public TCPConnectionPool, private PchLease::Owner
     friend class TestDistributed;
     friend class TestGateway;
 public:
+    // What a gateway does with what its clients send. Called with no Server lock held.
+    class Forwarder
+    {
+    public:
+        virtual uint32_t GetPoolSlots() const = 0;  // Phase A: every client's ack. 0: the handshake is closed without an ack.
+        virtual void GetToolchainInventory( uint32_t clientId, Array<uint64_t> & outToolIds ) = 0; // Pins what it returns for that client
+        virtual void OnClientJob( uint32_t clientId, const Protocol::MsgJob & msg, void * jobData, size_t jobDataSize ) = 0; // Takes jobData (FREE)
+        virtual void OnClientManifest( uint32_t clientId, uint64_t toolId, const void * payload, size_t payloadSize ) = 0;
+        virtual void OnClientFile( uint32_t clientId, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize ) = 0;
+        virtual void OnPchStored( uint64_t pchId, uint32_t uncompressedSize, uint32_t compressedSize ) = 0;
+        virtual void OnClientGone( uint32_t clientId ) = 0; // Every client, handshake or not. Nothing is queued for it from here on.
+    protected:
+        ~Forwarder() = default;
+    };
+
     Server( uint32_t numThreadsInJobQueue = 0, uint32_t prefetchBuffer = 0 );
+    // Gateway mode, pure forwarder: no JobQueueRemote, no toolchain extraction, no unpacking. cacheDir: the
+    // root of the PCH store and the log (an empty string: FBuild::GetWorkerCacheDir). The forwarder outlives the Server.
+    Server( Forwarder & forwarder, const AString & cacheDir );
     virtual ~Server() override;
+
+    explicit Server( const Server & other ) = delete;
+    Server & operator=( const Server & other ) = delete;
 
     static void GetHostForJob( const Job * job, AString & hostName );
 
@@ -52,6 +73,15 @@ public:
     // Sends holding only the client's send mutex, which is taken before the client list is released.
     // False if the client has gone or the send failed.
     bool SendToClient( uint32_t clientId, const Protocol::IMessage & msg );
+
+    bool FindCachedPch( uint64_t pchId, AString & outPath ); // The compressed PCH. Refreshes LRU recency.
+    PchLease AcquirePchLease( uint64_t pchId );
+
+    // Asks the client for a PCH that is not cached, once until it arrives (see RequestPchIfMissing).
+    // Sent by the client's outbox, so it never waits for a client that reads slowly.
+    void AskClientForPch( uint32_t clientId, uint64_t pchId );
+    void DisconnectClient( uint32_t clientId );
+    WorkerLog & GetLog() { return m_Log; }
 
 private:
     // TCPConnection interface
@@ -125,6 +155,7 @@ private:
 
         // Caller holds m_ClientListMutex. A result counts in cs.m_NumJobsActive until it is sent.
         void PushResult( bool compressed, MemoryStream && payload );
+        void PushPchNeeded( uint64_t pchId ); // Sent after what is queued before it
         void Wake();
 
         explicit ClientOutbox( const ClientOutbox & other ) = delete;
@@ -133,9 +164,10 @@ private:
     private:
         struct QueuedResult
         {
-            MemoryStream *  m_Payload;
-            uint32_t        m_AllocatedCapacity; // Of the client when the result was queued
+            MemoryStream *  m_Payload;              // Null for a PCH request
+            uint32_t        m_AllocatedCapacity;    // Of the client when the result was queued
             bool            m_Compressed;
+            uint64_t        m_PchNeededId;          // Of a PCH request
         };
 
         static uint32_t ThreadFuncStatic( void * param );
@@ -164,12 +196,15 @@ private:
     // the client cannot be asked or the PCH is already being received. The caller holds
     // m_ClientListMutex and cs.m_Mutex.
     void RequestPchIfMissing( ClientState & cs, uint64_t pchId );
+    bool MarkPchNeeded( ClientState & cs, uint64_t pchId ); // True if the client is to be asked. Same locks.
     bool IsPchBeingReceived( uint64_t pchId ) const; // Caller holds m_ClientListMutex
     bool IsPchCached( uint64_t pchId ); // Does not refresh LRU recency
 
+    Forwarder * const m_Forwarder = nullptr; // Gateway mode
+    AString m_CacheDir; // The root of the PCH store and the log, with a trailing slash. Empty if there is none.
     WorkerLog m_Log;
     uint32_t m_PrefetchBuffer = 0;
-    JobQueueRemote * m_JobQueueRemote;
+    JobQueueRemote * m_JobQueueRemote = nullptr; // None in a pure gateway
 
     Atomic<bool> m_ShouldExit; // signal from main thread
     Thread m_Thread; // the thread to manage workload
@@ -233,7 +268,6 @@ private:
     static uint64_t CountPchBytes( const Array<PchCacheEntry> & entries );
     void ScanPchCache();
     static void RemoveEmptyPchDirectories( const AString & basePath ); // Left by evicted PCHs
-    bool FindCachedPch( uint64_t pchId, AString & outPath ); // The compressed PCH. Refreshes LRU recency.
     PchCacheEntry * FindStoredPch( uint64_t pchId ); // Caller holds m_PchCacheMutex
     static void RemovePchFiles( const PchCacheEntry & entry ); // The stored PCH, its working copy and its directory
 
@@ -255,7 +289,6 @@ private:
 
     // PchLease::Owner: the job that held a lease is gone
     virtual void ReleasePchLease( uint64_t pchId ) override;
-    PchLease AcquirePchLease( uint64_t pchId );
 
     // Sets the working copy as the job's PCH if it exists. If it does not, asks for it to be made (once)
     // and returns false: the job waits. Also false if the PCH is not cached. The caller holds cs.m_Mutex.

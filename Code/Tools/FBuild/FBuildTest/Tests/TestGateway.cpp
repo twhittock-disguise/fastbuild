@@ -13,6 +13,7 @@
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
 #include "Tools/FBuild/FBuildCore/Protocol/WorkerSendQueue.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
 
 // Core
 #include "Core/Containers/Array.h"
@@ -167,6 +168,159 @@ namespace
         Thread m_Thread;
         Atomic<bool> m_Returned{ false };
     };
+
+    // Records what a gateway Server hands its forwarder
+    class StubForwarder : public Server::Forwarder
+    {
+    public:
+        explicit StubForwarder( uint32_t poolSlots, const Array<uint64_t> & toolIds = Array<uint64_t>() )
+            : m_PoolSlots( poolSlots )
+            , m_ToolIds( toolIds )
+        {
+        }
+        virtual ~StubForwarder() = default;
+        explicit StubForwarder( const StubForwarder & other ) = delete;
+        StubForwarder & operator=( const StubForwarder & other ) = delete;
+
+        struct Received
+        {
+            uint32_t    m_ClientId = 0;
+            uint64_t    m_ToolId = 0;
+            uint32_t    m_FileId = 0;   // Of a file
+            int16_t     m_Level = 0;    // Of a job
+            Array<char> m_Data;
+        };
+        struct StoredPch
+        {
+            uint64_t    m_PchId;
+            uint32_t    m_UncompressedSize;
+            uint32_t    m_CompressedSize;
+        };
+
+        uint32_t GetNumPoolSlotQueries() const { return m_NumPoolSlotQueries.Load(); }
+        void GetInventoryClients( Array<uint32_t> & out ) const { MutexHolder mh( m_Mutex ); out = m_InventoryClients; }
+        void GetJobs( Array<Received> & out ) const { MutexHolder mh( m_Mutex ); out = m_Jobs; }
+        void GetManifests( Array<Received> & out ) const { MutexHolder mh( m_Mutex ); out = m_Manifests; }
+        void GetFiles( Array<Received> & out ) const { MutexHolder mh( m_Mutex ); out = m_Files; }
+        void GetStoredPchs( Array<StoredPch> & out ) const { MutexHolder mh( m_Mutex ); out = m_StoredPchs; }
+        void GetGoneClients( Array<uint32_t> & out ) const { MutexHolder mh( m_Mutex ); out = m_GoneClients; }
+        size_t GetNumJobs() const { MutexHolder mh( m_Mutex ); return m_Jobs.GetSize(); }
+        size_t GetNumToolchainMessages() const { MutexHolder mh( m_Mutex ); return m_Manifests.GetSize() + m_Files.GetSize(); }
+        size_t GetNumStoredPchs() const { MutexHolder mh( m_Mutex ); return m_StoredPchs.GetSize(); }
+        size_t GetNumGoneClients() const { MutexHolder mh( m_Mutex ); return m_GoneClients.GetSize(); }
+
+        virtual uint32_t GetPoolSlots() const override
+        {
+            m_NumPoolSlotQueries.Increment();
+            return m_PoolSlots;
+        }
+        virtual void GetToolchainInventory( uint32_t clientId, Array<uint64_t> & outToolIds ) override
+        {
+            MutexHolder mh( m_Mutex );
+            m_InventoryClients.Append( clientId );
+            outToolIds = m_ToolIds;
+        }
+        virtual void OnClientJob( uint32_t clientId, const Protocol::MsgJob & msg, void * jobData, size_t jobDataSize ) override
+        {
+            Received job;
+            job.m_ClientId = clientId;
+            job.m_ToolId = msg.GetToolId();
+            job.m_Level = msg.GetResultCompressionLevel();
+            job.m_Data.Append( static_cast<const char *>( jobData ), static_cast<const char *>( jobData ) + jobDataSize );
+            FREE( jobData );
+            MutexHolder mh( m_Mutex );
+            m_Jobs.Append( job );
+        }
+        virtual void OnClientManifest( uint32_t clientId, uint64_t toolId, const void * payload, size_t payloadSize ) override
+        {
+            MutexHolder mh( m_Mutex );
+            Record( m_Manifests, clientId, toolId, 0, payload, payloadSize );
+        }
+        virtual void OnClientFile( uint32_t clientId, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize ) override
+        {
+            MutexHolder mh( m_Mutex );
+            Record( m_Files, clientId, toolId, fileId, payload, payloadSize );
+        }
+        virtual void OnPchStored( uint64_t pchId, uint32_t uncompressedSize, uint32_t compressedSize ) override
+        {
+            MutexHolder mh( m_Mutex );
+            m_StoredPchs.Append( StoredPch{ pchId, uncompressedSize, compressedSize } );
+        }
+        virtual void OnClientGone( uint32_t clientId ) override
+        {
+            MutexHolder mh( m_Mutex );
+            m_GoneClients.Append( clientId );
+        }
+
+    private:
+        static void Record( Array<Received> & to, uint32_t clientId, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize )
+        {
+            Received & r = to.EmplaceBack();
+            r.m_ClientId = clientId;
+            r.m_ToolId = toolId;
+            r.m_FileId = fileId;
+            r.m_Data.Append( static_cast<const char *>( payload ), static_cast<const char *>( payload ) + payloadSize );
+        }
+
+        const uint32_t m_PoolSlots;
+        const Array<uint64_t> m_ToolIds;
+        mutable Atomic<uint32_t> m_NumPoolSlotQueries{ 0 };
+        mutable Mutex m_Mutex;
+        Array<uint32_t> m_InventoryClients;
+        Array<Received> m_Jobs;
+        Array<Received> m_Manifests;
+        Array<Received> m_Files;
+        Array<StoredPch> m_StoredPchs;
+        Array<uint32_t> m_GoneClients;
+    };
+
+    // A serialized job as far as the gateway reads it: the id first, the PCH id last, and the name
+    // (Job::Serialize) between them as a marker
+    void MakeJob( uint32_t jobId, const char * marker, uint64_t pchId, MemoryStream & out )
+    {
+        out.Write( jobId );
+        out.Write( AStackString<>( marker ) );
+        out.Write( pchId );
+    }
+
+    // The chunks of a PCH, as a client sends them after its handshake
+    bool SendPchFromProbe( DistributedTest::HandshakeProbe & probe, const ConnectionInfo * ci, const DistributedTest::CompressedPch & pch )
+    {
+        const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( pch.m_CompressedSize, Protocol::kPchChunkSize );
+        for ( uint32_t i = 0; i < numChunks; ++i )
+        {
+            const Protocol::MsgPchFile msg( pch.m_Id, (uint32_t)pch.m_Content.GetSize(), pch.m_CompressedSize, Protocol::kPchChunkSize, i );
+            if ( probe.SendMessage( ci,
+                                    msg,
+                                    static_cast<const char *>( pch.m_Compressed.GetResult() ) + ( (size_t)i * Protocol::kPchChunkSize ),
+                                    Protocol::MsgPchFile::GetChunkLength( pch.m_CompressedSize, Protocol::kPchChunkSize, i ) ) == false )
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    size_t CountFilesUnder( const AString & directory )
+    {
+        Array<AString> files;
+        FileIO::GetFiles( directory, AStackString<>( "*" ), true, &files );
+        return files.GetSize();
+    }
+
+    bool AnyPathContains( const AString & directory, const char * text )
+    {
+        Array<AString> files;
+        FileIO::GetFiles( directory, AStackString<>( "*" ), true, &files );
+        for ( const AString & file : files )
+        {
+            if ( file.Find( text ) )
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 }
 
 // TestGateway
@@ -190,6 +344,15 @@ private:
     void ResultCutShortIsRejected() const;
     void LanesUseRealThreadIndexes() const;
     void LostResultIsASystemError() const;
+    void GatewayAdvertisesTheForwarderPool() const;
+    void GatewayWithoutCapacityClosesTheHandshake() const;
+    void GatewayRefusesAClientOfAnotherMajor() const;
+    void GatewayHandsDecodedJobsToTheForwarder() const;
+    void GatewayHandsToolchainMessagesToTheForwarder() const;
+    void GatewayReportsAStoredPch() const;
+    void GatewayResultReachesOnlyALiveClient() const;
+    void PureGatewayNeverTouchesTheJobQueue() const;
+    void AskingASlowClientForAPchDoesNotHoldBackAnother() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -209,7 +372,9 @@ private:
     }
 
     // Connects the probe and completes its handshake. The id of its client on the server, or 0.
-    static uint32_t ConnectProbe( Server & server, DistributedTest::HandshakeProbe & probe );
+    static uint32_t ConnectProbe( Server & server, DistributedTest::HandshakeProbe & probe, const ConnectionInfo ** outConnection = nullptr );
+    // The cache root of a pure gateway that shares the process with a real Server
+    static void GetGatewayCacheDir( AString & outDir );
     static void AddActiveJobs( Server & server, uint32_t clientId, uint32_t numJobs );
     static uint32_t GetNumJobsActive( Server & server, uint32_t clientId );
     static size_t CountMessages( const DistributedTest::HandshakeProbe & probe, uint8_t type );
@@ -231,6 +396,15 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( ResultCutShortIsRejected )
     REGISTER_TEST( LanesUseRealThreadIndexes )
     REGISTER_TEST( LostResultIsASystemError )
+    REGISTER_TEST( GatewayAdvertisesTheForwarderPool )
+    REGISTER_TEST( GatewayWithoutCapacityClosesTheHandshake )
+    REGISTER_TEST( GatewayRefusesAClientOfAnotherMajor )
+    REGISTER_TEST( GatewayHandsDecodedJobsToTheForwarder )
+    REGISTER_TEST( GatewayHandsToolchainMessagesToTheForwarder )
+    REGISTER_TEST( GatewayReportsAStoredPch )
+    REGISTER_TEST( GatewayResultReachesOnlyALiveClient )
+    REGISTER_TEST( PureGatewayNeverTouchesTheJobQueue )
+    REGISTER_TEST( AskingASlowClientForAPchDoesNotHoldBackAnother )
 REGISTER_TESTS_END
 
 // PreTest
@@ -255,12 +429,16 @@ REGISTER_TESTS_END
 
 // ConnectProbe
 //------------------------------------------------------------------------------
-/*static*/ uint32_t TestGateway::ConnectProbe( Server & server, DistributedTest::HandshakeProbe & probe )
+/*static*/ uint32_t TestGateway::ConnectProbe( Server & server, DistributedTest::HandshakeProbe & probe, const ConnectionInfo ** outConnection )
 {
     const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
     if ( ci == nullptr )
     {
         return 0;
+    }
+    if ( outConnection )
+    {
+        *outConnection = ci;
     }
     const Protocol::MsgConnection msg;
     if ( ( probe.Send( ci, &msg, sizeof( msg ) ) == false ) ||
@@ -277,6 +455,15 @@ REGISTER_TESTS_END
         id = ( cs->m_Id > id ) ? cs->m_Id : id;
     }
     return id;
+}
+
+// GetGatewayCacheDir
+//------------------------------------------------------------------------------
+/*static*/ void TestGateway::GetGatewayCacheDir( AString & outDir )
+{
+    VERIFY( FBuild::GetTempDir( outDir ) );
+    outDir += "gateway_tmp";
+    outDir += NATIVE_SLASH;
 }
 
 // AddActiveJobs
@@ -703,6 +890,414 @@ void TestGateway::LostResultIsASystemError() const
     Array<AString> messages;
     TEST_ASSERT( reader.Read( jobId ) && reader.Read( name ) && reader.Read( ok ) && reader.Read( systemError ) && reader.Read( messages ) );
     TEST_ASSERT( ( messages.GetSize() == 1 ) && ( messages[ 0 ] == "lost on worker" ) );
+}
+
+// GatewayAdvertisesTheForwarderPool
+//------------------------------------------------------------------------------
+void TestGateway::GatewayAdvertisesTheForwarderPool() const
+{
+    Array<uint64_t> toolIds;
+    toolIds.Append( 0x11 );
+    toolIds.Append( 0x22 );
+    StubForwarder forwarder( 340, toolIds );
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    Server s( forwarder, cacheDir );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    DistributedTest::HandshakeProbe a;
+    const uint32_t idA = ConnectProbe( s, a );
+    TEST_ASSERT( idA != 0 );
+    TEST_ASSERT( a.GetNumMessages() == 3 );
+    TEST_ASSERT( a.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
+    TEST_ASSERT( a.GetMessageType( 1 ) == Protocol::MSG_PCH_INVENTORY );
+    TEST_ASSERT( a.GetMessageType( 2 ) == Protocol::MSG_TOOLCHAIN_INVENTORY );
+    TEST_ASSERT( a.GetAckCapacity() == 340 );
+    Array<uint64_t> advertised;
+    a.GetToolchainIds( advertised );
+    TEST_ASSERT( ( advertised.GetSize() == 2 ) && ( advertised[ 0 ] == 0x11 ) && ( advertised[ 1 ] == 0x22 ) );
+
+    // Every client is offered the whole pool
+    DistributedTest::HandshakeProbe b;
+    const uint32_t idB = ConnectProbe( s, b );
+    TEST_ASSERT( ( idB != 0 ) && ( idB != idA ) );
+    TEST_ASSERT( b.GetAckCapacity() == 340 );
+
+    Array<uint32_t> inventoryClients;
+    forwarder.GetInventoryClients( inventoryClients );
+    TEST_ASSERT( ( inventoryClients.GetSize() == 2 ) && ( inventoryClients[ 0 ] == idA ) && ( inventoryClients[ 1 ] == idB ) );
+    TEST_ASSERT( JobQueueRemote::IsValid() == false );
+
+    a.ShutdownAllConnections();
+    b.ShutdownAllConnections();
+}
+
+// GatewayWithoutCapacityClosesTheHandshake
+//------------------------------------------------------------------------------
+void TestGateway::GatewayWithoutCapacityClosesTheHandshake() const
+{
+    StubForwarder forwarder( 0 );
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    Server s( forwarder, cacheDir );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    TEST_ASSERT( ci );
+    const Protocol::MsgConnection msg;
+    TEST_ASSERT( probe.Send( ci, &msg, sizeof( msg ) ) );
+
+    // Closed without an ack, so the client builds elsewhere
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( probe.GetNumMessages() == 0 );
+    TEST_ASSERT( forwarder.GetNumPoolSlotQueries() == 1 );
+    Array<uint32_t> inventoryClients;
+    forwarder.GetInventoryClients( inventoryClients );
+    TEST_ASSERT( inventoryClients.IsEmpty() );
+
+    uint32_t numRefused = 0;
+    TEST_ASSERT( DistributedTest::CountInStatsLogSince( s.GetLogPath(), 0, "refused addr=", numRefused ) );
+    TEST_ASSERT( numRefused == 1 );
+    uint32_t numNoCapacity = 0;
+    TEST_ASSERT( DistributedTest::CountInStatsLogSince( s.GetLogPath(), 0, "reason=no-capacity", numNoCapacity ) );
+    TEST_ASSERT( numNoCapacity == 1 );
+}
+
+// GatewayRefusesAClientOfAnotherMajor
+//------------------------------------------------------------------------------
+void TestGateway::GatewayRefusesAClientOfAnotherMajor() const
+{
+    StubForwarder forwarder( 4 );
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    Server s( forwarder, cacheDir );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    TEST_ASSERT( ci );
+
+    // The major follows the message header
+    const Protocol::MsgConnection msg;
+    char handshake[ sizeof( msg ) ];
+    memcpy( handshake, &msg, sizeof( msg ) );
+    const uint32_t otherMajor = ( Protocol::kVersionMajor + 1 );
+    memcpy( handshake + sizeof( Protocol::IMessage ), &otherMajor, sizeof( otherMajor ) );
+    TEST_ASSERT( probe.Send( ci, handshake, sizeof( handshake ) ) );
+
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( probe.GetNumMessages() == 1 );
+    TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_REFUSED );
+    TEST_ASSERT( probe.GetRefusedMajor() == Protocol::kVersionMajor );
+    TEST_ASSERT( forwarder.GetNumPoolSlotQueries() == 0 );
+}
+
+// GatewayHandsDecodedJobsToTheForwarder
+//------------------------------------------------------------------------------
+void TestGateway::GatewayHandsDecodedJobsToTheForwarder() const
+{
+    StubForwarder forwarder( 4 );
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    Server s( forwarder, cacheDir );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    const uint32_t id = ConnectProbe( s, probe, &ci );
+    TEST_ASSERT( id != 0 );
+
+    // The second is compressed against the first, so they are decoded in order
+    MemoryStream first;
+    MakeJob( 7, "first job", 0x99, first );
+    MemoryStream second;
+    MakeJob( 8, "second job", 0, second );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( probe.SendJob( ci, encoder, 0xAB, 3, first ) );
+    TEST_ASSERT( probe.SendJob( ci, encoder, 0xAB, -1, second ) );
+    TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumJobs() == 2 ); } ) );
+
+    Array<StubForwarder::Received> jobs;
+    forwarder.GetJobs( jobs );
+    const MemoryStream * sent[] = { &first, &second };
+    const int16_t levels[] = { 3, -1 };
+    for ( size_t i = 0; i < 2; ++i )
+    {
+        TEST_ASSERT( jobs[ i ].m_ClientId == id );
+        TEST_ASSERT( jobs[ i ].m_ToolId == 0xAB );
+        TEST_ASSERT( jobs[ i ].m_Level == levels[ i ] );
+        TEST_ASSERT( jobs[ i ].m_Data.GetSize() == sent[ i ]->GetSize() );
+        TEST_ASSERT( memcmp( jobs[ i ].m_Data.Begin(), sent[ i ]->GetData(), sent[ i ]->GetSize() ) == 0 );
+    }
+    uint32_t jobId = 0;
+    uint64_t pchId = 0;
+    TEST_ASSERT( GatewayWire::PeekJob( jobs[ 0 ].m_Data.Begin(), jobs[ 0 ].m_Data.GetSize(), jobId, pchId ) );
+    TEST_ASSERT( ( jobId == 7 ) && ( pchId == 0x99 ) );
+
+    // Each counts until its result is sent
+    TEST_ASSERT( GetNumJobsActive( s, id ) == 2 );
+    TEST_ASSERT( JobQueueRemote::IsValid() == false );
+
+    probe.ShutdownAllConnections();
+}
+
+// GatewayHandsToolchainMessagesToTheForwarder
+//------------------------------------------------------------------------------
+void TestGateway::GatewayHandsToolchainMessagesToTheForwarder() const
+{
+    StubForwarder forwarder( 4 );
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    Server s( forwarder, cacheDir );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    const uint32_t id = ConnectProbe( s, probe, &ci );
+    TEST_ASSERT( id != 0 );
+
+    // A toolchain a worker would unpack and keep
+    const uint64_t toolId = 0x11;
+    const char * const content = "the compiler";
+    AStackString<> root;
+    SyntheticToolchain::GetRootPath( root );
+    AStackString<> fileName( root );
+    fileName += "tool.exe";
+    MemoryStream manifest;
+    SyntheticToolchain::WriteManifest( manifest, toolId, root, fileName, content );
+    TEST_ASSERT( probe.SendMessage( ci, Protocol::MsgManifest( toolId ), manifest.GetData(), manifest.GetSize() ) );
+    TEST_ASSERT( probe.SendMessage( ci, Protocol::MsgFile( toolId, 0 ), content, strlen( content ) ) );
+    TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumToolchainMessages() == 2 ); } ) );
+
+    Array<StubForwarder::Received> manifests;
+    forwarder.GetManifests( manifests );
+    TEST_ASSERT( manifests.GetSize() == 1 );
+    TEST_ASSERT( ( manifests[ 0 ].m_ClientId == id ) && ( manifests[ 0 ].m_ToolId == toolId ) );
+    TEST_ASSERT( manifests[ 0 ].m_Data.GetSize() == manifest.GetSize() );
+    TEST_ASSERT( memcmp( manifests[ 0 ].m_Data.Begin(), manifest.GetData(), manifest.GetSize() ) == 0 );
+
+    Array<StubForwarder::Received> files;
+    forwarder.GetFiles( files );
+    TEST_ASSERT( files.GetSize() == 1 );
+    TEST_ASSERT( ( files[ 0 ].m_ClientId == id ) && ( files[ 0 ].m_ToolId == toolId ) && ( files[ 0 ].m_FileId == 0 ) );
+    TEST_ASSERT( files[ 0 ].m_Data.GetSize() == strlen( content ) );
+    TEST_ASSERT( memcmp( files[ 0 ].m_Data.Begin(), content, strlen( content ) ) == 0 );
+
+    // Nothing is unpacked
+    AStackString<> workerCache;
+    TEST_ASSERT( FBuild::GetWorkerCacheDir( workerCache ) );
+    AStackString<> toolchainDir;
+    toolchainDir.Format( "%stoolchain.%016" PRIx64, workerCache.Get(), toolId );
+    TEST_ASSERT( FileIO::DirectoryExists( toolchainDir ) == false );
+    TEST_ASSERT( AnyPathContains( workerCache, "toolchain." ) == false );
+    TEST_ASSERT( AnyPathContains( cacheDir, "toolchain." ) == false );
+
+    probe.ShutdownAllConnections();
+}
+
+// GatewayReportsAStoredPch
+//------------------------------------------------------------------------------
+void TestGateway::GatewayReportsAStoredPch() const
+{
+    StubForwarder forwarder( 4 );
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    Server s( forwarder, cacheDir );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( s, probe, &ci ) != 0 );
+
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 2 * MEGABYTE, 1, pch );
+    TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+    TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumStoredPchs() == 1 ); } ) );
+
+    Array<StubForwarder::StoredPch> stored;
+    forwarder.GetStoredPchs( stored );
+    TEST_ASSERT( stored[ 0 ].m_PchId == pch.m_Id );
+    TEST_ASSERT( stored[ 0 ].m_UncompressedSize == pch.m_Content.GetSize() );
+    TEST_ASSERT( stored[ 0 ].m_CompressedSize == pch.m_CompressedSize );
+
+    // Kept under the gateway's root, and nothing under the worker cache
+    AStackString<> path;
+    TEST_ASSERT( s.FindCachedPch( pch.m_Id, path ) );
+    TEST_ASSERT( path.BeginsWith( cacheDir ) );
+    TEST_ASSERT( FileIO::FileExists( path.Get() ) );
+    TEST_ASSERT( s.GetLogPath().BeginsWith( cacheDir ) );
+    AStackString<> workerCache;
+    TEST_ASSERT( FBuild::GetWorkerCacheDir( workerCache ) );
+    TEST_ASSERT( CountFilesUnder( workerCache ) == 0 );
+
+    probe.ShutdownAllConnections();
+}
+
+// GatewayResultReachesOnlyALiveClient
+//------------------------------------------------------------------------------
+void TestGateway::GatewayResultReachesOnlyALiveClient() const
+{
+    StubForwarder forwarder( 4 );
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    Server s( forwarder, cacheDir );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    const uint32_t id = ConnectProbe( s, probe, &ci );
+    TEST_ASSERT( id != 0 );
+
+    MemoryStream job;
+    MakeJob( 7, "job", 0, job );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( probe.SendJob( ci, encoder, 0xAB, 0, job ) );
+    TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumJobs() == 1 ); } ) );
+
+    MemoryStream result;
+    MakeResult( result, 7, 1001, "obj", 3 );
+    TEST_ASSERT( s.QueueResult( id, false, Move( result ) ) );
+    Array<GatewayWire::ResultHeader> results;
+    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( results[ 0 ].m_JobId == 7 );
+    TEST_ASSERT( WaitUntil( [ &s, id ]() { return ( GetNumJobsActive( s, id ) == 0 ); } ) );
+
+    // Once the forwarder hears the client has gone, nothing more is queued for it
+    s.DisconnectClient( id );
+    TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumGoneClients() == 1 ); } ) );
+    Array<uint32_t> gone;
+    forwarder.GetGoneClients( gone );
+    TEST_ASSERT( gone[ 0 ] == id );
+    MemoryStream late;
+    MakeResult( late, 7, 1001, "obj", 3 );
+    TEST_ASSERT( s.QueueResult( id, false, Move( late ) ) == false );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+}
+
+// PureGatewayNeverTouchesTheJobQueue
+//------------------------------------------------------------------------------
+void TestGateway::PureGatewayNeverTouchesTheJobQueue() const
+{
+    TEST_ASSERT( JobQueueRemote::IsValid() == false ); // No other Server in the process
+
+    StubForwarder forwarder( 4 );
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    {
+        Server s( forwarder, cacheDir );
+        TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+        DistributedTest::HandshakeProbe probe;
+        const ConnectionInfo * ci = nullptr;
+        TEST_ASSERT( ConnectProbe( s, probe, &ci ) != 0 );
+
+        const char manifest[] = "manifest";
+        const char file[] = "file";
+        TEST_ASSERT( probe.SendMessage( ci, Protocol::MsgManifest( 0x11 ), manifest, sizeof( manifest ) ) );
+        TEST_ASSERT( probe.SendMessage( ci, Protocol::MsgFile( 0x11, 0 ), file, sizeof( file ) ) );
+        DistributedTest::CompressedPch pch;
+        DistributedTest::MakeCompressedPch( 64 * 1024, 2, pch );
+        TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+        MemoryStream job;
+        MakeJob( 7, "job", pch.m_Id, job );
+        JobStreamEncoder encoder;
+        TEST_ASSERT( probe.SendJob( ci, encoder, 0x11, 0, job ) );
+
+        TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumJobs() == 1 ) &&
+                                                          ( forwarder.GetNumToolchainMessages() == 2 ) &&
+                                                          ( forwarder.GetNumStoredPchs() == 1 ); } ) );
+        TEST_ASSERT( JobQueueRemote::IsValid() == false );
+
+        probe.ShutdownAllConnections();
+        TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumGoneClients() == 1 ); } ) );
+    }
+    TEST_ASSERT( JobQueueRemote::IsValid() == false );
+    TEST_ASSERT( forwarder.GetNumGoneClients() == 1 );
+}
+
+// AskingASlowClientForAPchDoesNotHoldBackAnother
+//------------------------------------------------------------------------------
+namespace
+{
+    // Asks on its own thread, so that a call that waits for a slow client fails the test instead of hanging it
+    struct PchAsker
+    {
+        static uint32_t ThreadFunc( void * param )
+        {
+            PchAsker * asker = static_cast<PchAsker *>( param );
+            asker->m_Server->AskClientForPch( asker->m_SlowClient, asker->m_SlowPchId );
+            asker->m_Server->AskClientForPch( asker->m_SlowClient, asker->m_SlowPchId ); // Asked once until it arrives
+            asker->m_Server->AskClientForPch( asker->m_OtherClient, asker->m_OtherPchId );
+            asker->m_Done.Store( true );
+            return 0;
+        }
+
+        Server *            m_Server = nullptr;
+        uint32_t            m_SlowClient = 0;
+        uint64_t            m_SlowPchId = 0;
+        uint32_t            m_OtherClient = 0;
+        uint64_t            m_OtherPchId = 0;
+        Atomic<bool>        m_Done{ false };
+    };
+}
+
+void TestGateway::AskingASlowClientForAPchDoesNotHoldBackAnother() const
+{
+    StubForwarder forwarder( 4 );
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    Server s( forwarder, cacheDir );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    DistributedTest::HandshakeProbe a;
+    DistributedTest::HandshakeProbe b;
+    const uint32_t idA = ConnectProbe( s, a );
+    TEST_ASSERT( idA != 0 );
+    const uint32_t idB = ConnectProbe( s, b );
+    TEST_ASSERT( ( idB != 0 ) && ( idB != idA ) );
+    a.StallReading( true );
+
+    // More than the socket buffers hold, so A's outbox is held in a send
+    const uint32_t kNumLargeResults = 4;
+    Array<char> large;
+    large.SetSize( 64 * MEGABYTE );
+    memset( large.Begin(), 0x5A, large.GetSize() );
+    AddActiveJobs( s, idA, kNumLargeResults );
+    for ( uint32_t i = 0; i < kNumLargeResults; ++i )
+    {
+        MemoryStream payload( large.GetSize() );
+        payload.WriteBuffer( large.Begin(), large.GetSize() );
+        TEST_ASSERT( s.QueueResult( idA, false, Move( payload ) ) );
+    }
+    TEST_ASSERT( WaitUntil( [ &s, idA ]() { return ( GetNumJobsActive( s, idA ) < kNumLargeResults ); } ) );
+    Thread::Sleep( 100 ); // It has taken A's send mutex
+
+    PchAsker asker;
+    asker.m_Server = &s;
+    asker.m_SlowClient = idA;
+    asker.m_SlowPchId = 0x1234;
+    asker.m_OtherClient = idB;
+    asker.m_OtherPchId = 0x5678;
+    Thread thread;
+    thread.Start( PchAsker::ThreadFunc, "PchAsker", &asker );
+    const bool returned = WaitUntil( [ &asker ]() { return asker.m_Done.Load(); }, 2.0f );
+    const bool otherAsked = WaitUntil( [ &b ]() { return ( b.GetNumPchNeeded() == 1 ); }, 2.0f );
+    a.StallReading( false );
+    thread.Join();
+    TEST_ASSERT( returned );
+    TEST_ASSERT( otherAsked );
+    TEST_ASSERT( b.GetPchNeededId( 0 ) == 0x5678 );
+
+    // A is asked once, after the results queued before
+    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetNumPchNeeded() == 1 ); } ) );
+    TEST_ASSERT( CountMessages( a, Protocol::MSG_JOB_RESULT ) == kNumLargeResults );
+    Thread::Sleep( 100 );
+    TEST_ASSERT( a.GetNumPchNeeded() == 1 );
+    TEST_ASSERT( a.GetPchNeededId( 0 ) == 0x1234 );
+
+    a.ShutdownAllConnections();
+    b.ShutdownAllConnections();
 }
 
 //------------------------------------------------------------------------------

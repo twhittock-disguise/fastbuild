@@ -66,13 +66,21 @@ namespace
 
     constexpr uint64_t kNoLimit = ~(uint64_t)0;
 
-    // Where the worker log is kept: with the caches. Empty (so no log) if there is no such place.
-    AString GetWorkerLogDirectory()
+    // Where the PCH store and the worker log are kept: cacheDir, or else the worker cache.
+    // Empty (so no store and no log) if there is no such place.
+    AString GetCacheRoot( const AString & cacheDir )
     {
-        AStackString<> directory;
-        if ( FBuild::GetWorkerCacheDir( directory ) == false )
+        AStackString<> directory( cacheDir );
+        if ( directory.IsEmpty() )
         {
-            directory.Clear();
+            if ( FBuild::GetWorkerCacheDir( directory ) == false )
+            {
+                directory.Clear();
+            }
+        }
+        else
+        {
+            PathUtils::EnsureTrailingSlash( directory );
         }
         return AString( directory );
     }
@@ -141,15 +149,17 @@ namespace
         }
     }
 
-    // Persistent on-disk cache layout (toolchains and PCHs), under FBuild::GetWorkerCacheDir:
+    // Persistent on-disk cache layout. Toolchains are under FBuild::GetWorkerCacheDir, PCHs under the
+    // Server's cache root (the same directory unless a gateway is given another):
     //   toolchain.<toolId hex>/...
     //   pch.<pchId hex>/pch.zst (the PCH, compressed)
     //   pch.<pchId hex>/pch.pch (a working copy for the compiler, while jobs need it)
     //   pch.<pchId hex>/incoming.<process id>.<number>.pch (while a PCH is being received)
     //   pch.<pchId hex>/unpack.<process id>.<number>.pch (while a working copy is being made)
-    bool BuildPchFilePath( uint64_t pchId, AStackString<> & outFile )
+    bool BuildPchFilePath( const AString & cacheRoot, uint64_t pchId, AStackString<> & outFile )
     {
-        if ( FBuild::GetWorkerCacheDir( outFile ) == false ) { return false; }
+        if ( cacheRoot.IsEmpty() ) { return false; }
+        outFile = cacheRoot;
         outFile.AppendFormat( "pch.%016" PRIx64 "%c%s", pchId, (char)NATIVE_SLASH, PchBlob::kStoredFileName );
         return true;
     }
@@ -244,7 +254,8 @@ namespace
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
 Server::Server( uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
-    : m_Log( GetWorkerLogDirectory() )
+    : m_CacheDir( GetCacheRoot( AString::GetEmpty() ) )
+    , m_Log( m_CacheDir )
     , m_PrefetchBuffer( prefetchBuffer )
     , m_ShouldExit( false )
 {
@@ -262,15 +273,36 @@ Server::Server( uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
     ScanToolchainCache();
 }
 
+// CONSTRUCTOR (gateway)
+//------------------------------------------------------------------------------
+Server::Server( Forwarder & forwarder, const AString & cacheDir )
+    : m_Forwarder( &forwarder )
+    , m_CacheDir( GetCacheRoot( cacheDir ) )
+    , m_Log( m_CacheDir )
+    , m_ShouldExit( false )
+{
+    m_ClientList.SetCapacity( 32 );
+
+    // PCHs are kept as they arrive, for the gateway to send on: none is unpacked
+    m_Thread.Start( ThreadFuncStatic, "Server", this );
+    ScanPchCache();
+}
+
 // DESTRUCTOR
 //------------------------------------------------------------------------------
 Server::~Server()
 {
     m_ShouldExit.Store( true );
-    JobQueueRemote::Get().WakeMainThread();
+    if ( m_JobQueueRemote )
+    {
+        m_JobQueueRemote->WakeMainThread();
+    }
     m_Thread.Join();
-    m_PchUnpackSemaphore.Signal();
-    m_PchUnpackThread.Join();
+    if ( m_PchUnpackThread.IsRunning() )
+    {
+        m_PchUnpackSemaphore.Signal();
+        m_PchUnpackThread.Join();
+    }
 
     ShutdownAllConnections();
 
@@ -382,11 +414,19 @@ void Server::LogWarning( const char * fmtString, ... )
     Disconnect( connection );
     FDELETE outbox;
 
+    // Before the client leaves the list (QueueResult already fails for it), with no lock held
+    if ( m_Forwarder )
+    {
+        m_Forwarder->OnClientGone( cs->m_Id );
+    }
+
     // Unhook any jobs which are queued or in progress for this client
     // - deletes the queued jobs
     // - unhooks the UserData for in-progress jobs so the result is discarded on completion
-    JobQueueRemote & jqr = JobQueueRemote::Get();
-    jqr.CancelJobsWithUserData( cs );
+    if ( m_JobQueueRemote )
+    {
+        m_JobQueueRemote->CancelJobsWithUserData( cs );
+    }
 
     // check if any tool chain was being sync'd from this Client
     Array<ToolManifest *> cancelledManifests;
@@ -619,6 +659,47 @@ bool Server::SendToClient( uint32_t clientId, const Protocol::IMessage & msg )
     return sent;
 }
 
+// AskClientForPch
+//------------------------------------------------------------------------------
+void Server::AskClientForPch( uint32_t clientId, uint64_t pchId )
+{
+    MutexHolder mh( m_ClientListMutex );
+    for ( ClientState * cs : m_ClientList )
+    {
+        if ( cs->m_Id == clientId )
+        {
+            MutexHolder mh2( cs->m_Mutex );
+            if ( cs->m_Outbox && MarkPchNeeded( *cs, pchId ) )
+            {
+                cs->m_Outbox->PushPchNeeded( pchId );
+            }
+            return;
+        }
+    }
+}
+
+// DisconnectClient
+//------------------------------------------------------------------------------
+void Server::DisconnectClient( uint32_t clientId )
+{
+    const ConnectionInfo * connection = nullptr;
+    {
+        MutexHolder mh( m_ClientListMutex );
+        for ( const ClientState * cs : m_ClientList )
+        {
+            if ( cs->m_Id == clientId )
+            {
+                connection = cs->m_Connection;
+                break;
+            }
+        }
+    }
+    if ( connection )
+    {
+        Disconnect( connection ); // Does nothing if the connection has gone since
+    }
+}
+
 // ClientOutbox
 //------------------------------------------------------------------------------
 Server::ClientOutbox::ClientOutbox( ClientState & cs )
@@ -650,9 +731,26 @@ void Server::ClientOutbox::PushResult( bool compressed, MemoryStream && payload 
     result.m_Payload = FNEW( MemoryStream( Move( payload ) ) );
     result.m_AllocatedCapacity = m_ClientState.m_AllocatedCapacity;
     result.m_Compressed = compressed;
+    result.m_PchNeededId = 0;
     {
         MutexHolder mh( m_Mutex );
         m_Results.Append( result );
+    }
+    m_WakeSemaphore.Signal();
+}
+
+// PushPchNeeded
+//------------------------------------------------------------------------------
+void Server::ClientOutbox::PushPchNeeded( uint64_t pchId )
+{
+    QueuedResult request;
+    request.m_Payload = nullptr;
+    request.m_AllocatedCapacity = 0;
+    request.m_Compressed = false;
+    request.m_PchNeededId = pchId;
+    {
+        MutexHolder mh( m_Mutex );
+        m_Results.Append( request );
     }
     m_WakeSemaphore.Signal();
 }
@@ -703,8 +801,15 @@ void Server::ClientOutbox::ThreadFunc()
 //------------------------------------------------------------------------------
 void Server::ClientOutbox::Send( const QueuedResult & result )
 {
-    // Before the send mutex is taken, so the result is no longer counted while it waits to be sent
     ClientState & cs = m_ClientState;
+    if ( result.m_Payload == nullptr )
+    {
+        const Protocol::MsgPchNeeded msg( result.m_PchNeededId );
+        SendTo( cs, msg );
+        return;
+    }
+
+    // Before the send mutex is taken, so the result is no longer counted while it waits to be sent
     ASSERT( cs.m_NumJobsActive.Load() > 0 );
     cs.m_NumJobsActive.Decrement();
 
@@ -791,14 +896,35 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
         cs->m_HostName = hostName;
     }
 
+    // A gateway offers every client its whole pool
+    uint32_t capacity = 0;
+    if ( m_Forwarder )
+    {
+        capacity = m_Forwarder->GetPoolSlots();
+        if ( capacity == 0 )
+        {
+            FLOG_WARN( "Disconnecting '%s' (%s): the gateway has no workers\n", remoteAddr.Get(), hostName.Get() );
+            m_Log.Write( "refused addr=%s host=%s reason=no-capacity", remoteAddr.Get(), hostName.Get() );
+            Disconnect( connection );
+            return;
+        }
+        MutexHolder mh( m_ClientListMutex );
+        cs->m_AllocatedCapacity = capacity;
+    }
+
     m_Log.Write( "handshake addr=%s host=%s", remoteAddr.Get(), hostName.Get() );
 
-    // Recalculate capacity across all connected coordinators
-    // (takes m_ClientListMutex, so cs->m_Mutex must not be held)
-    RecalculateCapacity();
+    if ( m_Forwarder == nullptr )
+    {
+        // Recalculate capacity across all connected coordinators
+        // (takes m_ClientListMutex, so cs->m_Mutex must not be held)
+        RecalculateCapacity();
+        MutexHolder mh( m_ClientListMutex );
+        capacity = cs->m_AllocatedCapacity;
+    }
 
     // Send ack with allocated capacity
-    const Protocol::MsgConnectionAck ack( cs->m_AllocatedCapacity );
+    const Protocol::MsgConnectionAck ack( capacity );
     SendTo( *cs, ack );
 
     // Send PCH inventory so coordinator knows what's already cached
@@ -814,6 +940,13 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
 
     // Send toolchain inventory so coordinator can skip sending toolchains we already have.
     // It follows the PCH inventory, so the coordinator knows both have arrived.
+    if ( m_Forwarder )
+    {
+        Array<uint64_t> toolIds;
+        m_Forwarder->GetToolchainInventory( cs->m_Id, toolIds );
+        SendIdInventory<Protocol::MsgToolchainInventory>( *cs, toolIds );
+        return;
+    }
     SendToolchainInventory( *cs );
 }
 
@@ -836,6 +969,12 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
         return;
     }
     cs->m_NumJobsActive.Increment();
+
+    if ( m_Forwarder )
+    {
+        m_Forwarder->OnClientJob( cs->m_Id, *msg, jobData, jobDataSize );
+        return;
+    }
 
     // Lock order: m_ClientListMutex before cs->m_Mutex, so asking for a PCH comes after this scope
     uint64_t missingPchId = 0;
@@ -935,6 +1074,12 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgMani
     ClientState * cs = (ClientState *)connection->GetUserData();
     m_NumManifestsReceived.Increment();
 
+    if ( m_Forwarder )
+    {
+        m_Forwarder->OnClientManifest( cs->m_Id, toolId, payload, payloadSize );
+        return;
+    }
+
     {
         MutexHolder manifestMH( m_ToolManifestsMutex ); // ensure we don't make redundant requests
 
@@ -991,6 +1136,13 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgFile
     const uint64_t toolId = msg->GetToolId();
     const uint32_t fileId = msg->GetFileId();
     m_NumToolFilesReceived.Increment();
+
+    if ( m_Forwarder )
+    {
+        const ClientState * cs = (const ClientState *)connection->GetUserData();
+        m_Forwarder->OnClientFile( cs->m_Id, toolId, fileId, payload, payloadSize );
+        return;
+    }
 
     // Update the Manifest
     ToolManifest * manifest = nullptr;
@@ -1054,7 +1206,10 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgFile
     // ToolChain is now synchronized — allow any jobs waiting on it to start
     OnToolchainSynchronized( manifest );
     ReleaseReadyWaitingJobs();
-    JobQueueRemote::Get().WakeMainThread();
+    if ( m_JobQueueRemote )
+    {
+        m_JobQueueRemote->WakeMainThread();
+    }
 }
 
 // ReleaseReadyWaitingJobs
@@ -1064,6 +1219,10 @@ void Server::ReleaseReadyWaitingJobs()
     // Queue any jobs whose toolchain has finished syncing AND whose PCH (if
     // any) is now in the cache. Called whenever a dependency lands —
     // typically the final MsgFile of a toolchain or a MsgPchFile.
+    if ( m_JobQueueRemote == nullptr )
+    {
+        return; // A pure gateway holds no jobs
+    }
     MutexHolder mhC( m_ClientListMutex );
     for ( ClientState * cs : m_ClientList )
     {
@@ -1094,7 +1253,7 @@ void Server::ReleaseReadyWaitingJobs()
             if ( !manifest->IsSynchronized() || !pchReady ) { continue; }
 
             cs->m_WaitingJobs.EraseIndex( (size_t)i );
-            JobQueueRemote::Get().QueueJob( job );
+            m_JobQueueRemote->QueueJob( job );
             PROTOCOL_DEBUG( "Server: Job %x can now be started\n", job );
         }
     }
@@ -1104,9 +1263,20 @@ void Server::ReleaseReadyWaitingJobs()
 //------------------------------------------------------------------------------
 void Server::RequestPchIfMissing( ClientState & cs, uint64_t pchId )
 {
+    if ( MarkPchNeeded( cs, pchId ) )
+    {
+        const Protocol::MsgPchNeeded msg( pchId );
+        SendTo( cs, msg );
+    }
+}
+
+// MarkPchNeeded
+//------------------------------------------------------------------------------
+bool Server::MarkPchNeeded( ClientState & cs, uint64_t pchId )
+{
     if ( cs.m_PchNeededSent.Find( pchId ) || IsPchCached( pchId ) || IsPchBeingReceived( pchId ) )
     {
-        return;
+        return false;
     }
 
     // Once until it arrives: the client sends it again when asked, and the chunks take a while
@@ -1114,8 +1284,7 @@ void Server::RequestPchIfMissing( ClientState & cs, uint64_t pchId )
     FLOG_VERBOSE( "PCH 0x%016" PRIx64 " is needed by a job from '%s' and is not cached: asking for it\n",
                   pchId, cs.m_HostName.Get() );
     m_Log.Write( "pch needed id=0x%016" PRIx64 " host=%s", pchId, cs.m_HostName.Get() );
-    const Protocol::MsgPchNeeded msg( pchId );
-    SendTo( cs, msg );
+    return true;
 }
 
 // IsPchBeingReceived
@@ -1151,7 +1320,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
     m_NumPchChunksReceived.Increment();
 
     AStackString pchFilePath;
-    if ( BuildPchFilePath( pchId, pchFilePath ) == false )
+    if ( BuildPchFilePath( m_CacheDir, pchId, pchFilePath ) == false )
     {
         LogWarning( "Failed to get temp dir for PCH cache\n" );
         Disconnect( connection );
@@ -1254,9 +1423,17 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
                      pchId, pchFilePath.Get(), alreadyCached ? "disk" : "new" );
     }
 
+    if ( m_Forwarder )
+    {
+        m_Forwarder->OnPchStored( pchId, msg->GetUncompressedSize(), msg->GetCompressedSize() );
+    }
+
     // Release any jobs that were waiting for this PCH
     ReleaseReadyWaitingJobs();
-    JobQueueRemote::Get().WakeMainThread();
+    if ( m_JobQueueRemote )
+    {
+        m_JobQueueRemote->WakeMainThread();
+    }
 }
 
 // ScanPchCache
@@ -1272,13 +1449,8 @@ void Server::ScanPchCache()
     }
     m_PchCacheScanned = true;
 
-    AStackString basePath;
-    if ( FBuild::GetWorkerCacheDir( basePath ) == false )
-    {
-        return;
-    }
-
-    if ( FileIO::DirectoryExists( basePath ) == false )
+    const AString & basePath = m_CacheDir;
+    if ( basePath.IsEmpty() || ( FileIO::DirectoryExists( basePath ) == false ) )
     {
         return;
     }
@@ -1965,7 +2137,10 @@ void Server::UnpackPch( uint64_t pchId )
     }
 
     ReleaseReadyWaitingJobs();
-    JobQueueRemote::Get().WakeMainThread();
+    if ( m_JobQueueRemote )
+    {
+        m_JobQueueRemote->WakeMainThread();
+    }
 }
 
 // DisconnectClientsWaitingForPch
@@ -2093,7 +2268,10 @@ void Server::ThreadFunc()
 {
     while ( m_ShouldExit.Load() == false )
     {
-        FinalizeCompletedJobs();
+        if ( m_JobQueueRemote )
+        {
+            FinalizeCompletedJobs();
+        }
 
         TouchToolchains();
 
@@ -2104,7 +2282,14 @@ void Server::ThreadFunc()
             TrimRawPchs( Time::GetCurrentFileTime() );
         }
 
-        JobQueueRemote::Get().MainThreadWait( 100 );
+        if ( m_JobQueueRemote )
+        {
+            m_JobQueueRemote->MainThreadWait( 100 );
+        }
+        else
+        {
+            Thread::Sleep( 100 );
+        }
     }
 }
 
@@ -2114,7 +2299,7 @@ void Server::FinalizeCompletedJobs()
 {
     PROFILE_FUNCTION;
 
-    JobQueueRemote & jcr = JobQueueRemote::Get();
+    JobQueueRemote & jcr = *m_JobQueueRemote;
     Node::BuildResult result;
     while ( Job * job = jcr.GetCompletedJob( result ) )
     {
@@ -2188,7 +2373,7 @@ void Server::RecalculateCapacityLocked()
 {
     // Caller must hold m_ClientListMutex
     const uint32_t numClients = (uint32_t)m_ClientList.GetSize();
-    if ( numClients == 0 )
+    if ( ( numClients == 0 ) || m_Forwarder ) // A gateway offers every client its whole pool
     {
         return;
     }
