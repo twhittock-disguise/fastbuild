@@ -71,10 +71,6 @@ public:
     };
     void GetStats( Stats & outStats ) const;
 
-    // Runs before each PCH found at start is measured, so a test can hold the measurement until quit is set
-    typedef void ( *MeasureTestHook )( const Atomic<bool> & quit );
-    static void SetMeasureTestHook( MeasureTestHook hook ) { s_MeasureTestHook = hook; }
-
 private:
     // Server::Forwarder
     virtual uint32_t GetPoolSlots() const override;
@@ -251,6 +247,8 @@ private:
     Thread                  m_MeasureThread;    // Started if the store held PCHs at start, as measuring them can take minutes
     Atomic<bool>            m_Quit{ false };
 
+    // Runs before each PCH found at start is measured, so a test can hold the measurement until quit is set
+    typedef void ( *MeasureTestHook )( const Atomic<bool> & quit );
     inline static MeasureTestHook s_MeasureTestHook = nullptr;
 };
 

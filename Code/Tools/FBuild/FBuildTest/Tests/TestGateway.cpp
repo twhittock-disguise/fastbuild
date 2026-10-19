@@ -2097,6 +2097,20 @@ void TestGateway::DroppingAnIncompleteToolchainKeepsItsPins() const
 //------------------------------------------------------------------------------
 namespace
 {
+    // Runs its function when it goes out of scope, so a test hook is cleared however the test ends
+    template <class FUNCTION>
+    class AtScopeEnd
+    {
+    public:
+        explicit AtScopeEnd( FUNCTION function ) : m_Function( function ) {}
+        ~AtScopeEnd() { m_Function(); }
+        explicit AtScopeEnd( const AtScopeEnd & other ) = delete;
+        AtScopeEnd & operator=( const AtScopeEnd & other ) = delete;
+
+    private:
+        FUNCTION m_Function;
+    };
+
     struct StalledDelete
     {
         static void Hook( void * param )
@@ -2162,7 +2176,9 @@ void TestGateway::ReUploadDuringAPendingDeleteEndsIntact() const
 
     // Toolchain 1 is evicted, and its directory delete stalls
     StalledDelete stall;
-    stash.SetBeforeDeleteHook( StalledDelete::Hook, &stall );
+    stash.m_BeforeDelete = StalledDelete::Hook;
+    stash.m_BeforeDeleteUserData = &stall;
+    const AtScopeEnd clearHook( [ &stash ]() { stash.m_BeforeDelete = nullptr; stash.m_BeforeDeleteUserData = nullptr; } );
     StashUploader uploader;
     uploader.m_Stash = &stash;
     Thread evictor;
@@ -2178,7 +2194,6 @@ void TestGateway::ReUploadDuringAPendingDeleteEndsIntact() const
     evictor.Join();
     const bool done = WaitUntil( [ &uploader ]() { return uploader.m_Done.Load(); } );
     reuploader.Join();
-    stash.SetBeforeDeleteHook( nullptr, nullptr );
     TEST_ASSERT( done );
 
     // What the delete removed is what was evicted, not what arrived
@@ -4180,7 +4195,8 @@ void TestGateway::HousekeepingRunsWhileStoredPchsAreMeasured() const
     TEST_ASSERT( WriteStoredPch( config.m_CacheDir, pch.m_Id, pch.m_Compressed.GetResult(), pch.m_CompressedSize ).IsEmpty() == false );
     s_HeldMeasurements.Store( 0 );
     s_MeasurementsReleased.Store( false );
-    Gateway::SetMeasureTestHook( HoldStoredPchMeasurement );
+    Gateway::s_MeasureTestHook = HoldStoredPchMeasurement;
+    const AtScopeEnd clearHook( []() { Gateway::s_MeasureTestHook = nullptr; } );
 
     // Not listening when the gateway starts
     EchoWorker worker( 2, EchoWorker::ANSWER_NEVER );
@@ -4227,7 +4243,6 @@ void TestGateway::HousekeepingRunsWhileStoredPchsAreMeasured() const
         TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
         probe.ShutdownAllConnections();
     }
-    Gateway::SetMeasureTestHook( nullptr );
 
     AString log;
     TEST_ASSERT( ReadWholeFile( logPath, log ) );

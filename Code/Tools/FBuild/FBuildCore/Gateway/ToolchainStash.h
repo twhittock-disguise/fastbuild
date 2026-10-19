@@ -42,10 +42,9 @@ public:
     void ReleaseUse( uint64_t toolId );
     void DropIncomplete( uint64_t toolId );
 
-    // Called, with no lock held, before the directories of removed toolchains are deleted (tests stall it)
-    void SetBeforeDeleteHook( void ( *hook )( void * ), void * userData ) { m_BeforeDelete = hook; m_BeforeDeleteUserData = userData; }
-
 private:
+    friend class TestGateway;
+
     enum SlotState : uint8_t { SLOT_EMPTY, SLOT_WRITING, SLOT_HELD };
 
     struct Entry
@@ -85,6 +84,8 @@ private:
     Array<uint32_t>     m_PinCounts;
     Array<uint64_t>     m_Deleting;     // Removed toolchains whose directory is not yet deleted
     mutable uint64_t    m_Clock = 0;
+
+    // Called, with no lock held, before the directories of removed toolchains are deleted (tests stall it)
     void ( *m_BeforeDelete )( void * ) = nullptr;
     void *              m_BeforeDeleteUserData = nullptr;
 };
