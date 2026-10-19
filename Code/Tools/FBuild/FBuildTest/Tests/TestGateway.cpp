@@ -5512,9 +5512,21 @@ void TestGateway::JobsWaitingWithNoWorkersAreReturned() const
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
         TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Running == 1 ) && ( s.m_Waiting == 1 ); } ) );
 
-        // The only worker goes and does not come back: the job it held is retried, and both wait for nothing
+        // The only worker goes and does not come back. Until the gateway is told it is lost, which retries the job
+        // it held, the job waiting for it does not count as having no worker.
         const Timer timer;
-        worker.ShutdownAllConnections();
+        bool countedWithoutWorker = true;
+        {
+            MutexHolder mh( gateway.m_Mutex ); // Holds back the loss
+            DownstreamConnection * connection = gateway.m_Workers[ 0 ].m_Connection;
+            worker.ShutdownAllConnections();
+            TEST_ASSERT( WaitUntil( [ connection ]() { return connection->HasEnded(); } ) );
+            Gateway::Actions actions;
+            gateway.GiveUpJobsNoWorkerCanTake( actions );
+            const Gateway::GatewayJob * waiting = gateway.FindJob( 2 ); // Client job 6
+            countedWithoutWorker = waiting && waiting->m_NoWorker;
+        }
+        TEST_ASSERT( countedWithoutWorker == false );
         TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 2 ); } ) );
 
         // Once the bound has passed, each goes back to the client flagged, so it requeues it and keeps the gateway

@@ -100,6 +100,13 @@ bool DownstreamConnection::HasEnded() const
     return m_Ended.Load();
 }
 
+// IsClosing
+//------------------------------------------------------------------------------
+bool DownstreamConnection::IsClosing() const
+{
+    return m_Ended.Load() || m_SendQueue.IsQuitting();
+}
+
 // GetAddress
 //------------------------------------------------------------------------------
 const AString & DownstreamConnection::GetAddress() const
@@ -133,7 +140,7 @@ uint32_t DownstreamConnection::GetPoolSlots() const
 void DownstreamConnection::UpdateDemand( uint32_t waiting, uint32_t inFlight )
 {
     // The first demand follows the inventories, as a client's does
-    if ( ( m_Ready.Load() == false ) || m_Ended.Load() || m_SendQueue.IsQuitting() )
+    if ( ( m_Ready.Load() == false ) || IsClosing() )
     {
         return;
     }
@@ -151,7 +158,7 @@ void DownstreamConnection::UpdateDemand( uint32_t waiting, uint32_t inFlight )
 //------------------------------------------------------------------------------
 GatewayScheduler::Affinity DownstreamConnection::GetAffinity( uint64_t pchId, uint64_t toolId ) const
 {
-    if ( ( m_Ready.Load() == false ) || m_Ended.Load() || m_SendQueue.IsQuitting() )
+    if ( ( m_Ready.Load() == false ) || IsClosing() )
     {
         return GatewayScheduler::AFFINITY_UNABLE;
     }

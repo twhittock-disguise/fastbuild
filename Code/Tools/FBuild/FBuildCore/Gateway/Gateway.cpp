@@ -1294,6 +1294,10 @@ void Gateway::GiveUpJobsNoWorkerCanTake( Actions & actions )
     {
         const Worker & worker = m_Workers[ i ];
         const uint32_t index = (uint32_t)( i + 1 );
+        if ( worker.m_Ready && worker.m_Connection && worker.m_Connection->IsClosing() )
+        {
+            return; // Until it is lost, which decides what happens to the jobs it runs, no job counts as without a worker
+        }
         if ( worker.m_Ready && worker.m_Connection && ( worker.m_Connection->GetPoolSlots() > CountExpiredAttempts( index ) ) )
         {
             ableWorkers.Append( index );

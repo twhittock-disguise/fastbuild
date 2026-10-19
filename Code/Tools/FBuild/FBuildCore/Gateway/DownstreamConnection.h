@@ -79,6 +79,7 @@ public:
     void Close( const char * reason );
     const char * GetCloseReason() const;   // The first given, or null
     bool HasEnded() const;
+    bool IsClosing() const;                // Closed or ended, so it takes no more jobs: the owner is told it is lost, if it has not been yet
     const AString & GetAddress() const;
     uint32_t GetIndex() const;
     uint32_t GetAllowance() const;         // The slots the worker gives the gateway: the ack's, then the last MSG_CAPACITY's
