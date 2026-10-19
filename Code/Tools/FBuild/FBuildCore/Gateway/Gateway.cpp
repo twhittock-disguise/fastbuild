@@ -223,7 +223,6 @@ void Gateway::GetStats( Stats & outStats ) const
 
     MutexHolder mh( m_Mutex );
     Client & client = FindOrAddClient( clientId );
-    client.m_OfferedSlots = m_PoolSlots.Load(); // As the ack just sent it (Server::Process( MsgConnection ))
     for ( const uint64_t toolId : outToolIds )
     {
         client.m_Pins.Append( toolId );
@@ -262,6 +261,9 @@ void Gateway::GetStats( Stats & outStats ) const
         job->m_PchLease = m_Server->AcquirePchLease( pchId );
     }
 
+    // Jobs sent before the client learnt of a smaller allowance arrive after it, so the bound is the largest
+    const uint32_t maxAllowance = m_Server->GetMaxAllowance( clientId );
+
     Actions actions;
     {
         MutexHolder mh( m_Mutex );
@@ -270,12 +272,12 @@ void Gateway::GetStats( Stats & outStats ) const
         {
             actions.m_FreeJobs.Append( job );
         }
-        else if ( client->m_NumJobs >= ( kMaxHeldJobsPerSlot * client->m_OfferedSlots ) )
+        else if ( client->m_NumJobs >= ( kMaxHeldJobsPerSlot * maxAllowance ) )
         {
             actions.m_FreeJobs.Append( job );
             actions.m_Disconnects.Append( clientId );
             AStackString<> line;
-            line.Format( "gateway client-dropped client=%u reason=held-jobs held=%u", clientId, client->m_NumJobs );
+            line.Format( "gateway client-dropped client=%u reason=held-jobs held=%u allowance=%u", clientId, client->m_NumJobs, maxAllowance );
             actions.m_LogLines.EmplaceBack( line.Get() );
         }
         else
@@ -454,20 +456,30 @@ void Gateway::GetStats( Stats & outStats ) const
     {
         MutexHolder mh( m_Mutex );
         Worker * worker = FindWorker( connection );
-        const uint32_t slots = connection.GetCapacity();
-        if ( ( worker == nullptr ) || worker->m_Ready || worker->m_Lost || ( slots == 0 ) || m_ShuttingDown )
+        if ( ( worker == nullptr ) || worker->m_Ready || worker->m_Lost || m_ShuttingDown )
         {
             return;
         }
+        UpdateWorker( *worker, connection, actions );
+        Dispatch( actions );
+    }
+    Run( actions );
+}
 
-        // Only while it has slots: a job that failed elsewhere would wait for a registered worker
-        worker->m_Ready = true;
-        m_Scheduler.SetWorkerSlots( connection.GetIndex(), slots );
-        UpdatePool();
-
-        AStackString<> line;
-        line.Format( "gateway worker-ready worker=%s slots=%u", connection.GetAddress().Get(), slots );
-        actions.m_LogLines.EmplaceBack( line.Get() );
+// OnDownstreamCapacity
+//------------------------------------------------------------------------------
+/*virtual*/ void Gateway::OnDownstreamCapacity( DownstreamConnection & connection, uint32_t /*allowance*/, uint32_t /*poolSlots*/ )
+{
+    Actions actions;
+    {
+        // A connection no longer in the table has been replaced, and one that has ended is out of the scheduler
+        MutexHolder mh( m_Mutex );
+        Worker * worker = FindWorker( connection );
+        if ( ( worker == nullptr ) || worker->m_Lost || connection.HasEnded() || m_ShuttingDown )
+        {
+            return;
+        }
+        UpdateWorker( *worker, connection, actions ); // From what the connection holds now
         Dispatch( actions );
     }
     Run( actions );
@@ -568,35 +580,70 @@ void Gateway::GetStats( Stats & outStats ) const
             return;
         }
 
-        // Out of the scheduler and the pool, then what it was building is tried elsewhere
-        const uint32_t index = connection.GetIndex();
-        worker->m_Ready = false;
-        Array<uint32_t> runningJobIds;
-        m_Scheduler.RemoveWorker( index, runningJobIds );
-        UpdatePool();
-
         const char * reason = connection.GetCloseReason();
-        AStackString<> line;
-        line.Format( "gateway worker-lost worker=%s reason=%s running=%u", connection.GetAddress().Get(), reason ? reason : "disconnected", (uint32_t)runningJobIds.GetSize() );
-        actions.m_LogLines.EmplaceBack( line.Get() );
-
-        for ( size_t i = m_Attempts.GetSize(); i > 0; --i )
-        {
-            const Attempt attempt = m_Attempts[ i - 1 ];
-            if ( attempt.m_WorkerIndex != index )
-            {
-                continue;
-            }
-            m_Attempts.EraseIndex( i - 1 ); // An expired one has no slot to give back now
-            GatewayJob * job = attempt.m_Expired ? nullptr : FindJob( attempt.m_JobId );
-            if ( job && FailAttempt( *job, index, "lost", actions ) )
-            {
-                GiveUpWithoutResult( *job, actions );
-            }
-        }
+        RemoveWorker( *worker, connection, reason ? reason : "disconnected", actions );
         Dispatch( actions );
     }
     Run( actions );
+}
+
+// UpdateWorker
+//------------------------------------------------------------------------------
+void Gateway::UpdateWorker( Worker & worker, DownstreamConnection & connection, Actions & actions )
+{
+    // A worker with a pool stays in the scheduler while its allowance is 0, so the jobs waiting for it are
+    // its demand. One without leaves it: a job that failed elsewhere would wait for a registered worker.
+    const uint32_t poolSlots = connection.GetPoolSlots();
+    const uint32_t allowance = connection.GetAllowance();
+    if ( poolSlots == 0 )
+    {
+        if ( worker.m_Ready )
+        {
+            RemoveWorker( worker, connection, "no-slots", actions );
+        }
+        return;
+    }
+
+    m_Scheduler.SetWorkerSlots( connection.GetIndex(), allowance );
+    if ( worker.m_Ready == false )
+    {
+        worker.m_Ready = true;
+        AStackString<> line;
+        line.Format( "gateway worker-ready worker=%s slots=%u pool=%u", connection.GetAddress().Get(), allowance, poolSlots );
+        actions.m_LogLines.EmplaceBack( line.Get() );
+    }
+    UpdatePool();
+}
+
+// RemoveWorker
+//------------------------------------------------------------------------------
+void Gateway::RemoveWorker( Worker & worker, DownstreamConnection & connection, const char * reason, Actions & actions )
+{
+    // Out of the scheduler and the pool, then what it was building is tried elsewhere
+    const uint32_t index = connection.GetIndex();
+    worker.m_Ready = false;
+    Array<uint32_t> runningJobIds;
+    m_Scheduler.RemoveWorker( index, runningJobIds );
+    UpdatePool();
+
+    AStackString<> line;
+    line.Format( "gateway worker-lost worker=%s reason=%s running=%u", connection.GetAddress().Get(), reason, (uint32_t)runningJobIds.GetSize() );
+    actions.m_LogLines.EmplaceBack( line.Get() );
+
+    for ( size_t i = m_Attempts.GetSize(); i > 0; --i )
+    {
+        const Attempt attempt = m_Attempts[ i - 1 ];
+        if ( attempt.m_WorkerIndex != index )
+        {
+            continue;
+        }
+        m_Attempts.EraseIndex( i - 1 ); // An expired one has no slot to give back now. A late result is dropped.
+        GatewayJob * job = attempt.m_Expired ? nullptr : FindJob( attempt.m_JobId );
+        if ( job && FailAttempt( *job, index, connection.HasEnded() ? "lost" : reason, actions ) )
+        {
+            GiveUpWithoutResult( *job, actions );
+        }
+    }
 }
 
 // FindPch
@@ -686,6 +733,10 @@ void Gateway::Run( Actions & actions )
     for ( const AString & line : actions.m_LogLines )
     {
         m_Server->GetLog().Write( "%s", line.Get() );
+    }
+    for ( const Actions::Demand & demand : actions.m_Demands )
+    {
+        demand.m_Connection->UpdateDemand( demand.m_Waiting, demand.m_InFlight );
     }
 }
 
@@ -1063,12 +1114,36 @@ bool Gateway::CanAnyWorkerTakeAJob() const
         {
             hung += ( attempt.m_Expired && ( attempt.m_WorkerIndex == index ) ) ? 1 : 0;
         }
-        if ( worker.m_Connection->GetCapacity() > hung )
+        if ( worker.m_Connection->GetPoolSlots() > hung ) // Its allowance follows the gateway's demand
         {
             return true;
         }
     }
     return false;
+}
+
+// CollectDemands
+//------------------------------------------------------------------------------
+void Gateway::CollectDemands( Actions & actions )
+{
+    // A worker's demand is the jobs it could take that wait, and those it runs, expired or not. Every worker
+    // is reported: one that is not ready (or has no pool) has nothing waiting for it.
+    const WorkerAffinity affinity( *this );
+    for ( size_t i = 0; i < m_Workers.GetSize(); ++i )
+    {
+        DownstreamConnection * connection = m_Workers[ i ].m_Connection;
+        if ( connection == nullptr )
+        {
+            continue;
+        }
+        const uint32_t index = (uint32_t)( i + 1 );
+        uint32_t inFlight = 0;
+        for ( const Attempt & attempt : m_Attempts )
+        {
+            inFlight += ( attempt.m_WorkerIndex == index ) ? 1 : 0;
+        }
+        actions.m_Demands.Append( Actions::Demand{ connection, m_Scheduler.GetNumWaitingFor( index, affinity ), inFlight } );
+    }
 }
 
 // UpdatePool
@@ -1082,7 +1157,7 @@ void Gateway::UpdatePool()
         {
             if ( worker.m_Ready && worker.m_Connection && ( worker.m_Connection->HasEnded() == false ) )
             {
-                slots += worker.m_Connection->GetCapacity();
+                slots += worker.m_Connection->GetPoolSlots();
             }
         }
     }
@@ -1218,9 +1293,10 @@ void Gateway::FormatStats( AString & outLine ) const
 //------------------------------------------------------------------------------
 void Gateway::HousekeepingThreadFunc()
 {
-    // Often enough for the watchdog, the reconnect delay and the no-worker bound to be kept to within a quarter of the shortest
+    // Often enough for the demand reports, and for the watchdog, the reconnect delay and the no-worker bound to be
+    // kept to within a quarter of the shortest
     const float shortest = Math::Min( Math::Min( m_Config.m_JobTimeoutSeconds, m_Config.m_ReconnectSeconds ), m_Config.m_NoWorkerGiveUpSeconds );
-    const uint32_t tickMs = Math::Clamp( (uint32_t)( shortest * 1000.0f / 4.0f ), 10u, 1000u );
+    const uint32_t tickMs = Math::Clamp( (uint32_t)( shortest * 1000.0f / 4.0f ), 10u, kDemandTickMs );
 
     Timer statsTimer;
     while ( m_Quit.Load() == false )
@@ -1240,6 +1316,7 @@ void Gateway::HousekeepingThreadFunc()
             {
                 ExpireHungAttempts( actions );
                 GiveUpJobsNoWorkerCanTake( actions );
+                CollectDemands( actions );
             }
             UpdatePool();
             if ( statsTimer.GetElapsed() >= m_Config.m_StatsSeconds )

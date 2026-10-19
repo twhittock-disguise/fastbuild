@@ -114,11 +114,37 @@ uint32_t DownstreamConnection::GetIndex() const
     return m_Index;
 }
 
-// GetCapacity
+// GetAllowance
 //------------------------------------------------------------------------------
-uint32_t DownstreamConnection::GetCapacity() const
+uint32_t DownstreamConnection::GetAllowance() const
 {
-    return m_Capacity.Load();
+    return m_Allowance.Load();
+}
+
+// GetPoolSlots
+//------------------------------------------------------------------------------
+uint32_t DownstreamConnection::GetPoolSlots() const
+{
+    return m_PoolSlots.Load();
+}
+
+// UpdateDemand
+//------------------------------------------------------------------------------
+void DownstreamConnection::UpdateDemand( uint32_t waiting, uint32_t inFlight )
+{
+    // The first demand follows the inventories, as a client's does
+    if ( ( m_Ready.Load() == false ) || m_Ended.Load() || m_SendQueue.IsQuitting() )
+    {
+        return;
+    }
+
+    const float now = m_DemandTimer.GetElapsed();
+    const uint32_t demand = m_DemandRamp.Update( waiting, inFlight, now );
+    if ( m_DemandRamp.ShouldSend( demand, now ) )
+    {
+        m_SendQueue.Push( SendQueueItem( Protocol::MsgDemand( demand ) ) );
+        m_DemandRamp.OnSent( demand, now );
+    }
 }
 
 // GetAffinity
@@ -331,7 +357,14 @@ void DownstreamConnection::OnJobCompleted( uint64_t pchId )
             }
             case Protocol::MSG_CAPACITY:
             {
-                break; // The gateway keeps to the slots of the ack
+                const Protocol::MsgCapacity * msg = static_cast<const Protocol::MsgCapacity *>( imsg );
+                m_Allowance.Store( msg->GetAllowance() );
+                m_PoolSlots.Store( msg->GetPoolSlots() );
+                if ( m_Ready.Load() ) // Before that, the owner reads them when told the connection is ready
+                {
+                    m_Owner.OnDownstreamCapacity( *this, msg->GetAllowance(), msg->GetPoolSlots() );
+                }
+                break;
             }
             default:
             {
@@ -358,7 +391,8 @@ void DownstreamConnection::Process( const Protocol::MsgConnectionAck * msg, uint
         return;
     }
     m_AckReceived = true;
-    m_Capacity.Store( msg->GetWorkerCapacity() );
+    m_Allowance.Store( msg->GetWorkerCapacity() ); // Both, until the worker sends a MSG_CAPACITY
+    m_PoolSlots.Store( msg->GetWorkerCapacity() );
 }
 
 // ProcessInventory

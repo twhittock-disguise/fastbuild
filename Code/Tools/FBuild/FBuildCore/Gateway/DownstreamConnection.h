@@ -8,6 +8,7 @@
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayScheduler.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
 #include "Tools/FBuild/FBuildCore/Protocol/WorkerSendQueue.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/DemandRamp.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/PchDispatch.h"
 
 // Core
@@ -17,6 +18,7 @@
 #include "Core/Process/Mutex.h"
 #include "Core/Process/Thread.h"
 #include "Core/Strings/AString.h"
+#include "Core/Time/Timer.h"
 
 // Forward Declarations
 //------------------------------------------------------------------------------
@@ -41,7 +43,8 @@ struct StoredPch
 // happens to the jobs it had sent.
 //
 // The send thread connects, sends the handshake and then the queue. The receive thread handles
-// what the worker sends. A worker's MSG_PCH_NEEDED is answered from the owner's store.
+// what the worker sends. A worker's MSG_PCH_NEEDED is answered from the owner's store. As any client
+// does, the gateway reports its demand on the worker, which shares its slots out by demand.
 //------------------------------------------------------------------------------
 class DownstreamConnection : public TCPConnectionPool, private WorkerSendQueue::Listener
 {
@@ -58,6 +61,8 @@ public:
         virtual bool FindPch( uint64_t pchId, StoredPch & outPch, PchLease & outLease ) = 0;
         virtual bool FindToolchainFile( uint64_t toolId, uint32_t fileId, AString & outPath, uint32_t & outSize ) = 0;
         virtual uint32_t GetToolchainNumFiles( uint64_t toolId ) = 0;    // The Gateway answers from ToolchainStash::GetNumFiles
+        // A MSG_CAPACITY once the connection is ready. One that comes before is in what the connection reports when ready.
+        virtual void OnDownstreamCapacity( DownstreamConnection & /*connection*/, uint32_t /*allowance*/, uint32_t /*poolSlots*/ ) {}
     protected:
         ~Owner() = default;
     };
@@ -76,8 +81,13 @@ public:
     bool HasEnded() const;
     const AString & GetAddress() const;
     uint32_t GetIndex() const;
-    uint32_t GetCapacity() const;          // Phase A: the ack's capacity
+    uint32_t GetAllowance() const;         // The slots the worker gives the gateway: the ack's, then the last MSG_CAPACITY's
+    uint32_t GetPoolSlots() const;         // The worker's whole pool: the ack's capacity, then the last MSG_CAPACITY's
     GatewayScheduler::Affinity GetAffinity( uint64_t pchId, uint64_t toolId ) const;
+
+    // Reports the gateway's demand on the worker through a DemandRamp, once the connection is ready.
+    // The owner's housekeeping thread only.
+    void UpdateDemand( uint32_t waiting, uint32_t inFlight );
 
     // Queues the job's toolchain unless the worker has it, then the PCH unless the worker has it or it is
     // on its way, then the job. A job whose PCH is not on the worker yet waits here until the PCH's last
@@ -117,8 +127,11 @@ private:
     Atomic<bool> m_SendThreadDone{ false };     // It no longer uses the connection
     Atomic<bool> m_Ended{ false };
     Atomic<bool> m_Ready{ false };
-    Atomic<uint32_t> m_Capacity{ 0 };
+    Atomic<uint32_t> m_Allowance{ 0 };
+    Atomic<uint32_t> m_PoolSlots{ 0 };
     const Protocol::IMessage * m_CurrentMessage = nullptr; // Receive thread: a header whose payload is next
+    DemandRamp m_DemandRamp;    // UpdateDemand's thread only. Its time is m_DemandTimer's.
+    const Timer m_DemandTimer;
 
     // Receive thread: the handshake as far as it has come
     bool m_AckReceived = false;

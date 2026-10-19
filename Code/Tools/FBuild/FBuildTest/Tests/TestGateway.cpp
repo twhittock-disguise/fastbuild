@@ -34,6 +34,7 @@
 #include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/FileStream.h"
 #include "Core/FileIO/MemoryStream.h"
+#include "Core/Math/Conversions.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
@@ -328,6 +329,14 @@ namespace
         return true;
     }
 
+    // Whether the last MSG_CAPACITY the probe received carried these
+    bool LastCapacityIs( const DistributedTest::HandshakeProbe & probe, uint32_t allowance, uint32_t poolSlots )
+    {
+        Array<DistributedTest::HandshakeProbe::CapacityUpdate> updates;
+        probe.GetCapacityUpdates( updates );
+        return ( updates.IsEmpty() == false ) && ( updates.Top().m_Allowance == allowance ) && ( updates.Top().m_PoolSlots == poolSlots );
+    }
+
     size_t CountFilesUnder( const AString & directory )
     {
         Array<AString> files;
@@ -474,6 +483,14 @@ private:
     void RampStartsSmallAndGrows() const;
     void RampFallsWhenNothingWaits() const;
     void RampReportsOnlyRealChanges() const;
+    void DownstreamReportsDemandAndTakesItsAllowance() const;
+    void DownstreamKeepsACapacityThatComesBeforeItIsReady() const;
+    void GatewayPoolIsTheSumOfItsWorkerPools() const;
+    void WorkerWithoutSlotsLeavesTheScheduler() const;
+    void SharesMoveWithDemandThroughTheGateway() const;
+    void ReducedAllowanceKeepsTheJobsAClientHolds() const;
+    void GatewayDemandSharesADownstreamWorker() const;
+    void ClientWithoutAllowanceLearnsANewPool() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -507,6 +524,8 @@ private:
     static void MakeFailureConfig( uint32_t numWorkers, GatewayConfig & outConfig );
     static Gateway::Stats GetGatewayStats( const Gateway & gateway );
     static bool WaitForReadyWorkers( const Gateway & gateway, uint32_t numWorkers );
+    static uint32_t GetSchedulerSlots( const Gateway & gateway ); // Of every worker in the gateway's scheduler
+    static uint32_t WatchTheShares( void * param ); // A ShareWatch
     // A stored PCH that does not hold what its id says is dropped at start, and asked of the client
     static void CheckStoredPchIsDropped( const void * storedData, size_t storedSize, const DistributedTest::CompressedPch & pch );
 
@@ -630,6 +649,14 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( RampStartsSmallAndGrows )
     REGISTER_TEST( RampFallsWhenNothingWaits )
     REGISTER_TEST( RampReportsOnlyRealChanges )
+    REGISTER_TEST( DownstreamReportsDemandAndTakesItsAllowance )
+    REGISTER_TEST( DownstreamKeepsACapacityThatComesBeforeItIsReady )
+    REGISTER_TEST( GatewayPoolIsTheSumOfItsWorkerPools )
+    REGISTER_TEST( WorkerWithoutSlotsLeavesTheScheduler )
+    REGISTER_TEST( SharesMoveWithDemandThroughTheGateway )
+    REGISTER_TEST( ReducedAllowanceKeepsTheJobsAClientHolds )
+    REGISTER_TEST( GatewayDemandSharesADownstreamWorker )
+    REGISTER_TEST( ClientWithoutAllowanceLearnsANewPool )
 REGISTER_TESTS_END
 
 // PreTest
@@ -1191,23 +1218,28 @@ void TestGateway::GatewayAdvertisesTheForwarderPool() const
     Server s( forwarder, cacheDir );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
+    // A new client is given its share of the demand it is assumed to have, and ramps up from there
     DistributedTest::HandshakeProbe a;
-    const uint32_t idA = ConnectProbe( s, a );
+    const ConnectionInfo * ciA = nullptr;
+    const uint32_t idA = ConnectProbe( s, a, &ciA );
     TEST_ASSERT( idA != 0 );
     TEST_ASSERT( a.GetNumMessages() == 3 );
     TEST_ASSERT( a.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
     TEST_ASSERT( a.GetMessageType( 1 ) == Protocol::MSG_PCH_INVENTORY );
     TEST_ASSERT( a.GetMessageType( 2 ) == Protocol::MSG_TOOLCHAIN_INVENTORY );
-    TEST_ASSERT( a.GetAckCapacity() == 340 );
+    TEST_ASSERT( a.GetAckCapacity() == FairShareAllocator::kInitialDemand );
     Array<uint64_t> advertised;
     a.GetToolchainIds( advertised );
     TEST_ASSERT( ( advertised.GetSize() == 2 ) && ( advertised[ 0 ] == 0x11 ) && ( advertised[ 1 ] == 0x22 ) );
 
-    // Every client is offered the whole pool
+    // The forwarder's pool is what is shared
+    TEST_ASSERT( a.SendDemand( ciA, 340 ) );
+    TEST_ASSERT( WaitUntil( [ &a ]() { return LastCapacityIs( a, 340, 340 ); } ) );
+
     DistributedTest::HandshakeProbe b;
     const uint32_t idB = ConnectProbe( s, b );
     TEST_ASSERT( ( idB != 0 ) && ( idB != idA ) );
-    TEST_ASSERT( b.GetAckCapacity() == 340 );
+    TEST_ASSERT( b.GetAckCapacity() == FairShareAllocator::kInitialDemand );
 
     Array<uint32_t> inventoryClients;
     forwarder.GetInventoryClients( inventoryClients );
@@ -1237,7 +1269,7 @@ void TestGateway::GatewayWithoutCapacityClosesTheHandshake() const
     // Closed without an ack, so the client builds elsewhere
     TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
     TEST_ASSERT( probe.GetNumMessages() == 0 );
-    TEST_ASSERT( forwarder.GetNumPoolSlotQueries() == 1 );
+    TEST_ASSERT( forwarder.GetNumPoolSlotQueries() >= 1 ); // The Server also reads it on every tick, to share it out
     Array<uint32_t> inventoryClients;
     forwarder.GetInventoryClients( inventoryClients );
     TEST_ASSERT( inventoryClients.IsEmpty() );
@@ -1276,7 +1308,11 @@ void TestGateway::GatewayRefusesAClientOfAnotherMajor() const
     TEST_ASSERT( probe.GetNumMessages() == 1 );
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_REFUSED );
     TEST_ASSERT( probe.GetRefusedMajor() == Protocol::kVersionMajor );
-    TEST_ASSERT( forwarder.GetNumPoolSlotQueries() == 0 );
+
+    // The forwarder never took it on (the Server reads the pool on every tick, so the reads do not tell)
+    Array<uint32_t> inventoryClients;
+    forwarder.GetInventoryClients( inventoryClients );
+    TEST_ASSERT( inventoryClients.IsEmpty() );
 }
 
 // GatewayHandsDecodedJobsToTheForwarder
@@ -3113,6 +3149,7 @@ namespace
         uint32_t GetNumPchLookups() const { return m_NumPchLookups.Load(); }
         GatewayScheduler::Affinity GetAffinityWhenReady() const { MutexHolder mh( m_Mutex ); return m_AffinityWhenReady; }
         uint32_t GetCapacityWhenReady() const { MutexHolder mh( m_Mutex ); return m_CapacityWhenReady; }
+        void GetCapacityUpdates( Array<uint32_t> & out ) const { MutexHolder mh( m_Mutex ); out = m_CapacityUpdates; } // Allowance, pool, in pairs
         void GetResults( Array<GatewayWire::ResultHeader> & out ) const { MutexHolder mh( m_Mutex ); out = m_Results; }
         size_t GetNumResults() const { MutexHolder mh( m_Mutex ); return m_Results.GetSize(); }
         bool WasAnyResultCompressed() const { MutexHolder mh( m_Mutex ); return m_AnyCompressed; }
@@ -3133,8 +3170,14 @@ namespace
         {
             MutexHolder mh( m_Mutex );
             m_AffinityWhenReady = connection.GetAffinity( m_ReadyPchId, m_ReadyToolId );
-            m_CapacityWhenReady = connection.GetCapacity();
+            m_CapacityWhenReady = connection.GetAllowance();
             m_NumReady.Increment();
+        }
+        virtual void OnDownstreamCapacity( DownstreamConnection &, uint32_t allowance, uint32_t poolSlots ) override
+        {
+            MutexHolder mh( m_Mutex );
+            m_CapacityUpdates.Append( allowance );
+            m_CapacityUpdates.Append( poolSlots );
         }
         virtual void OnDownstreamResult( DownstreamConnection &, bool compressed, void * payload, uint32_t payloadSize ) override
         {
@@ -3195,6 +3238,7 @@ namespace
         mutable Mutex m_Mutex;
         GatewayScheduler::Affinity m_AffinityWhenReady = GatewayScheduler::AFFINITY_UNABLE;
         uint32_t m_CapacityWhenReady = 0;
+        Array<uint32_t> m_CapacityUpdates; // Allowance, pool, in pairs
         Array<GatewayWire::ResultHeader> m_Results;
         bool m_AnyCompressed = false;
         Atomic<uint32_t> m_NumReady{ 0 };
@@ -3265,7 +3309,7 @@ void TestGateway::DownstreamBecomesReadyWithTheWorkerInventories() const
         AStackString<> address;
         address.Format( "127.0.0.1:%u", (uint32_t)kGatewayTestDownstreamPort );
         TEST_ASSERT( connection.GetAddress() == address );
-        TEST_ASSERT( connection.GetCapacity() == 0 );
+        TEST_ASSERT( ( connection.GetAllowance() == 0 ) && ( connection.GetPoolSlots() == 0 ) );
 
         connection.Start();
         TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
@@ -3273,7 +3317,7 @@ void TestGateway::DownstreamBecomesReadyWithTheWorkerInventories() const
         // Both inventories were in by then
         TEST_ASSERT( owner.GetAffinityWhenReady() == GatewayScheduler::AFFINITY_HOLDS );
         TEST_ASSERT( owner.GetCapacityWhenReady() == 8 );
-        TEST_ASSERT( connection.GetCapacity() == 8 );
+        TEST_ASSERT( ( connection.GetAllowance() == 8 ) && ( connection.GetPoolSlots() == 8 ) ); // The ack's, until a MSG_CAPACITY
         TEST_ASSERT( connection.GetAffinity( heldPch, kDownstreamTool ) == GatewayScheduler::AFFINITY_HOLDS );
         TEST_ASSERT( connection.GetAffinity( 0, kDownstreamTool ) == GatewayScheduler::AFFINITY_HOLDS );
         TEST_ASSERT( connection.GetAffinity( otherPch, kDownstreamTool ) == GatewayScheduler::AFFINITY_NONE );
@@ -3573,7 +3617,7 @@ void TestGateway::DownstreamOfAnotherMajorIsLost() const
         TEST_ASSERT( connection.HasEnded() );
         TEST_ASSERT( strcmp( connection.GetCloseReason(), "handshake" ) == 0 );
         TEST_ASSERT( owner.GetNumReady() == 0 );
-        TEST_ASSERT( connection.GetCapacity() == 0 );
+        TEST_ASSERT( ( connection.GetAllowance() == 0 ) && ( connection.GetPoolSlots() == 0 ) );
     }
 }
 
@@ -3710,9 +3754,10 @@ void TestGateway::GatewayAdvertisesTheSumOfItsWorkers() const
     TEST_ASSERT( stats.m_Workers == 2 );
     TEST_ASSERT( stats.m_PoolSlots == 24 );
 
+    // A client starts at its initial share of that pool
     DistributedTest::HandshakeProbe probe;
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe ) != 0 );
-    TEST_ASSERT( probe.GetAckCapacity() == 24 );
+    TEST_ASSERT( probe.GetAckCapacity() == FairShareAllocator::kInitialDemand );
     probe.ShutdownAllConnections();
 }
 
@@ -4071,6 +4116,10 @@ void TestGateway::ClientsAreServedInTurn() const
     Gateway gateway( config );
     TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    // The worker's pool has a slot for each client, and it gives the gateway one of them
+    worker.SendCapacity( 1, 2 );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_PoolSlots == 2 ); } ) );
 
     DistributedTest::HandshakeProbe a;
     DistributedTest::HandshakeProbe b;
@@ -4867,7 +4916,7 @@ void TestGateway::StalledWorkerDoesNotStallTheGateway() const
     TEST_ASSERT( w2.GetNumJobs() == 1 );
     DistributedTest::HandshakeProbe other;
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), other ) != 0 );
-    TEST_ASSERT( other.GetAckCapacity() == 3 );
+    TEST_ASSERT( other.GetAckCapacity() >= 1 ); // Its share of the pool of 3
     TEST_ASSERT( CountJobs( w1, w2 ) == 1 );
 
     w1.StallReading( false );
@@ -6207,6 +6256,355 @@ void TestGateway::RampReportsOnlyRealChanges() const
     ramp.OnSent( 0, 3.01f );
     TEST_ASSERT( ramp.ShouldSend( 0, 4.0f ) == false );
     TEST_ASSERT( ramp.ShouldSend( 1, 3.02f ) );
+}
+
+// GetSchedulerSlots
+//------------------------------------------------------------------------------
+/*static*/ uint32_t TestGateway::GetSchedulerSlots( const Gateway & gateway )
+{
+    MutexHolder mh( gateway.m_Mutex );
+    return gateway.m_Scheduler.GetTotalSlots();
+}
+
+// DownstreamReportsDemandAndTakesItsAllowance
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamReportsDemandAndTakesItsAllowance() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+
+    // Nothing is reported before the inventories, and the ramp starts small
+    connection.UpdateDemand( 2, 0 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    connection.UpdateDemand( 100, 0 );
+    Array<uint32_t> demands;
+    TEST_ASSERT( WaitUntil( [ &worker, &demands ]() { worker.GetDemands( demands ); return ( demands.IsEmpty() == false ); } ) );
+    TEST_ASSERT( demands[ 0 ] == DemandRamp::kStartSlots );
+
+    // The same demand is not sent again
+    connection.UpdateDemand( 100, 0 );
+    Thread::Sleep( 200 );
+    worker.GetDemands( demands );
+    TEST_ASSERT( demands.GetSize() == 1 );
+
+    // The worker's share for the gateway, and its whole pool, until the worker says otherwise
+    TEST_ASSERT( ( connection.GetAllowance() == 4 ) && ( connection.GetPoolSlots() == 4 ) );
+    worker.SendCapacity( 3, 12 );
+    Array<uint32_t> updates;
+    TEST_ASSERT( WaitUntil( [ &owner, &updates ]() { owner.GetCapacityUpdates( updates ); return ( updates.GetSize() == 2 ); } ) );
+    TEST_ASSERT( ( updates[ 0 ] == 3 ) && ( updates[ 1 ] == 12 ) );
+    TEST_ASSERT( ( connection.GetAllowance() == 3 ) && ( connection.GetPoolSlots() == 12 ) );
+
+    // Nothing left to do is sent at once
+    connection.UpdateDemand( 0, 0 );
+    TEST_ASSERT( WaitUntil( [ &worker, &demands ]() { worker.GetDemands( demands ); return ( demands.GetSize() == 2 ); } ) );
+    TEST_ASSERT( demands[ 1 ] == 0 );
+    TEST_ASSERT( connection.HasEnded() == false );
+}
+
+// DownstreamKeepsACapacityThatComesBeforeItIsReady
+//------------------------------------------------------------------------------
+namespace
+{
+    // Tells the gateway its allowance between the ack and the inventories
+    class EarlyCapacityWorker : public EchoWorker
+    {
+    public:
+        EarlyCapacityWorker() : EchoWorker( 4 ) {}
+        virtual ~EarlyCapacityWorker() override = default;
+        explicit EarlyCapacityWorker( const EarlyCapacityWorker & other ) = delete;
+        EarlyCapacityWorker & operator=( const EarlyCapacityWorker & other ) = delete;
+
+    private:
+        virtual void Handshake( const ConnectionInfo * connection ) override
+        {
+            Protocol::MsgConnectionAck( 4 ).Send( connection );
+            Protocol::MsgCapacity( 2, 10 ).Send( connection );
+            SendInventory( connection, Protocol::MsgPchInventory( 0 ), Array<uint64_t>() );
+            SendInventory( connection, Protocol::MsgToolchainInventory( 0 ), Array<uint64_t>() );
+        }
+    };
+}
+
+void TestGateway::DownstreamKeepsACapacityThatComesBeforeItIsReady() const
+{
+    EarlyCapacityWorker worker;
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+    // The owner reads it when the connection is ready, and is not told of it before
+    TEST_ASSERT( owner.GetCapacityWhenReady() == 2 );
+    TEST_ASSERT( ( connection.GetAllowance() == 2 ) && ( connection.GetPoolSlots() == 10 ) );
+    Array<uint32_t> updates;
+    owner.GetCapacityUpdates( updates );
+    TEST_ASSERT( updates.IsEmpty() );
+    TEST_ASSERT( connection.HasEnded() == false );
+}
+
+// GatewayPoolIsTheSumOfItsWorkerPools
+//------------------------------------------------------------------------------
+void TestGateway::GatewayPoolIsTheSumOfItsWorkerPools() const
+{
+    EchoWorker w1( 4 );
+    EchoWorker w2( 4 );
+    TEST_ASSERT( w1.Listen( kGatewayTestDownstreamPort ) );
+    TEST_ASSERT( w2.Listen( kGatewayTestDownstreamPort + 1 ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 2, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
+
+    // Their pools, not the shares they give the gateway, which are its slots on them
+    w1.SendCapacity( 1, 8 );
+    w2.SendCapacity( 3, 16 );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_PoolSlots == 24 ) && ( GetSchedulerSlots( gateway ) == 4 ); } ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( probe.GetAckCapacity() == FairShareAllocator::kInitialDemand );
+    TEST_ASSERT( probe.SendDemand( ci, 100 ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 24, 24 ); } ) );
+    probe.ShutdownAllConnections();
+}
+
+// WorkerWithoutSlotsLeavesTheScheduler
+//------------------------------------------------------------------------------
+void TestGateway::WorkerWithoutSlotsLeavesTheScheduler() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    // A worker that offers nothing leaves the pool
+    worker.SendCapacity( 0, 0 );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_ReadyWorkers == 0 ) && ( s.m_PoolSlots == 0 ); } ) );
+
+    // With a pool and no share for the gateway, it is back, without slots until the gateway is given some
+    worker.SendCapacity( 0, 6 );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_ReadyWorkers == 1 ) && ( s.m_PoolSlots == 6 ); } ) );
+    TEST_ASSERT( GetSchedulerSlots( gateway ) == 0 );
+    worker.SendCapacity( 2, 6 );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetSchedulerSlots( gateway ) == 2 ); } ) );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 6 );
+}
+
+// SharesMoveWithDemandThroughTheGateway
+//------------------------------------------------------------------------------
+void TestGateway::SharesMoveWithDemandThroughTheGateway() const
+{
+    EchoWorker worker( 20 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+    Server & server = gateway.GetServer();
+
+    DistributedTest::HandshakeProbe a;
+    const ConnectionInfo * ciA = nullptr;
+    TEST_ASSERT( ConnectProbe( server, a, &ciA ) != 0 );
+    TEST_ASSERT( a.SendDemand( ciA, 100 ) );
+    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 20 ); } ) );
+
+    // Only the final shares are known: A may pass through what is left once B's first share is taken
+    DistributedTest::HandshakeProbe b;
+    const ConnectionInfo * ciB = nullptr;
+    TEST_ASSERT( ConnectProbe( server, b, &ciB ) != 0 );
+    TEST_ASSERT( b.SendDemand( ciB, 100 ) );
+    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 10 ) && ( b.GetLastAllowance() == 10 ); } ) );
+
+    TEST_ASSERT( b.SendDemand( ciB, 0 ) );
+    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 20 ) && ( b.GetLastAllowance() == 0 ); } ) );
+
+    b.ShutdownAllConnections();
+    TEST_ASSERT( WaitUntil( [ &server ]() { MutexHolder mh( server.m_ClientListMutex ); return ( server.m_ClientList.GetSize() == 1 ); } ) );
+    Thread::Sleep( 200 ); // An update would have come by now
+    TEST_ASSERT( a.GetLastAllowance() == 20 );
+
+    // Each demand is logged with the allowance it led to
+    uint32_t numLines = 0;
+    TEST_ASSERT( DistributedTest::CountInStatsLogSince( server.GetLogPath(), 0, "gateway allowance client=", numLines ) );
+    TEST_ASSERT( numLines == 3 );
+    a.ShutdownAllConnections();
+}
+
+// ReducedAllowanceKeepsTheJobsAClientHolds
+//------------------------------------------------------------------------------
+void TestGateway::ReducedAllowanceKeepsTheJobsAClientHolds() const
+{
+    EchoWorker worker( 8, EchoWorker::ANSWER_NEVER );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeFailureConfig( 1, config );
+    config.m_JobTimeoutSeconds = 600.0f;
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    // A has had the whole pool, and then half of it
+    DistributedTest::HandshakeProbe a;
+    DistributedTest::HandshakeProbe b;
+    const ConnectionInfo * ciA = nullptr;
+    const ConnectionInfo * ciB = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), a, &ciA ) != 0 );
+    TEST_ASSERT( a.SendDemand( ciA, 8 ) );
+    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 8 ); } ) );
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), b, &ciB ) != 0 );
+    TEST_ASSERT( b.SendDemand( ciB, 8 ) );
+    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 4 ) && ( b.GetLastAllowance() == 4 ); } ) );
+
+    // What it could have sent under the larger allowance is more than the smaller one bounds, and is kept
+    TEST_ASSERT( SendToolchain( a, ciA ) );
+    JobStreamEncoder encoder;
+    const uint32_t maxJobs = Gateway::kMaxHeldJobsPerSlot * 8;
+    for ( uint32_t i = 0; i < maxJobs; ++i )
+    {
+        AStackString<> marker;
+        marker.Format( "m%u", i );
+        TEST_ASSERT( SendGatewayJob( a, ciA, encoder, i + 1, marker.Get() ) );
+    }
+    TEST_ASSERT( WaitUntil( [ &gateway, maxJobs ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Waiting + s.m_Running ) == maxJobs; } ) );
+    Thread::Sleep( 100 );
+    TEST_ASSERT( a.IsDisconnected() == false );
+
+    // Past the largest allowance it was given, it goes
+    TEST_ASSERT( SendGatewayJob( a, ciA, encoder, maxJobs + 1, "over" ) );
+    TEST_ASSERT( WaitUntil( [ &a ]() { return a.IsDisconnected(); } ) );
+    TEST_ASSERT( b.IsDisconnected() == false );
+    worker.AnswerHeldJobs();
+    b.ShutdownAllConnections();
+}
+
+// GatewayDemandSharesADownstreamWorker
+//------------------------------------------------------------------------------
+namespace
+{
+    // The largest allowance the worker gives the gateway, and the smallest it gives its other client
+    struct ShareWatch
+    {
+        Server *                                m_Worker = nullptr;
+        uint32_t                                m_OtherClientId = 0;
+        const DistributedTest::HandshakeProbe * m_Other = nullptr;
+        Atomic<bool>                            m_Stop{ false };
+        Atomic<uint32_t>                        m_MaxGatewayAllowance{ 0 };
+        Atomic<uint32_t>                        m_MinOtherAllowance{ 0xFFFFFFFF };
+    };
+}
+
+/*static*/ uint32_t TestGateway::WatchTheShares( void * param )
+{
+    ShareWatch * watch = static_cast<ShareWatch *>( param );
+    while ( watch->m_Stop.Load() == false )
+    {
+        {
+            MutexHolder mh( watch->m_Worker->m_ClientListMutex );
+            for ( const Server::ClientState * cs : watch->m_Worker->m_ClientList )
+            {
+                if ( cs->m_Id != watch->m_OtherClientId )
+                {
+                    watch->m_MaxGatewayAllowance.Store( Math::Max( watch->m_MaxGatewayAllowance.Load(), cs->m_AllocatedCapacity ) );
+                }
+            }
+        }
+        watch->m_MinOtherAllowance.Store( Math::Min( watch->m_MinOtherAllowance.Load(), watch->m_Other->GetLastAllowance() ) );
+        Thread::Sleep( 1 );
+    }
+    return 0;
+}
+
+void TestGateway::GatewayDemandSharesADownstreamWorker() const
+{
+    const DistributedTest::RemoteCpusForTest cpus( 8 );
+    FBuildTestOptions options;
+    MakeRemoteBuildOptions( options );
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    DeleteDistributedTestOutputs();
+
+    Server worker( 1 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+
+    // Another client of the worker wants all of it
+    DistributedTest::HandshakeProbe other;
+    const ConnectionInfo * ci = other.Connect( AStackString( "127.0.0.1" ), kGatewayTestDownstreamPort, 2000 );
+    TEST_ASSERT( ci );
+    const Protocol::MsgConnection msg;
+    TEST_ASSERT( other.Send( ci, &msg, sizeof( msg ) ) );
+    TEST_ASSERT( WaitUntil( [ &other ]() { return ( other.GetNumMessages() >= 3 ); } ) );
+    uint32_t otherId = 0;
+    {
+        MutexHolder mh( worker.m_ClientListMutex );
+        otherId = worker.m_ClientList[ 0 ]->m_Id;
+    }
+    TEST_ASSERT( other.SendDemand( ci, 100 ) );
+    TEST_ASSERT( WaitUntil( [ &other ]() { return ( other.GetLastAllowance() == 8 ); } ) );
+
+    // An idle gateway asks for nothing, so the other client keeps the worker
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+    TEST_ASSERT( WaitUntil( [ &worker ]() { MutexHolder mh( worker.m_ClientListMutex ); return ( worker.m_ClientList.GetSize() == 2 ) && ( worker.m_ClientList[ 1 ]->m_Demand == 0 ); } ) );
+    TEST_ASSERT( WaitUntil( [ &other ]() { return ( other.GetLastAllowance() == 8 ); } ) );
+
+    // While the gateway has jobs, the worker shares itself evenly between the two
+    ShareWatch watch;
+    watch.m_Worker = &worker;
+    watch.m_OtherClientId = otherId;
+    watch.m_Other = &other;
+    Thread watcher;
+    watcher.Start( WatchTheShares, "WatchTheShares", &watch );
+    bool built = false;
+    {
+        auto never = []() { return false; };
+        DistributedTest::BuildAborter aborter( never, 60.0f );
+        built = fBuild.Build( "ManyJobs" );
+        TEST_ASSERT( aborter.HasTimedOut() == false );
+    }
+    watch.m_Stop.Store( true );
+    watcher.Join();
+    TEST_ASSERT( built );
+    TEST_ASSERT( watch.m_MaxGatewayAllowance.Load() == 4 );
+    TEST_ASSERT( watch.m_MinOtherAllowance.Load() == 4 );
+
+    // Once the gateway has nothing left to do, the other client has the worker again
+    TEST_ASSERT( WaitUntil( [ &other ]() { return ( other.GetLastAllowance() == 8 ); } ) );
+    other.ShutdownAllConnections();
+}
+
+// ClientWithoutAllowanceLearnsANewPool
+//------------------------------------------------------------------------------
+void TestGateway::ClientWithoutAllowanceLearnsANewPool() const
+{
+    // A gateway with nothing waiting has no allowance, and learns from the pool that the worker has slots again
+    const DistributedTest::RemoteCpusForTest cpus( 4 );
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( s, probe, &ci ) != 0 );
+    TEST_ASSERT( probe.SendDemand( ci, 0 ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 4 ); } ) );
+
+    WorkerThreadRemote::SetNumCPUsToUse( 0 );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 0 ); } ) );
+    WorkerThreadRemote::SetNumCPUsToUse( 6 );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 6 ); } ) );
+    probe.ShutdownAllConnections();
 }
 
 //------------------------------------------------------------------------------

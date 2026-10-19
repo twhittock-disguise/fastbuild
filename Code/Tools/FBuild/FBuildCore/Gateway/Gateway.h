@@ -26,6 +26,10 @@
 // the job's result has come back from a downstream worker, and sends that result to the client
 // that sent the job, with the client's job id restored and the thread index moved to the worker's lane.
 //
+// Slots: its Server shares out the pool, the sum of its ready workers' pools, between its clients by their
+// demand. Toward each worker the gateway is a client like any other: it reports what waits for and runs on
+// that worker as its demand, and runs there as many jobs as the worker's allowance.
+//
 // A worker's faults are the gateway's to retry: a job that fails, is lost with its worker or outlives
 // the watchdog is tried again elsewhere, at most GatewayScheduler::kMaxAttempts times in all. Only then
 // does the client get a failed result, flagged Protocol::kResultReturnedByGateway, so it requeues the
@@ -40,9 +44,11 @@ class Gateway : private Server::Forwarder, private DownstreamConnection::Owner
     friend class TestGateway;
 public:
     static constexpr uint32_t kLocalWorkerIndex = 0;   // Used from Task 18
-    // A client that holds more jobs at the gateway than this many per slot it was offered does not keep
-    // to its capacity, and is disconnected: each job is held in memory with a toolchain pin
+    // A client that holds more jobs at the gateway than this many per slot of the largest allowance it was
+    // given does not keep to its allowance, and is disconnected: each job is held in memory with a toolchain pin
     static constexpr uint32_t kMaxHeldJobsPerSlot = 4;
+    // At most this long between the gateway's demand reports to its workers (DemandRamp paces what is sent)
+    static constexpr uint32_t kDemandTickMs = 100;
     explicit Gateway( const GatewayConfig & config );  // Phase A: a pure forwarder
     virtual ~Gateway();
 
@@ -85,6 +91,7 @@ private:
     virtual void OnDownstreamReady( DownstreamConnection & connection ) override;
     virtual void OnDownstreamResult( DownstreamConnection & connection, bool compressed, void * payload, uint32_t payloadSize ) override;
     virtual void OnDownstreamLost( DownstreamConnection & connection ) override;
+    virtual void OnDownstreamCapacity( DownstreamConnection & connection, uint32_t allowance, uint32_t poolSlots ) override;
     virtual bool FindPch( uint64_t pchId, StoredPch & outPch, PchLease & outLease ) override;
     virtual bool FindToolchainFile( uint64_t toolId, uint32_t fileId, AString & outPath, uint32_t & outSize ) override;
     virtual uint32_t GetToolchainNumFiles( uint64_t toolId ) override;
@@ -122,7 +129,7 @@ private:
     struct Worker
     {
         DownstreamConnection *  m_Connection = nullptr;
-        bool                    m_Ready = false;    // In the scheduler and the pool
+        bool                    m_Ready = false;    // In the scheduler and the pool: its connection is ready and its pool has slots
         bool                    m_Lost = false;     // Its connection has ended, and is replaced once m_LostTimer passes m_ReconnectSeconds
         Timer                   m_LostTimer;
     };
@@ -130,7 +137,6 @@ private:
     struct Client
     {
         uint32_t        m_Id = 0;
-        uint32_t        m_OfferedSlots = 0;     // The pool when it was taken on
         uint32_t        m_NumJobs = 0;          // Held for it
         Array<uint64_t> m_Pins;     // The toolchains it was advertised
     };
@@ -159,6 +165,7 @@ private:
         struct PchAsk { uint32_t m_ClientId; uint64_t m_PchId; };
         struct ToolchainRequest { uint32_t m_ClientId; uint64_t m_ToolId; uint32_t m_FileId; }; // kManifestFileId: the manifest
         struct GivenUp { uint32_t m_ClientId; bool m_Compressed; MemoryStream * m_Payload; }; // Sent flagged kResultReturnedByGateway
+        struct Demand { DownstreamConnection * m_Connection; uint32_t m_Waiting; uint32_t m_InFlight; };
 
         Actions() = default;
         ~Actions();
@@ -174,6 +181,7 @@ private:
         Array<ToolchainRequest> m_ToolchainRequests;
         Array<GivenUp>          m_GivenUp;
         Array<AString>          m_LogLines;
+        Array<Demand>           m_Demands;      // The housekeeping thread's only: it is the one that destroys connections
     };
     void Run( Actions & actions );
 
@@ -199,7 +207,12 @@ private:
     void ExpireHungAttempts( Actions & actions );
     // Waiting jobs that no worker can take for m_NoWorkerGiveUpSeconds are given up. Waiting behind busy workers is not.
     void GiveUpJobsNoWorkerCanTake( Actions & actions );
-    bool CanAnyWorkerTakeAJob() const; // Some ready worker has a slot that no expired attempt holds
+    bool CanAnyWorkerTakeAJob() const; // Some ready worker has a slot in its pool that no expired attempt holds
+    // A worker is in the scheduler, with its allowance as its slots, while its connection is ready and its pool
+    // has slots. One whose pool falls to 0 leaves it, and what it was building is tried elsewhere.
+    void UpdateWorker( Worker & worker, DownstreamConnection & connection, Actions & actions );
+    void RemoveWorker( Worker & worker, DownstreamConnection & connection, const char * reason, Actions & actions );
+    void CollectDemands( Actions & actions ); // What waits for and runs on each worker
     void UpdatePool();
     Client * FindClient( uint32_t clientId );
     Client & FindOrAddClient( uint32_t clientId );

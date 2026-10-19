@@ -44,7 +44,7 @@ public:
     class Forwarder
     {
     public:
-        virtual uint32_t GetPoolSlots() const = 0;  // Phase A: every client's ack. 0: the handshake is closed without an ack.
+        virtual uint32_t GetPoolSlots() const = 0;  // The slots its clients share by demand. 0: the handshake is closed without an ack.
         virtual void GetToolchainInventory( uint32_t clientId, Array<uint64_t> & outToolIds ) = 0; // Pins what it returns for that client
         virtual void OnClientJob( uint32_t clientId, const Protocol::MsgJob & msg, void * jobData, size_t jobDataSize ) = 0; // Takes jobData (FREE)
         virtual void OnClientManifest( uint32_t clientId, uint64_t toolId, const void * payload, size_t payloadSize ) = 0;
@@ -88,6 +88,9 @@ public:
     // Sent by the client's outbox, so it never waits for a client that reads slowly.
     void AskClientForPch( uint32_t clientId, uint64_t pchId );
     void DisconnectClient( uint32_t clientId );
+    // The largest allowance the client has been given, so jobs it sent before learning of a smaller one are
+    // within it. 0 if it has gone.
+    uint32_t GetMaxAllowance( uint32_t clientId ) const;
     WorkerLog & GetLog() { return m_Log; }
 
 private:
@@ -114,11 +117,11 @@ private:
     void TouchToolchains();
     void ReleaseReadyWaitingJobs();
 
-    // Slot sharing (not in gateway mode). Every client's allowance is its share of the pool by demand
-    // (m_Allocator). A client whose allowance changes is sent it by its outbox (MarkCapacityChanged); the
-    // ack is a new client's first allowance.
-    uint32_t GetPoolSlots() const;
-    void ShareSlotsLocked( uint32_t unmarkedClientId = 0 ); // Caller holds m_ClientListMutex. Marks those that changed but that one.
+    // Slot sharing. Every client's allowance is its share of the pool by demand (m_Allocator). A client whose
+    // allowance changes is sent it by its outbox (MarkCapacityChanged); the ack is a new client's first allowance.
+    uint32_t GetPoolSlots() const; // The forwarder's in gateway mode, so it is never called under m_ClientListMutex
+    // Caller holds m_ClientListMutex. Marks those whose allowance changed, or all of them when the pool did, but that one.
+    void ShareSlotsLocked( uint32_t poolSlots, uint32_t unmarkedClientId = 0 );
     void ShareSlotsOnTick(); // When the pool changes, and every kRotateSeconds while slots are scarce, so they rotate
     static constexpr float kRotateSeconds = 1.0f;
 
@@ -142,6 +145,7 @@ private:
         const ConnectionInfo * m_Connection = nullptr;
         Atomic<uint32_t> m_NumJobsActive;
         uint32_t m_AllocatedCapacity = 0; // The allowance. Under m_ClientListMutex.
+        uint32_t m_MaxAllocatedCapacity = 0; // The largest allowance so far. Under m_ClientListMutex.
         uint32_t m_Demand = FairShareAllocator::kInitialDemand; // The last reported. Under m_ClientListMutex.
         Atomic<bool> m_CapacityChanged{ false }; // The outbox is to send the allowance
         Atomic<bool> m_HandshakeDone{ false };   // The ack and the inventories have been sent: allowances may follow

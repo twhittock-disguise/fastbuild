@@ -449,6 +449,7 @@ void Server::LogWarning( const char * fmtString, ... )
     cs->m_KnownTools.Clear();
 
     // free the serverstate structure
+    const uint32_t poolSlots = GetPoolSlots();
     {
         // Remove from ClientList
         MutexHolder mh( m_ClientListMutex );
@@ -484,11 +485,8 @@ void Server::LogWarning( const char * fmtString, ... )
         FDELETE cs;
 
         // Its slots go to the clients that remain
-        if ( m_Forwarder == nullptr )
-        {
-            m_Allocator.RemoveClient( clientId );
-            ShareSlotsLocked();
-        }
+        m_Allocator.RemoveClient( clientId );
+        ShareSlotsLocked( poolSlots );
     }
 
     // Once the client has left the list, with no lock held
@@ -699,6 +697,21 @@ void Server::DisconnectClient( uint32_t clientId )
     {
         Disconnect( connection ); // Does nothing if the connection has gone since
     }
+}
+
+// GetMaxAllowance
+//------------------------------------------------------------------------------
+uint32_t Server::GetMaxAllowance( uint32_t clientId ) const
+{
+    MutexHolder mh( m_ClientListMutex );
+    for ( const ClientState * cs : m_ClientList )
+    {
+        if ( cs->m_Id == clientId )
+        {
+            return cs->m_MaxAllocatedCapacity;
+        }
+    }
+    return 0;
 }
 
 // ClientOutbox
@@ -922,30 +935,24 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
         cs->m_HostName = hostName;
     }
 
-    // A gateway offers every client its whole pool
-    uint32_t capacity = 0;
-    if ( m_Forwarder )
+    // A gateway without workers takes no clients
+    const uint32_t poolSlots = GetPoolSlots();
+    if ( m_Forwarder && ( poolSlots == 0 ) )
     {
-        capacity = m_Forwarder->GetPoolSlots();
-        if ( capacity == 0 )
-        {
-            FLOG_WARN( "Disconnecting '%s' (%s): the gateway has no workers\n", remoteAddr.Get(), hostName.Get() );
-            m_Log.Write( "refused addr=%s host=%s reason=no-capacity", remoteAddr.Get(), hostName.Get() );
-            Disconnect( connection );
-            return;
-        }
-        MutexHolder mh( m_ClientListMutex );
-        cs->m_AllocatedCapacity = capacity;
+        FLOG_WARN( "Disconnecting '%s' (%s): the gateway has no workers\n", remoteAddr.Get(), hostName.Get() );
+        m_Log.Write( "refused addr=%s host=%s reason=no-capacity", remoteAddr.Get(), hostName.Get() );
+        Disconnect( connection );
+        return;
     }
 
     m_Log.Write( "handshake addr=%s host=%s", remoteAddr.Get(), hostName.Get() );
 
     // The new client's share of the demand it is assumed to have. The ack carries it, so it is not sent again.
-    if ( m_Forwarder == nullptr )
+    uint32_t capacity = 0;
     {
         MutexHolder mh( m_ClientListMutex );
         m_Allocator.AddClient( cs->m_Id );
-        ShareSlotsLocked( cs->m_Id );
+        ShareSlotsLocked( poolSlots, cs->m_Id );
         capacity = cs->m_AllocatedCapacity;
     }
 
@@ -984,25 +991,30 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
 //------------------------------------------------------------------------------
 void Server::Process( const ConnectionInfo * connection, const Protocol::MsgDemand * msg )
 {
-    // A gateway offers every client its whole pool
     ClientState * cs = (ClientState *)connection->GetUserData();
-    if ( ( m_Forwarder != nullptr ) || ( cs->m_HandshakeDone.Load() == false ) )
+    if ( cs->m_HandshakeDone.Load() == false )
     {
         return;
     }
 
+    const uint32_t poolSlots = GetPoolSlots();
     uint32_t allowance = 0;
-    uint32_t poolSlots = 0;
     {
         MutexHolder mh( m_ClientListMutex );
         cs->m_Demand = msg->GetDemand();
         m_Allocator.SetDemand( cs->m_Id, cs->m_Demand );
-        ShareSlotsLocked();
+        ShareSlotsLocked( poolSlots );
         MarkCapacityChanged( *cs ); // Whether or not its allowance changed, so that it learns the pool
         allowance = cs->m_AllocatedCapacity;
-        poolSlots = m_Allocator.GetPoolSlots();
     }
-    m_Log.Write( "demand host=%s demand=%u allowance=%u pool=%u", cs->m_HostName.Get(), msg->GetDemand(), allowance, poolSlots );
+    if ( m_Forwarder )
+    {
+        m_Log.Write( "gateway allowance client=%u demand=%u allowance=%u", cs->m_Id, msg->GetDemand(), allowance );
+    }
+    else
+    {
+        m_Log.Write( "demand host=%s demand=%u allowance=%u pool=%u", cs->m_HostName.Get(), msg->GetDemand(), allowance, poolSlots );
+    }
 }
 
 // Process( MsgJob )
@@ -2359,10 +2371,7 @@ void Server::ThreadFunc()
             FinalizeCompletedJobs();
         }
 
-        if ( m_Forwarder == nullptr )
-        {
-            ShareSlotsOnTick();
-        }
+        ShareSlotsOnTick();
 
         TouchToolchains();
 
@@ -2454,28 +2463,31 @@ void Server::FinalizeCompletedJobs()
 //------------------------------------------------------------------------------
 uint32_t Server::GetPoolSlots() const
 {
-    return WorkerThreadRemote::GetNumCPUsToUse() + m_PrefetchBuffer;
+    return m_Forwarder ? m_Forwarder->GetPoolSlots() : ( WorkerThreadRemote::GetNumCPUsToUse() + m_PrefetchBuffer );
 }
 
 // ShareSlotsLocked
 //------------------------------------------------------------------------------
-void Server::ShareSlotsLocked( uint32_t unmarkedClientId )
+void Server::ShareSlotsLocked( uint32_t poolSlots, uint32_t unmarkedClientId )
 {
-    ASSERT( m_Forwarder == nullptr );
-    m_Allocator.SetPoolSlots( GetPoolSlots() );
+    // Every client learns a new pool, so one with no allowance (a gateway with nothing waiting) knows it has slots
+    const bool poolChanged = ( poolSlots != m_Allocator.GetPoolSlots() );
+    m_Allocator.SetPoolSlots( poolSlots );
     Array<uint32_t> changed;
     m_Allocator.Recompute( changed );
     m_ShareTimer.Restart();
 
     for ( ClientState * cs : m_ClientList )
     {
-        if ( changed.Find( cs->m_Id ) )
+        const bool allowanceChanged = ( changed.Find( cs->m_Id ) != nullptr );
+        if ( allowanceChanged )
         {
             cs->m_AllocatedCapacity = m_Allocator.GetAllowance( cs->m_Id );
-            if ( cs->m_Id != unmarkedClientId )
-            {
-                MarkCapacityChanged( *cs );
-            }
+            cs->m_MaxAllocatedCapacity = Math::Max( cs->m_MaxAllocatedCapacity, cs->m_AllocatedCapacity );
+        }
+        if ( ( allowanceChanged || poolChanged ) && ( cs->m_Id != unmarkedClientId ) )
+        {
+            MarkCapacityChanged( *cs );
         }
     }
 }
@@ -2489,7 +2501,7 @@ void Server::ShareSlotsOnTick()
     if ( ( poolSlots != m_Allocator.GetPoolSlots() ) ||
          ( m_Allocator.IsScarce() && ( m_ShareTimer.GetElapsed() >= kRotateSeconds ) ) )
     {
-        ShareSlotsLocked();
+        ShareSlotsLocked( poolSlots );
     }
 }
 
