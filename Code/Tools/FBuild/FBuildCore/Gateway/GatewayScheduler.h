@@ -15,6 +15,12 @@
 // A job is waiting (in its client's queue) or running (on one worker). Slots are
 // counted apart from jobs: Next takes a slot and only ReleaseSlot gives it back, so a
 // job retried after a timeout keeps the slot of its first attempt taken.
+//
+// Every registered worker counts as connected when a failed job decides whether to
+// avoid the workers that failed it, even one with 0 slots for now (a Phase B worker
+// with no allowance gets one from the demand GetNumWaitingFor reports). So the gateway
+// registers a worker only while its capacity is above 0, and calls RemoveWorker when
+// that drops to 0; otherwise a failed job could wait for it forever.
 //------------------------------------------------------------------------------
 class GatewayScheduler
 {
@@ -79,7 +85,7 @@ private:
 
     // A free worker for the job: the best affinity, then the most free slots, then the lowest id
     template <class AFFINITY> const Worker * PickWorker( const Job & job, const AFFINITY & affinity, Affinity & outAffinity ) const;
-    // Whether the job avoids the worker: it failed there, and some able worker with slots has not failed it
+    // Whether the job avoids the worker: it failed there, and some registered able worker, with slots or not, has not failed it
     template <class AFFINITY> bool IsAvoided( const Job & job, uint32_t workerId, const AFFINITY & affinity ) const;
     template <class AFFINITY> bool NextFromClient( Client & client, const AFFINITY & affinity, Assignment & outAssignment );
 
@@ -185,8 +191,7 @@ bool GatewayScheduler::IsAvoided( const Job & job, uint32_t workerId, const AFFI
     }
     for ( const Worker & worker : m_Workers )
     {
-        if ( ( worker.m_Slots > 0 ) &&
-             ( job.HasFailedOn( worker.m_Id ) == false ) &&
+        if ( ( job.HasFailedOn( worker.m_Id ) == false ) &&
              ( affinity( worker.m_Id, job.m_PchId, job.m_ToolId ) != AFFINITY_UNABLE ) )
         {
             return true;

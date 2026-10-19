@@ -388,6 +388,7 @@ private:
     void SchedulerUsesNoMoreSlotsThanAWorkerHas() const;
     void FailedJobIsRetriedElsewhereAtMostTwice() const;
     void RetryUsesTheSameWorkerWhenThereIsNoOther() const;
+    void RetryWaitsForAConnectedWorkerWithoutSlots() const;
     void RetriedJobGoesFirst() const;
     void RemovedWorkerReportsItsRunningJobs() const;
     void RemovedClientDropsOnlyItsWaitingJobs() const;
@@ -465,6 +466,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( SchedulerUsesNoMoreSlotsThanAWorkerHas )
     REGISTER_TEST( FailedJobIsRetriedElsewhereAtMostTwice )
     REGISTER_TEST( RetryUsesTheSameWorkerWhenThereIsNoOther )
+    REGISTER_TEST( RetryWaitsForAConnectedWorkerWithoutSlots )
     REGISTER_TEST( RetriedJobGoesFirst )
     REGISTER_TEST( RemovedWorkerReportsItsRunningJobs )
     REGISTER_TEST( RemovedClientDropsOnlyItsWaitingJobs )
@@ -2239,13 +2241,12 @@ void TestGateway::FailedJobIsRetriedElsewhereAtMostTwice() const
 //------------------------------------------------------------------------------
 void TestGateway::RetryUsesTheSameWorkerWhenThereIsNoOther() const
 {
-    // Worker 2 is unable to take the job, and worker 3 has no slots
+    // Worker 2 is unable to take the job
     FakeAffinity affinity;
     affinity.Set( 2, 0, kSchedulerTool, GatewayScheduler::AFFINITY_UNABLE );
     GatewayScheduler scheduler;
     scheduler.SetWorkerSlots( 1, 1 );
     scheduler.SetWorkerSlots( 2, 1 );
-    scheduler.SetWorkerSlots( 3, 0 );
     scheduler.AddJob( 1, 1, 0, kSchedulerTool );
 
     TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
@@ -2256,6 +2257,29 @@ void TestGateway::RetryUsesTheSameWorkerWhenThereIsNoOther() const
     scheduler.ReleaseSlot( 1 );
     TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
     TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_GIVE_UP );
+}
+
+// RetryWaitsForAConnectedWorkerWithoutSlots
+//------------------------------------------------------------------------------
+void TestGateway::RetryWaitsForAConnectedWorkerWithoutSlots() const
+{
+    // Worker 2 is connected and idle, with no slots yet (no demand, no allowance)
+    const FakeAffinity affinity;
+    GatewayScheduler scheduler;
+    scheduler.SetWorkerSlots( 1, 1 );
+    scheduler.SetWorkerSlots( 2, 0 );
+    scheduler.AddJob( 1, 1, 0, kSchedulerTool );
+
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
+    TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_RETRY );
+    scheduler.ReleaseSlot( 1 );
+
+    // Not back on worker 1; worker 2's demand counts the job, and it runs there once it has a slot
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+    TEST_ASSERT( scheduler.GetNumWaitingFor( 1, affinity ) == 0 );
+    TEST_ASSERT( scheduler.GetNumWaitingFor( 2, affinity ) == 1 );
+    scheduler.SetWorkerSlots( 2, 1 );
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 2 ) );
 }
 
 // RetriedJobGoesFirst
