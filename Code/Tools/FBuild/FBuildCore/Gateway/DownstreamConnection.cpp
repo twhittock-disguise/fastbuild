@@ -181,15 +181,25 @@ void DownstreamConnection::SendJob( const Protocol::MsgJob & msg, ConstMemoryStr
     }
 
     const uint64_t rawBytes = job.GetSize();
-    m_SendQueue.Push( SendQueueItem( msg, Move( job ), SendKind::Job, rawBytes, true ) );
-
-    if ( pch && ( pch->m_Id != 0 ) )
+    SendQueueItem item( msg, Move( job ), SendKind::Job, rawBytes, true );
+    if ( ( pch == nullptr ) || ( pch->m_Id == 0 ) )
     {
-        MutexHolder mh( m_Mutex );
-        if ( m_PchState.OnRequested( pch->m_Id ) )
-        {
-            QueuePch( *pch, Move( lease ) );
-        }
+        m_SendQueue.Push( Move( item ) );
+        return;
+    }
+
+    MutexHolder mh( m_Mutex );
+    if ( m_PchState.OnRequested( pch->m_Id ) )
+    {
+        QueuePch( *pch, Move( lease ) );
+    }
+    if ( m_PchState.IsOnWorker( pch->m_Id ) )
+    {
+        m_SendQueue.Push( Move( item ) );
+    }
+    else
+    {
+        m_JobsWaitingForPch.EmplaceBack( pch->m_Id, Move( item ) ); // OnPchDelivered queues it
     }
 }
 
@@ -479,6 +489,20 @@ void DownstreamConnection::QueuePch( const StoredPch & pch, PchLease && lease )
             lease = Move( m_PchLeases[ i ].m_Lease );
             m_PchLeases.EraseIndex( i );
             break;
+        }
+    }
+
+    // The last chunk is sent before anything pushed now, so these jobs reach the worker behind it
+    for ( size_t i = 0; i < m_JobsWaitingForPch.GetSize(); )
+    {
+        if ( m_JobsWaitingForPch[ i ].m_PchId == pchId )
+        {
+            m_SendQueue.Push( Move( m_JobsWaitingForPch[ i ].m_Item ) );
+            m_JobsWaitingForPch.EraseIndex( i );
+        }
+        else
+        {
+            ++i;
         }
     }
 }

@@ -76,9 +76,11 @@ public:
     uint32_t GetCapacity() const;          // Phase A: the ack's capacity
     GatewayScheduler::Affinity GetAffinity( uint64_t pchId, uint64_t toolId ) const;
 
-    // Queues the job's toolchain unless the worker has it, the job, then the PCH unless the worker has it
-    // or it is on its way. pchLease is kept while the PCH's chunks are queued. The toolchain's files are
-    // asked of the owner (GetToolchainNumFiles, FindToolchainFile) on the caller's thread.
+    // Queues the job's toolchain unless the worker has it, then the PCH unless the worker has it or it is
+    // on its way, then the job. A job whose PCH is not on the worker yet waits here until the PCH's last
+    // chunk has been handed to the socket, because a worker asks for a PCH that a job needs and that it
+    // neither holds nor is receiving. pchLease is kept while the PCH's chunks are queued. The toolchain's
+    // files are asked of the owner (GetToolchainNumFiles, FindToolchainFile) on the caller's thread.
     void SendJob( const Protocol::MsgJob & msg, ConstMemoryStream && job, const StoredPch * pch, PchLease && pchLease );
 
 private:
@@ -118,6 +120,18 @@ private:
 
     Mutex m_SendJobMutex; // One SendJob at a time, so a job never goes ahead of its toolchain
 
+    struct JobWaitingForPch
+    {
+        JobWaitingForPch( uint64_t pchId, SendQueueItem && item ) : m_PchId( pchId ), m_Item( Move( item ) ) {}
+        JobWaitingForPch( JobWaitingForPch && other ) = default;
+        JobWaitingForPch & operator=( JobWaitingForPch && other ) = default;
+        explicit JobWaitingForPch( const JobWaitingForPch & other ) = delete;
+        JobWaitingForPch & operator=( const JobWaitingForPch & other ) = delete;
+
+        uint64_t m_PchId = 0;
+        SendQueueItem m_Item;
+    };
+
     struct QueuedPchLease
     {
         QueuedPchLease() = default;
@@ -136,6 +150,7 @@ private:
     PchSendState m_PchState;
     Array<uint64_t> m_Toolchains;           // The worker has them, or they are queued
     Array<QueuedPchLease> m_PchLeases;      // Of PCHs whose chunks are queued
+    Array<JobWaitingForPch> m_JobsWaitingForPch; // Queued once their PCH is on the worker
 
     WorkerSendQueue m_SendQueue;
 };

@@ -400,7 +400,8 @@ private:
     void WaitingForCountsOnlyJobsAWorkerCanTake() const;
     void GatewayConfigReadsHostsAndPorts() const;
     void DownstreamBecomesReadyWithTheWorkerInventories() const;
-    void DownstreamSendsToolchainJobThenPch() const;
+    void DownstreamSendsToolchainPchThenJob() const;
+    void DownstreamSendsAJobOnlyBehindItsPch() const;
     void DownstreamResultIsHandedOver() const;
     void DownstreamAskingForAPchGetsItAgain() const;
     void DownstreamAskingTooOftenIsClosed() const;
@@ -487,7 +488,8 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( WaitingForCountsOnlyJobsAWorkerCanTake )
     REGISTER_TEST( GatewayConfigReadsHostsAndPorts )
     REGISTER_TEST( DownstreamBecomesReadyWithTheWorkerInventories )
-    REGISTER_TEST( DownstreamSendsToolchainJobThenPch )
+    REGISTER_TEST( DownstreamSendsToolchainPchThenJob )
+    REGISTER_TEST( DownstreamSendsAJobOnlyBehindItsPch )
     REGISTER_TEST( DownstreamResultIsHandedOver )
     REGISTER_TEST( DownstreamAskingForAPchGetsItAgain )
     REGISTER_TEST( DownstreamAskingTooOftenIsClosed )
@@ -2540,6 +2542,7 @@ namespace
             : FakeWorker( slots, toolchainInventory, pchInventory )
             , m_ThreadIndex( threadIndex )
             , m_Answer( answer )
+            , m_HeldPchs( pchInventory )
         {
         }
         virtual ~EchoWorker() override
@@ -2556,6 +2559,11 @@ namespace
         uint64_t GetPchBytes() const { MutexHolder mh( m_Mutex ); return m_PchBytes; }
         uint32_t GetNumPchCopies() const { MutexHolder mh( m_Mutex ); return m_NumPchCopies; } // Last chunks received
         void SetAnswer( Answer answer ) { MutexHolder mh( m_Mutex ); m_Answer = answer; }
+
+        // As a real Server does (Server::Process( MsgJob )): a job whose PCH is neither held nor being received
+        // makes the worker ask for it, once until a copy arrives
+        void AskForMissingPchs() { MutexHolder mh( m_Mutex ); m_AsksForMissingPchs = true; }
+        uint32_t GetNumPchAsks() const { MutexHolder mh( m_Mutex ); return m_NumPchAsks; }
 
         void AnswerHeldJobs( Answer answer = ANSWER_OK )
         {
@@ -2628,6 +2636,19 @@ namespace
                 MutexHolder mh( m_Mutex );
                 m_PchBytes += payloadSize;
                 m_NumPchCopies += isLast ? 1 : 0;
+                if ( isLast )
+                {
+                    m_ReceivingPchs.FindAndErase( msg.GetPchId() );
+                    m_AskedPchs.FindAndErase( msg.GetPchId() );
+                    if ( m_HeldPchs.Find( msg.GetPchId() ) == nullptr )
+                    {
+                        m_HeldPchs.Append( msg.GetPchId() );
+                    }
+                }
+                else if ( m_ReceivingPchs.Find( msg.GetPchId() ) == nullptr )
+                {
+                    m_ReceivingPchs.Append( msg.GetPchId() );
+                }
             }
             else if ( ( message.GetType() == Protocol::MSG_JOB ) && payload )
             {
@@ -2656,10 +2677,19 @@ namespace
             }
 
             Answer answer;
+            bool askForPch = false;
             {
                 MutexHolder mh( m_Mutex );
                 m_Jobs.Append( received );
                 answer = m_Answer;
+                const uint64_t pchId = received.m_PchId;
+                if ( m_AsksForMissingPchs && ( pchId != 0 ) && ( m_HeldPchs.Find( pchId ) == nullptr ) &&
+                     ( m_ReceivingPchs.Find( pchId ) == nullptr ) && ( m_AskedPchs.Find( pchId ) == nullptr ) )
+                {
+                    m_AskedPchs.Append( pchId );
+                    ++m_NumPchAsks;
+                    askForPch = true;
+                }
                 if ( answer == ANSWER_NEVER )
                 {
                     HeldJob & held = m_Held.EmplaceBack();
@@ -2667,6 +2697,10 @@ namespace
                     held.m_JobId = received.m_JobId;
                     held.m_Name = received.m_Name;
                 }
+            }
+            if ( askForPch )
+            {
+                Protocol::MsgPchNeeded( received.m_PchId ).Send( connection );
             }
             if ( answer == ANSWER_DISCONNECT )
             {
@@ -2709,6 +2743,11 @@ namespace
         Array<uint8_t> m_Types;
         uint64_t m_PchBytes = 0;
         uint32_t m_NumPchCopies = 0;
+        Array<uint64_t> m_HeldPchs;         // Advertised, or a copy arrived
+        Array<uint64_t> m_ReceivingPchs;    // Some chunks arrived
+        Array<uint64_t> m_AskedPchs;        // Asked for, and no copy arrived since
+        bool m_AsksForMissingPchs = false;
+        uint32_t m_NumPchAsks = 0;
         UniquePtr<JobStreamDecoder> m_Decoder;  // Receive thread
         Atomic<bool> m_StallReading{ false };
         Semaphore m_StallSemaphore;
@@ -2970,9 +3009,9 @@ void TestGateway::DownstreamBecomesReadyWithTheWorkerInventories() const
     TEST_ASSERT( owner.GetNumReady() == 1 );
 }
 
-// DownstreamSendsToolchainJobThenPch
+// DownstreamSendsToolchainPchThenJob
 //------------------------------------------------------------------------------
-void TestGateway::DownstreamSendsToolchainJobThenPch() const
+void TestGateway::DownstreamSendsToolchainPchThenJob() const
 {
     EchoWorker worker( 4 );
     TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
@@ -3007,11 +3046,11 @@ void TestGateway::DownstreamSendsToolchainJobThenPch() const
     TEST_ASSERT( types.GetSize() == ( 3 + numChunks ) );
     TEST_ASSERT( types[ 0 ] == Protocol::MSG_MANIFEST );
     TEST_ASSERT( types[ 1 ] == Protocol::MSG_FILE );
-    TEST_ASSERT( types[ 2 ] == Protocol::MSG_JOB );
-    for ( size_t i = 3; i < types.GetSize(); ++i )
+    for ( size_t i = 2; i < ( 2 + numChunks ); ++i )
     {
         TEST_ASSERT( types[ i ] == Protocol::MSG_PCH_FILE );
     }
+    TEST_ASSERT( types.Top() == Protocol::MSG_JOB );
 
     // What the worker holds is not sent again, and the job's lease is not kept
     SendDownstreamJob( connection, owner, 6, "m6", &pch );
@@ -3029,6 +3068,41 @@ void TestGateway::DownstreamSendsToolchainJobThenPch() const
     TEST_ASSERT( jobs.GetSize() == 2 );
     TEST_ASSERT( ( jobs[ 0 ].m_JobId == 5 ) && ( jobs[ 0 ].m_PchId == pch.m_Id ) && ( jobs[ 0 ].m_ToolId == kDownstreamTool ) );
     TEST_ASSERT( ( jobs[ 1 ].m_JobId == 6 ) && ( jobs[ 1 ].m_Name == "m6" ) );
+}
+
+// DownstreamSendsAJobOnlyBehindItsPch
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamSendsAJobOnlyBehindItsPch() const
+{
+    // A PCH smaller than the socket buffers is handed to the socket at once. A job that reached the
+    // worker ahead of it would make the worker ask for it, and it would be sent twice.
+    Array<uint64_t> tools;
+    tools.Append( kDownstreamTool );
+    EchoWorker worker( 4, EchoWorker::ANSWER_OK, Array<uint64_t>(), tools );
+    worker.AskForMissingPchs();
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    const StoredPch small = WriteDownstreamPch( 0xB501, 5000 );
+    const StoredPch large = WriteDownstreamPch( 0xB502, ( 3 * Protocol::kPchChunkSize ) + 1000 );
+    owner.AddPch( small );
+    owner.AddPch( large );
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+    // Two jobs for each, the second sent while the PCH is on its way
+    SendDownstreamJob( connection, owner, 5, "m5", &small );
+    SendDownstreamJob( connection, owner, 6, "m6", &small );
+    SendDownstreamJob( connection, owner, 7, "m7", &large );
+    SendDownstreamJob( connection, owner, 8, "m8", &large );
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 4 ); } ) );
+    Thread::Sleep( 100 ); // A copy sent again would have arrived by now
+
+    TEST_ASSERT( worker.GetNumPchAsks() == 0 );
+    TEST_ASSERT( worker.GetNumPchCopies() == 2 );
+    TEST_ASSERT( owner.GetNumPchLookups() == 0 );
+    TEST_ASSERT( owner.GetNumLeases() == 0 );
+    TEST_ASSERT( connection.HasEnded() == false );
 }
 
 // DownstreamResultIsHandedOver
