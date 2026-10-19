@@ -448,6 +448,13 @@ void Gateway::GetStats( Stats & outStats ) const
     Run( actions );
 }
 
+// OnLocalJobEnded
+//------------------------------------------------------------------------------
+/*virtual*/ void Gateway::OnLocalJobEnded( uint32_t /*jobId*/, bool /*hasResult*/, bool /*compressed*/, MemoryStream & /*payload*/ )
+{
+    // Its Server is a pure forwarder, so it runs no local jobs
+}
+
 // OnDownstreamReady
 //------------------------------------------------------------------------------
 /*virtual*/ void Gateway::OnDownstreamReady( DownstreamConnection & connection )

@@ -53,20 +53,35 @@ public:
         // Every client, handshake or not, once it has left the client list: nothing is queued for it from here on,
         // and a PCH it was sending no longer counts as being received, so another client can be asked for it
         virtual void OnClientGone( uint32_t clientId ) = 0;
+        // A job given to RunLocalJob has ended, on the Server's thread. With a result, the payload is laid out as
+        // a worker's MSG_JOB_RESULT(_COMPRESSED) payload, job id first; without one (aborted, or it could not be
+        // run here), it is empty.
+        virtual void OnLocalJobEnded( uint32_t jobId, bool hasResult, bool compressed, MemoryStream & payload ) = 0;
     protected:
         ~Forwarder() = default;
     };
 
     Server( uint32_t numThreadsInJobQueue = 0, uint32_t prefetchBuffer = 0 );
-    // Gateway mode, pure forwarder: no JobQueueRemote, no toolchain extraction, no unpacking. cacheDir: the
-    // root of the PCH store and the log (an empty string: FBuild::GetWorkerCacheDir). The forwarder outlives the Server.
-    Server( Forwarder & forwarder, const AString & cacheDir );
+    // Gateway mode. cacheDir: the root of the PCH store and the log (an empty string: FBuild::GetWorkerCacheDir).
+    // The forwarder outlives the Server.
+    // - localThreads == 0, a pure forwarder: no JobQueueRemote, no toolchain extraction, no unpacking.
+    // - localThreads > 0, with a local pool: jobs given to RunLocalJob are built here, as a worker builds them.
+    //   cacheDir must then be the worker cache dir, where ToolManifest keeps toolchains.
+    Server( Forwarder & forwarder, const AString & cacheDir, uint32_t localThreads = 0, uint32_t prefetchBuffer = 0 );
     virtual ~Server() override;
 
     explicit Server( const Server & other ) = delete;
     Server & operator=( const Server & other ) = delete;
 
     static void GetHostForJob( const Job * job, AString & hostName );
+
+    // The local pool of a gateway
+    uint32_t GetLocalSlots() const; // 0 if pure or if the worker gives no CPUs; else CPUs + prefetch
+    bool IsToolchainSynchronized( uint64_t toolId ) const; // Takes only m_ToolManifestsMutex
+    // Builds a decoded job (as Forwarder::OnClientJob has it) once its toolchain and PCH are here. Forwarder::
+    // OnLocalJobEnded follows, from the Server's thread. Takes m_LocalJobsMutex, then the PCH cache's and the
+    // job queue's locks.
+    void RunLocalJob( const Protocol::MsgJob & msg, const void * job, size_t jobSize );
 
     bool IsSynchingTool( AString & statusStr ) const;
 
@@ -116,6 +131,22 @@ private:
     void FinalizeCompletedJobs();
     void TouchToolchains();
     void ReleaseReadyWaitingJobs();
+
+    // A worker synchronizes the toolchain it is sent. Data it cannot use closes a worker's connection, while
+    // a gateway keeps the client and its local pool goes without the toolchain.
+    void ReceiveManifest( const ConnectionInfo * connection, uint64_t toolId, const void * payload, size_t payloadSize );
+    void ReceiveFile( const ConnectionInfo * connection, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize );
+    void OnUnusableToolchainData( const ConnectionInfo * connection, const char * what );
+
+    // Local jobs (tagged s_LocalJobTag). Lock order: m_LocalJobsMutex, then m_PchCacheMutex and JobQueueRemote's.
+    enum LocalJobState : uint8_t { LOCAL_JOB_READY, LOCAL_JOB_WAITING, LOCAL_JOB_CANNOT_RUN };
+    LocalJobState GetLocalJobState( Job & job ); // Resolves its PCH if it can. Caller holds m_LocalJobsMutex.
+    void ReleaseReadyLocalJobs();
+    void EndLocalJobsWaitingForPch( uint64_t pchId ); // Its working copy cannot be made
+    static uint8_t s_LocalJobTag;       // Job::SetUserData of a gateway's local job
+    mutable Mutex m_LocalJobsMutex;
+    Array<Job *> m_LocalWaitingJobs;    // For their toolchain or PCH
+    Array<Job *> m_LocalEndedJobs;      // Not run, to end without a result on the Server's thread
 
     // Slot sharing. Every client's allowance is its share of the pool by demand (m_Allocator). A client whose
     // allowance changes is sent it by its outbox (MarkCapacityChanged); the ack is a new client's first allowance.

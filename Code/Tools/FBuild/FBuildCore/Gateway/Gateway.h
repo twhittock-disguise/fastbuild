@@ -86,6 +86,7 @@ private:
     virtual void OnClientFile( uint32_t clientId, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize ) override;
     virtual void OnPchStored( uint64_t pchId, uint32_t uncompressedSize, uint32_t compressedSize ) override;
     virtual void OnClientGone( uint32_t clientId ) override;
+    virtual void OnLocalJobEnded( uint32_t jobId, bool hasResult, bool compressed, MemoryStream & payload ) override;
 
     // DownstreamConnection::Owner
     virtual void OnDownstreamReady( DownstreamConnection & connection ) override;

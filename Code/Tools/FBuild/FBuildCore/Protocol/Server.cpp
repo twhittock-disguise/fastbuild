@@ -249,7 +249,28 @@ namespace
             FileIO::DirectoryDelete( directory );
         }
     }
+
+    // The payload of a MSG_JOB_RESULT(_COMPRESSED) for a job built here
+    void WriteJobResult( const Job & job, bool ok, MemoryStream & ms )
+    {
+        const Node * node = job.GetNode();
+        ms.Write( job.GetJobId() );
+        ms.Write( node->GetName() );
+        ms.Write( ok );
+        ms.Write( job.GetSystemErrorCount() > 0 );
+        ms.Write( job.GetMessages() );
+        ms.Write( node->GetLastBuildTime() );
+        ms.Write( job.GetRemoteThreadIndex() ); // The thread used to build the job to assist with visualization
+
+        // write the data - build result for success, or output+errors for failure
+        ms.Write( (uint32_t)job.GetDataSize() );
+        ms.WriteBuffer( job.GetData(), job.GetDataSize() );
+    }
 }
+
+// Static Data
+//------------------------------------------------------------------------------
+/*static*/ uint8_t Server::s_LocalJobTag = 0;
 
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
@@ -275,17 +296,32 @@ Server::Server( uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
 
 // CONSTRUCTOR (gateway)
 //------------------------------------------------------------------------------
-Server::Server( Forwarder & forwarder, const AString & cacheDir )
+Server::Server( Forwarder & forwarder, const AString & cacheDir, uint32_t localThreads, uint32_t prefetchBuffer )
     : m_Forwarder( &forwarder )
     , m_CacheDir( GetCacheRoot( cacheDir ) )
     , m_Log( m_CacheDir )
+    , m_PrefetchBuffer( prefetchBuffer )
     , m_ShouldExit( false )
 {
     m_ClientList.SetCapacity( 32 );
 
-    // PCHs are kept as they arrive, for the gateway to send on: none is unpacked
+    // A pure gateway keeps PCHs as they arrive, for the gateway to send on: none is unpacked
+    if ( localThreads > 0 )
+    {
+        ASSERT( m_CacheDir == GetCacheRoot( AString::GetEmpty() ) ); // Its PCHs are next to the toolchains
+        m_JobQueueRemote = FNEW( JobQueueRemote( localThreads ) );
+    }
     m_Thread.Start( ThreadFuncStatic, "Server", this );
+    if ( m_JobQueueRemote )
+    {
+        m_PchUnpackThread.Start( UnpackThreadFuncStatic, "PchUnpack", this, 256 * 1024 );
+    }
+
     ScanPchCache();
+    if ( m_JobQueueRemote )
+    {
+        ScanToolchainCache();
+    }
 }
 
 // DESTRUCTOR
@@ -308,6 +344,16 @@ Server::~Server()
 
     FDELETE m_JobQueueRemote;
 
+    // They hold PCH leases and toolchain uses, so they go first
+    for ( Job * job : m_LocalWaitingJobs )
+    {
+        FDELETE job;
+    }
+    for ( Job * job : m_LocalEndedJobs )
+    {
+        FDELETE job;
+    }
+
     for ( ToolManifest * tool : m_Tools )
     {
         FDELETE tool;
@@ -318,6 +364,11 @@ Server::~Server()
 //------------------------------------------------------------------------------
 /*static*/ void Server::GetHostForJob( const Job * job, AString & hostName )
 {
+    if ( job->GetUserData() == &s_LocalJobTag )
+    {
+        hostName = "gateway";
+        return;
+    }
     const ClientState * cs = (const ClientState *)job->GetUserData();
     if ( cs )
     {
@@ -1135,17 +1186,27 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
 //------------------------------------------------------------------------------
 void Server::Process( const ConnectionInfo * connection, const Protocol::MsgManifest * msg, const void * payload, size_t payloadSize )
 {
-    ToolManifest * manifest = nullptr;
-    const uint64_t toolId = msg->GetToolId();
-    ConstMemoryStream ms( payload, payloadSize );
-    ClientState * cs = (ClientState *)connection->GetUserData();
     m_NumManifestsReceived.Increment();
 
+    // A gateway's local pool synchronizes the toolchain as a worker does, before it is forwarded
+    if ( m_JobQueueRemote )
+    {
+        ReceiveManifest( connection, msg->GetToolId(), payload, payloadSize );
+    }
     if ( m_Forwarder )
     {
-        m_Forwarder->OnClientManifest( cs->m_Id, toolId, payload, payloadSize );
-        return;
+        const ClientState * cs = (const ClientState *)connection->GetUserData();
+        m_Forwarder->OnClientManifest( cs->m_Id, msg->GetToolId(), payload, payloadSize );
     }
+}
+
+// ReceiveManifest
+//------------------------------------------------------------------------------
+void Server::ReceiveManifest( const ConnectionInfo * connection, uint64_t toolId, const void * payload, size_t payloadSize )
+{
+    ToolManifest * manifest = nullptr;
+    ConstMemoryStream ms( payload, payloadSize );
+    ClientState * cs = (ClientState *)connection->GetUserData();
 
     {
         MutexHolder manifestMH( m_ToolManifestsMutex ); // ensure we don't make redundant requests
@@ -1164,14 +1225,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgMani
         }
         if ( manifest->DeserializeFromRemote( ms ) == false )
         {
-            ASSERT( false && "MsgManifest corrupt" );
-
-            AStackString remoteAddr;
-            TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-            LogWarning( "Disconnecting '%s' (%s) due to corrupt MsgManifest\n",
-                       remoteAddr.Get(),
-                       cs->m_HostName.Get() );
-            Disconnect( connection );
+            OnUnusableToolchainData( connection, "corrupt MsgManifest" );
             return;
         }
 
@@ -1189,7 +1243,6 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgMani
     {
         OnToolchainSynchronized( manifest );
         ReleaseReadyWaitingJobs();
-        return;
     }
 
     // In push mode, files arrive proactively from the coordinator.
@@ -1200,17 +1253,24 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgMani
 //------------------------------------------------------------------------------
 void Server::Process( const ConnectionInfo * connection, const Protocol::MsgFile * msg, const void * payload, size_t payloadSize )
 {
-    const uint64_t toolId = msg->GetToolId();
-    const uint32_t fileId = msg->GetFileId();
     m_NumToolFilesReceived.Increment();
 
+    // A gateway's local pool synchronizes the toolchain as a worker does, before it is forwarded
+    if ( m_JobQueueRemote )
+    {
+        ReceiveFile( connection, msg->GetToolId(), msg->GetFileId(), payload, payloadSize );
+    }
     if ( m_Forwarder )
     {
         const ClientState * cs = (const ClientState *)connection->GetUserData();
-        m_Forwarder->OnClientFile( cs->m_Id, toolId, fileId, payload, payloadSize );
-        return;
+        m_Forwarder->OnClientFile( cs->m_Id, msg->GetToolId(), msg->GetFileId(), payload, payloadSize );
     }
+}
 
+// ReceiveFile
+//------------------------------------------------------------------------------
+void Server::ReceiveFile( const ConnectionInfo * connection, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize )
+{
     // Update the Manifest
     ToolManifest * manifest = nullptr;
     {
@@ -1237,14 +1297,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgFile
         {
             if ( corruptData )
             {
-                ASSERT( false && "MsgFile corrupt" );
-
-                ClientState * cs = (ClientState *)connection->GetUserData();
-                AStackString remoteAddr;
-                TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-                LogWarning( "Disconnecting '%s' (%s) due to corrupt MsgFile\n",
-                           remoteAddr.Get(),
-                           cs->m_HostName.Get() );
+                OnUnusableToolchainData( connection, "corrupt MsgFile" );
             }
             else
             {
@@ -1256,9 +1309,11 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgFile
                            fileId,
                            toolId,
                            fileName.Get() );
+                if ( m_Forwarder == nullptr )
+                {
+                    Disconnect( connection );
+                }
             }
-
-            Disconnect( connection );
             return;
         }
 
@@ -1273,10 +1328,26 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgFile
     // ToolChain is now synchronized — allow any jobs waiting on it to start
     OnToolchainSynchronized( manifest );
     ReleaseReadyWaitingJobs();
-    if ( m_JobQueueRemote )
+    m_JobQueueRemote->WakeMainThread();
+}
+
+// OnUnusableToolchainData
+//------------------------------------------------------------------------------
+void Server::OnUnusableToolchainData( const ConnectionInfo * connection, const char * what )
+{
+    const ClientState * cs = (const ClientState *)connection->GetUserData();
+    AStackString remoteAddr;
+    TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
+    if ( m_Forwarder )
     {
-        m_JobQueueRemote->WakeMainThread();
+        // The forwarder has the same data, and decides for itself whether the client stays
+        LogWarning( "The gateway's local pool cannot use the toolchain '%s' (%s) sent: %s\n", remoteAddr.Get(), cs->m_HostName.Get(), what );
+        return;
     }
+
+    ASSERT( false && "Toolchain data corrupt" );
+    LogWarning( "Disconnecting '%s' (%s) due to %s\n", remoteAddr.Get(), cs->m_HostName.Get(), what );
+    Disconnect( connection );
 }
 
 // ReleaseReadyWaitingJobs
@@ -1290,6 +1361,8 @@ void Server::ReleaseReadyWaitingJobs()
     {
         return; // A pure gateway holds no jobs
     }
+    ReleaseReadyLocalJobs();
+
     MutexHolder mhC( m_ClientListMutex );
     for ( ClientState * cs : m_ClientList )
     {
@@ -1323,6 +1396,164 @@ void Server::ReleaseReadyWaitingJobs()
             m_JobQueueRemote->QueueJob( job );
             PROTOCOL_DEBUG( "Server: Job %x can now be started\n", job );
         }
+    }
+}
+
+// GetLocalSlots
+//------------------------------------------------------------------------------
+uint32_t Server::GetLocalSlots() const
+{
+    if ( m_Forwarder == nullptr || m_JobQueueRemote == nullptr )
+    {
+        return 0;
+    }
+    // None when the worker gives no CPUs: disabled, idle on a busy machine, or short of disk or memory
+    const uint32_t numCPUs = WorkerThreadRemote::GetNumCPUsToUse();
+    return ( numCPUs > 0 ) ? ( numCPUs + m_PrefetchBuffer ) : 0;
+}
+
+// IsToolchainSynchronized
+//------------------------------------------------------------------------------
+bool Server::IsToolchainSynchronized( uint64_t toolId ) const
+{
+    MutexHolder manifestMH( m_ToolManifestsMutex );
+    ToolManifest * const * found = m_Tools.FindDeref( toolId );
+    return found && ( *found )->IsSynchronized();
+}
+
+// RunLocalJob
+//------------------------------------------------------------------------------
+void Server::RunLocalJob( const Protocol::MsgJob & msg, const void * jobData, size_t jobDataSize )
+{
+    ASSERT( m_Forwarder );
+
+    ConstMemoryStream ms( jobData, jobDataSize );
+    Job * job = FNEW( Job( ms ) );
+    job->SetUserData( &s_LocalJobTag );
+    job->SetResultCompressionLevel( msg.GetResultCompressionLevel(), true /*allowZstdUse*/ );
+    const AStackString<> jobName( job->GetRemoteName() ); // The job may be finished and gone as soon as it is queued
+    const uint64_t pchId = job->GetPchId();
+
+    LocalJobState state = LOCAL_JOB_CANNOT_RUN; // In a pure gateway, which has no local pool
+    if ( m_JobQueueRemote )
+    {
+        // Held from here to its end, as a worker's job holds them, so neither is evicted while it waits
+        if ( pchId != 0 )
+        {
+            job->SetPchLease( AcquirePchLease( pchId ) );
+        }
+        {
+            MutexHolder manifestMH( m_ToolManifestsMutex );
+            ToolManifest ** found = m_Tools.FindDeref( msg.GetToolId() );
+            if ( found )
+            {
+                job->SetToolManifest( *found );
+            }
+        }
+
+        // Checked and parked under one lock, so a toolchain or PCH that lands meanwhile releases it
+        MutexHolder mh( m_LocalJobsMutex );
+        state = GetLocalJobState( *job );
+        if ( state == LOCAL_JOB_READY )
+        {
+            m_JobQueueRemote->QueueJob( job );
+        }
+        else if ( state == LOCAL_JOB_WAITING )
+        {
+            m_LocalWaitingJobs.Append( job );
+        }
+    }
+    if ( state == LOCAL_JOB_CANNOT_RUN )
+    {
+        MutexHolder mh( m_LocalJobsMutex );
+        m_LocalEndedJobs.Append( job );
+    }
+
+    m_Log.Write( "job received name=%s pch=0x%016" PRIx64 " waiting=%u local=1", jobName.Get(), pchId, ( state == LOCAL_JOB_WAITING ) ? 1u : 0u );
+    if ( ( state == LOCAL_JOB_CANNOT_RUN ) && m_JobQueueRemote )
+    {
+        m_JobQueueRemote->WakeMainThread();
+    }
+}
+
+// GetLocalJobState
+//------------------------------------------------------------------------------
+Server::LocalJobState Server::GetLocalJobState( Job & job )
+{
+    // The gateway gives the local pool a job once its toolchain is synchronized and its PCH stored here,
+    // so a job that cannot have them is not waited for
+    const ToolManifest * manifest = job.GetToolManifest();
+    if ( manifest == nullptr )
+    {
+        return LOCAL_JOB_CANNOT_RUN;
+    }
+    bool pchReady = true;
+    const uint64_t pchId = job.GetPchId();
+    if ( ( pchId != 0 ) && job.GetPchCachePath().IsEmpty() && ( TryResolvePch( job ) == false ) )
+    {
+        if ( IsPchCached( pchId ) == false )
+        {
+            return LOCAL_JOB_CANNOT_RUN; // Dropped as damaged, or never stored
+        }
+        pchReady = false; // Being unpacked
+    }
+    return ( manifest->IsSynchronized() && pchReady ) ? LOCAL_JOB_READY : LOCAL_JOB_WAITING;
+}
+
+// ReleaseReadyLocalJobs
+//------------------------------------------------------------------------------
+void Server::ReleaseReadyLocalJobs()
+{
+    bool anyEnded = false;
+    {
+        MutexHolder mh( m_LocalJobsMutex );
+        for ( size_t i = m_LocalWaitingJobs.GetSize(); i > 0; --i )
+        {
+            Job * job = m_LocalWaitingJobs[ i - 1 ];
+            const LocalJobState state = GetLocalJobState( *job );
+            if ( state == LOCAL_JOB_WAITING )
+            {
+                continue;
+            }
+            m_LocalWaitingJobs.EraseIndex( i - 1 );
+            if ( state == LOCAL_JOB_READY )
+            {
+                m_JobQueueRemote->QueueJob( job );
+            }
+            else
+            {
+                m_LocalEndedJobs.Append( job );
+                anyEnded = true;
+            }
+        }
+    }
+    if ( anyEnded )
+    {
+        m_JobQueueRemote->WakeMainThread();
+    }
+}
+
+// EndLocalJobsWaitingForPch
+//------------------------------------------------------------------------------
+void Server::EndLocalJobsWaitingForPch( uint64_t pchId )
+{
+    bool anyEnded = false;
+    {
+        MutexHolder mh( m_LocalJobsMutex );
+        for ( size_t i = m_LocalWaitingJobs.GetSize(); i > 0; --i )
+        {
+            Job * job = m_LocalWaitingJobs[ i - 1 ];
+            if ( ( job->GetPchId() == pchId ) && job->GetPchCachePath().IsEmpty() )
+            {
+                m_LocalWaitingJobs.EraseIndex( i - 1 );
+                m_LocalEndedJobs.Append( job );
+                anyEnded = true;
+            }
+        }
+    }
+    if ( anyEnded && m_JobQueueRemote )
+    {
+        m_JobQueueRemote->WakeMainThread();
     }
 }
 
@@ -2231,6 +2462,7 @@ void Server::UnpackPch( uint64_t pchId )
     {
         LogWarning( "PCH 0x%016" PRIx64 " cannot be unpacked, as its working copy cannot be written: returning the jobs that need it to their clients\n", pchId );
         DisconnectClientsWaitingForPch( pchId );
+        EndLocalJobsWaitingForPch( pchId );
         return; // Nothing changed for the jobs of other clients: they would only ask for it to be unpacked again
     }
 
@@ -2366,10 +2598,7 @@ void Server::ThreadFunc()
 {
     while ( m_ShouldExit.Load() == false )
     {
-        if ( m_JobQueueRemote )
-        {
-            FinalizeCompletedJobs();
-        }
+        FinalizeCompletedJobs();
 
         ShareSlotsOnTick();
 
@@ -2399,6 +2628,24 @@ void Server::FinalizeCompletedJobs()
 {
     PROFILE_FUNCTION;
 
+    // Local jobs that could not be run here end without a result, so the gateway can send them elsewhere
+    Array<Job *> notRun;
+    {
+        MutexHolder mh( m_LocalJobsMutex );
+        notRun.Swap( m_LocalEndedJobs );
+    }
+    for ( Job * job : notRun )
+    {
+        m_Log.Write( "job finished name=%s ms=0 result=not-run", job->GetRemoteName().Get() );
+        MemoryStream none;
+        m_Forwarder->OnLocalJobEnded( job->GetJobId(), false, false, none );
+        FDELETE job;
+    }
+
+    if ( m_JobQueueRemote == nullptr )
+    {
+        return;
+    }
     JobQueueRemote & jcr = *m_JobQueueRemote;
     Node::BuildResult result;
     while ( Job * job = jcr.GetCompletedJob( result ) )
@@ -2415,9 +2662,23 @@ void Server::FinalizeCompletedJobs()
         const Node * node = job->GetNode();
         m_Log.Write( "job finished name=%s ms=%u result=%s", job->GetRemoteName().Get(), node->GetLastBuildTime(), outcome );
 
+        const bool hasResult = ( result == Node::BuildResult::eOk ) || ( result == Node::BuildResult::eFailed );
+        if ( job->GetUserData() == &s_LocalJobTag )
+        {
+            // The gateway's: it is never cancelled with a client, and an aborted one ends without a result
+            MemoryStream ms;
+            if ( hasResult )
+            {
+                WriteJobResult( *job, result == Node::BuildResult::eOk, ms );
+            }
+            m_Forwarder->OnLocalJobEnded( job->GetJobId(), hasResult, hasResult && ( job->GetResultCompressionLevel() != 0 ), ms );
+            FDELETE job;
+            continue;
+        }
+
         // Jobs that ended in a useful state are reported to the Client
         // Other jobs (like those that were cancelled) are not
-        if ( ( result == Node::BuildResult::eOk ) || ( result == Node::BuildResult::eFailed ) )
+        if ( hasResult )
         {
             // get associated connection
             ClientState * cs = (ClientState *)job->GetUserData();
@@ -2434,17 +2695,7 @@ void Server::FinalizeCompletedJobs()
             {
                 // Build the message before taking any lock, as the result can be large
                 MemoryStream ms;
-                ms.Write( job->GetJobId() );
-                ms.Write( node->GetName() );
-                ms.Write( result == Node::BuildResult::eOk );
-                ms.Write( job->GetSystemErrorCount() > 0 );
-                ms.Write( job->GetMessages() );
-                ms.Write( node->GetLastBuildTime() );
-                ms.Write( job->GetRemoteThreadIndex() ); // The thread used to build the job to assist with visualization
-
-                // write the data - build result for success, or output+errors for failure
-                ms.Write( (uint32_t)job->GetDataSize() );
-                ms.WriteBuffer( job->GetData(), job->GetDataSize() );
+                WriteJobResult( *job, result == Node::BuildResult::eOk, ms );
 
                 // The client's outbox sends it, so no lock is held while the client reads
                 MutexHolder mh( m_ClientListMutex );

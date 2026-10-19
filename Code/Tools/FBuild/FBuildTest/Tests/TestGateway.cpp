@@ -22,6 +22,7 @@
 #include "Tools/FBuild/FBuildCore/Protocol/WorkerSendQueue.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/DemandRamp.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/FairShareAllocator.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/PchDispatch.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
@@ -274,6 +275,7 @@ namespace
             m_GoneClients.Append( clientId );
             m_QueuedWhenGone.Append( queued );
         }
+        virtual void OnLocalJobEnded( uint32_t /*jobId*/, bool /*hasResult*/, bool /*compressed*/, MemoryStream & /*payload*/ ) override {}
 
         // Set to have each OnClientGone try to queue a result for the client
         Server * m_Server = nullptr;
@@ -494,6 +496,8 @@ private:
     void WorkerWithoutSlotsKeepsTheJobsItRuns() const;
     void WorkerBackWithSlotsCountsTheJobsItRuns() const;
     void LostWorkerWithoutSlotsHasItsJobsRetried() const;
+    void GatewayWithALocalPoolKeepsItsJobQueue() const;
+    void LocalJobHostIsTheGateway() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -663,6 +667,8 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( WorkerWithoutSlotsKeepsTheJobsItRuns )
     REGISTER_TEST( WorkerBackWithSlotsCountsTheJobsItRuns )
     REGISTER_TEST( LostWorkerWithoutSlotsHasItsJobsRetried )
+    REGISTER_TEST( GatewayWithALocalPoolKeepsItsJobQueue )
+    REGISTER_TEST( LocalJobHostIsTheGateway )
 REGISTER_TESTS_END
 
 // PreTest
@@ -6730,6 +6736,46 @@ void TestGateway::LostWorkerWithoutSlotsHasItsJobsRetried() const
     TEST_ASSERT( w2.GetNumJobs() == 2 );
     TEST_ASSERT( GetGatewayStats( gateway ).m_Retries == 2 );
     probe.ShutdownAllConnections();
+}
+
+// GatewayWithALocalPoolKeepsItsJobQueue
+//------------------------------------------------------------------------------
+void TestGateway::GatewayWithALocalPoolKeepsItsJobQueue() const
+{
+    TEST_ASSERT( JobQueueRemote::IsValid() == false ); // No other Server in the process
+
+    const uint32_t originalCpus = WorkerThreadRemote::GetNumCPUsToUse();
+    StubForwarder forwarder( 4 );
+    {
+        Server s( forwarder, AString::GetEmpty(), 2, 1 );
+        TEST_ASSERT( JobQueueRemote::IsValid() );
+        TEST_ASSERT( s.GetLocalSlots() == ( 999 + 1 ) );
+
+        // Disabled, or idle and busy: the gateway runs no jobs itself
+        WorkerThreadRemote::SetNumCPUsToUse( 0 );
+        const uint32_t disabledSlots = s.GetLocalSlots();
+        WorkerThreadRemote::SetNumCPUsToUse( originalCpus );
+        TEST_ASSERT( disabledSlots == 0 );
+    }
+    TEST_ASSERT( JobQueueRemote::IsValid() == false );
+
+    // A pure gateway has no local pool
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    Server pure( forwarder, cacheDir );
+    TEST_ASSERT( pure.GetLocalSlots() == 0 );
+    TEST_ASSERT( JobQueueRemote::IsValid() == false );
+}
+
+// LocalJobHostIsTheGateway
+//------------------------------------------------------------------------------
+void TestGateway::LocalJobHostIsTheGateway() const
+{
+    Job job( static_cast<Node *>( nullptr ) );
+    job.SetUserData( &Server::s_LocalJobTag );
+    AStackString<> hostName( "unset" );
+    Server::GetHostForJob( &job, hostName );
+    TEST_ASSERT( hostName == "gateway" );
 }
 
 //------------------------------------------------------------------------------
