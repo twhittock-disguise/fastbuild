@@ -22,6 +22,7 @@
 #include "Tools/FBuild/FBuildCore/Protocol/WorkerSendQueue.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/PchDispatch.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
 
 // Core
 #include "Core/Containers/Array.h"
@@ -39,6 +40,7 @@
 #include "Core/Strings/AStackString.h"
 #include "Core/Time/Timer.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 // Defines
@@ -449,6 +451,12 @@ private:
     void JobsQueuedBehindABusyWorkerAreKept() const;
     void NoWorkerBoundStartsAgainWhenAWorkerReturns() const;
     void GatewayLogsFailures() const;
+    void BuildThroughAPureForwardingGateway() const;
+#if defined( __WINDOWS__ )
+    void PchBuildThroughTheGatewaySendsEachPchOnce() const;
+    void GatewayRestartMidBuildCompletesTheBuild() const;
+#endif
+    void GatewayIsNoSlowerThanDirect() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -584,6 +592,12 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( JobsQueuedBehindABusyWorkerAreKept )
     REGISTER_TEST( NoWorkerBoundStartsAgainWhenAWorkerReturns )
     REGISTER_TEST( GatewayLogsFailures )
+    REGISTER_TEST( BuildThroughAPureForwardingGateway )
+#if defined( __WINDOWS__ ) // PCH distribution is for MSVC
+    REGISTER_TEST( PchBuildThroughTheGatewaySendsEachPchOnce )
+    REGISTER_TEST( GatewayRestartMidBuildCompletesTheBuild )
+#endif
+    REGISTER_TEST( GatewayIsNoSlowerThanDirect )
 REGISTER_TESTS_END
 
 // PreTest
@@ -4996,6 +5010,370 @@ void TestGateway::GatewayLogsFailures() const
     TEST_ASSERT( log.Find( expected.Get() ) );
     const char * stats = log.Find( "gateway stats clients=" );
     TEST_ASSERT( stats && strstr( stats, " retries=3 giveups=1 timeouts=0" ) );
+}
+
+// Builds through the gateway
+//------------------------------------------------------------------------------
+namespace
+{
+    // The slots a real Server offers, for the length of a test
+    class RemoteCpusForTest
+    {
+    public:
+        explicit RemoteCpusForTest( uint32_t numCpus ) : m_Original( WorkerThreadRemote::GetNumCPUsToUse() ) { WorkerThreadRemote::SetNumCPUsToUse( numCpus ); }
+        ~RemoteCpusForTest() { WorkerThreadRemote::SetNumCPUsToUse( m_Original ); }
+        explicit RemoteCpusForTest( const RemoteCpusForTest & other ) = delete;
+        RemoteCpusForTest & operator=( const RemoteCpusForTest & other ) = delete;
+
+    private:
+        const uint32_t m_Original;
+    };
+
+    // Every job is built on a worker, as TestDistributed::TestHelper builds
+    void MakeRemoteBuildOptions( FBuildTestOptions & options )
+    {
+        DistributedTest::MakeDistributedPchOptions( options );
+        options.m_ForceCleanBuild = true;
+    }
+
+    void DeleteDistributedTestOutputs()
+    {
+        Array<AString> files;
+        FileIO::GetFiles( AStackString( "../tmp/Test/Distributed" ), AStackString( "*.*" ), true, &files );
+        for ( const AString & file : files )
+        {
+            FileIO::FileDelete( file.Get() );
+        }
+    }
+
+    // The compressed PCHs in a gateway's store
+    void GetStoredPchSizes( const AString & cacheDir, Array<uint64_t> & outSizes )
+    {
+        Array<AString> files;
+        FileIO::GetFiles( cacheDir, AStackString<>( "*" ), true, &files );
+        for ( const AString & file : files )
+        {
+            FileStream f;
+            if ( file.EndsWith( PchBlob::kStoredFileName ) && f.Open( file.Get(), FileStream::READ_ONLY ) )
+            {
+                outSizes.Append( f.GetFileSize() );
+            }
+        }
+    }
+
+    // The stats log writes sizes to one decimal of a KB, or of a MB from 1 MB
+    bool IsLoggedSize( uint64_t logged, uint64_t actual )
+    {
+        const uint64_t tolerance = ( actual >= MEGABYTE ) ? ( MEGABYTE / 10 ) : 103;
+        return ( ( logged + tolerance ) >= actual ) && ( logged <= ( actual + tolerance ) );
+    }
+
+    // The toolchain messages a client sent over each of its connections, and the toolchains it did not
+    // send because the worker had them
+    void GetToolchainStats( const AString & logPath, Array<uint32_t> & outMessages, uint32_t & outNumSkipped )
+    {
+        outNumSkipped = 0;
+        AString log;
+        if ( ReadWholeFile( logPath, log ) == false )
+        {
+            return;
+        }
+        const char * const kPrefix = "  toolchain: ";
+        for ( const char * line = log.Find( kPrefix ); line; line = strstr( line + 1, kPrefix ) )
+        {
+            char * end = nullptr;
+            const uint32_t n = (uint32_t)strtoul( line + strlen( kPrefix ), &end, 10 );
+            if ( strncmp( end, " msgs", 5 ) == 0 )
+            {
+                outMessages.Append( n );
+            }
+            else if ( strncmp( end, " cached on the worker", 21 ) == 0 )
+            {
+                outNumSkipped += n;
+            }
+        }
+    }
+
+    // Once the gateway has forwarded a job, puts a new one with the same config in its place
+    class GatewayRestarter
+    {
+    public:
+        GatewayRestarter( UniquePtr<Gateway> & gateway, const GatewayConfig & config )
+            : m_Gateway( gateway )
+            , m_Config( config )
+        {
+            m_Thread.Start( ThreadFunc, "GatewayRestarter", this );
+        }
+        ~GatewayRestarter() { Join(); }
+        explicit GatewayRestarter( const GatewayRestarter & other ) = delete;
+        GatewayRestarter & operator=( const GatewayRestarter & other ) = delete;
+
+        // After this, the gateway is the main thread's again
+        void Join()
+        {
+            if ( m_Thread.IsRunning() )
+            {
+                m_Stop.Store( true );
+                m_Thread.Join();
+            }
+        }
+        bool HasRestarted() const { return m_Restarted.Load(); }
+
+    private:
+        static uint32_t ThreadFunc( void * param )
+        {
+            GatewayRestarter * r = static_cast<GatewayRestarter *>( param );
+            while ( r->m_Stop.Load() == false )
+            {
+                Gateway::Stats stats;
+                r->m_Gateway.Get()->GetStats( stats );
+                if ( stats.m_Forwarded >= 1 )
+                {
+                    r->m_Gateway.Replace( nullptr );
+                    r->m_Gateway.Replace( FNEW( Gateway( r->m_Config ) ) );
+
+                    // Listening once its worker is ready, so the client is not refused for want of slots
+                    const Timer timer;
+                    do
+                    {
+                        r->m_Gateway.Get()->GetStats( stats );
+                        Thread::Sleep( 1 );
+                    } while ( ( stats.m_ReadyWorkers == 0 ) && ( timer.GetElapsed() < 30.0f ) );
+                    r->m_Restarted.Store( r->m_Gateway.Get()->Listen( Protocol::kTestPort ) );
+                    break;
+                }
+                Thread::Sleep( 1 );
+            }
+            return 0;
+        }
+
+        UniquePtr<Gateway> & m_Gateway;
+        const GatewayConfig & m_Config;
+        Thread m_Thread;
+        Atomic<bool> m_Stop{ false };
+        Atomic<bool> m_Restarted{ false };
+    };
+}
+
+// BuildThroughAPureForwardingGateway
+//------------------------------------------------------------------------------
+void TestGateway::BuildThroughAPureForwardingGateway() const
+{
+    FBuildTestOptions options;
+    MakeRemoteBuildOptions( options );
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    DeleteDistributedTestOutputs();
+
+    Server worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    const char * target( "../tmp/Test/Distributed/dist.lib" );
+    TEST_ASSERT( FileIO::FileExists( target ) == false );
+    TEST_ASSERT( fBuild.Build( target ) );
+    TEST_ASSERT( FileIO::FileExists( target ) );
+
+    // Each of the three objects went through the gateway once
+    const Gateway::Stats stats = GetGatewayStats( gateway );
+    TEST_ASSERT( stats.m_Forwarded == 3 );
+    TEST_ASSERT( ( stats.m_Retries == 0 ) && ( stats.m_GiveUps == 0 ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+}
+
+#if defined( __WINDOWS__ )
+// PchBuildThroughTheGatewaySendsEachPchOnce
+//------------------------------------------------------------------------------
+void TestGateway::PchBuildThroughTheGatewaySendsEachPchOnce() const
+{
+    // The Server offers one slot, as the echo worker does, so the scheduler (more free slots, then
+    // the lower index) gives the first job to the Server and the second to the echo worker. Each job
+    // that fails there is retried on the Server.
+    const RemoteCpusForTest oneSlot( 1 );
+
+    FBuildTestOptions options;
+    MakeRemoteBuildOptions( options );
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    DeleteDistributedTestOutputs();
+
+    GatewayConfig config;
+    MakeGatewayConfig( 2, config );
+    AStackString<> logPath;
+    {
+        Server worker( 4 );
+        TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+        EchoWorker echo( 1, EchoWorker::ANSWER_SYSTEM_ERROR );
+        TEST_ASSERT( echo.Listen( kGatewayTestDownstreamPort + 1 ) );
+        Gateway gateway( config );
+        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
+        TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 2 );
+        logPath = gateway.GetServer().GetLogPath();
+
+        DistributedTest::DenyListPoller poller( fBuild );
+        TEST_ASSERT( fBuild.Build( "../tmp/Test/Distributed/distpch.lib" ) );
+        TEST_ASSERT( FileIO::FileExists( "../tmp/Test/Distributed/distpch.lib" ) );
+        TEST_ASSERT( poller.GetMax() == 0 );
+
+        const Gateway::Stats stats = GetGatewayStats( gateway );
+        TEST_ASSERT( echo.GetNumJobs() >= 1 );
+        TEST_ASSERT( echo.GetNumPchCopies() == 1 );
+        TEST_ASSERT( stats.m_Retries == echo.GetNumJobs() );
+        TEST_ASSERT( stats.m_GiveUps == 0 );
+    }
+
+    // The client sent one copy of the PCH: the one the gateway stored
+    Array<uint64_t> storedSizes;
+    GetStoredPchSizes( config.m_CacheDir, storedSizes );
+    TEST_ASSERT( storedSizes.GetSize() == 1 );
+    AStackString<> statsLogPath;
+    DistributedTest::GetStatsLogPath( statsLogPath );
+    uint32_t numConnections = 0;
+    uint32_t numMessages = 0;
+    uint64_t rawBytes = 0;
+    uint64_t sentBytes = 0;
+    DistributedTest::ReadStats( statsLogPath, "  pch: ", numConnections, rawBytes, sentBytes, &numMessages );
+    TEST_ASSERT( numConnections == 1 );
+    TEST_ASSERT( numMessages == Protocol::MsgPchFile::GetNumChunks( (uint32_t)storedSizes[ 0 ], Protocol::kPchChunkSize ) );
+    TEST_ASSERT( IsLoggedSize( sentBytes, storedSizes[ 0 ] ) );
+
+    // The gateway sent it on to both workers
+    AString log;
+    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    for ( uint32_t i = 0; i < 2; ++i )
+    {
+        AStackString<> expected;
+        expected.Format( " worker=127.0.0.1:%u bytes=%" PRIu64, (uint32_t)( kGatewayTestDownstreamPort + i ), storedSizes[ 0 ] );
+        bool found = false;
+        for ( const char * line = log.Find( "gateway pch-forward pch=0x" ); line && ( found == false ); line = strstr( line + 1, "gateway pch-forward pch=0x" ) )
+        {
+            const char * end = strchr( line, '\n' );
+            const char * match = strstr( line, expected.Get() );
+            found = match && ( ( end == nullptr ) || ( match < end ) );
+        }
+        TEST_ASSERT( found );
+    }
+}
+
+// GatewayRestartMidBuildCompletesTheBuild
+//------------------------------------------------------------------------------
+void TestGateway::GatewayRestartMidBuildCompletesTheBuild() const
+{
+    // One slot downstream, so the gateway offers one and the three jobs are forwarded one at a time
+    const RemoteCpusForTest oneSlot( 1 );
+
+    FBuildTestOptions options;
+    MakeRemoteBuildOptions( options );
+    options.m_DistributionReconnectDelay = 0.1f; // The restarted gateway is connected to again within the build
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    DeleteDistributedTestOutputs();
+
+    Server worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    UniquePtr<Gateway> gateway( FNEW( Gateway( config ) ) );
+    TEST_ASSERT( gateway.Get()->Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( *gateway.Get(), 1 ) );
+    TEST_ASSERT( GetGatewayStats( *gateway.Get() ).m_PoolSlots == 1 );
+
+    // A forwarded job's PCH and toolchain were stored before it, so nothing is being uploaded when the
+    // gateway goes
+    bool built = false;
+    {
+        GatewayRestarter restarter( gateway, config );
+        DistributedTest::DenyListPoller poller( fBuild );
+        auto never = []() { return false; };
+        DistributedTest::BuildAborter aborter( never, 120.0f );
+        built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
+        TEST_ASSERT( aborter.HasTimedOut() == false );
+        TEST_ASSERT( poller.GetMax() == 0 );
+        restarter.Join();
+        TEST_ASSERT( restarter.HasRestarted() );
+    }
+    TEST_ASSERT( built );
+    TEST_ASSERT( FileIO::FileExists( "../tmp/Test/Distributed/distpch.lib" ) );
+
+    // The new gateway was given the build's remaining jobs
+    TEST_ASSERT( GetGatewayStats( *gateway.Get() ).m_Forwarded >= 1 );
+    gateway.Replace( nullptr );
+
+    // The client sent the toolchain and the PCH once over both connections: the restarted gateway
+    // advertised what the first had stored
+    AStackString<> statsLogPath;
+    DistributedTest::GetStatsLogPath( statsLogPath );
+    Array<uint32_t> toolchainMessages;
+    uint32_t numSkippedToolchains = 0;
+    GetToolchainStats( statsLogPath, toolchainMessages, numSkippedToolchains );
+    TEST_ASSERT( toolchainMessages.GetSize() >= 2 );
+    TEST_ASSERT( toolchainMessages[ 0 ] >= 2 ); // The manifest and its files
+    for ( size_t i = 1; i < toolchainMessages.GetSize(); ++i )
+    {
+        TEST_ASSERT( toolchainMessages[ i ] == 0 );
+    }
+    TEST_ASSERT( numSkippedToolchains >= 1 );
+
+    Array<uint64_t> storedSizes;
+    GetStoredPchSizes( config.m_CacheDir, storedSizes );
+    TEST_ASSERT( storedSizes.GetSize() == 1 );
+    uint32_t numConnections = 0;
+    uint32_t numMessages = 0;
+    uint64_t rawBytes = 0;
+    uint64_t sentBytes = 0;
+    DistributedTest::ReadStats( statsLogPath, "  pch: ", numConnections, rawBytes, sentBytes, &numMessages );
+    TEST_ASSERT( numConnections >= 2 );
+    TEST_ASSERT( numMessages == Protocol::MsgPchFile::GetNumChunks( (uint32_t)storedSizes[ 0 ], Protocol::kPchChunkSize ) );
+    TEST_ASSERT( IsLoggedSize( sentBytes, storedSizes[ 0 ] ) );
+}
+#endif
+
+// GatewayIsNoSlowerThanDirect
+//------------------------------------------------------------------------------
+void TestGateway::GatewayIsNoSlowerThanDirect() const
+{
+    // A guard against gross regressions, not a measure of the gateway
+    const char * target( "../tmp/Test/Distributed/dist.lib" );
+    FBuildTestOptions options;
+    MakeRemoteBuildOptions( options );
+    float direct = 0.0f;
+    {
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+        DeleteDistributedTestOutputs();
+        Server worker( 4 );
+        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+        const Timer timer;
+        TEST_ASSERT( fBuild.Build( target ) );
+        direct = timer.GetElapsed();
+    }
+
+    // Only one Server may build jobs at a time (JobQueueRemote), so the direct one has gone
+    float throughGateway = 0.0f;
+    {
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+        DeleteDistributedTestOutputs();
+        Server worker( 4 );
+        TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+        GatewayConfig config;
+        MakeGatewayConfig( 1, config );
+        Gateway gateway( config );
+        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+        const Timer timer;
+        TEST_ASSERT( fBuild.Build( target ) );
+        throughGateway = timer.GetElapsed();
+        TEST_ASSERT( GetGatewayStats( gateway ).m_Forwarded == 3 );
+    }
+
+    OUTPUT( "GatewayIsNoSlowerThanDirect: direct %.2fs, through the gateway %.2fs\n", (double)direct, (double)throughGateway );
+    TEST_ASSERT( throughGateway <= ( ( direct * 1.5f ) + 2.0f ) );
 }
 
 //------------------------------------------------------------------------------
