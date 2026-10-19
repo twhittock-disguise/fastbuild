@@ -161,12 +161,14 @@ private:
     void ToolchainIsSentBeforeAnyJob() const;
     void PchIsNotSentToAWorkerWithoutAFreeSlot() const;
     void PchIsSentToAWorkerWithAFreeSlot() const;
-    void BuildUntilPchSettles( uint8_t capacity, uint32_t & outNumPchFiles, bool & outJobWaited ) const;
+    void BuildUntilPchSettles( uint32_t capacity, uint32_t & outNumPchFiles, bool & outJobWaited ) const;
     void CachedToolchainIsNotSent() const;
     void ToolchainIsNotSentWhenNothingIsDistributed() const;
     void MismatchedProtocolVersionIsRefused() const;
     void FramesOfAnotherMajorAreRefused() const;
     void HandshakeLayoutIsFrozen() const;
+    void AckCarriesACapacityAbove255() const;
+    void ClientReadsACapacityAbove255() const;
     void VersionIsShownWithTheProtocol() const;
     void ShortMessagesAreRejected() const;
     void HeadersWithTheWrongPayloadAreRejected() const;
@@ -419,6 +421,10 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( MismatchedProtocolVersionIsRefused )
     REGISTER_TEST( FramesOfAnotherMajorAreRefused )
     REGISTER_TEST( HandshakeLayoutIsFrozen )
+    REGISTER_TEST( AckCarriesACapacityAbove255 )
+#if defined( __WINDOWS__ )
+    REGISTER_TEST( ClientReadsACapacityAbove255 )
+#endif
     REGISTER_TEST( VersionIsShownWithTheProtocol )
     REGISTER_TEST( ShortMessagesAreRejected )
     REGISTER_TEST( HeadersWithTheWrongPayloadAreRejected )
@@ -2951,9 +2957,9 @@ namespace
     class RecordingWorker : public FakeWorker
     {
     public:
-        static constexpr uint8_t kNoCapacity = 0;
+        static constexpr uint32_t kNoCapacity = 0;
 
-        explicit RecordingWorker( uint8_t capacity, const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
+        explicit RecordingWorker( uint32_t capacity, const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
             : FakeWorker( capacity, toolchainInventory )
         {
         }
@@ -3062,7 +3068,7 @@ void TestDistributed::ToolchainIsSentBeforeAnyJob() const
 //------------------------------------------------------------------------------
 // Builds against a worker of the capacity until its PCH is sent, or has had time to be once a job
 // that needs it waits
-void TestDistributed::BuildUntilPchSettles( uint8_t capacity, uint32_t & outNumPchFiles, bool & outJobWaited ) const
+void TestDistributed::BuildUntilPchSettles( uint32_t capacity, uint32_t & outNumPchFiles, bool & outJobWaited ) const
 {
     constexpr float kSettleSeconds = 5.0f; // Far longer than a client that sends the PCH takes
     constexpr float kBuildTimeoutSeconds = 60.0f;
@@ -3481,6 +3487,15 @@ void TestDistributed::HandshakeLayoutIsFrozen() const
     TEST_ASSERT( ackBytes[ kGoldenAckMajorOffset ] == Protocol::kVersionMajor );
     TEST_ASSERT( ackBytes[ kGoldenAckMajorOffset + 1 ] == Protocol::kVersionMinor );
     TEST_ASSERT( ackBytes[ kGoldenPrefixSize ] == 4 ); // The capacity follows the version fields
+    TEST_ASSERT( ack.GetWorkerCapacity() == 4 );
+
+    // The capacity is 32 bits, little endian
+    const Protocol::MsgConnectionAck wideAck( 340 );
+    uint8_t wideAckBytes[ sizeof( wideAck ) ];
+    memcpy( wideAckBytes, &wideAck, sizeof( wideAck ) );
+    const uint8_t wideCapacity[] = { 0x54, 0x01, 0, 0 };
+    TEST_ASSERT( memcmp( wideAckBytes + kGoldenPrefixSize, wideCapacity, sizeof( wideCapacity ) ) == 0 );
+    TEST_ASSERT( wideAck.GetWorkerCapacity() == 340 );
 
     const Protocol::MsgRefused refused;
     uint8_t refusedBytes[ sizeof( refused ) ];
@@ -3505,6 +3520,51 @@ void TestDistributed::HandshakeLayoutIsFrozen() const
     const Protocol::MsgConnectionAck * oldAck = reinterpret_cast<const Protocol::MsgConnectionAck *>( ack23 );
     TEST_ASSERT( oldAck->GetProtocolVersionMajor() == 23 );
     TEST_ASSERT( oldAck->GetWorkerVersion() == 0x1234 );
+    TEST_ASSERT( oldAck->GetWorkerCapacity() == 4 );
+}
+
+// AckCarriesACapacityAbove255
+//------------------------------------------------------------------------------
+void TestDistributed::AckCarriesACapacityAbove255() const
+{
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+
+    HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    TEST_ASSERT( ci );
+    const Protocol::MsgConnection msg;
+    TEST_ASSERT( probe.Send( ci, &msg, sizeof( msg ) ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 1 ); } ) );
+    TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
+
+    // A test worker uses every thread it is told to
+    TEST_ASSERT( probe.GetAckCapacity() == WorkerThreadRemote::GetNumCPUsToUse() );
+    TEST_ASSERT( probe.GetAckCapacity() > 255 );
+    probe.ShutdownAllConnections();
+}
+
+// ClientReadsACapacityAbove255
+//------------------------------------------------------------------------------
+void TestDistributed::ClientReadsACapacityAbove255() const
+{
+    RecordingWorker worker( 300 );
+    FBuildTestOptions options;
+    MakeDistributedPchOptions( options );
+    options.m_DistVerbose = true;
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    auto reached = [ &worker ]() { return worker.GetNumManifests() >= 1; };
+    BuildAborter aborter( reached, kWaitTimeoutSeconds );
+    const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
+    worker.ShutdownAllConnections();
+
+    TEST_ASSERT( built == false ); // Aborted
+    TEST_ASSERT( aborter.HasReached() );
+    TEST_ASSERT( GetRecordedOutput().Find( "capacity=300" ) );
 }
 
 // VersionIsShownWithTheProtocol

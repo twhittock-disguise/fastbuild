@@ -142,7 +142,7 @@ void Protocol::MsgConnection::GetHostName( uint32_t frameSize, AString & outName
 
 // MsgConnectionAck
 //------------------------------------------------------------------------------
-Protocol::MsgConnectionAck::MsgConnectionAck( uint8_t capacity )
+Protocol::MsgConnectionAck::MsgConnectionAck( uint32_t capacity )
     : Protocol::IMessage( Protocol::MSG_CONNECTION_ACK, sizeof( MsgConnectionAck ), false )
     , m_WorkerVersion( static_cast<uint16_t>( GetVersionIdentifier() ) )
     , m_ProtocolVersionMajor( kVersionMajor )
@@ -152,7 +152,7 @@ Protocol::MsgConnectionAck::MsgConnectionAck( uint8_t capacity )
     static_assert( offsetof( MsgConnectionAck, m_WorkerVersion ) == 4, "MsgConnectionAck worker version moved" );
     static_assert( offsetof( MsgConnectionAck, m_ProtocolVersionMajor ) == 6, "MsgConnectionAck major moved" );
     static_assert( offsetof( MsgConnectionAck, m_ProtocolVersionMinor ) == 7, "MsgConnectionAck minor moved" );
-    memset( m_Padding2, 0, sizeof( m_Padding2 ) );
+    static_assert( offsetof( MsgConnectionAck, m_WorkerCapacity ) == 8, "MsgConnectionAck capacity moved" );
 }
 
 // MsgRefused

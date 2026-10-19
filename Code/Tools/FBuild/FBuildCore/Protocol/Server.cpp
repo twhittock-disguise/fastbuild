@@ -627,7 +627,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     RecalculateCapacity();
 
     // Send ack with allocated capacity
-    const Protocol::MsgConnectionAck ack( (uint8_t)cs->m_AllocatedCapacity );
+    const Protocol::MsgConnectionAck ack( cs->m_AllocatedCapacity );
     SendTo( *cs, ack );
 
     // Send PCH inventory so coordinator knows what's already cached

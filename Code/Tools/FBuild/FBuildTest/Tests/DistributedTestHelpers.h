@@ -262,7 +262,7 @@ namespace DistributedTest
     class FakeWorker : public TCPConnectionPool
     {
     public:
-        explicit FakeWorker( uint8_t capacity, const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
+        explicit FakeWorker( uint32_t capacity, const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
             : m_Capacity( capacity )
             , m_ToolchainInventory( toolchainInventory )
         {
@@ -385,7 +385,7 @@ namespace DistributedTest
             FREE( payload );
         }
 
-        const uint8_t m_Capacity;
+        const uint32_t m_Capacity;
         const Array<uint64_t> m_ToolchainInventory;
         struct ConnectionState
         {
@@ -427,6 +427,7 @@ namespace DistributedTest
         bool IsDisconnected() const { return m_Disconnected.Load(); }
         uint32_t GetRefusedMajor() const { return m_RefusedMajor.Load(); }
         uint32_t GetRefusedMinor() const { return m_RefusedMinor.Load(); }
+        uint32_t GetAckCapacity() const { return m_AckCapacity.Load(); }
         void GetToolchainIds( Array<uint64_t> & outToolIds ) const
         {
             MutexHolder mh( m_Mutex );
@@ -461,6 +462,10 @@ namespace DistributedTest
                     m_RefusedMajor.Store( refused->GetProtocolVersionMajor() );
                     m_RefusedMinor.Store( refused->GetProtocolVersionMinor() );
                 }
+                if ( m_CurrentMessage->GetType() == Protocol::MSG_CONNECTION_ACK )
+                {
+                    m_AckCapacity.Store( static_cast<const Protocol::MsgConnectionAck *>( m_CurrentMessage )->GetWorkerCapacity() );
+                }
                 if ( m_CurrentMessage->GetType() == Protocol::MSG_PCH_NEEDED )
                 {
                     m_PchNeededIds.Append( static_cast<const Protocol::MsgPchNeeded *>( m_CurrentMessage )->GetPchId() );
@@ -488,6 +493,7 @@ namespace DistributedTest
         Atomic<bool> m_Disconnected{ false };
         Atomic<uint32_t> m_RefusedMajor{ 0 };
         Atomic<uint32_t> m_RefusedMinor{ 0 };
+        Atomic<uint32_t> m_AckCapacity{ 0 };
         const Protocol::IMessage * m_CurrentMessage = nullptr;
     };
 

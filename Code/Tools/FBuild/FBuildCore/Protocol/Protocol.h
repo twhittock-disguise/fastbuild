@@ -129,19 +129,18 @@ namespace Protocol
     class MsgConnectionAck : public IMessage
     {
     public:
-        explicit MsgConnectionAck( uint8_t capacity );
+        explicit MsgConnectionAck( uint32_t capacity );
 
         uint16_t GetWorkerVersion() const { return m_WorkerVersion; }
         uint8_t GetProtocolVersionMajor() const { return m_ProtocolVersionMajor; }
         uint8_t GetProtocolVersionMinor() const { return m_ProtocolVersionMinor; }
-        uint8_t GetWorkerCapacity() const { return m_WorkerCapacity; }
+        uint32_t GetWorkerCapacity() const { return m_WorkerCapacity; }
 
     private:
         uint16_t m_WorkerVersion;
         uint8_t m_ProtocolVersionMajor;
         uint8_t m_ProtocolVersionMinor;
-        uint8_t m_WorkerCapacity;
-        char m_Padding2[ 3 ];
+        uint32_t m_WorkerCapacity;
     };
     static_assert( sizeof( MsgConnectionAck ) == sizeof( IMessage ) + 8, "MsgConnectionAck message has incorrect size" );
 
