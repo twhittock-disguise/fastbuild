@@ -454,6 +454,7 @@ private:
     void StoredPchThatFailsMeasurementIsDropped() const;
     void StoredPchOfAnotherIdIsDropped() const;
     void HousekeepingRunsWhileStoredPchsAreMeasured() const;
+    void StoredPchsThatJobsWaitForAreMeasuredFirst() const;
     void StashRejectsAManifestAWorkerWouldRefuse() const;
     void GiveUpDoesNotDenyListTheGateway() const;
     void JobOfALostWorkerIsRetriedElsewhere() const;
@@ -638,6 +639,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( StoredPchThatFailsMeasurementIsDropped )
     REGISTER_TEST( StoredPchOfAnotherIdIsDropped )
     REGISTER_TEST( HousekeepingRunsWhileStoredPchsAreMeasured )
+    REGISTER_TEST( StoredPchsThatJobsWaitForAreMeasuredFirst )
     REGISTER_TEST( StashRejectsAManifestAWorkerWouldRefuse )
     REGISTER_TEST( GiveUpDoesNotDenyListTheGateway )
     REGISTER_TEST( JobOfALostWorkerIsRetriedElsewhere )
@@ -4286,10 +4288,30 @@ namespace
     // Each measurement waits until the test releases it, or the gateway quits
     Atomic<uint32_t> s_HeldMeasurements;
     Atomic<bool> s_MeasurementsReleased;
-    void HoldStoredPchMeasurement( const Atomic<bool> & quit )
+    void HoldStoredPchMeasurement( uint64_t /*pchId*/, const Atomic<bool> & quit )
     {
         s_HeldMeasurements.Increment();
         while ( ( s_MeasurementsReleased.Load() == false ) && ( quit.Load() == false ) )
+        {
+            Thread::Sleep( 1 );
+        }
+    }
+
+    // The first measurement waits until the test releases it, and each one after lasts kMeasureDelayMs. Records the order.
+    constexpr uint32_t kOrderedStoredPchs = 8;
+    constexpr uint32_t kMeasureDelayMs = 400;
+    uint64_t s_MeasureOrder[ kOrderedStoredPchs ];
+    void DelayStoredPchMeasurement( uint64_t pchId, const Atomic<bool> & quit )
+    {
+        const uint32_t index = s_HeldMeasurements.Load();
+        if ( index < kOrderedStoredPchs )
+        {
+            s_MeasureOrder[ index ] = pchId;
+        }
+        s_HeldMeasurements.Increment();
+        const Timer timer;
+        while ( ( ( index == 0 ) ? ( s_MeasurementsReleased.Load() == false ) : ( timer.GetElapsedMS() < (float)kMeasureDelayMs ) ) &&
+                ( quit.Load() == false ) )
         {
             Thread::Sleep( 1 );
         }
@@ -4423,6 +4445,97 @@ void TestGateway::HousekeepingRunsWhileStoredPchsAreMeasured() const
     AString log;
     TEST_ASSERT( ReadWholeFile( logPath, log ) );
     TEST_ASSERT( log.Find( "gateway pch-measured n=1 failed=0 ms=" ) );
+}
+
+// StoredPchsThatJobsWaitForAreMeasuredFirst
+//------------------------------------------------------------------------------
+void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
+{
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    for ( uint32_t i = 0; i < kOrderedStoredPchs; ++i )
+    {
+        DistributedTest::CompressedPch pch;
+        DistributedTest::MakeCompressedPch( 16 * 1024, 20 + i, pch );
+        TEST_ASSERT( WriteStoredPch( config.m_CacheDir, pch.m_Id, pch.m_Compressed.GetResult(), pch.m_CompressedSize ).IsEmpty() == false );
+    }
+    s_HeldMeasurements.Store( 0 );
+    s_MeasurementsReleased.Store( false );
+    Gateway::s_MeasureTestHook = DelayStoredPchMeasurement;
+    const AtScopeEnd clearHook( []() { Gateway::s_MeasureTestHook = nullptr; } );
+
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    AStackString<> logPath;
+    Array<uint64_t> storeOrder;
+    uint64_t lastPchId = 0;
+    uint64_t otherPchId = 0;
+    {
+        Gateway gateway( config );
+        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+        logPath = gateway.GetServer().GetLogPath();
+        TEST_ASSERT( WaitUntil( []() { return ( s_HeldMeasurements.Load() == 1 ); } ) );
+        {
+            MutexHolder mh( gateway.m_Mutex );
+            for ( const Gateway::KnownPch & known : gateway.m_Pchs )
+            {
+                storeOrder.Append( known.m_Id );
+            }
+        }
+        TEST_ASSERT( storeOrder.GetSize() == kOrderedStoredPchs );
+        TEST_ASSERT( s_MeasureOrder[ 0 ] == storeOrder[ 0 ] );
+        lastPchId = storeOrder[ kOrderedStoredPchs - 1 ];
+        otherPchId = storeOrder[ kOrderedStoredPchs - 2 ];
+
+        // A job for the last PCH in store order parks while the first is measured
+        DistributedTest::HandshakeProbe probe;
+        const ConnectionInfo * ci = nullptr;
+        TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+        TEST_ASSERT( SendToolchain( probe, ci ) );
+        JobStreamEncoder encoder;
+        TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", lastPchId ) );
+        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
+        const Timer sinceRelease;
+        s_MeasurementsReleased.Store( true );
+
+        // Another job parks while the next measurement is under way
+        TEST_ASSERT( WaitUntil( []() { return ( s_HeldMeasurements.Load() == 2 ); } ) );
+        TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6", otherPchId ) );
+        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 2 ); } ) );
+        TEST_ASSERT( s_HeldMeasurements.Load() == 2 );
+
+        // The first job is released after one measurement, not the store's
+        Array<GatewayWire::ResultHeader> results;
+        TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.IsEmpty() == false ); } ) );
+        const float releasedMs = sinceRelease.GetElapsedMS();
+        TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
+        TEST_ASSERT( releasedMs < (float)( kMeasureDelayMs + 750 ) );
+        TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
+        TEST_ASSERT( ( results[ 1 ].m_JobId == 6 ) && results[ 1 ].m_Ok );
+        TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
+
+        // The awaited ones first, in the order they were awaited, then the rest in store order
+        TEST_ASSERT( WaitUntil( [ &logPath ]() { AString log; return ReadWholeFile( logPath, log ) && ( log.Find( "gateway pch-measured n=" ) != nullptr ); } ) );
+        TEST_ASSERT( s_HeldMeasurements.Load() == kOrderedStoredPchs );
+        TEST_ASSERT( s_MeasureOrder[ 1 ] == lastPchId );
+        TEST_ASSERT( s_MeasureOrder[ 2 ] == otherPchId );
+        for ( uint32_t i = 3; i < kOrderedStoredPchs; ++i )
+        {
+            TEST_ASSERT( s_MeasureOrder[ i ] == storeOrder[ i - 2 ] );
+        }
+        probe.ShutdownAllConnections();
+    }
+
+    AString log;
+    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    AStackString<> expected;
+    expected.Format( "gateway pch-measured n=%u failed=0 ms=", kOrderedStoredPchs );
+    TEST_ASSERT( log.Find( expected.Get() ) );
+    expected.Format( "gateway pch-awaited pch=0x%016" PRIx64 " waited-ms=", lastPchId );
+    TEST_ASSERT( log.Find( expected.Get() ) );
+    expected.Format( "gateway pch-awaited pch=0x%016" PRIx64 " waited-ms=", otherPchId );
+    TEST_ASSERT( log.Find( expected.Get() ) );
 }
 
 // The gateway under failure

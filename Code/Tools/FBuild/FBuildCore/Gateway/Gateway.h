@@ -161,6 +161,7 @@ private:
         uint32_t    m_UncompressedSize = 0;
         uint32_t    m_CompressedSize = 0;
         bool        m_Measured = false;
+        int64_t     m_AwaitedSince = 0;         // Timer::GetNow when a job first parked for it unmeasured; 0: not awaited
     };
 
     // A client that is sending a toolchain the stash does not hold whole yet
@@ -258,7 +259,9 @@ private:
     void HousekeepingThreadFunc();
     void ReconnectLostWorkers();
     static uint32_t MeasureThreadFuncStatic( void * param );
-    void MeasureStoredPchs(); // Those found at start
+    // Those found at start. Each pick takes first the one awaited longest, else the next in store order. A measurement
+    // under way is not interrupted, so an awaited PCH waits at most for one other PCH's measurement.
+    void MeasureStoredPchs();
 
     const GatewayConfig     m_Config;
     ToolchainStash          m_Stash;
@@ -292,7 +295,7 @@ private:
     Atomic<bool>            m_Quit{ false };
 
     // Runs before each PCH found at start is measured, so a test can hold the measurement until quit is set
-    typedef void ( *MeasureTestHook )( const Atomic<bool> & quit );
+    typedef void ( *MeasureTestHook )( uint64_t pchId, const Atomic<bool> & quit );
     inline static MeasureTestHook s_MeasureTestHook = nullptr;
 };
 

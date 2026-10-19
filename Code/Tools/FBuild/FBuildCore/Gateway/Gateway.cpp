@@ -1008,6 +1008,13 @@ void Gateway::Park( GatewayJob & job, Actions & actions )
     if ( ( job.m_PchId != 0 ) && ( IsPchStored( job.m_PchId ) == false ) )
     {
         actions.m_PchAsks.Append( Actions::PchAsk{ job.m_ClientId, job.m_PchId } );
+
+        // Stored but not yet measured: it is measured next
+        KnownPch * known = FindKnownPch( job.m_PchId );
+        if ( known && ( known->m_AwaitedSince == 0 ) )
+        {
+            known->m_AwaitedSince = Timer::GetNow();
+        }
     }
     if ( ( job.m_ToolId != 0 ) && ( m_Stash.IsComplete( job.m_ToolId ) == false ) && ( IsUploaded( job.m_ToolId ) == false ) )
     {
@@ -1680,14 +1687,23 @@ void Gateway::MeasureStoredPchs()
         uint64_t pchId = 0;
         {
             MutexHolder mh( m_Mutex );
+            const KnownPch * next = nullptr;
             for ( const KnownPch & known : m_Pchs )
             {
-                if ( known.m_Measured == false )
+                if ( known.m_Measured )
                 {
-                    pchId = known.m_Id;
-                    break;
+                    continue;
+                }
+                if ( next == nullptr )
+                {
+                    next = &known;
+                }
+                else if ( ( known.m_AwaitedSince != 0 ) && ( ( next->m_AwaitedSince == 0 ) || ( known.m_AwaitedSince < next->m_AwaitedSince ) ) )
+                {
+                    next = &known;
                 }
             }
+            pchId = next ? next->m_Id : 0;
         }
         if ( pchId == 0 )
         {
@@ -1703,7 +1719,7 @@ void Gateway::MeasureStoredPchs()
         const bool found = m_Server->FindCachedPch( pchId, path );
         if ( s_MeasureTestHook )
         {
-            s_MeasureTestHook( m_Quit );
+            s_MeasureTestHook( pchId, m_Quit );
         }
         const bool measured = found && FileIO::GetFileInfo( path, info ) &&
                               PchBlob::MeasureFile( path.Get(), pchId, &m_Quit, uncompressedSize );
@@ -1734,6 +1750,13 @@ void Gateway::MeasureStoredPchs()
                     known->m_UncompressedSize = uncompressedSize;
                     known->m_CompressedSize = (uint32_t)info.m_Size;
                     known->m_Measured = true;
+                    if ( known->m_AwaitedSince != 0 )
+                    {
+                        const float waitedMs = (float)( Timer::GetNow() - known->m_AwaitedSince ) * Timer::GetFrequencyInvFloatMS();
+                        AStackString<> line;
+                        line.Format( "gateway pch-awaited pch=0x%016" PRIx64 " waited-ms=%u", pchId, (uint32_t)waitedMs );
+                        actions.m_LogLines.EmplaceBack( line.Get() );
+                    }
                     ReleaseParked();
                     Dispatch( actions );
                 }
