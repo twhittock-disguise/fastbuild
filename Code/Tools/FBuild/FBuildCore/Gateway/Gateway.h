@@ -209,9 +209,10 @@ private:
     void GiveUpJobsNoWorkerCanTake( Actions & actions );
     bool CanAnyWorkerTakeAJob() const; // Some ready worker has a slot in its pool that no expired attempt holds
     // A worker is in the scheduler, with its allowance as its slots, while its connection is ready and its pool
-    // has slots. One whose pool falls to 0 leaves it, and what it was building is tried elsewhere.
+    // has slots. One whose pool falls to 0 leaves it, and finishes the jobs it runs.
     void UpdateWorker( Worker & worker, DownstreamConnection & connection, Actions & actions );
-    void RemoveWorker( Worker & worker, DownstreamConnection & connection, const char * reason, Actions & actions );
+    // Out of the scheduler. The jobs it runs are tried elsewhere only if it is lost.
+    void RemoveWorker( Worker & worker, DownstreamConnection & connection, const char * reason, bool lost, Actions & actions );
     void CollectDemands( Actions & actions ); // What waits for and runs on each worker
     void UpdatePool();
     Client * FindClient( uint32_t clientId );

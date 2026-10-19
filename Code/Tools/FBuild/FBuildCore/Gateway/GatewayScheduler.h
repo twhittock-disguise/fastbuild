@@ -32,7 +32,7 @@ public:
     struct Assignment { uint32_t m_JobId = 0; uint32_t m_WorkerId = 0; };
     enum Outcome { OUTCOME_RETRY, OUTCOME_GIVE_UP };
 
-    void SetWorkerSlots( uint32_t workerId, uint32_t slots );  // Adds it if new. Fewer slots than running: no new work until below.
+    void SetWorkerSlots( uint32_t workerId, uint32_t slots );  // Adds it if new, its running jobs using slots. Fewer slots than running: no new work until below.
     void RemoveWorker( uint32_t workerId, Array<uint32_t> & outRunningJobIds ); // The jobs stay running until OnFailed or OnCompleted
     void ReleaseSlot( uint32_t workerId );
     uint32_t GetTotalSlots() const;

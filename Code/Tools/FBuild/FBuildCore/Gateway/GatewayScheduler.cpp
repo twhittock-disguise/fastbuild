@@ -12,8 +12,13 @@ void GatewayScheduler::SetWorkerSlots( uint32_t workerId, uint32_t slots )
     Worker * worker = FindWorker( workerId );
     if ( worker == nullptr )
     {
+        // Jobs still running on it since it was removed hold its slots
         worker = &m_Workers.EmplaceBack();
         worker->m_Id = workerId;
+        for ( const Job & job : m_Running )
+        {
+            worker->m_Used += ( job.m_WorkerId == workerId ) ? 1 : 0;
+        }
     }
     worker->m_Slots = slots;
 }

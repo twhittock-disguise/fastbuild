@@ -491,6 +491,9 @@ private:
     void ReducedAllowanceKeepsTheJobsAClientHolds() const;
     void GatewayDemandSharesADownstreamWorker() const;
     void ClientWithoutAllowanceLearnsANewPool() const;
+    void WorkerWithoutSlotsKeepsTheJobsItRuns() const;
+    void WorkerBackWithSlotsCountsTheJobsItRuns() const;
+    void LostWorkerWithoutSlotsHasItsJobsRetried() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -657,6 +660,9 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( ReducedAllowanceKeepsTheJobsAClientHolds )
     REGISTER_TEST( GatewayDemandSharesADownstreamWorker )
     REGISTER_TEST( ClientWithoutAllowanceLearnsANewPool )
+    REGISTER_TEST( WorkerWithoutSlotsKeepsTheJobsItRuns )
+    REGISTER_TEST( WorkerBackWithSlotsCountsTheJobsItRuns )
+    REGISTER_TEST( LostWorkerWithoutSlotsHasItsJobsRetried )
 REGISTER_TESTS_END
 
 // PreTest
@@ -1269,7 +1275,6 @@ void TestGateway::GatewayWithoutCapacityClosesTheHandshake() const
     // Closed without an ack, so the client builds elsewhere
     TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
     TEST_ASSERT( probe.GetNumMessages() == 0 );
-    TEST_ASSERT( forwarder.GetNumPoolSlotQueries() >= 1 ); // The Server also reads it on every tick, to share it out
     Array<uint32_t> inventoryClients;
     forwarder.GetInventoryClients( inventoryClients );
     TEST_ASSERT( inventoryClients.IsEmpty() );
@@ -4916,7 +4921,8 @@ void TestGateway::StalledWorkerDoesNotStallTheGateway() const
     TEST_ASSERT( w2.GetNumJobs() == 1 );
     DistributedTest::HandshakeProbe other;
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), other ) != 0 );
-    TEST_ASSERT( other.GetAckCapacity() >= 1 ); // Its share of the pool of 3
+    TEST_ASSERT( other.GetAckCapacity() >= 1 ); // Its share of the pool
+    TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 3 ); // The stalled worker is still in it
     TEST_ASSERT( CountJobs( w1, w2 ) == 1 );
 
     w1.StallReading( false );
@@ -6604,6 +6610,125 @@ void TestGateway::ClientWithoutAllowanceLearnsANewPool() const
     TEST_ASSERT( WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 0 ); } ) );
     WorkerThreadRemote::SetNumCPUsToUse( 6 );
     TEST_ASSERT( WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 6 ); } ) );
+    probe.ShutdownAllConnections();
+}
+
+// WorkerWithoutSlotsKeepsTheJobsItRuns
+//------------------------------------------------------------------------------
+void TestGateway::WorkerWithoutSlotsKeepsTheJobsItRuns() const
+{
+    // Worker 1 has the more slots, so it is given both jobs, and holds them
+    EchoWorker w1( 2, EchoWorker::ANSWER_NEVER );
+    EchoWorker w2( 1 );
+    TEST_ASSERT( w1.Listen( kGatewayTestDownstreamPort ) );
+    TEST_ASSERT( w2.Listen( kGatewayTestDownstreamPort + 1 ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 2, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 1, "m1" ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 2, "m2" ) );
+    TEST_ASSERT( WaitUntil( [ &w1 ]() { return ( w1.GetNumHeldJobs() == 2 ); } ) );
+
+    // A worker that offers no slots finishes what it runs, as a worker in idle mode does
+    w1.SendCapacity( 0, 0 );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); } ) );
+    Thread::Sleep( 200 );
+    TEST_ASSERT( w2.GetNumJobs() == 0 );
+    const Gateway::Stats stats = GetGatewayStats( gateway );
+    TEST_ASSERT( ( stats.m_Running == 2 ) && ( stats.m_Retries == 0 ) );
+
+    // Its results go to the client, once each
+    w1.AnswerHeldJobs();
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+    Thread::Sleep( 100 );
+    TEST_ASSERT( GetNumResults( probe ) == 2 );
+    TEST_ASSERT( ( GetGatewayStats( gateway ).m_Retries == 0 ) && ( w2.GetNumJobs() == 0 ) );
+    probe.ShutdownAllConnections();
+}
+
+// WorkerBackWithSlotsCountsTheJobsItRuns
+//------------------------------------------------------------------------------
+void TestGateway::WorkerBackWithSlotsCountsTheJobsItRuns() const
+{
+    EchoWorker worker( 2, EchoWorker::ANSWER_NEVER );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    // Two running, one waiting
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 1, "m1" ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 2, "m2" ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 3, "m3" ) );
+    TEST_ASSERT( WaitUntil( [ &worker, &gateway ]() { return ( worker.GetNumHeldJobs() == 2 ) && ( GetGatewayStats( gateway ).m_Waiting == 1 ); } ) );
+
+    // Back with its slots, which its running jobs still fill
+    worker.SendCapacity( 0, 0 );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 0 ); } ) );
+    worker.SendCapacity( 2, 2 );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ) && ( GetSchedulerSlots( gateway ) == 2 ); } ) );
+    Thread::Sleep( 200 );
+    TEST_ASSERT( worker.GetNumJobs() == 2 );
+
+    // A result frees a slot for the waiting job
+    worker.AnswerHeldJobs();
+    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumJobs() == 3 ); } ) );
+    worker.AnswerHeldJobs();
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 3 ); } ) );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_Retries == 0 );
+    probe.ShutdownAllConnections();
+}
+
+// LostWorkerWithoutSlotsHasItsJobsRetried
+//------------------------------------------------------------------------------
+void TestGateway::LostWorkerWithoutSlotsHasItsJobsRetried() const
+{
+    EchoWorker w1( 2, EchoWorker::ANSWER_NEVER );
+    EchoWorker w2( 1 );
+    TEST_ASSERT( w1.Listen( kGatewayTestDownstreamPort ) );
+    TEST_ASSERT( w2.Listen( kGatewayTestDownstreamPort + 1 ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 2, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 1, "m1" ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 2, "m2" ) );
+    TEST_ASSERT( WaitUntil( [ &w1 ]() { return ( w1.GetNumHeldJobs() == 2 ); } ) );
+
+    // Kept while the worker has no slots
+    w1.SendCapacity( 0, 0 );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); } ) );
+    Thread::Sleep( 200 );
+    TEST_ASSERT( w2.GetNumJobs() == 0 );
+
+    // Retried elsewhere once its connection is lost
+    w1.DisconnectConnections();
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    TEST_ASSERT( w2.GetNumJobs() == 2 );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_Retries == 2 );
     probe.ShutdownAllConnections();
 }
 

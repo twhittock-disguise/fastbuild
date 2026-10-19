@@ -575,13 +575,20 @@ void Gateway::GetStats( Stats & outStats ) const
         }
         worker->m_Lost = true; // The housekeeping thread connects again
         worker->m_LostTimer.Restart();
-        if ( worker->m_Ready == false )
+
+        // One without slots is out of the scheduler, and may still be running jobs
+        bool hasAttempts = false;
+        for ( const Attempt & attempt : m_Attempts )
+        {
+            hasAttempts |= ( attempt.m_WorkerIndex == connection.GetIndex() );
+        }
+        if ( ( worker->m_Ready == false ) && ( hasAttempts == false ) )
         {
             return;
         }
 
         const char * reason = connection.GetCloseReason();
-        RemoveWorker( *worker, connection, reason ? reason : "disconnected", actions );
+        RemoveWorker( *worker, connection, reason ? reason : "disconnected", true, actions );
         Dispatch( actions );
     }
     Run( actions );
@@ -599,7 +606,7 @@ void Gateway::UpdateWorker( Worker & worker, DownstreamConnection & connection, 
     {
         if ( worker.m_Ready )
         {
-            RemoveWorker( worker, connection, "no-slots", actions );
+            RemoveWorker( worker, connection, "no-slots", false, actions );
         }
         return;
     }
@@ -617,19 +624,30 @@ void Gateway::UpdateWorker( Worker & worker, DownstreamConnection & connection, 
 
 // RemoveWorker
 //------------------------------------------------------------------------------
-void Gateway::RemoveWorker( Worker & worker, DownstreamConnection & connection, const char * reason, Actions & actions )
+void Gateway::RemoveWorker( Worker & worker, DownstreamConnection & connection, const char * reason, bool lost, Actions & actions )
 {
-    // Out of the scheduler and the pool, then what it was building is tried elsewhere
+    // Out of the scheduler and the pool
     const uint32_t index = connection.GetIndex();
-    worker.m_Ready = false;
-    Array<uint32_t> runningJobIds;
-    m_Scheduler.RemoveWorker( index, runningJobIds );
-    UpdatePool();
+    if ( worker.m_Ready )
+    {
+        worker.m_Ready = false;
+        Array<uint32_t> runningJobIds;
+        m_Scheduler.RemoveWorker( index, runningJobIds );
+        UpdatePool();
+    }
 
+    uint32_t numRunning = 0;
+    for ( const Attempt & attempt : m_Attempts )
+    {
+        numRunning += ( ( attempt.m_WorkerIndex == index ) && ( attempt.m_Expired == false ) ) ? 1 : 0;
+    }
     AStackString<> line;
-    line.Format( "gateway worker-lost worker=%s reason=%s running=%u", connection.GetAddress().Get(), reason, (uint32_t)runningJobIds.GetSize() );
+    line.Format( "gateway %s worker=%s reason=%s running=%u", lost ? "worker-lost" : "worker-unready", connection.GetAddress().Get(), reason, numRunning );
     actions.m_LogLines.EmplaceBack( line.Get() );
 
+    // A lost worker's jobs are tried elsewhere. One without slots finishes those it runs: they stay running in
+    // the scheduler, and fill its slots when it is back. An expired attempt has no slot to give back either way,
+    // so it goes, and its late result is dropped.
     for ( size_t i = m_Attempts.GetSize(); i > 0; --i )
     {
         const Attempt attempt = m_Attempts[ i - 1 ];
@@ -637,9 +655,13 @@ void Gateway::RemoveWorker( Worker & worker, DownstreamConnection & connection, 
         {
             continue;
         }
-        m_Attempts.EraseIndex( i - 1 ); // An expired one has no slot to give back now. A late result is dropped.
+        if ( ( lost == false ) && ( attempt.m_Expired == false ) )
+        {
+            continue;
+        }
+        m_Attempts.EraseIndex( i - 1 );
         GatewayJob * job = attempt.m_Expired ? nullptr : FindJob( attempt.m_JobId );
-        if ( job && FailAttempt( *job, index, connection.HasEnded() ? "lost" : reason, actions ) )
+        if ( job && FailAttempt( *job, index, "lost", actions ) )
         {
             GiveUpWithoutResult( *job, actions );
         }
@@ -1039,17 +1061,32 @@ void Gateway::GiveUpWithoutResult( GatewayJob & job, Actions & actions )
 //------------------------------------------------------------------------------
 void Gateway::ExpireHungAttempts( Actions & actions )
 {
-    // An expired attempt keeps its slot taken until its late result arrives, or its worker is lost
-    for ( Attempt & attempt : m_Attempts )
+    // An expired attempt keeps its slot taken until its late result arrives, or its worker is lost. One on a
+    // worker out of the scheduler holds none (its slots, once it is back, are filled by its running jobs), so it
+    // goes, and its late result is dropped.
+    for ( size_t i = 0; i < m_Attempts.GetSize(); )
     {
+        Attempt & attempt = m_Attempts[ i ];
         if ( attempt.m_Expired || ( attempt.m_Started.GetElapsed() < m_Config.m_JobTimeoutSeconds ) )
         {
+            ++i;
             continue;
         }
-        attempt.m_Expired = true;
+        const uint32_t workerIndex = attempt.m_WorkerIndex;
+        const uint32_t jobId = attempt.m_JobId;
+        const bool inScheduler = ( workerIndex >= 1 ) && ( workerIndex <= m_Workers.GetSize() ) && m_Workers[ workerIndex - 1 ].m_Ready;
+        if ( inScheduler )
+        {
+            attempt.m_Expired = true;
+            ++i;
+        }
+        else
+        {
+            m_Attempts.EraseIndex( i );
+        }
         ++m_Timeouts;
-        GatewayJob * job = FindJob( attempt.m_JobId );
-        if ( job && FailAttempt( *job, attempt.m_WorkerIndex, "timeout", actions ) )
+        GatewayJob * job = FindJob( jobId );
+        if ( job && FailAttempt( *job, workerIndex, "timeout", actions ) )
         {
             GiveUpWithoutResult( *job, actions );
         }
