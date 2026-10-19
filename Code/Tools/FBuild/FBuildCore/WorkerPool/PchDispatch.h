@@ -132,9 +132,10 @@ struct PchWorkerState
 // A worker can only start a job once the PCH it uses has arrived, and over a slow link that
 // takes a long time. The uplink is kept busy by queueing the PCH that unblocks the most waiting
 // jobs as soon as fewer than kMaxSendingPchs are queued, whether or not a job for it has been
-// taken yet (ties go to the lowest id, so workers sharing an uplink choose alike). Jobs that can
-// run now go to a worker first. A few more are given to it for the PCHs it is receiving, so it
-// does not wait for the next job once one lands.
+// taken yet (ties go to the lowest id, so workers sharing an uplink choose alike). That is done
+// only while the worker has a free job slot: a PCH sent to a worker that cannot take a job is
+// wasted uplink. Jobs that can run now go to a worker first. A few more are given to it for the
+// PCHs it is receiving, so it does not wait for the next job once one lands.
 namespace PchDispatch
 {
     // Tuning choices, not derived: the next PCH is queued behind the one being sent so the link
@@ -146,11 +147,14 @@ namespace PchDispatch
     // The PCH to queue for sending next, or 0. "Sending" counts the PCHs queued on the connection
     // and not yet handed to the socket, so the next one is queued while the current is sent.
     // waitingPchIds and numWaiting list the PCHs the queued jobs need, and how many jobs need each.
+    // freeSlots is the worker's capacity less its jobs in flight; no more PCHs are queued than it
+    // has free slots.
     inline uint64_t SelectPchToQueue( const Array<uint64_t> & waitingPchIds,
                                       const Array<uint32_t> & numWaiting,
-                                      const PchSendState & state )
+                                      const PchSendState & state,
+                                      uint32_t freeSlots )
     {
-        if ( state.GetSending().GetSize() >= kMaxSendingPchs )
+        if ( state.GetSending().GetSize() >= Math::Min( kMaxSendingPchs, freeSlots ) )
         {
             return 0;
         }

@@ -25,6 +25,8 @@ private:
     void WorkersChooseTheSameNextPch() const;
     void NextPchIsQueuedBehindTheCurrentOne() const;
     void PchsAlreadyRequestedAreNotQueuedAgain() const;
+    void NoPchIsQueuedWithoutAFreeSlot() const;
+    void PchsQueuedAreBoundedByFreeSlots() const;
     void EmptyQueue() const;
     void PchSendStateTransitions() const;
     void PchSendStateWhenTheWorkerNeedsAPch() const;
@@ -46,9 +48,13 @@ private:
 
     // The queue holds the PCH id of each job, the last being the next to be taken
     // The PCHs the queued jobs need, with how many jobs need each
-    static uint64_t SelectPch( const Array<uint64_t> & pchIds, const Array<uint32_t> & numJobs, const PchSendState & state )
+    static constexpr uint32_t kManySlots = 64;
+    static uint64_t SelectPch( const Array<uint64_t> & pchIds,
+                               const Array<uint32_t> & numJobs,
+                               const PchSendState & state,
+                               uint32_t freeSlots = kManySlots )
     {
-        return PchDispatch::SelectPchToQueue( pchIds, numJobs, state );
+        return PchDispatch::SelectPchToQueue( pchIds, numJobs, state, freeSlots );
     }
 
     static int32_t Select( const Array<uint64_t> & queue,
@@ -77,6 +83,8 @@ REGISTER_TESTS_BEGIN( TestPchDispatch )
     REGISTER_TEST( WorkersChooseTheSameNextPch )
     REGISTER_TEST( NextPchIsQueuedBehindTheCurrentOne )
     REGISTER_TEST( PchsAlreadyRequestedAreNotQueuedAgain )
+    REGISTER_TEST( NoPchIsQueuedWithoutAFreeSlot )
+    REGISTER_TEST( PchsQueuedAreBoundedByFreeSlots )
     REGISTER_TEST( EmptyQueue )
     REGISTER_TEST( PchSendStateTransitions )
     REGISTER_TEST( PchSendStateWhenTheWorkerNeedsAPch )
@@ -243,6 +251,33 @@ void TestPchDispatch::PchsAlreadyRequestedAreNotQueuedAgain() const
     state.OnInventory( inventory, 1 );
     TEST_ASSERT( state.OnRequested( 2 ) );
     TEST_ASSERT( SelectPch( pchIds, numJobs, state ) == 3 );
+}
+
+// NoPchIsQueuedWithoutAFreeSlot
+//------------------------------------------------------------------------------
+void TestPchDispatch::NoPchIsQueuedWithoutAFreeSlot() const
+{
+    // A worker that cannot take a job has no use for a PCH
+    const IdList pchIds( { 2 } );
+    Array<uint32_t> numJobs;
+    numJobs.Append( 5 );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), 0 ) == 0 );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), 1 ) == 2 );
+}
+
+// PchsQueuedAreBoundedByFreeSlots
+//------------------------------------------------------------------------------
+void TestPchDispatch::PchsQueuedAreBoundedByFreeSlots() const
+{
+    const IdList pchIds( { 2 } );
+    Array<uint32_t> numJobs;
+    numJobs.Append( 5 );
+    PchSendState state;
+    TEST_ASSERT( state.OnRequested( 1 ) );
+
+    // One slot, and one PCH already on its way for it
+    TEST_ASSERT( SelectPch( pchIds, numJobs, state, 1 ) == 0 );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, state, 2 ) == 2 );
 }
 
 // EmptyQueue

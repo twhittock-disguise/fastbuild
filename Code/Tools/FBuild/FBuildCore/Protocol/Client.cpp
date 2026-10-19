@@ -978,9 +978,19 @@ void ClientToWorkerConnection::QueuePchsToWorker()
         return;
     }
 
+    // A worker with no free slot cannot use a PCH yet. The PCHs for jobs it already holds are
+    // on their way, or are sent when it asks for them.
+    const uint32_t capacity = m_WorkerCapacity.Load();
+    const uint32_t inFlight = m_JobsInFlight.Load();
+    const uint32_t freeSlots = ( inFlight >= capacity ) ? 0 : ( capacity - inFlight );
+    if ( freeSlots == 0 )
+    {
+        return;
+    }
+
     {
         MutexHolder mh( m_Mutex );
-        if ( m_PchState.GetSending().GetSize() >= PchDispatch::kMaxSendingPchs )
+        if ( m_PchState.GetSending().GetSize() >= Math::Min( PchDispatch::kMaxSendingPchs, freeSlots ) )
         {
             return;
         }
@@ -995,7 +1005,7 @@ void ClientToWorkerConnection::QueuePchsToWorker()
     MutexHolder mh( m_Mutex );
     for ( ;; )
     {
-        const uint64_t pchId = PchDispatch::SelectPchToQueue( waitingPchIds, numWaiting, m_PchState );
+        const uint64_t pchId = PchDispatch::SelectPchToQueue( waitingPchIds, numWaiting, m_PchState, freeSlots );
         if ( pchId == 0 )
         {
             break;

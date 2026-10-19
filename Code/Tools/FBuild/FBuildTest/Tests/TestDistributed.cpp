@@ -59,7 +59,7 @@
 //------------------------------------------------------------------------------
 namespace
 {
-    class NoCapacityWorker;
+    class RecordingWorker;
     class PchSender;
     struct CapturedJob;
     struct CompressedPch;
@@ -134,7 +134,7 @@ private:
     void CorruptResultIsRejected() const;
     void SendMutexHoldsBackResults() const;
     void ToolchainIsSentBeforeAnyJob() const;
-    void PchIsSentBeforeAnyJobIsDispatched() const;
+    void PchIsNotSentToAWorkerWithoutAFreeSlot() const;
     void CachedToolchainIsNotSent() const;
     void ToolchainIsNotSentWhenNothingIsDistributed() const;
     void MismatchedProtocolVersionIsRefused() const;
@@ -311,7 +311,7 @@ private:
         Atomic<bool>    m_ResultDeliveredWhileHeld{ false };
     };
     static uint32_t HoldSendMutexOnFirstJob( void * param );
-    void BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when ) const;
+    void BuildPchLibraryUntilStopped( RecordingWorker & worker, int when ) const;
 
     // PCH transform helpers
     static bool WritePchLikeFile( const char * path, uint32_t size, uint32_t seed, Array<char> & outContent );
@@ -390,7 +390,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( SendMutexHoldsBackResults )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( ToolchainIsSentBeforeAnyJob )
-    REGISTER_TEST( PchIsSentBeforeAnyJobIsDispatched )
+    REGISTER_TEST( PchIsNotSentToAWorkerWithoutAFreeSlot )
     REGISTER_TEST( CachedToolchainIsNotSent )
     REGISTER_TEST( ToolchainIsNotSentWhenNothingIsDistributed )
 #endif
@@ -3032,18 +3032,19 @@ namespace
 //------------------------------------------------------------------------------
 namespace
 {
-    // A worker that completes the handshake but has no capacity, so no job is ever sent to it
-    class NoCapacityWorker : public FakeWorker
+    // A worker that completes the handshake, records what it is sent and never answers. With
+    // kNoCapacity no job (and no PCH) is ever sent to it.
+    class RecordingWorker : public FakeWorker
     {
     public:
         static constexpr uint8_t kNoCapacity = 0;
 
-        explicit NoCapacityWorker( const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
-            : FakeWorker( kNoCapacity, toolchainInventory )
+        explicit RecordingWorker( uint8_t capacity, const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
+            : FakeWorker( capacity, toolchainInventory )
         {
         }
-        explicit NoCapacityWorker( const NoCapacityWorker & other ) = delete;
-        NoCapacityWorker & operator=( const NoCapacityWorker & other ) = delete;
+        explicit RecordingWorker( const RecordingWorker & other ) = delete;
+        RecordingWorker & operator=( const RecordingWorker & other ) = delete;
 
         uint32_t GetNumManifests() const { return m_NumManifests.Load(); }
         uint32_t GetNumFiles() const { return m_NumFiles.Load(); }
@@ -3106,8 +3107,8 @@ namespace
     };
 }
 
-// Builds the library with a PCH against a worker that never gets a job, until the build is stopped
-void TestDistributed::BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when ) const
+// Builds the library with a PCH against a worker that never answers, until the build is stopped
+void TestDistributed::BuildPchLibraryUntilStopped( RecordingWorker & worker, int when ) const
 {
     FBuildTestOptions options;
     MakeDistributedPchOptions( options );
@@ -3128,7 +3129,6 @@ void TestDistributed::BuildPchLibraryUntilStopped( NoCapacityWorker & worker, in
 
     TEST_ASSERT( built == false ); // Aborted
     TEST_ASSERT( aborter.HasReached() );
-    TEST_ASSERT( worker.GetNumJobs() == 0 );
 }
 
 // ToolchainIsSentBeforeAnyJob
@@ -3137,21 +3137,46 @@ void TestDistributed::ToolchainIsSentBeforeAnyJob() const
 {
     // The worker has no capacity, so the build never sends it a job. It is sent the toolchain
     // regardless, once the PCH starts building, so the upload does not wait for the first job.
-    NoCapacityWorker worker;
+    RecordingWorker worker( RecordingWorker::kNoCapacity );
     BuildPchLibraryUntilStopped( worker, BuildStop::TOOLCHAIN_ARRIVES );
     TEST_ASSERT( worker.GetNumManifests() >= 1 );
     TEST_ASSERT( worker.GetNumFiles() >= 1 );
+    TEST_ASSERT( worker.GetNumJobs() == 0 );
 }
 
-// PchIsSentBeforeAnyJobIsDispatched
+// PchIsNotSentToAWorkerWithoutAFreeSlot
 //------------------------------------------------------------------------------
-void TestDistributed::PchIsSentBeforeAnyJobIsDispatched() const
+void TestDistributed::PchIsNotSentToAWorkerWithoutAFreeSlot() const
 {
-    // The worker has no capacity, so no job is dispatched to it. The PCH the waiting jobs need
-    // is queued for sending anyway, so the uplink does not wait for a job to be taken.
-    NoCapacityWorker worker;
-    BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES );
-    TEST_ASSERT( worker.GetNumPchFiles() >= 1 );
+    // The worker has no capacity, so it cannot take a job and has no use for the PCH. The
+    // connection gets past the inventories and the toolchain is sent, but the PCH is not.
+    constexpr float kNoPchWaitSeconds = 10.0f;
+    FBuildTestOptions options;
+    MakeDistributedPchOptions( options );
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    RecordingWorker worker( RecordingWorker::kNoCapacity );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    // The PCH is built and recorded for sending (it is compressed once queued, which it is not)
+    const uint32_t numHashedBefore = PchDataCache::Get().GetNumFilesHashed();
+    bool sawPch = false;
+    auto pchSent = [ &worker, &sawPch, numHashedBefore ]()
+    {
+        sawPch = sawPch || ( PchDataCache::Get().GetNumFilesHashed() > numHashedBefore );
+        return ( worker.GetNumPchFiles() >= 1 );
+    };
+    BuildAborter aborter( pchSent, kNoPchWaitSeconds );
+    const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
+    worker.ShutdownAllConnections();
+
+    TEST_ASSERT( built == false ); // Aborted
+    TEST_ASSERT( aborter.HasTimedOut() );
+    TEST_ASSERT( worker.GetNumManifests() >= 1 );
+    TEST_ASSERT( sawPch );
+    TEST_ASSERT( worker.GetNumPchFiles() == 0 );
 }
 
 // CachedToolchainIsNotSent
@@ -3161,8 +3186,9 @@ void TestDistributed::CachedToolchainIsNotSent() const
     // Learn the toolchain's id from a first build
     uint64_t toolId = 0;
     {
-        NoCapacityWorker worker;
+        RecordingWorker worker( RecordingWorker::kNoCapacity );
         BuildPchLibraryUntilStopped( worker, BuildStop::TOOLCHAIN_ARRIVES );
+        TEST_ASSERT( worker.GetNumJobs() == 0 );
         toolId = worker.GetLastToolId();
         TEST_ASSERT( toolId != 0 );
     }
@@ -3170,7 +3196,7 @@ void TestDistributed::CachedToolchainIsNotSent() const
     // A worker that says it has the toolchain is not sent it
     Array<uint64_t> inventory;
     inventory.Append( toolId );
-    NoCapacityWorker worker( inventory );
+    RecordingWorker worker( 1, inventory ); // A free slot, so it is sent the PCH
     BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES );
     TEST_ASSERT( worker.GetNumConnections() >= 1 );
     TEST_ASSERT( worker.GetNumManifests() == 0 );
@@ -3182,7 +3208,7 @@ void TestDistributed::CachedToolchainIsNotSent() const
 void TestDistributed::ToolchainIsNotSentWhenNothingIsDistributed() const
 {
     // The library is compiled here, so workers have no use for the toolchain
-    NoCapacityWorker worker;
+    RecordingWorker worker( RecordingWorker::kNoCapacity );
     TEST_ASSERT( BuildPchLocal( worker ).m_Built );
     TEST_ASSERT( worker.GetNumConnections() >= 1 );
     TEST_ASSERT( worker.GetNumManifests() == 0 );
@@ -7084,7 +7110,7 @@ void TestDistributed::ClientSendsTheTransformedPch() const
 
     // The PCH is sent after the transform
     {
-        NoCapacityWorker worker;
+        RecordingWorker worker( 1 );
         BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES );
         TEST_ASSERT( worker.GetPchType() == kTransformedBlobType );
         TEST_ASSERT( worker.GetPchCompressedSize() < worker.GetPchUncompressedSize() );
@@ -7318,7 +7344,7 @@ namespace
     class PchDroppingWorker : public FakeWorker
     {
     public:
-        PchDroppingWorker() : FakeWorker( 0 ) {}
+        PchDroppingWorker() : FakeWorker( 1 ) {}
         explicit PchDroppingWorker( const PchDroppingWorker & other ) = delete;
         PchDroppingWorker & operator=( const PchDroppingWorker & other ) = delete;
 
@@ -7453,7 +7479,7 @@ void TestDistributed::ClientIsNotStuckWhenTheConnectionEndsBeforeAPchIsDelivered
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
-    NoCapacityWorker worker;
+    RecordingWorker worker( 1 ); // A free slot, so it is sent the PCH
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
     const ConnectionEndHook hook( Client::BEFORE_PCH_DELIVERED, worker );
     auto connectedAgain = [ &worker, &hook ]() { return ( hook.HasFired() && ( worker.GetNumConnections() >= 2 ) ); };
