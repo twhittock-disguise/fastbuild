@@ -8,18 +8,23 @@
 #include "Tools/FBuild/FBuildTest/Tests/SyntheticToolchain.h"
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
+#include "Tools/FBuild/FBuildCore/Gateway/DownstreamConnection.h"
+#include "Tools/FBuild/FBuildCore/Gateway/GatewayConfig.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayScheduler.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
 #include "Tools/FBuild/FBuildCore/Gateway/ToolchainStash.h"
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
 #include "Tools/FBuild/FBuildCore/Protocol/WorkerSendQueue.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/PchDispatch.h"
 
 // Core
 #include "Core/Containers/Array.h"
 #include "Core/Containers/Move.h"
+#include "Core/Containers/UniquePtr.h"
 #include "Core/FileIO/ConstMemoryStream.h"
 #include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/FileStream.h"
@@ -393,6 +398,15 @@ private:
     void RemovedWorkerReportsItsRunningJobs() const;
     void RemovedClientDropsOnlyItsWaitingJobs() const;
     void WaitingForCountsOnlyJobsAWorkerCanTake() const;
+    void GatewayConfigReadsHostsAndPorts() const;
+    void DownstreamBecomesReadyWithTheWorkerInventories() const;
+    void DownstreamSendsToolchainJobThenPch() const;
+    void DownstreamResultIsHandedOver() const;
+    void DownstreamAskingForAPchGetsItAgain() const;
+    void DownstreamAskingTooOftenIsClosed() const;
+    void DownstreamAskingForAnUnknownPchIsClosed() const;
+    void DownstreamOfAnotherMajorIsLost() const;
+    void UnreachableDownstreamIsLost() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -471,6 +485,15 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( RemovedWorkerReportsItsRunningJobs )
     REGISTER_TEST( RemovedClientDropsOnlyItsWaitingJobs )
     REGISTER_TEST( WaitingForCountsOnlyJobsAWorkerCanTake )
+    REGISTER_TEST( GatewayConfigReadsHostsAndPorts )
+    REGISTER_TEST( DownstreamBecomesReadyWithTheWorkerInventories )
+    REGISTER_TEST( DownstreamSendsToolchainJobThenPch )
+    REGISTER_TEST( DownstreamResultIsHandedOver )
+    REGISTER_TEST( DownstreamAskingForAPchGetsItAgain )
+    REGISTER_TEST( DownstreamAskingTooOftenIsClosed )
+    REGISTER_TEST( DownstreamAskingForAnUnknownPchIsClosed )
+    REGISTER_TEST( DownstreamOfAnotherMajorIsLost )
+    REGISTER_TEST( UnreachableDownstreamIsLost )
 REGISTER_TESTS_END
 
 // PreTest
@@ -2406,6 +2429,768 @@ void TestGateway::WaitingForCountsOnlyJobsAWorkerCanTake() const
     scheduler.ReleaseSlot( 1 );
     TEST_ASSERT( scheduler.GetNumWaitingFor( 1, affinity ) == 1 );
     TEST_ASSERT( scheduler.GetNumWaitingFor( 2, affinity ) == 4 );
+}
+
+// GatewayConfigReadsHostsAndPorts
+//------------------------------------------------------------------------------
+void TestGateway::GatewayConfigReadsHostsAndPorts() const
+{
+    const char * const text = "# The site's workers\r\n"
+                              "alpha\n"
+                              "\n"
+                              "  beta:4000   ; the fast one\n"
+                              "gamma.local:31264#\n"
+                              "beta:4001\n";
+    GatewayConfig config;
+    AStackString<> error;
+    TEST_ASSERT( GatewayConfig::Parse( AStackString<>( text ), config, error ) );
+    TEST_ASSERT( config.m_Workers.GetSize() == 4 );
+    TEST_ASSERT( config.m_Workers[ 0 ].m_Host == "alpha" );
+    TEST_ASSERT( config.m_Workers[ 0 ].m_Port == Protocol::kPort );
+    TEST_ASSERT( config.m_Workers[ 1 ].m_Host == "beta" );
+    TEST_ASSERT( config.m_Workers[ 1 ].m_Port == 4000 );
+    TEST_ASSERT( config.m_Workers[ 2 ].m_Host == "gamma.local" );
+    TEST_ASSERT( config.m_Workers[ 2 ].m_Port == 31264 );
+    TEST_ASSERT( config.m_Workers[ 3 ].m_Host == "beta" );
+    TEST_ASSERT( config.m_Workers[ 3 ].m_Port == 4001 );
+    TEST_ASSERT( config.m_CacheDir.IsEmpty() );
+    TEST_ASSERT( config.m_JobTimeoutSeconds == 600.0f );
+    TEST_ASSERT( config.m_ReconnectSeconds == 10.0f );
+    TEST_ASSERT( config.m_StatsSeconds == 60.0f );
+
+    // A list with no worker is read; the gateway then refuses its clients
+    TEST_ASSERT( GatewayConfig::Parse( AStackString<>( "; none yet\n\n" ), config, error ) );
+    TEST_ASSERT( config.m_Workers.IsEmpty() );
+
+    // Each error names its line
+    struct Bad
+    {
+        const char * m_Text;
+        const char * m_Line;
+    };
+    const Bad bad[] = {
+        { "alpha\nbeta\nALPHA\n", "line 3" },   // The same worker twice
+        { "alpha\nalpha:31264\n", "line 2" },   // Also the same worker, on the default port
+        { ":4000\n", "line 1" },
+        { "alpha:0\n", "line 1" },
+        { "alpha:65536\n", "line 1" },
+        { "alpha:\n", "line 1" },
+        { "alpha:12x\n", "line 1" },
+    };
+    for ( const Bad & b : bad )
+    {
+        error.Clear();
+        TEST_ASSERT( GatewayConfig::Parse( AStackString<>( b.m_Text ), config, error ) == false );
+        TEST_ASSERT( error.Find( b.m_Line ) );
+    }
+
+    // From a file
+    AStackString<> path;
+    VERIFY( FBuild::GetTempDir( path ) );
+    path += "gateway_workers.txt";
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( path.Get(), FileStream::WRITE_ONLY ) );
+        TEST_ASSERT( f.Write( text, strlen( text ) ) == strlen( text ) );
+    }
+    GatewayConfig loaded;
+    TEST_ASSERT( GatewayConfig::Load( path, loaded, error ) );
+    TEST_ASSERT( loaded.m_Workers.GetSize() == 4 );
+    TEST_ASSERT( loaded.m_Workers[ 1 ].m_Host == "beta" );
+    TEST_ASSERT( loaded.m_Workers[ 1 ].m_Port == 4000 );
+
+    path += ".missing";
+    error.Clear();
+    TEST_ASSERT( GatewayConfig::Load( path, loaded, error ) == false );
+    TEST_ASSERT( error.Find( path.Get() ) );
+}
+
+// Downstream connections
+//------------------------------------------------------------------------------
+namespace
+{
+    constexpr uint64_t kDownstreamTool = 0x7101;
+
+    // A worker that answers each job as it is told to. Its results have the layout of
+    // Server::FinalizeCompletedJobs and are named by the job's name field (MakeJob's marker).
+    class EchoWorker : public DistributedTest::FakeWorker
+    {
+    public:
+        enum Answer
+        {
+            ANSWER_OK,
+            ANSWER_COMPILE_FAILURE,
+            ANSWER_SYSTEM_ERROR,
+            ANSWER_NEVER,       // Held until AnswerHeldJobs
+            ANSWER_DISCONNECT,  // The connection is closed when a job arrives
+        };
+        struct ReceivedJob
+        {
+            uint32_t    m_JobId = 0;
+            uint64_t    m_PchId = 0;
+            uint64_t    m_ToolId = 0;
+            AString     m_Name;
+        };
+
+        explicit EchoWorker( uint32_t slots,
+                             Answer answer = ANSWER_OK,
+                             const Array<uint64_t> & pchInventory = Array<uint64_t>(),
+                             const Array<uint64_t> & toolchainInventory = Array<uint64_t>(),
+                             uint16_t threadIndex = 1001 )
+            : FakeWorker( slots, toolchainInventory, pchInventory )
+            , m_ThreadIndex( threadIndex )
+            , m_Answer( answer )
+        {
+        }
+        virtual ~EchoWorker() override
+        {
+            StallReading( false );
+            ShutdownAllConnections();
+        }
+        explicit EchoWorker( const EchoWorker & other ) = delete;
+        EchoWorker & operator=( const EchoWorker & other ) = delete;
+
+        void GetJobs( Array<ReceivedJob> & out ) const { MutexHolder mh( m_Mutex ); out = m_Jobs; }
+        size_t GetNumJobs() const { MutexHolder mh( m_Mutex ); return m_Jobs.GetSize(); }
+        void GetMessageTypes( Array<uint8_t> & out ) const { MutexHolder mh( m_Mutex ); out = m_Types; } // After the handshake, in order
+        uint64_t GetPchBytes() const { MutexHolder mh( m_Mutex ); return m_PchBytes; }
+        uint32_t GetNumPchCopies() const { MutexHolder mh( m_Mutex ); return m_NumPchCopies; } // Last chunks received
+        void SetAnswer( Answer answer ) { MutexHolder mh( m_Mutex ); m_Answer = answer; }
+
+        void AnswerHeldJobs( Answer answer = ANSWER_OK )
+        {
+            Array<HeldJob> held;
+            {
+                MutexHolder mh( m_Mutex );
+                held.Swap( m_Held );
+            }
+            for ( const HeldJob & job : held )
+            {
+                SendResult( job.m_Connection, job.m_JobId, job.m_Name, answer );
+            }
+        }
+
+        // While set, what arrives is not read, so what the gateway sends backs up
+        void StallReading( bool stall )
+        {
+            m_StallReading.Store( stall );
+            if ( stall == false )
+            {
+                m_StallSemaphore.Signal();
+            }
+        }
+
+        // As a worker that has lost a PCH a job waits for
+        bool AskForPch( uint64_t pchId )
+        {
+            const ConnectionInfo * connection = nullptr;
+            {
+                MutexHolder mh( m_Mutex );
+                connection = m_Connection;
+            }
+            return connection && Protocol::MsgPchNeeded( pchId ).Send( connection );
+        }
+
+    protected:
+        virtual void Handshake( const ConnectionInfo * connection ) override
+        {
+            {
+                MutexHolder mh( m_Mutex );
+                m_Connection = connection;
+            }
+            m_Decoder.Replace( FNEW( JobStreamDecoder ) ); // A new connection starts a new job stream
+            FakeWorker::Handshake( connection );
+        }
+
+    private:
+        struct HeldJob
+        {
+            const ConnectionInfo *  m_Connection = nullptr;
+            uint32_t                m_JobId = 0;
+            AString                 m_Name;
+        };
+
+        virtual void OnMessage( const ConnectionInfo * connection, const Protocol::IMessage & message, void * payload, uint32_t payloadSize ) override
+        {
+            while ( m_StallReading.Load() )
+            {
+                m_StallSemaphore.Wait( 10 );
+            }
+
+            {
+                MutexHolder mh( m_Mutex );
+                m_Types.Append( (uint8_t)message.GetType() );
+            }
+            if ( message.GetType() == Protocol::MSG_PCH_FILE )
+            {
+                const Protocol::MsgPchFile & msg = static_cast<const Protocol::MsgPchFile &>( message );
+                const bool isLast = ( ( msg.GetChunkIndex() + 1 ) == Protocol::MsgPchFile::GetNumChunks( msg.GetCompressedSize(), msg.GetChunkSize() ) );
+                MutexHolder mh( m_Mutex );
+                m_PchBytes += payloadSize;
+                m_NumPchCopies += isLast ? 1 : 0;
+            }
+            else if ( ( message.GetType() == Protocol::MSG_JOB ) && payload )
+            {
+                OnJob( connection, static_cast<const Protocol::MsgJob &>( message ), payload, payloadSize );
+            }
+        }
+
+        void OnJob( const ConnectionInfo * connection, const Protocol::MsgJob & msg, const void * payload, uint32_t payloadSize )
+        {
+            void * job = nullptr;
+            size_t jobSize = 0;
+            if ( m_Decoder.Get()->Decode( payload, payloadSize, job, jobSize ) == false )
+            {
+                return;
+            }
+            ReceivedJob received;
+            received.m_ToolId = msg.GetToolId();
+            const bool peeked = GatewayWire::PeekJob( job, jobSize, received.m_JobId, received.m_PchId );
+            ConstMemoryStream ms( job, jobSize );
+            uint32_t jobId = 0;
+            const bool named = peeked && ms.Read( jobId ) && ms.Read( received.m_Name );
+            FREE( job );
+            if ( named == false )
+            {
+                return;
+            }
+
+            Answer answer;
+            {
+                MutexHolder mh( m_Mutex );
+                m_Jobs.Append( received );
+                answer = m_Answer;
+                if ( answer == ANSWER_NEVER )
+                {
+                    HeldJob & held = m_Held.EmplaceBack();
+                    held.m_Connection = connection;
+                    held.m_JobId = received.m_JobId;
+                    held.m_Name = received.m_Name;
+                }
+            }
+            if ( answer == ANSWER_DISCONNECT )
+            {
+                Disconnect( connection );
+            }
+            else if ( answer != ANSWER_NEVER )
+            {
+                SendResult( connection, received.m_JobId, received.m_Name, answer );
+            }
+        }
+
+        void SendResult( const ConnectionInfo * connection, uint32_t jobId, const AString & name, Answer answer )
+        {
+            const bool ok = ( answer == ANSWER_OK );
+            Array<AString> messages;
+            if ( ok == false )
+            {
+                messages.EmplaceBack( "echo worker failure" );
+            }
+            MemoryStream ms;
+            ms.Write( jobId );
+            ms.Write( name );
+            ms.Write( ok );
+            ms.Write( answer == ANSWER_SYSTEM_ERROR );
+            ms.Write( messages );
+            ms.Write( (uint32_t)1 ); // Build time
+            ms.Write( m_ThreadIndex );
+            ms.Write( (uint32_t)name.GetLength() ); // The data: the name again
+            ms.WriteBuffer( name.Get(), name.GetLength() );
+            const Protocol::MsgJobResult result( 0 );
+            result.Send( connection, ms );
+        }
+
+        const uint16_t m_ThreadIndex;
+        mutable Mutex m_Mutex;
+        Answer m_Answer;
+        const ConnectionInfo * m_Connection = nullptr;  // The latest
+        Array<ReceivedJob> m_Jobs;
+        Array<HeldJob> m_Held;
+        Array<uint8_t> m_Types;
+        uint64_t m_PchBytes = 0;
+        uint32_t m_NumPchCopies = 0;
+        UniquePtr<JobStreamDecoder> m_Decoder;  // Receive thread
+        Atomic<bool> m_StallReading{ false };
+        Semaphore m_StallSemaphore;
+    };
+
+    // Answers the handshake with an ack this version cannot use
+    class OddAckWorker : public EchoWorker
+    {
+    public:
+        enum Reply
+        {
+            ACK_OF_ANOTHER_MAJOR,
+            ACK_TOO_SHORT,  // The version fields and a little more
+        };
+        explicit OddAckWorker( Reply reply ) : EchoWorker( 4 ), m_Reply( reply ) {}
+        virtual ~OddAckWorker() override = default;
+        explicit OddAckWorker( const OddAckWorker & other ) = delete;
+        OddAckWorker & operator=( const OddAckWorker & other ) = delete;
+
+    private:
+        virtual void Handshake( const ConnectionInfo * connection ) override
+        {
+            const Protocol::MsgConnectionAck ack( 4 );
+            uint8_t bytes[ sizeof( ack ) ];
+            memcpy( bytes, &ack, sizeof( ack ) );
+            size_t size = sizeof( bytes );
+            if ( m_Reply == ACK_OF_ANOTHER_MAJOR )
+            {
+                bytes[ sizeof( Protocol::IMessage ) + sizeof( uint16_t ) ] = (uint8_t)( Protocol::kVersionMajor + 1 ); // After the worker version
+            }
+            else
+            {
+                size = Protocol::kHandshakePrefixSize + 2;
+            }
+            Send( connection, bytes, size );
+
+            // The inventories follow, as they would from a worker of this version
+            SendInventory( connection, Protocol::MsgPchInventory( 0 ), Array<uint64_t>() );
+            SendInventory( connection, Protocol::MsgToolchainInventory( 0 ), Array<uint64_t>() );
+        }
+
+        const Reply m_Reply;
+    };
+
+    // Plays the gateway: the PCHs and toolchains it stores, and what the connection tells it
+    class RecordingOwner : public DownstreamConnection::Owner, public PchLease::Owner
+    {
+    public:
+        RecordingOwner() = default;
+        virtual ~RecordingOwner() = default;
+        explicit RecordingOwner( const RecordingOwner & other ) = delete;
+        RecordingOwner & operator=( const RecordingOwner & other ) = delete;
+
+        // Before the connection starts
+        void AddPch( const StoredPch & pch ) { m_Pchs.Append( pch ); }
+        void AddToolchain( uint64_t toolId, uint32_t numFiles )
+        {
+            // The payloads as a client sent them: their content is not looked at on the way
+            Toolchain & toolchain = m_Toolchains.EmplaceBack();
+            toolchain.m_ToolId = toolId;
+            for ( uint32_t i = 0; i <= numFiles; ++i )
+            {
+                const uint32_t fileId = ( i == numFiles ) ? DownstreamConnection::kManifestFileId : i;
+                AString & path = toolchain.m_Paths.EmplaceBack();
+                VERIFY( FBuild::GetTempDir( path ) );
+                path.AppendFormat( "downstream_tool_%u_%u.bin", (uint32_t)toolId, fileId );
+                char bytes[ 100 ];
+                memset( bytes, (int)i, sizeof( bytes ) );
+                FileStream f;
+                VERIFY( f.Open( path.Get(), FileStream::WRITE_ONLY ) );
+                VERIFY( f.Write( bytes, sizeof( bytes ) ) == sizeof( bytes ) );
+                toolchain.m_FileIds.Append( fileId );
+            }
+        }
+        // A lease of the kind FindPch hands out, as the gateway takes for a job it forwards
+        PchLease Lease( uint64_t pchId )
+        {
+            m_NumLeases.Increment();
+            return PchLease( this, pchId );
+        }
+
+        uint32_t GetNumReady() const { return m_NumReady.Load(); }
+        uint32_t GetNumLost() const { return m_NumLost.Load(); }
+        uint32_t GetNumLeases() const { return m_NumLeases.Load(); }
+        uint32_t GetNumPchLookups() const { return m_NumPchLookups.Load(); }
+        GatewayScheduler::Affinity GetAffinityWhenReady() const { MutexHolder mh( m_Mutex ); return m_AffinityWhenReady; }
+        uint32_t GetCapacityWhenReady() const { MutexHolder mh( m_Mutex ); return m_CapacityWhenReady; }
+        void GetResults( Array<GatewayWire::ResultHeader> & out ) const { MutexHolder mh( m_Mutex ); out = m_Results; }
+        size_t GetNumResults() const { MutexHolder mh( m_Mutex ); return m_Results.GetSize(); }
+        bool WasAnyResultCompressed() const { MutexHolder mh( m_Mutex ); return m_AnyCompressed; }
+
+        // What the connection says of these ids when it becomes ready
+        uint64_t m_ReadyPchId = 0;
+        uint64_t m_ReadyToolId = 0;
+
+    private:
+        struct Toolchain
+        {
+            uint64_t            m_ToolId = 0;
+            Array<uint32_t>     m_FileIds;
+            Array<AString>      m_Paths;
+        };
+
+        virtual void OnDownstreamReady( DownstreamConnection & connection ) override
+        {
+            MutexHolder mh( m_Mutex );
+            m_AffinityWhenReady = connection.GetAffinity( m_ReadyPchId, m_ReadyToolId );
+            m_CapacityWhenReady = connection.GetCapacity();
+            m_NumReady.Increment();
+        }
+        virtual void OnDownstreamResult( DownstreamConnection &, bool compressed, void * payload, uint32_t payloadSize ) override
+        {
+            GatewayWire::ResultHeader header;
+            const bool read = GatewayWire::ReadResultHeader( payload, payloadSize, header );
+            FREE( payload );
+            MutexHolder mh( m_Mutex );
+            m_AnyCompressed |= compressed;
+            if ( read )
+            {
+                m_Results.Append( header );
+            }
+        }
+        virtual void OnDownstreamLost( DownstreamConnection & ) override { m_NumLost.Increment(); }
+        virtual bool FindPch( uint64_t pchId, StoredPch & outPch, PchLease & outLease ) override
+        {
+            m_NumPchLookups.Increment();
+            for ( const StoredPch & pch : m_Pchs )
+            {
+                if ( pch.m_Id == pchId )
+                {
+                    outPch = pch;
+                    outLease = Lease( pchId );
+                    return true;
+                }
+            }
+            return false;
+        }
+        virtual bool FindToolchainFile( uint64_t toolId, uint32_t fileId, AString & outPath, uint32_t & outSize ) override
+        {
+            for ( const Toolchain & toolchain : m_Toolchains )
+            {
+                const uint32_t * found = ( toolchain.m_ToolId == toolId ) ? toolchain.m_FileIds.Find( fileId ) : nullptr;
+                if ( found )
+                {
+                    outPath = toolchain.m_Paths[ (size_t)( found - toolchain.m_FileIds.Begin() ) ];
+                    outSize = 100;
+                    return true;
+                }
+            }
+            return false;
+        }
+        virtual uint32_t GetToolchainNumFiles( uint64_t toolId ) override
+        {
+            for ( const Toolchain & toolchain : m_Toolchains )
+            {
+                if ( toolchain.m_ToolId == toolId )
+                {
+                    return (uint32_t)( toolchain.m_FileIds.GetSize() - 1 ); // Not the manifest
+                }
+            }
+            return 0;
+        }
+        virtual void ReleasePchLease( uint64_t ) override { m_NumLeases.Decrement(); }
+
+        Array<StoredPch> m_Pchs;
+        Array<Toolchain> m_Toolchains;
+        mutable Mutex m_Mutex;
+        GatewayScheduler::Affinity m_AffinityWhenReady = GatewayScheduler::AFFINITY_UNABLE;
+        uint32_t m_CapacityWhenReady = 0;
+        Array<GatewayWire::ResultHeader> m_Results;
+        bool m_AnyCompressed = false;
+        Atomic<uint32_t> m_NumReady{ 0 };
+        Atomic<uint32_t> m_NumLost{ 0 };
+        Atomic<uint32_t> m_NumLeases{ 0 };
+        Atomic<uint32_t> m_NumPchLookups{ 0 };
+    };
+
+    GatewayConfig::Worker GetEchoWorkerAddress()
+    {
+        GatewayConfig::Worker worker;
+        worker.m_Host = "127.0.0.1";
+        worker.m_Port = kGatewayTestDownstreamPort;
+        return worker;
+    }
+
+    // A stored PCH as the gateway replays it. The connection sends the file as it is, so its bytes need not be zstd.
+    StoredPch WriteDownstreamPch( uint64_t pchId, uint32_t size )
+    {
+        StoredPch pch;
+        pch.m_Id = pchId;
+        pch.m_UncompressedSize = 2 * size;
+        pch.m_CompressedSize = size;
+        VERIFY( FBuild::GetTempDir( pch.m_File ) );
+        pch.m_File.AppendFormat( "downstream_pch_%u.bin", (uint32_t)pchId );
+        Array<char> bytes;
+        bytes.SetSize( size );
+        uint32_t x = (uint32_t)pchId;
+        for ( char & c : bytes )
+        {
+            x = ( x * 1664525u ) + 1013904223u;
+            c = (char)( x >> 24 );
+        }
+        FileStream f;
+        VERIFY( f.Open( pch.m_File.Get(), FileStream::WRITE_ONLY ) );
+        VERIFY( f.Write( bytes.Begin(), size ) == size );
+        return pch;
+    }
+
+    void SendDownstreamJob( DownstreamConnection & connection, RecordingOwner & owner, uint32_t jobId, const char * marker, const StoredPch * pch, uint64_t toolId = kDownstreamTool )
+    {
+        MemoryStream job;
+        MakeJob( jobId, marker, pch ? pch->m_Id : 0, job );
+        connection.SendJob( Protocol::MsgJob( toolId, 0 ), ConstMemoryStream( Move( job ) ), pch, pch ? owner.Lease( pch->m_Id ) : PchLease() );
+    }
+}
+
+// DownstreamBecomesReadyWithTheWorkerInventories
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamBecomesReadyWithTheWorkerInventories() const
+{
+    const uint64_t heldPch = 0xA101;
+    const uint64_t otherPch = 0xA102;
+    const uint64_t otherTool = 0x7102;
+    Array<uint64_t> pchs;
+    pchs.Append( heldPch );
+    Array<uint64_t> tools;
+    tools.Append( kDownstreamTool );
+    EchoWorker worker( 8, EchoWorker::ANSWER_OK, pchs, tools );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+
+    RecordingOwner owner;
+    owner.m_ReadyPchId = heldPch;
+    owner.m_ReadyToolId = kDownstreamTool;
+    {
+        DownstreamConnection connection( owner, GetEchoWorkerAddress(), 3 );
+        TEST_ASSERT( connection.GetIndex() == 3 );
+        AStackString<> address;
+        address.Format( "127.0.0.1:%u", (uint32_t)kGatewayTestDownstreamPort );
+        TEST_ASSERT( connection.GetAddress() == address );
+        TEST_ASSERT( connection.GetCapacity() == 0 );
+
+        connection.Start();
+        TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+        // Both inventories were in by then
+        TEST_ASSERT( owner.GetAffinityWhenReady() == GatewayScheduler::AFFINITY_HOLDS );
+        TEST_ASSERT( owner.GetCapacityWhenReady() == 8 );
+        TEST_ASSERT( connection.GetCapacity() == 8 );
+        TEST_ASSERT( connection.GetAffinity( heldPch, kDownstreamTool ) == GatewayScheduler::AFFINITY_HOLDS );
+        TEST_ASSERT( connection.GetAffinity( 0, kDownstreamTool ) == GatewayScheduler::AFFINITY_HOLDS );
+        TEST_ASSERT( connection.GetAffinity( otherPch, kDownstreamTool ) == GatewayScheduler::AFFINITY_NONE );
+        TEST_ASSERT( connection.GetAffinity( heldPch, otherTool ) == GatewayScheduler::AFFINITY_NONE );
+        TEST_ASSERT( connection.HasEnded() == false );
+        TEST_ASSERT( owner.GetNumLost() == 0 );
+    }
+
+    // Told once, from the destructor
+    TEST_ASSERT( owner.GetNumLost() == 1 );
+    TEST_ASSERT( owner.GetNumReady() == 1 );
+}
+
+// DownstreamSendsToolchainJobThenPch
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamSendsToolchainJobThenPch() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+
+    // More chunks than the socket buffers hold, so a stalled worker keeps the PCH on its way
+    const uint32_t pchSize = ( 32 * Protocol::kPchChunkSize ) + 1000;
+    const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( pchSize, Protocol::kPchChunkSize );
+    RecordingOwner owner;
+    const StoredPch pch = WriteDownstreamPch( 0xB201, pchSize );
+    owner.AddPch( pch );
+    owner.AddToolchain( kDownstreamTool, 1 );
+
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( connection.GetAffinity( pch.m_Id, kDownstreamTool ) == GatewayScheduler::AFFINITY_NONE );
+
+    worker.StallReading( true );
+    SendDownstreamJob( connection, owner, 5, "m5", &pch );
+    TEST_ASSERT( connection.GetAffinity( pch.m_Id, kDownstreamTool ) == GatewayScheduler::AFFINITY_RECEIVING );
+    TEST_ASSERT( owner.GetNumLeases() == 1 ); // Held while the chunks are queued
+    worker.StallReading( false );
+
+    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
+    TEST_ASSERT( connection.GetAffinity( pch.m_Id, kDownstreamTool ) == GatewayScheduler::AFFINITY_HOLDS );
+    TEST_ASSERT( owner.GetNumLeases() == 0 );
+    TEST_ASSERT( worker.GetPchBytes() == pchSize );
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 1 ); } ) );
+
+    Array<uint8_t> types;
+    worker.GetMessageTypes( types );
+    TEST_ASSERT( types.GetSize() == ( 3 + numChunks ) );
+    TEST_ASSERT( types[ 0 ] == Protocol::MSG_MANIFEST );
+    TEST_ASSERT( types[ 1 ] == Protocol::MSG_FILE );
+    TEST_ASSERT( types[ 2 ] == Protocol::MSG_JOB );
+    for ( size_t i = 3; i < types.GetSize(); ++i )
+    {
+        TEST_ASSERT( types[ i ] == Protocol::MSG_PCH_FILE );
+    }
+
+    // What the worker holds is not sent again, and the job's lease is not kept
+    SendDownstreamJob( connection, owner, 6, "m6", &pch );
+    TEST_ASSERT( connection.GetAffinity( pch.m_Id, kDownstreamTool ) == GatewayScheduler::AFFINITY_HOLDS );
+    TEST_ASSERT( owner.GetNumLeases() == 0 );
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 2 ); } ) );
+    Thread::Sleep( 100 ); // Anything sent after the job would have arrived by now
+    worker.GetMessageTypes( types );
+    TEST_ASSERT( types.GetSize() == ( 4 + numChunks ) );
+    TEST_ASSERT( types.Top() == Protocol::MSG_JOB );
+    TEST_ASSERT( worker.GetNumPchCopies() == 1 );
+
+    Array<EchoWorker::ReceivedJob> jobs;
+    worker.GetJobs( jobs );
+    TEST_ASSERT( jobs.GetSize() == 2 );
+    TEST_ASSERT( ( jobs[ 0 ].m_JobId == 5 ) && ( jobs[ 0 ].m_PchId == pch.m_Id ) && ( jobs[ 0 ].m_ToolId == kDownstreamTool ) );
+    TEST_ASSERT( ( jobs[ 1 ].m_JobId == 6 ) && ( jobs[ 1 ].m_Name == "m6" ) );
+}
+
+// DownstreamResultIsHandedOver
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamResultIsHandedOver() const
+{
+    Array<uint64_t> tools;
+    tools.Append( kDownstreamTool );
+    EchoWorker worker( 4, EchoWorker::ANSWER_OK, Array<uint64_t>(), tools, 1007 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+    SendDownstreamJob( connection, owner, 9, "m9", nullptr );
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 1 ); } ) );
+
+    // A failure the worker reports is the owner's to judge
+    worker.SetAnswer( EchoWorker::ANSWER_SYSTEM_ERROR );
+    SendDownstreamJob( connection, owner, 10, "m10", nullptr );
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 2 ); } ) );
+
+    Array<GatewayWire::ResultHeader> results;
+    owner.GetResults( results );
+    TEST_ASSERT( ( results[ 0 ].m_JobId == 9 ) && ( results[ 0 ].m_Name == "m9" ) );
+    TEST_ASSERT( results[ 0 ].m_Ok && ( results[ 0 ].m_SystemError == false ) );
+    TEST_ASSERT( results[ 0 ].m_ThreadIndex == 1007 );
+    TEST_ASSERT( ( results[ 1 ].m_JobId == 10 ) && ( results[ 1 ].m_Name == "m10" ) );
+    TEST_ASSERT( ( results[ 1 ].m_Ok == false ) && results[ 1 ].m_SystemError );
+    TEST_ASSERT( owner.WasAnyResultCompressed() == false );
+    TEST_ASSERT( connection.HasEnded() == false );
+    TEST_ASSERT( owner.GetNumLost() == 0 );
+
+    // The worker had the toolchain, so only the jobs were sent
+    Array<uint8_t> types;
+    worker.GetMessageTypes( types );
+    TEST_ASSERT( types.GetSize() == 2 );
+    TEST_ASSERT( ( types[ 0 ] == Protocol::MSG_JOB ) && ( types[ 1 ] == Protocol::MSG_JOB ) );
+}
+
+// DownstreamAskingForAPchGetsItAgain
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamAskingForAPchGetsItAgain() const
+{
+    Array<uint64_t> tools;
+    tools.Append( kDownstreamTool );
+    EchoWorker worker( 4, EchoWorker::ANSWER_OK, Array<uint64_t>(), tools );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    const StoredPch pch = WriteDownstreamPch( 0xB301, 5000 );
+    owner.AddPch( pch );
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+    SendDownstreamJob( connection, owner, 5, "m5", &pch );
+    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
+
+    TEST_ASSERT( worker.AskForPch( pch.m_Id ) );
+    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 2 ); } ) );
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLeases() == 0 ); } ) );
+    TEST_ASSERT( owner.GetNumPchLookups() == 1 );
+    TEST_ASSERT( worker.GetPchBytes() == ( 2 * 5000 ) );
+    TEST_ASSERT( connection.GetAffinity( pch.m_Id, kDownstreamTool ) == GatewayScheduler::AFFINITY_HOLDS );
+    TEST_ASSERT( connection.HasEnded() == false );
+    TEST_ASSERT( owner.GetNumLost() == 0 );
+}
+
+// DownstreamAskingTooOftenIsClosed
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamAskingTooOftenIsClosed() const
+{
+    Array<uint64_t> tools;
+    tools.Append( kDownstreamTool );
+    EchoWorker worker( 4, EchoWorker::ANSWER_OK, Array<uint64_t>(), tools );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    const StoredPch pch = WriteDownstreamPch( 0xB401, 5000 );
+    owner.AddPch( pch );
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+    SendDownstreamJob( connection, owner, 5, "m5", &pch );
+    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
+
+    // Each copy is asked for once it has arrived, so none is still on its way
+    for ( uint32_t i = 1; i <= PchSendState::kMaxResends; ++i )
+    {
+        TEST_ASSERT( worker.AskForPch( pch.m_Id ) );
+        TEST_ASSERT( WaitUntil( [ &worker, i ]() { return ( worker.GetNumPchCopies() == ( i + 1 ) ); } ) );
+    }
+    TEST_ASSERT( connection.HasEnded() == false );
+
+    TEST_ASSERT( worker.AskForPch( pch.m_Id ) );
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
+    TEST_ASSERT( connection.HasEnded() );
+    TEST_ASSERT( strcmp( connection.GetCloseReason(), "pch" ) == 0 );
+    TEST_ASSERT( worker.GetNumPchCopies() == ( PchSendState::kMaxResends + 1 ) );
+    TEST_ASSERT( owner.GetNumLeases() == 0 );
+}
+
+// DownstreamAskingForAnUnknownPchIsClosed
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamAskingForAnUnknownPchIsClosed() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+    TEST_ASSERT( worker.AskForPch( 0xDEAD0002 ) );
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
+    TEST_ASSERT( connection.HasEnded() );
+    TEST_ASSERT( strcmp( connection.GetCloseReason(), "pch" ) == 0 );
+    TEST_ASSERT( owner.GetNumPchLookups() == 1 );
+    TEST_ASSERT( worker.GetNumPchCopies() == 0 );
+}
+
+// DownstreamOfAnotherMajorIsLost
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamOfAnotherMajorIsLost() const
+{
+    const OddAckWorker::Reply replies[] = { OddAckWorker::ACK_OF_ANOTHER_MAJOR, OddAckWorker::ACK_TOO_SHORT };
+    for ( const OddAckWorker::Reply reply : replies )
+    {
+        OddAckWorker worker( reply );
+        TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+        RecordingOwner owner;
+        DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+        connection.Start();
+        TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
+        TEST_ASSERT( connection.HasEnded() );
+        TEST_ASSERT( strcmp( connection.GetCloseReason(), "handshake" ) == 0 );
+        TEST_ASSERT( owner.GetNumReady() == 0 );
+        TEST_ASSERT( connection.GetCapacity() == 0 );
+    }
+}
+
+// UnreachableDownstreamIsLost
+//------------------------------------------------------------------------------
+void TestGateway::UnreachableDownstreamIsLost() const
+{
+    RecordingOwner owner;
+    {
+        DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 ); // Nothing listens there
+        connection.Start();
+        TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
+        TEST_ASSERT( connection.HasEnded() );
+        TEST_ASSERT( connection.GetCloseReason() == nullptr );
+        TEST_ASSERT( owner.GetNumReady() == 0 );
+    }
+    TEST_ASSERT( owner.GetNumLost() == 1 );
+
+    // One that was never started is lost when it is destroyed
+    {
+        DownstreamConnection connection( owner, GetEchoWorkerAddress(), 2 );
+    }
+    TEST_ASSERT( owner.GetNumLost() == 2 );
 }
 
 //------------------------------------------------------------------------------

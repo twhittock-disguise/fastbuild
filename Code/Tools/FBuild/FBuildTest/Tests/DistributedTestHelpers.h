@@ -265,9 +265,12 @@ namespace DistributedTest
     class FakeWorker : public TCPConnectionPool
     {
     public:
-        explicit FakeWorker( uint32_t capacity, const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
+        explicit FakeWorker( uint32_t capacity,
+                             const Array<uint64_t> & toolchainInventory = Array<uint64_t>(),
+                             const Array<uint64_t> & pchInventory = Array<uint64_t>() )
             : m_Capacity( capacity )
             , m_ToolchainInventory( toolchainInventory )
+            , m_PchInventory( pchInventory )
         {
         }
         explicit FakeWorker( const FakeWorker & other ) = delete;
@@ -305,22 +308,24 @@ namespace DistributedTest
         {
             const Protocol::MsgConnectionAck ack( m_Capacity );
             ack.Send( connection );
-            const Protocol::MsgPchInventory pchInventory( 0 );
-            pchInventory.Send( connection );
-            const Protocol::MsgToolchainInventory toolchainInventory( (uint32_t)m_ToolchainInventory.GetSize() );
-            if ( m_ToolchainInventory.IsEmpty() )
+            SendInventory( connection, Protocol::MsgPchInventory( (uint32_t)m_PchInventory.GetSize() ), m_PchInventory );
+            SendInventory( connection, Protocol::MsgToolchainInventory( (uint32_t)m_ToolchainInventory.GetSize() ), m_ToolchainInventory );
+        }
+
+        // With the ids as its payload, if there are any
+        static void SendInventory( const ConnectionInfo * connection, const Protocol::IMessage & msg, const Array<uint64_t> & ids )
+        {
+            if ( ids.IsEmpty() )
             {
-                toolchainInventory.Send( connection );
+                msg.Send( connection );
+                return;
             }
-            else
+            MemoryStream payload;
+            for ( const uint64_t id : ids )
             {
-                MemoryStream ids;
-                for ( const uint64_t toolId : m_ToolchainInventory )
-                {
-                    ids.Write( toolId );
-                }
-                toolchainInventory.Send( connection, ids );
+                payload.Write( id );
             }
+            msg.Send( connection, payload );
         }
 
         // Every message after the handshake. The payload is null for a message that has none.
@@ -390,6 +395,7 @@ namespace DistributedTest
 
         const uint32_t m_Capacity;
         const Array<uint64_t> m_ToolchainInventory;
+        const Array<uint64_t> m_PchInventory;
         struct ConnectionState
         {
             const ConnectionInfo *      m_Connection = nullptr;
