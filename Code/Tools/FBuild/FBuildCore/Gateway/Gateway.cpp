@@ -1276,64 +1276,74 @@ void Gateway::ExpireHungAttempts( Actions & actions )
 //------------------------------------------------------------------------------
 void Gateway::GiveUpJobsNoWorkerCanTake( Actions & actions )
 {
-    // The bound starts again whenever a worker could take a job, or nothing waits
-    if ( ( m_Scheduler.GetNumWaiting() == 0 ) || CanAnyWorkerTakeAJob() )
+    // The workers that can take a job at all: ready, with a slot in their pool that no expired attempt holds.
+    // A downstream worker's allowance follows the gateway's demand, so its pool counts.
+    Array<uint32_t> ableWorkers;
+    if ( m_LocalSlots > CountExpiredAttempts( kLocalWorkerIndex ) )
     {
-        m_NoWorkerForWaitingJobs = false;
-        return;
+        ableWorkers.Append( kLocalWorkerIndex );
     }
-    if ( m_NoWorkerForWaitingJobs == false )
-    {
-        m_NoWorkerForWaitingJobs = true;
-        m_NoWorkerTimer.Restart();
-        return;
-    }
-    if ( m_NoWorkerTimer.GetElapsed() < m_Config.m_NoWorkerGiveUpSeconds )
-    {
-        return;
-    }
-    m_NoWorkerForWaitingJobs = false;
-
-    // Each goes back to its client flagged, so the client requeues it and keeps the gateway
-    Array<uint32_t> jobIds;
-    m_Scheduler.RemoveWaitingJobs( jobIds );
-    for ( const uint32_t jobId : jobIds )
-    {
-        GatewayJob * job = FindJob( jobId );
-        if ( job )
-        {
-            ++m_GiveUps;
-            GiveUpWithoutResult( *job, actions );
-            RemoveJob( job, actions );
-        }
-    }
-    AStackString<> line;
-    line.Format( "gateway jobs-giveup reason=no-worker n=%u", (uint32_t)jobIds.GetSize() );
-    actions.m_LogLines.EmplaceBack( line.Get() );
-}
-
-// CanAnyWorkerTakeAJob
-//------------------------------------------------------------------------------
-bool Gateway::CanAnyWorkerTakeAJob() const
-{
     for ( size_t i = 0; i < m_Workers.GetSize(); ++i )
     {
         const Worker & worker = m_Workers[ i ];
-        if ( ( worker.m_Ready == false ) || ( worker.m_Connection == nullptr ) )
+        const uint32_t index = (uint32_t)( i + 1 );
+        if ( worker.m_Ready && worker.m_Connection && ( worker.m_Connection->GetPoolSlots() > CountExpiredAttempts( index ) ) )
         {
-            continue;
-        }
-        if ( worker.m_Connection->GetPoolSlots() > CountExpiredAttempts( (uint32_t)( i + 1 ) ) ) // Its allowance follows the gateway's demand
-        {
-            return true;
+            ableWorkers.Append( index );
         }
     }
-    if ( m_LocalSlots > CountExpiredAttempts( kLocalWorkerIndex ) )
+
+    // Each waiting job's bound starts when none of them can take it, and starts again once one can. m_Jobs is in
+    // the order of the job ids, so it is walked along with the sorted waiting ids.
+    Array<uint32_t> waitingJobIds;
+    m_Scheduler.GetWaitingJobIds( waitingJobIds );
+    waitingJobIds.Sort();
+    const WorkerAffinity affinity( *this );
+    const int64_t now = Timer::GetNow(); // One time for the tick, so the jobs that lost their workers together go together
+    const int64_t bound = (int64_t)( (double)m_Config.m_NoWorkerGiveUpSeconds * (double)Timer::GetFrequency() );
+    Array<GatewayJob *> givenUp;
+    size_t w = 0;
+    for ( GatewayJob * job : m_Jobs )
     {
-        const WorkerAffinity affinity( *this );
-        return ( m_Scheduler.GetNumWaitingFor( kLocalWorkerIndex, affinity ) > 0 );
+        while ( ( w < waitingJobIds.GetSize() ) && ( waitingJobIds[ w ] < job->m_Id ) )
+        {
+            ++w;
+        }
+        bool noWorker = ( w < waitingJobIds.GetSize() ) && ( waitingJobIds[ w ] == job->m_Id );
+        for ( size_t i = 0; noWorker && ( i < ableWorkers.GetSize() ); ++i )
+        {
+            noWorker = ( affinity( ableWorkers[ i ], job->m_PchId, job->m_ToolId ) == GatewayScheduler::AFFINITY_UNABLE );
+        }
+        if ( noWorker == false )
+        {
+            job->m_NoWorker = false;
+        }
+        else if ( job->m_NoWorker == false )
+        {
+            job->m_NoWorker = true;
+            job->m_NoWorkerSince = now;
+        }
+        else if ( ( now - job->m_NoWorkerSince ) >= bound )
+        {
+            givenUp.Append( job );
+        }
     }
-    return false;
+    if ( givenUp.IsEmpty() )
+    {
+        return;
+    }
+
+    // Each goes back to its client flagged, so the client requeues it and keeps the gateway
+    for ( GatewayJob * job : givenUp )
+    {
+        VERIFY( m_Scheduler.RemoveWaitingJob( job->m_Id ) );
+        ++m_GiveUps;
+        GiveUpWithoutResult( *job, actions );
+        RemoveJob( job, actions );
+    }
+    AStackString<> line;
+    line.Format( "gateway jobs-giveup reason=no-worker n=%u", (uint32_t)givenUp.GetSize() );
+    actions.m_LogLines.EmplaceBack( line.Get() );
 }
 
 // CountExpiredAttempts

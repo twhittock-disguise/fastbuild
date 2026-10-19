@@ -156,6 +156,20 @@ bool GatewayScheduler::RemoveWaitingJob( uint32_t jobId )
     return false;
 }
 
+// GetWaitingJobIds
+//------------------------------------------------------------------------------
+void GatewayScheduler::GetWaitingJobIds( Array<uint32_t> & outJobIds ) const
+{
+    outJobIds.Clear();
+    for ( const Client & client : m_Clients )
+    {
+        for ( const Job & job : client.m_Waiting )
+        {
+            outJobIds.Append( job.m_Id );
+        }
+    }
+}
+
 // OnCompleted
 //------------------------------------------------------------------------------
 void GatewayScheduler::OnCompleted( uint32_t jobId )

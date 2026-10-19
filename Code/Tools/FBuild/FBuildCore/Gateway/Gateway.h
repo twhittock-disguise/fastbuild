@@ -125,6 +125,8 @@ private:
         PchLease    m_PchLease;                 // From its arrival, so the PCH is not evicted while it is held
         uint32_t    m_NumAttempts = 0;          // Dispatched so far
         bool        m_Parked = false;           // Waiting for its toolchain or PCH, and not yet in the scheduler
+        bool        m_NoWorker = false;         // Waiting in the scheduler with no worker able to take it, since m_NoWorkerSince
+        int64_t     m_NoWorkerSince = 0;        // Timer::GetNow
     };
 
     // One dispatch of a job. The attempt id is the job id the worker sees.
@@ -230,11 +232,10 @@ private:
     void OnLocalAttemptFailed( uint32_t attemptId, Actions & actions ); // It ended without a result
     void ParkJobsWaitingForPch( uint64_t pchId, Actions & actions ); // It has gone from the store: the jobs wait for it again
     void ExpireHungAttempts( Actions & actions );
-    // Waiting jobs that no worker can take for m_NoWorkerGiveUpSeconds are given up. Waiting behind busy workers is not.
+    // A waiting job that no worker can take for m_NoWorkerGiveUpSeconds is given up. A worker can take it if it is
+    // ready, has a slot in its pool that no expired attempt holds, and is not unable for that job (the local pool
+    // lacks its toolchain). Waiting behind busy workers is not a reason.
     void GiveUpJobsNoWorkerCanTake( Actions & actions );
-    // Some ready worker has a slot in its pool that no expired attempt holds. The local pool counts only if it can take
-    // one of the waiting jobs: a toolchain it does not have is not on its way to it, as downstream ones are.
-    bool CanAnyWorkerTakeAJob() const;
     uint32_t CountExpiredAttempts( uint32_t workerIndex ) const;
     // The local pool is in the scheduler while it has slots. Without, it finishes the jobs it runs.
     void UpdateLocalWorker( Actions & actions );
@@ -284,8 +285,6 @@ private:
     uint32_t                m_Timeouts = 0;
     uint64_t                m_PchBytesForwarded = 0;
     uint32_t                m_ToolchainRequests = 0;         // MSG_REQUEST_MANIFEST and MSG_REQUEST_FILE sent
-    bool                    m_NoWorkerForWaitingJobs = false; // Since m_NoWorkerTimer started
-    Timer                   m_NoWorkerTimer;
 
     Thread                  m_HousekeepingThread;
     Semaphore               m_HousekeepingSemaphore;
