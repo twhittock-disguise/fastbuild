@@ -79,7 +79,7 @@ Gateway::Gateway( const GatewayConfig & config )
 {
     m_Server = FNEW( Server( *this, config.m_CacheDir ) );
 
-    // What the store held at start never reaches OnPchStored: the housekeeping thread measures it
+    // What the store held at start never reaches OnPchStored: its own thread measures it
     Array<uint64_t> pchIds;
     m_Server->GetCachedPchIds( pchIds );
     for ( const uint64_t pchId : pchIds )
@@ -87,6 +87,7 @@ Gateway::Gateway( const GatewayConfig & config )
         KnownPch & pch = m_Pchs.EmplaceBack();
         pch.m_Id = pchId;
     }
+    const bool measure = ( pchIds.IsEmpty() == false );
 
     // The table is whole before any connection can call back
     size_t numWorkers = config.m_Workers.GetSize();
@@ -110,6 +111,10 @@ Gateway::Gateway( const GatewayConfig & config )
     }
 
     m_HousekeepingThread.Start( HousekeepingThreadFuncStatic, "GatewayHousekeeping", this );
+    if ( measure )
+    {
+        m_MeasureThread.Start( MeasureThreadFuncStatic, "GatewayMeasure", this );
+    }
 }
 
 // DESTRUCTOR
@@ -128,6 +133,10 @@ Gateway::~Gateway()
     m_Quit.Store( true );
     m_HousekeepingSemaphore.Signal();
     m_HousekeepingThread.Join();
+    if ( m_MeasureThread.IsRunning() )
+    {
+        m_MeasureThread.Join(); // A measurement stops at its next piece
+    }
 
     // Outside the mutex: a connection waits for its threads as it goes, and they call back
     Array<DownstreamConnection *> connections;
@@ -1222,7 +1231,6 @@ void Gateway::HousekeepingThreadFunc()
             break;
         }
 
-        MeasureStoredPchs();
         ReconnectLostWorkers();
 
         Actions actions;
@@ -1289,10 +1297,22 @@ void Gateway::ReconnectLostWorkers()
     }
 }
 
+// MeasureThreadFuncStatic
+//------------------------------------------------------------------------------
+/*static*/ uint32_t Gateway::MeasureThreadFuncStatic( void * param )
+{
+    PROFILE_SET_THREAD_NAME( "GatewayMeasure" );
+    static_cast<Gateway *>( param )->MeasureStoredPchs();
+    return 0;
+}
+
 // MeasureStoredPchs
 //------------------------------------------------------------------------------
 void Gateway::MeasureStoredPchs()
 {
+    const Timer timer;
+    uint32_t numMeasured = 0;
+    uint32_t numFailed = 0;
     while ( m_Quit.Load() == false )
     {
         uint64_t pchId = 0;
@@ -1309,6 +1329,7 @@ void Gateway::MeasureStoredPchs()
         }
         if ( pchId == 0 )
         {
+            m_Server->GetLog().Write( "gateway pch-measured n=%u failed=%u ms=%u", numMeasured, numFailed, (uint32_t)timer.GetElapsedMS() );
             return;
         }
 
@@ -1318,12 +1339,18 @@ void Gateway::MeasureStoredPchs()
         FileIO::FileInfo info;
         uint32_t uncompressedSize = 0;
         const bool found = m_Server->FindCachedPch( pchId, path );
+        if ( s_MeasureTestHook )
+        {
+            s_MeasureTestHook( m_Quit );
+        }
         const bool measured = found && FileIO::GetFileInfo( path, info ) &&
                               PchBlob::MeasureFile( path.Get(), pchId, &m_Quit, uncompressedSize );
         if ( m_Quit.Load() )
         {
             return;
         }
+        numMeasured += measured ? 1 : 0;
+        numFailed += ( found && ( measured == false ) ) ? 1 : 0;
 
         Actions actions;
         {

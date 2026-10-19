@@ -71,6 +71,10 @@ public:
     };
     void GetStats( Stats & outStats ) const;
 
+    // Runs before each PCH found at start is measured, so a test can hold the measurement until quit is set
+    typedef void ( *MeasureTestHook )( const Atomic<bool> & quit );
+    static void SetMeasureTestHook( MeasureTestHook hook ) { s_MeasureTestHook = hook; }
+
 private:
     // Server::Forwarder
     virtual uint32_t GetPoolSlots() const override;
@@ -211,8 +215,9 @@ private:
 
     static uint32_t HousekeepingThreadFuncStatic( void * param );
     void HousekeepingThreadFunc();
-    void MeasureStoredPchs(); // Those found at start
     void ReconnectLostWorkers();
+    static uint32_t MeasureThreadFuncStatic( void * param );
+    void MeasureStoredPchs(); // Those found at start
 
     const GatewayConfig     m_Config;
     ToolchainStash          m_Stash;
@@ -243,7 +248,10 @@ private:
 
     Thread                  m_HousekeepingThread;
     Semaphore               m_HousekeepingSemaphore;
+    Thread                  m_MeasureThread;    // Started if the store held PCHs at start, as measuring them can take minutes
     Atomic<bool>            m_Quit{ false };
+
+    inline static MeasureTestHook s_MeasureTestHook = nullptr;
 };
 
 //------------------------------------------------------------------------------

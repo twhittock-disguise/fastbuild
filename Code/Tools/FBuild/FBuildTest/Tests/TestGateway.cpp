@@ -427,6 +427,7 @@ private:
     void GatewayLogsForwarding() const;
     void StoredPchThatFailsMeasurementIsDropped() const;
     void StoredPchOfAnotherIdIsDropped() const;
+    void HousekeepingRunsWhileStoredPchsAreMeasured() const;
     void StashRejectsAManifestAWorkerWouldRefuse() const;
     void GiveUpDoesNotDenyListTheGateway() const;
     void JobOfALostWorkerIsRetriedElsewhere() const;
@@ -568,6 +569,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( GatewayLogsForwarding )
     REGISTER_TEST( StoredPchThatFailsMeasurementIsDropped )
     REGISTER_TEST( StoredPchOfAnotherIdIsDropped )
+    REGISTER_TEST( HousekeepingRunsWhileStoredPchsAreMeasured )
     REGISTER_TEST( StashRejectsAManifestAWorkerWouldRefuse )
     REGISTER_TEST( GiveUpDoesNotDenyListTheGateway )
     REGISTER_TEST( JobOfALostWorkerIsRetriedElsewhere )
@@ -4068,22 +4070,49 @@ void TestGateway::GatewayLogsForwarding() const
     TEST_ASSERT( strstr( stats, " workers=1/1 pool=4 waiting=0 parked=0 running=0 heldMiB=0 forwarded=1 retries=0 giveups=0 timeouts=0 pchMiB=0" ) );
 }
 
+// PCHs found in the gateway's store at start
+//------------------------------------------------------------------------------
+namespace
+{
+    // As an earlier run left it in the store. The path of the stored file, or empty.
+    AString WriteStoredPch( const AString & cacheDir, uint64_t pchId, const void * storedData, size_t storedSize )
+    {
+        AStackString<> storedFile( cacheDir );
+        storedFile.AppendFormat( "pch.%016" PRIx64, pchId );
+        if ( FileIO::EnsurePathExists( storedFile ) == false )
+        {
+            return AString();
+        }
+        storedFile.AppendFormat( "%c%s", (char)NATIVE_SLASH, PchBlob::kStoredFileName );
+        FileStream f;
+        if ( ( f.Open( storedFile.Get(), FileStream::WRITE_ONLY ) == false ) || ( f.Write( storedData, storedSize ) != storedSize ) )
+        {
+            return AString();
+        }
+        return AString( storedFile );
+    }
+
+    // Each measurement waits until the test releases it, or the gateway quits
+    Atomic<uint32_t> s_HeldMeasurements;
+    Atomic<bool> s_MeasurementsReleased;
+    void HoldStoredPchMeasurement( const Atomic<bool> & quit )
+    {
+        s_HeldMeasurements.Increment();
+        while ( ( s_MeasurementsReleased.Load() == false ) && ( quit.Load() == false ) )
+        {
+            Thread::Sleep( 1 );
+        }
+    }
+}
+
 // CheckStoredPchIsDropped
 //------------------------------------------------------------------------------
 /*static*/ void TestGateway::CheckStoredPchIsDropped( const void * storedData, size_t storedSize, const DistributedTest::CompressedPch & pch )
 {
-    // Left in the gateway's store by an earlier run
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
-    AStackString<> storedFile( config.m_CacheDir );
-    storedFile.AppendFormat( "pch.%016" PRIx64, pch.m_Id );
-    TEST_ASSERT( FileIO::EnsurePathExists( storedFile ) );
-    storedFile.AppendFormat( "%c%s", (char)NATIVE_SLASH, PchBlob::kStoredFileName );
-    {
-        FileStream f;
-        TEST_ASSERT( f.Open( storedFile.Get(), FileStream::WRITE_ONLY ) );
-        TEST_ASSERT( f.Write( storedData, storedSize ) == storedSize );
-    }
+    const AString storedFile = WriteStoredPch( config.m_CacheDir, pch.m_Id, storedData, storedSize );
+    TEST_ASSERT( storedFile.IsEmpty() == false );
 
     EchoWorker worker( 4 );
     TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
@@ -4136,6 +4165,73 @@ void TestGateway::StoredPchOfAnotherIdIsDropped() const
     DistributedTest::MakeCompressedPch( 64 * 1024, 8, other );
     TEST_ASSERT( other.m_Id != pch.m_Id );
     CheckStoredPchIsDropped( other.m_Compressed.GetResult(), other.m_CompressedSize, pch );
+}
+
+// HousekeepingRunsWhileStoredPchsAreMeasured
+//------------------------------------------------------------------------------
+void TestGateway::HousekeepingRunsWhileStoredPchsAreMeasured() const
+{
+    // A valid PCH left in the store, whose measurement lasts until the test releases it
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 64 * 1024, 9, pch );
+    GatewayConfig config;
+    MakeFailureConfig( 1, config );
+    config.m_StatsSeconds = 0.2f;
+    TEST_ASSERT( WriteStoredPch( config.m_CacheDir, pch.m_Id, pch.m_Compressed.GetResult(), pch.m_CompressedSize ).IsEmpty() == false );
+    s_HeldMeasurements.Store( 0 );
+    s_MeasurementsReleased.Store( false );
+    Gateway::SetMeasureTestHook( HoldStoredPchMeasurement );
+
+    // Not listening when the gateway starts
+    EchoWorker worker( 2, EchoWorker::ANSWER_NEVER );
+    AStackString<> logPath;
+    {
+        Gateway gateway( config );
+        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        logPath = gateway.GetServer().GetLogPath();
+        TEST_ASSERT( WaitUntil( []() { return ( s_HeldMeasurements.Load() == 1 ); } ) );
+
+        // The reconnect: once the first connection has failed, the worker is connected when it listens (the delay
+        // is 0.2 s, plus a refused connect's retries)
+        TEST_ASSERT( WaitUntil( [ &gateway ]() { MutexHolder mh( gateway.m_Mutex ); return gateway.m_Workers[ 0 ].m_Lost; } ) );
+        TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); }, 10.0f ) );
+
+        // The stats line
+        TEST_ASSERT( WaitUntil( [ &logPath ]() { AString log; return ReadWholeFile( logPath, log ) && ( log.Find( "gateway stats clients=" ) != nullptr ); }, 5.0f ) );
+
+        // The watchdog
+        DistributedTest::HandshakeProbe probe;
+        const ConnectionInfo * ci = nullptr;
+        TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+        TEST_ASSERT( SendToolchain( probe, ci ) );
+        JobStreamEncoder encoder;
+        TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Timeouts >= 1 ); }, 5.0f ) );
+        worker.SetAnswer( EchoWorker::ANSWER_OK );
+        worker.AnswerHeldJobs();
+        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+
+        // A job for the PCH waits for its measurement, and its client is not asked for the PCH
+        TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6", pch.m_Id ) );
+        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
+        Thread::Sleep( 100 );
+        TEST_ASSERT( ( GetGatewayStats( gateway ).m_Parked == 1 ) && ( GetNumResults( probe ) == 1 ) );
+
+        // Once measured, it is sent from the store
+        s_MeasurementsReleased.Store( true );
+        Array<GatewayWire::ResultHeader> results;
+        TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
+        TEST_ASSERT( ( results[ 1 ].m_JobId == 6 ) && results[ 1 ].m_Ok );
+        TEST_ASSERT( worker.GetPchBytes() == pch.m_CompressedSize );
+        TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
+        probe.ShutdownAllConnections();
+    }
+    Gateway::SetMeasureTestHook( nullptr );
+
+    AString log;
+    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    TEST_ASSERT( log.Find( "gateway pch-measured n=1 failed=0 ms=" ) );
 }
 
 // The gateway under failure
