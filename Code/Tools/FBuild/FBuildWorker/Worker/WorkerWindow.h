@@ -28,7 +28,7 @@ class OSWindow;
 class WorkerWindow : public OSWindow
 {
 public:
-    WorkerWindow();
+    explicit WorkerWindow( size_t numWorkers );
     virtual ~WorkerWindow() override;
 
     // Show/Update UI (blocks)

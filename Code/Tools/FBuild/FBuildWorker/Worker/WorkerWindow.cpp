@@ -10,7 +10,6 @@
 
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/FBuildVersion.h"
-#include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
 #include "Tools/FBuild/FBuildWorker/Worker/Worker.h"
 
 // OSUI
@@ -45,7 +44,7 @@ const size_t gTrayIconSize = sizeof( gTrayIcon );
 
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
-WorkerWindow::WorkerWindow()
+WorkerWindow::WorkerWindow( size_t numWorkers )
     : OSWindow()
     , m_TrayIcon( nullptr )
     , m_Font( nullptr )
@@ -88,7 +87,6 @@ WorkerWindow::WorkerWindow()
     m_ThreadList->AddColumn( "CPU", 0, 35 );
     m_ThreadList->AddColumn( "Host", 1, 100 );
     m_ThreadList->AddColumn( "Status", 2, 530 );
-    const size_t numWorkers = JobQueueRemote::Get().GetNumWorkers();
     m_ThreadList->SetItemCount( (uint32_t)numWorkers );
     for ( size_t i = 0; i < numWorkers; ++i )
     {

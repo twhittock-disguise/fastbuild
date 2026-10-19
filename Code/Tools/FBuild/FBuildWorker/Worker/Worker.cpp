@@ -148,17 +148,20 @@ int32_t Worker::Work()
 
         // TODO: Block until Ctrl+C
     }
-    else
-    {
-        // Create UI
-        m_MainWindow = FNEW( WorkerWindow() );
-        m_MainWindow->SetStatus( m_WorkerBrokerage.GetHostName(), AStackString( "Idle" ) );
-    }
 
+    // Before any window: there is nothing to run
     if ( !m_GatewayConfigError.IsEmpty() )
     {
         ErrorMessage( "Failed to load the gateway config. %s", m_GatewayConfigError.Get() );
         return -4;
+    }
+
+    if ( !InConsoleMode() )
+    {
+        // Create UI. A gateway has no job queue, so no thread list rows.
+        const size_t numWorkers = m_Gateway ? 0 : JobQueueRemote::Get().GetNumWorkers();
+        m_MainWindow = FNEW( WorkerWindow( numWorkers ) );
+        m_MainWindow->SetStatus( m_WorkerBrokerage.GetHostName(), AStackString( "Idle" ) );
     }
 
     // spawn work thread
