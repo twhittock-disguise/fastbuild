@@ -197,6 +197,9 @@ private:
     bool FailAttempt( GatewayJob & job, uint32_t workerIndex, const char * reason, Actions & actions );
     void GiveUpWithoutResult( GatewayJob & job, Actions & actions ); // After FailAttempt: a lost-job result goes up
     void ExpireHungAttempts( Actions & actions );
+    // Waiting jobs that no worker can take for m_NoWorkerGiveUpSeconds are given up. Waiting behind busy workers is not.
+    void GiveUpJobsNoWorkerCanTake( Actions & actions );
+    bool CanAnyWorkerTakeAJob() const; // Some ready worker has a slot that no expired attempt holds
     void UpdatePool();
     Client * FindClient( uint32_t clientId );
     Client & FindOrAddClient( uint32_t clientId );
@@ -235,6 +238,8 @@ private:
     uint32_t                m_Timeouts = 0;
     uint64_t                m_PchBytesForwarded = 0;
     uint32_t                m_ToolchainRequests = 0;         // MSG_REQUEST_MANIFEST and MSG_REQUEST_FILE sent
+    bool                    m_NoWorkerForWaitingJobs = false; // Since m_NoWorkerTimer started
+    Timer                   m_NoWorkerTimer;
 
     Thread                  m_HousekeepingThread;
     Semaphore               m_HousekeepingSemaphore;

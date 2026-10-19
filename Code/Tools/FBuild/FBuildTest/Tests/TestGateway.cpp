@@ -444,6 +444,10 @@ private:
 #if defined( __WINDOWS__ )
     void ClientBuildsLocallyWhenTheGatewayHasNoWorkers() const;
 #endif
+    void JobsWaitingWithNoWorkersAreReturned() const;
+    void JobWaitingForAHungWorkerIsReturned() const;
+    void JobsQueuedBehindABusyWorkerAreKept() const;
+    void NoWorkerBoundStartsAgainWhenAWorkerReturns() const;
     void GatewayLogsFailures() const;
 
     // Waits for something that happens on another thread
@@ -575,6 +579,10 @@ REGISTER_TESTS_BEGIN( TestGateway )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( ClientBuildsLocallyWhenTheGatewayHasNoWorkers )
 #endif
+    REGISTER_TEST( JobsWaitingWithNoWorkersAreReturned )
+    REGISTER_TEST( JobWaitingForAHungWorkerIsReturned )
+    REGISTER_TEST( JobsQueuedBehindABusyWorkerAreKept )
+    REGISTER_TEST( NoWorkerBoundStartsAgainWhenAWorkerReturns )
     REGISTER_TEST( GatewayLogsFailures )
 REGISTER_TESTS_END
 
@@ -4744,6 +4752,198 @@ void TestGateway::ClientBuildsLocallyWhenTheGatewayHasNoWorkers() const
     TEST_ASSERT( result.m_MaxDenyListed == 0 );
 }
 #endif
+
+// Jobs that no worker can take
+//------------------------------------------------------------------------------
+namespace
+{
+    // The client's job ids of the results received, each flagged as given up by the gateway
+    bool AreAllGivenUp( const DistributedTest::HandshakeProbe & probe, Array<uint32_t> & outJobIds )
+    {
+        Array<GatewayWire::ResultHeader> results;
+        Array<uint8_t> flags;
+        probe.GetResults( results );
+        probe.GetResultFlags( flags );
+        outJobIds.Clear();
+        for ( size_t i = 0; i < results.GetSize(); ++i )
+        {
+            if ( ( results[ i ].m_SystemError == false ) || ( flags[ i ] != Protocol::kResultReturnedByGateway ) )
+            {
+                return false;
+            }
+            outJobIds.Append( results[ i ].m_JobId );
+        }
+        return true;
+    }
+}
+
+// JobsWaitingWithNoWorkersAreReturned
+//------------------------------------------------------------------------------
+void TestGateway::JobsWaitingWithNoWorkersAreReturned() const
+{
+    EchoWorker worker( 1, EchoWorker::ANSWER_NEVER );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeFailureConfig( 1, config );
+    config.m_JobTimeoutSeconds = 600.0f;
+    config.m_NoWorkerGiveUpSeconds = 1.0f;
+    AStackString<> logPath;
+    {
+        Gateway gateway( config );
+        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+        logPath = gateway.GetServer().GetLogPath();
+
+        DistributedTest::HandshakeProbe probe;
+        const ConnectionInfo * ci = nullptr;
+        TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+        TEST_ASSERT( SendToolchain( probe, ci ) );
+        JobStreamEncoder encoder;
+        TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+        TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
+        TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Running == 1 ) && ( s.m_Waiting == 1 ); } ) );
+
+        // The only worker goes and does not come back: the job it held is retried, and both wait for nothing
+        const Timer timer;
+        worker.ShutdownAllConnections();
+        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 2 ); } ) );
+
+        // Once the bound has passed, each goes back to the client flagged, so it requeues it and keeps the gateway
+        Array<uint32_t> jobIds;
+        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+        TEST_ASSERT( timer.GetElapsed() >= ( config.m_NoWorkerGiveUpSeconds * 0.9f ) );
+        TEST_ASSERT( AreAllGivenUp( probe, jobIds ) );
+        TEST_ASSERT( jobIds.Find( 5u ) && jobIds.Find( 6u ) );
+        TEST_ASSERT( probe.IsDisconnected() == false );
+        const Gateway::Stats stats = GetGatewayStats( gateway );
+        TEST_ASSERT( ( stats.m_Waiting == 0 ) && ( stats.m_Running == 0 ) && ( stats.m_HeldJobBytes == 0 ) && ( stats.m_GiveUps == 2 ) );
+        Thread::Sleep( 200 );
+        TEST_ASSERT( GetNumResults( probe ) == 2 );
+        probe.ShutdownAllConnections();
+    }
+
+    AString log;
+    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    TEST_ASSERT( log.Find( "gateway jobs-giveup reason=no-worker n=2" ) );
+}
+
+// JobWaitingForAHungWorkerIsReturned
+//------------------------------------------------------------------------------
+void TestGateway::JobWaitingForAHungWorkerIsReturned() const
+{
+    // The only worker never answers: once its attempt has expired, the job's retry waits for the slot the
+    // hung attempt holds
+    EchoWorker worker( 1, EchoWorker::ANSWER_NEVER );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeFailureConfig( 1, config );
+    config.m_NoWorkerGiveUpSeconds = 1.0f;
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Timeouts == 1 ) && ( s.m_Waiting == 1 ); } ) );
+    const Timer timer;
+
+    Array<uint32_t> jobIds;
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( timer.GetElapsed() >= ( config.m_NoWorkerGiveUpSeconds * 0.8f ) );
+    TEST_ASSERT( AreAllGivenUp( probe, jobIds ) && ( jobIds[ 0 ] == 5 ) );
+    TEST_ASSERT( worker.GetNumJobs() == 1 );
+    const Gateway::Stats stats = GetGatewayStats( gateway );
+    TEST_ASSERT( ( stats.m_Waiting == 0 ) && ( stats.m_HeldJobBytes == 0 ) && ( stats.m_ReadyWorkers == 1 ) );
+    probe.ShutdownAllConnections();
+}
+
+// JobsQueuedBehindABusyWorkerAreKept
+//------------------------------------------------------------------------------
+void TestGateway::JobsQueuedBehindABusyWorkerAreKept() const
+{
+    EchoWorker worker( 1, EchoWorker::ANSWER_NEVER );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeFailureConfig( 1, config );
+    config.m_JobTimeoutSeconds = 600.0f;
+    config.m_NoWorkerGiveUpSeconds = 0.5f;
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 7, "m7" ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 2 ); } ) );
+
+    // The worker builds one job at a time, each for longer than the bound: the others wait their turn
+    for ( uint32_t i = 1; i <= 3; ++i )
+    {
+        Thread::Sleep( 1000 );
+        TEST_ASSERT( GetNumResults( probe ) == ( i - 1 ) );
+        TEST_ASSERT( GetGatewayStats( gateway ).m_GiveUps == 0 );
+        worker.AnswerHeldJobs();
+        TEST_ASSERT( WaitUntil( [ &probe, i ]() { return ( GetNumResults( probe ) == i ); } ) );
+        TEST_ASSERT( WaitUntil( [ &worker, i ]() { return ( worker.GetNumJobs() == ( ( i < 3 ) ? ( i + 1 ) : 3 ) ); } ) );
+    }
+    Array<GatewayWire::ResultHeader> results;
+    probe.GetResults( results );
+    for ( const GatewayWire::ResultHeader & result : results )
+    {
+        TEST_ASSERT( result.m_Ok );
+    }
+    probe.ShutdownAllConnections();
+}
+
+// NoWorkerBoundStartsAgainWhenAWorkerReturns
+//------------------------------------------------------------------------------
+void TestGateway::NoWorkerBoundStartsAgainWhenAWorkerReturns() const
+{
+    EchoWorker worker( 1, EchoWorker::ANSWER_NEVER );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeFailureConfig( 1, config );
+    config.m_JobTimeoutSeconds = 600.0f;
+    config.m_ReconnectSeconds = 0.5f;
+    config.m_NoWorkerGiveUpSeconds = 1.5f;
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
+    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumHeldJobs() == 1 ); } ) );
+
+    // The worker goes, for less than the bound, and comes back to build the retried job
+    worker.DisconnectConnections();
+    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumHeldJobs() == 1 ) && ( worker.GetNumConnections() == 2 ); } ) );
+    TEST_ASSERT( GetNumResults( probe ) == 0 );
+    Thread::Sleep( 500 ); // Busy, with a job waiting behind it
+
+    // It goes for good: the bound is counted from here, not from when it first went
+    const Timer timer;
+    worker.ShutdownAllConnections();
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    TEST_ASSERT( timer.GetElapsed() >= ( config.m_NoWorkerGiveUpSeconds * 0.9f ) );
+    Array<uint32_t> jobIds;
+    TEST_ASSERT( AreAllGivenUp( probe, jobIds ) );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_HeldJobBytes == 0 );
+    probe.ShutdownAllConnections();
+}
 
 // GatewayLogsFailures
 //------------------------------------------------------------------------------

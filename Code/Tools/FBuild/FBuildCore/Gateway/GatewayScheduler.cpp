@@ -118,6 +118,21 @@ void GatewayScheduler::RemoveClient( uint32_t clientId, Array<uint32_t> & outWai
     }
 }
 
+// RemoveWaitingJobs
+//------------------------------------------------------------------------------
+void GatewayScheduler::RemoveWaitingJobs( Array<uint32_t> & outJobIds )
+{
+    outJobIds.Clear();
+    for ( Client & client : m_Clients )
+    {
+        for ( const Job & job : client.m_Waiting )
+        {
+            outJobIds.Append( job.m_Id );
+        }
+        client.m_Waiting.Clear();
+    }
+}
+
 // OnCompleted
 //------------------------------------------------------------------------------
 void GatewayScheduler::OnCompleted( uint32_t jobId )

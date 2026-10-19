@@ -997,6 +997,71 @@ void Gateway::ExpireHungAttempts( Actions & actions )
     Dispatch( actions );
 }
 
+// GiveUpJobsNoWorkerCanTake
+//------------------------------------------------------------------------------
+void Gateway::GiveUpJobsNoWorkerCanTake( Actions & actions )
+{
+    // The bound starts again whenever a worker could take a job, or nothing waits
+    if ( ( m_Scheduler.GetNumWaiting() == 0 ) || CanAnyWorkerTakeAJob() )
+    {
+        m_NoWorkerForWaitingJobs = false;
+        return;
+    }
+    if ( m_NoWorkerForWaitingJobs == false )
+    {
+        m_NoWorkerForWaitingJobs = true;
+        m_NoWorkerTimer.Restart();
+        return;
+    }
+    if ( m_NoWorkerTimer.GetElapsed() < m_Config.m_NoWorkerGiveUpSeconds )
+    {
+        return;
+    }
+    m_NoWorkerForWaitingJobs = false;
+
+    // Each goes back to its client flagged, so the client requeues it and keeps the gateway
+    Array<uint32_t> jobIds;
+    m_Scheduler.RemoveWaitingJobs( jobIds );
+    for ( const uint32_t jobId : jobIds )
+    {
+        GatewayJob * job = FindJob( jobId );
+        if ( job )
+        {
+            ++m_GiveUps;
+            GiveUpWithoutResult( *job, actions );
+            RemoveJob( job, actions );
+        }
+    }
+    AStackString<> line;
+    line.Format( "gateway jobs-giveup reason=no-worker n=%u", (uint32_t)jobIds.GetSize() );
+    actions.m_LogLines.EmplaceBack( line.Get() );
+}
+
+// CanAnyWorkerTakeAJob
+//------------------------------------------------------------------------------
+bool Gateway::CanAnyWorkerTakeAJob() const
+{
+    for ( size_t i = 0; i < m_Workers.GetSize(); ++i )
+    {
+        const Worker & worker = m_Workers[ i ];
+        if ( ( worker.m_Ready == false ) || ( worker.m_Connection == nullptr ) )
+        {
+            continue;
+        }
+        const uint32_t index = (uint32_t)( i + 1 );
+        uint32_t hung = 0;
+        for ( const Attempt & attempt : m_Attempts )
+        {
+            hung += ( attempt.m_Expired && ( attempt.m_WorkerIndex == index ) ) ? 1 : 0;
+        }
+        if ( worker.m_Connection->GetCapacity() > hung )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 // UpdatePool
 //------------------------------------------------------------------------------
 void Gateway::UpdatePool()
@@ -1144,8 +1209,8 @@ void Gateway::FormatStats( AString & outLine ) const
 //------------------------------------------------------------------------------
 void Gateway::HousekeepingThreadFunc()
 {
-    // Often enough for the watchdog and the reconnect delay to be kept to within a quarter of the shorter
-    const float shortest = Math::Min( m_Config.m_JobTimeoutSeconds, m_Config.m_ReconnectSeconds );
+    // Often enough for the watchdog, the reconnect delay and the no-worker bound to be kept to within a quarter of the shortest
+    const float shortest = Math::Min( Math::Min( m_Config.m_JobTimeoutSeconds, m_Config.m_ReconnectSeconds ), m_Config.m_NoWorkerGiveUpSeconds );
     const uint32_t tickMs = Math::Clamp( (uint32_t)( shortest * 1000.0f / 4.0f ), 10u, 1000u );
 
     Timer statsTimer;
@@ -1166,6 +1231,7 @@ void Gateway::HousekeepingThreadFunc()
             if ( m_ShuttingDown == false )
             {
                 ExpireHungAttempts( actions );
+                GiveUpJobsNoWorkerCanTake( actions );
             }
             UpdatePool();
             if ( statsTimer.GetElapsed() >= m_Config.m_StatsSeconds )
