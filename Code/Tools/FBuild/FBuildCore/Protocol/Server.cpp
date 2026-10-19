@@ -1888,13 +1888,12 @@ void Server::ScanPchCache()
 
 // QueryPchCacheLimits
 //------------------------------------------------------------------------------
-/*static*/ bool Server::QueryPchCacheLimits( uint64_t cacheBytes, PchCacheLimits & outLimits )
+/*static*/ bool Server::QueryPchCacheLimits( const AString & cacheDir, uint64_t cacheBytes, PchCacheLimits & outLimits )
 {
-    AStackString<> dir;
     uint64_t freeBytes = 0;
-    if ( ( FBuild::GetWorkerCacheDir( dir ) == false ) ||
-         ( FileIO::EnsurePathExists( dir ) == false ) ||
-         ( FileIO::GetFreeDiskSpace( dir, freeBytes ) == false ) )
+    if ( cacheDir.IsEmpty() ||
+         ( FileIO::EnsurePathExists( cacheDir ) == false ) ||
+         ( FileIO::GetFreeDiskSpace( cacheDir, freeBytes ) == false ) )
     {
         return false;
     }
@@ -1909,7 +1908,7 @@ void Server::ScanPchCache()
 Server::PchCacheLimits Server::GetPchCacheLimits( uint64_t cacheBytes ) const
 {
     PchCacheLimits limits;
-    if ( m_PchCacheLimitsFunc( cacheBytes, limits ) == false )
+    if ( m_PchCacheLimitsFunc( m_CacheDir, cacheBytes, limits ) == false )
     {
         // The free space is not known: keep the cache small
         static bool logged = false;
@@ -2157,6 +2156,17 @@ void Server::DropStoredPch( uint64_t pchId )
         }
         dropped = Move( *stored );
         m_PchCache.Erase( stored );
+
+        // Its working copy goes with it, so the next job has one made again
+        PchRawEntry * raw = FindRawPch( pchId );
+        if ( raw && ( raw->state == PchRawEntry::READY ) )
+        {
+            raw->state = PchRawEntry::ABSENT;
+            if ( raw->numLeases == 0 )
+            {
+                m_PchRaw.EraseIndex( (size_t)( raw - m_PchRaw.Begin() ) );
+            }
+        }
     }
     RemovePchFiles( dropped ); // The disk is written with no lock held
     m_Log.Write( "pch dropped id=0x%016" PRIx64, pchId );

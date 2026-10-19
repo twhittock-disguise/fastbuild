@@ -315,7 +315,7 @@ private:
     inline static Server::PchCacheLimits s_PchCacheLimits = { 0, 0, 0 };
     inline static bool s_PchCacheLimitsKnown = true;
     inline static Atomic<uint64_t> s_LastCacheBytes{ 0 }; // What the Server said the cache holds, when it asked
-    static bool GetTestPchCacheLimits( uint64_t cacheBytes, Server::PchCacheLimits & outLimits );
+    static bool GetTestPchCacheLimits( const AString & cacheDir, uint64_t cacheBytes, Server::PchCacheLimits & outLimits );
     static void SetPchCacheLimits( Server & server, uint64_t bytes, uint32_t minEntries, uint64_t rawBytes = ( 1ull << 30 ) );
     static void SetPchCacheLimitsUnknown( Server & server ); // As when the free space cannot be read
 
@@ -1532,7 +1532,7 @@ void TestDistributed::PchStartupScanRemovesStaleTempFiles() const
 
 // PchBudgetFollowsTheFreeSpace
 //------------------------------------------------------------------------------
-/*static*/ bool TestDistributed::GetTestPchCacheLimits( uint64_t cacheBytes, Server::PchCacheLimits & outLimits )
+/*static*/ bool TestDistributed::GetTestPchCacheLimits( const AString & /*cacheDir*/, uint64_t cacheBytes, Server::PchCacheLimits & outLimits )
 {
     s_LastCacheBytes.Store( cacheBytes );
     if ( s_PchCacheLimitsKnown == false )

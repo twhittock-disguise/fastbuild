@@ -455,6 +455,8 @@ private:
     void ThreadLanesOfTwoWorkersDoNotCollide() const;
     void ClientsAreServedInTurn() const;
     void GatewayLogsForwarding() const;
+    void DroppedPchIsUnpackedAgainOnceStoredAgain() const;
+    void PchStoreOfAGatewayCacheDirLeavesTheWorkerCacheAlone() const;
     void StoredPchThatFailsMeasurementIsDropped() const;
     void StoredPchOfAnotherIdIsDropped() const;
     void HousekeepingRunsWhileStoredPchsAreMeasured() const;
@@ -644,6 +646,8 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( ThreadLanesOfTwoWorkersDoNotCollide )
     REGISTER_TEST( ClientsAreServedInTurn )
     REGISTER_TEST( GatewayLogsForwarding )
+    REGISTER_TEST( DroppedPchIsUnpackedAgainOnceStoredAgain )
+    REGISTER_TEST( PchStoreOfAGatewayCacheDirLeavesTheWorkerCacheAlone )
     REGISTER_TEST( StoredPchThatFailsMeasurementIsDropped )
     REGISTER_TEST( StoredPchOfAnotherIdIsDropped )
     REGISTER_TEST( HousekeepingRunsWhileStoredPchsAreMeasured )
@@ -4564,6 +4568,87 @@ namespace
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( worker.GetPchBytes() == pch.m_CompressedSize );
     probe.ShutdownAllConnections();
+}
+
+// DroppedPchIsUnpackedAgainOnceStoredAgain
+//------------------------------------------------------------------------------
+void TestGateway::DroppedPchIsUnpackedAgainOnceStoredAgain() const
+{
+    Server s( 1 );
+    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( s, probe, &ci ) != 0 );
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 64 * 1024, 9, pch );
+    AStackString<> stored;
+    TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.FindCachedPch( pch.m_Id, stored ); } ) );
+
+    // A job has the working copy made
+    Job first( static_cast<Node *>( nullptr ) );
+    first.SetPchId( pch.m_Id );
+    first.SetPchLease( s.AcquirePchLease( pch.m_Id ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( first ); } ) );
+    TEST_ASSERT( FileIO::FileExists( first.GetPchCachePath().Get() ) );
+
+    // Dropped with its working copy while that job holds it, then stored again: the next job has a working copy made again
+    s.DropStoredPch( pch.m_Id );
+    TEST_ASSERT( FileIO::FileExists( first.GetPchCachePath().Get() ) == false );
+    TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.FindCachedPch( pch.m_Id, stored ); } ) );
+    Job second( static_cast<Node *>( nullptr ) );
+    second.SetPchId( pch.m_Id );
+    second.SetPchLease( s.AcquirePchLease( pch.m_Id ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( second ); } ) );
+    TEST_ASSERT( FileIO::FileExists( second.GetPchCachePath().Get() ) );
+    TEST_ASSERT( s.m_NumPchsUnpacked.Load() == 2 );
+
+    probe.ShutdownAllConnections();
+}
+
+// PchStoreOfAGatewayCacheDirLeavesTheWorkerCacheAlone
+//------------------------------------------------------------------------------
+void TestGateway::PchStoreOfAGatewayCacheDirLeavesTheWorkerCacheAlone() const
+{
+    // A worker cache that does not exist, so whatever makes it is seen
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    AStackString<> original;
+    VERIFY( FBuild::GetTempDir( original ) );
+    AStackString<> elsewhere( original );
+    elsewhere += "elsewhere";
+    elsewhere += NATIVE_SLASH;
+    Env::SetEnvVariable( "FASTBUILD_TEMP_PATH", elsewhere );
+    AStackString<> workerCache;
+    VERIFY( FBuild::GetWorkerCacheDir( workerCache ) );
+    AStackString<> directory( workerCache );
+    while ( directory.GetLength() > elsewhere.GetLength() )
+    {
+        directory.SetLength( directory.GetLength() - 1 ); // The slash
+        FileIO::DirectoryDelete( directory ); // Empty: only this test makes them
+        directory.SetLength( (uint32_t)( directory.FindLast( NATIVE_SLASH ) + 1 - directory.Get() ) );
+    }
+    const bool hadWorkerCache = FileIO::DirectoryExists( workerCache );
+
+    // The store is sized when a PCH arrives
+    {
+        StubForwarder forwarder( 4 );
+        Server s( forwarder, cacheDir );
+        TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+        DistributedTest::HandshakeProbe probe;
+        const ConnectionInfo * ci = nullptr;
+        TEST_ASSERT( ConnectProbe( s, probe, &ci ) != 0 );
+        DistributedTest::CompressedPch pch;
+        DistributedTest::MakeCompressedPch( 64 * 1024, 10, pch );
+        TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+        TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumStoredPchs() == 1 ); } ) );
+        probe.ShutdownAllConnections();
+    }
+    const bool madeWorkerCache = FileIO::DirectoryExists( workerCache );
+    Env::SetEnvVariable( "FASTBUILD_TEMP_PATH", original );
+    TEST_ASSERT( hadWorkerCache == false );
+    TEST_ASSERT( madeWorkerCache == false );
 }
 
 // StoredPchThatFailsMeasurementIsDropped

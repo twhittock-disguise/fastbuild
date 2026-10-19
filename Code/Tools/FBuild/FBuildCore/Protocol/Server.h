@@ -317,10 +317,10 @@ private:
         uint32_t m_MinEntries;
         uint64_t m_RawBytes = 0;    // Of working copies nothing uses
     };
-    // The limits for a cache holding cacheBytes (compressed PCHs and working copies), or false if they
+    // The limits for a cache in cacheDir holding cacheBytes (compressed PCHs and working copies), or false if they
     // cannot be told. Tests replace it.
-    using PchCacheLimitsFunc = bool ( * )( uint64_t cacheBytes, PchCacheLimits & outLimits );
-    static bool QueryPchCacheLimits( uint64_t cacheBytes, PchCacheLimits & outLimits ); // From the free space of the cache volume
+    using PchCacheLimitsFunc = bool ( * )( const AString & cacheDir, uint64_t cacheBytes, PchCacheLimits & outLimits );
+    static bool QueryPchCacheLimits( const AString & cacheDir, uint64_t cacheBytes, PchCacheLimits & outLimits ); // From the free space of its volume
     PchCacheLimits GetPchCacheLimits( uint64_t cacheBytes ) const; // Reads the disk: not under m_PchCacheMutex
     static uint64_t CountPchBytes( const Array<PchCacheEntry> & entries );
     void ScanPchCache();
