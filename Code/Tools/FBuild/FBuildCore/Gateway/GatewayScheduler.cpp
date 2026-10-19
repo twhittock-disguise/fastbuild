@@ -138,6 +138,24 @@ void GatewayScheduler::RemoveWaitingJobs( Array<uint32_t> & outJobIds )
     }
 }
 
+// RemoveWaitingJob
+//------------------------------------------------------------------------------
+bool GatewayScheduler::RemoveWaitingJob( uint32_t jobId )
+{
+    for ( Client & client : m_Clients )
+    {
+        for ( size_t i = 0; i < client.m_Waiting.GetSize(); ++i )
+        {
+            if ( client.m_Waiting[ i ].m_Id == jobId )
+            {
+                client.m_Waiting.EraseIndex( i );
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // OnCompleted
 //------------------------------------------------------------------------------
 void GatewayScheduler::OnCompleted( uint32_t jobId )

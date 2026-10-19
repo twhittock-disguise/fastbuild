@@ -40,6 +40,7 @@ public:
     void AddJob( uint32_t jobId, uint32_t clientId, uint64_t pchId, uint64_t toolId );
     void RemoveClient( uint32_t clientId, Array<uint32_t> & outWaitingJobIds ); // Its running jobs are given up when they fail
     void RemoveWaitingJobs( Array<uint32_t> & outJobIds ); // Every client's; the running jobs stay
+    bool RemoveWaitingJob( uint32_t jobId ); // False if it is not waiting
 
     // Round-robin over clients with waiting jobs, one job per turn. Within a client: the first of kScanDepth
     // jobs with a free worker that HOLDS what it needs, else the first job any free, able worker can take.

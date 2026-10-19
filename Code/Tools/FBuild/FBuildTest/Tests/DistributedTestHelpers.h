@@ -13,6 +13,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
 
 // Core
@@ -765,6 +766,86 @@ namespace DistributedTest
         Atomic<bool> m_Stop{ false };
         Atomic<uint32_t> m_Max{ 0 };
     };
+
+    // A job as a client sends it to a worker, taken from a build
+    struct CapturedJob
+    {
+        uint64_t        m_ToolId = 0;
+        uint64_t        m_PchId = 0;
+        Array<char>     m_Data;     // The job, before it is compressed for the stream
+    };
+
+    // A worker that keeps the first job it is sent, and does not answer it
+    class JobCapturingWorker : public FakeWorker
+    {
+    public:
+        JobCapturingWorker() : FakeWorker( 4 ) {}
+        explicit JobCapturingWorker( const JobCapturingWorker & other ) = delete;
+        JobCapturingWorker & operator=( const JobCapturingWorker & other ) = delete;
+
+        bool HasJob() const { return m_HasJob.Load(); }
+        const CapturedJob & GetJob() const { return m_Job; } // Once there is one
+
+    private:
+        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage & message, void * payload, uint32_t payloadSize ) override
+        {
+            if ( ( message.GetType() != Protocol::MSG_JOB ) || m_HasJob.Load() )
+            {
+                return;
+            }
+            void * job = nullptr;
+            size_t jobSize = 0;
+            if ( m_Decoder.Decode( payload, payloadSize, job, jobSize ) == false )
+            {
+                return;
+            }
+            m_Job.m_ToolId = static_cast<const Protocol::MsgJob &>( message ).GetToolId();
+            m_Job.m_Data.SetSize( jobSize );
+            memcpy( m_Job.m_Data.Begin(), job, jobSize );
+            ConstMemoryStream ms( job, jobSize );
+            const Job parsed( ms );
+            m_Job.m_PchId = parsed.GetPchId();
+            FREE( job );
+            m_HasJob.Store( true );
+        }
+
+        JobStreamDecoder m_Decoder;
+        CapturedJob m_Job;
+        Atomic<bool> m_HasJob{ false };
+    };
+
+    // Runs a build that sends a job for a PCH to a worker, and keeps the job. False if none was sent in time.
+    inline bool CapturePchJob( CapturedJob & outJob, float timeoutSeconds )
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_NoLocalConsumptionOfRemoteJobs = true; // jobs stay queued for the remote worker
+        options.m_AllowLocalRace = false;
+        options.m_ForceCleanBuild = true;
+        FBuildForTest fBuild( options );
+        JobCapturingWorker worker;
+        if ( ( fBuild.Initialize() == false ) || ( worker.Listen( Protocol::kTestPort ) == false ) )
+        {
+            return false;
+        }
+
+        auto reached = [ &worker ]() { return worker.HasJob(); };
+        {
+            BuildAborter aborter( reached, timeoutSeconds );
+            fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
+        }
+        worker.ShutdownAllConnections();
+        if ( worker.HasJob() == false )
+        {
+            return false;
+        }
+        outJob.m_ToolId = worker.GetJob().m_ToolId;
+        outJob.m_PchId = worker.GetJob().m_PchId;
+        outJob.m_Data = worker.GetJob().m_Data;
+        return ( outJob.m_ToolId != 0 ) && ( outJob.m_PchId != 0 );
+    }
 
     struct LocalBuildResult
     {

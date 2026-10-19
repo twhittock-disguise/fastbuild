@@ -305,10 +305,15 @@ Server::Server( Forwarder & forwarder, const AString & cacheDir, uint32_t localT
 {
     m_ClientList.SetCapacity( 32 );
 
-    // A pure gateway keeps PCHs as they arrive, for the gateway to send on: none is unpacked
+    // A pure gateway keeps PCHs as they arrive, for the gateway to send on: none is unpacked.
+    // ToolManifest keeps toolchains in the worker cache dir, so a local pool needs its PCHs there too.
+    if ( ( localThreads > 0 ) && ( PathUtils::ArePathsEqual( m_CacheDir, GetCacheRoot( AString::GetEmpty() ) ) == false ) )
+    {
+        LogWarning( "The gateway has no local pool: its cache dir '%s' is not the worker cache dir, where toolchains are kept\n", m_CacheDir.Get() );
+        localThreads = 0;
+    }
     if ( localThreads > 0 )
     {
-        ASSERT( m_CacheDir == GetCacheRoot( AString::GetEmpty() ) ); // Its PCHs are next to the toolchains
         m_JobQueueRemote = FNEW( JobQueueRemote( localThreads ) );
     }
     m_Thread.Start( ThreadFuncStatic, "Server", this );

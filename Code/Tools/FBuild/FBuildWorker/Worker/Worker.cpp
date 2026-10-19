@@ -23,6 +23,7 @@
 #include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
 
 // Core
+#include "Core/Env/CPUInfo.h"
 #include "Core/Env/Env.h"
 #include "Core/Env/ErrorFormat.h"
 #include "Core/Env/Types.h"
@@ -60,7 +61,9 @@ Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart, ui
         GatewayConfig config;
         if ( GatewayConfig::Load( gatewayConfigFile, config, m_GatewayConfigError ) )
         {
-            m_Gateway = FNEW( Gateway( config ) );
+            // Its own cores are one more worker, with what -cpus, -mode and -prefetch give a worker
+            const uint32_t localThreads = numThreadsInJobQueue ? numThreadsInJobQueue : CPUInfo::Get().GetNumUsefulCores();
+            m_Gateway = FNEW( Gateway( config, localThreads, prefetchBuffer ) );
             m_ConnectionPool = &m_Gateway->GetServer();
         }
     }
@@ -158,8 +161,8 @@ int32_t Worker::Work()
 
     if ( !InConsoleMode() )
     {
-        // Create UI. A gateway has no job queue, so no thread list rows.
-        const size_t numWorkers = m_Gateway ? 0 : JobQueueRemote::Get().GetNumWorkers();
+        // Create UI. A gateway without a local pool has no job queue, so no thread list rows.
+        const size_t numWorkers = JobQueueRemote::IsValid() ? JobQueueRemote::Get().GetNumWorkers() : 0;
         m_MainWindow = FNEW( WorkerWindow( numWorkers ) );
         m_MainWindow->SetStatus( m_WorkerBrokerage.GetHostName(), AStackString( "Idle" ) );
     }
@@ -425,8 +428,8 @@ void Worker::UpdateUI()
     {
         Gateway::Stats stats;
         m_Gateway->GetStats( stats );
-        status.AppendFormat( "\nGateway: %u of %u workers, %u slots, %u clients",
-                             stats.m_ReadyWorkers, stats.m_Workers, stats.m_PoolSlots, stats.m_Clients );
+        status.AppendFormat( "\nGateway: %u of %u workers, %u slots (%u local, %u running), %u clients",
+                             stats.m_ReadyWorkers, stats.m_Workers, stats.m_PoolSlots, stats.m_LocalSlots, stats.m_RunningLocally, stats.m_Clients );
     }
     if ( m_RestartNeeded )
     {
@@ -448,7 +451,7 @@ void Worker::UpdateUI()
         m_MainWindow->SetStatus( m_WorkerBrokerage.GetHostName(), status );
     }
 
-    if ( ( InConsoleMode() == false ) && ( m_Gateway == nullptr ) )
+    if ( ( InConsoleMode() == false ) && JobQueueRemote::IsValid() )
     {
         // thread output
         const JobQueueRemote & jqr = JobQueueRemote::Get();
@@ -484,7 +487,7 @@ void Worker::UpdateUI()
 //------------------------------------------------------------------------------
 void Worker::SignalStopWorkers()
 {
-    if ( m_Gateway == nullptr ) // A gateway runs no jobs itself
+    if ( JobQueueRemote::IsValid() ) // A gateway without a local pool runs no jobs itself
     {
         JobQueueRemote::Get().SignalStopWorkers();
     }
@@ -500,7 +503,7 @@ void Worker::CheckIfRestartNeeded()
     if ( m_RestartNeeded )
     {
         // can we restart yet?
-        if ( ( m_Gateway != nullptr ) || JobQueueRemote::Get().HaveWorkersStopped() )
+        if ( ( JobQueueRemote::IsValid() == false ) || JobQueueRemote::Get().HaveWorkersStopped() )
         {
             m_WantToQuit = true;
         }

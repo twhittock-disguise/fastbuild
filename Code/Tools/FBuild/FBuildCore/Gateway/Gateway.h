@@ -7,6 +7,7 @@
 #include "Tools/FBuild/FBuildCore/Gateway/DownstreamConnection.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayConfig.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayScheduler.h"
+#include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
 #include "Tools/FBuild/FBuildCore/Gateway/ToolchainStash.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
@@ -26,9 +27,14 @@
 // the job's result has come back from a downstream worker, and sends that result to the client
 // that sent the job, with the client's job id restored and the thread index moved to the worker's lane.
 //
-// Slots: its Server shares out the pool, the sum of its ready workers' pools, between its clients by their
-// demand. Toward each worker the gateway is a client like any other: it reports what waits for and runs on
-// that worker as its demand, and runs there as many jobs as the worker's allowance.
+// Slots: its Server shares out the pool, the sum of its ready workers' pools and of its local slots, between
+// its clients by their demand. Toward each worker the gateway is a client like any other: it reports what waits
+// for and runs on that worker as its demand, and runs there as many jobs as the worker's allowance.
+//
+// The local pool: with local threads, its Server builds jobs too, as a worker does. To the scheduler it is
+// worker kLocalWorkerIndex, with the slots the worker settings give (Server::GetLocalSlots, followed each tick),
+// able to take a job once the job's toolchain is synchronized there (its PCH is stored before the job is
+// scheduled). It is given no demand report, and its faults are retried as a downstream worker's are.
 //
 // A worker's faults are the gateway's to retry: a job that fails, is lost with its worker or outlives
 // the watchdog is tried again elsewhere, at most GatewayScheduler::kMaxAttempts times in all. Only then
@@ -43,13 +49,15 @@ class Gateway : private Server::Forwarder, private DownstreamConnection::Owner
 {
     friend class TestGateway;
 public:
-    static constexpr uint32_t kLocalWorkerIndex = 0;   // Used from Task 18
+    static constexpr uint32_t kLocalWorkerIndex = 0;
     // A client that holds more jobs at the gateway than this many per slot of the largest allowance it was
     // given does not keep to its allowance, and is disconnected: each job is held in memory with a toolchain pin
     static constexpr uint32_t kMaxHeldJobsPerSlot = 4;
     // At most this long between the gateway's demand reports to its workers (DemandRamp paces what is sent)
     static constexpr uint32_t kDemandTickMs = 100;
-    explicit Gateway( const GatewayConfig & config );  // Phase A: a pure forwarder
+    explicit Gateway( const GatewayConfig & config );  // A pure forwarder
+    // localThreads == 0: a pure forwarder. Otherwise a local pool, which needs the default cache dir (Server).
+    Gateway( const GatewayConfig & config, uint32_t localThreads, uint32_t prefetchBuffer );
     virtual ~Gateway();
 
     explicit Gateway( const Gateway & other ) = delete;
@@ -64,6 +72,8 @@ public:
         uint32_t m_Workers = 0;        // Configured
         uint32_t m_ReadyWorkers = 0;
         uint32_t m_PoolSlots = 0;
+        uint32_t m_LocalSlots = 0;
+        uint32_t m_RunningLocally = 0;
         uint32_t m_Waiting = 0;
         uint32_t m_Parked = 0;
         uint32_t m_Running = 0;
@@ -167,6 +177,7 @@ private:
         struct ToolchainRequest { uint32_t m_ClientId; uint64_t m_ToolId; uint32_t m_FileId; }; // kManifestFileId: the manifest
         struct GivenUp { uint32_t m_ClientId; bool m_Compressed; MemoryStream * m_Payload; }; // Sent flagged kResultReturnedByGateway
         struct Demand { DownstreamConnection * m_Connection; uint32_t m_Waiting; uint32_t m_InFlight; };
+        struct LocalJob { uint64_t m_ToolId; int16_t m_ResultCompressionLevel; void * m_Data; size_t m_DataSize; }; // For Server::RunLocalJob
 
         Actions() = default;
         ~Actions();
@@ -176,6 +187,7 @@ private:
         Array<uint64_t>         m_DropIncomplete;
         Array<uint64_t>         m_ReleaseUses;
         Array<GatewayJob *>     m_FreeJobs;
+        Array<LocalJob>         m_LocalJobs;
         Array<uint64_t>         m_DropPchs;     // From the Server's store
         Array<uint32_t>         m_Disconnects;
         Array<PchAsk>           m_PchAsks;
@@ -205,10 +217,27 @@ private:
     // to get the job's failed result (it is still connected), and the job is removed either way.
     bool FailAttempt( GatewayJob & job, uint32_t workerIndex, const char * reason, Actions & actions );
     void GiveUpWithoutResult( GatewayJob & job, Actions & actions ); // After FailAttempt: a lost-job result goes up
+    // A result for the worker's attempt: retried if the worker failed it, else passed on (PassOnResult). One for
+    // an attempt the gateway no longer waits for only frees its slot.
+    struct ResultRoute
+    {
+        uint32_t    m_ClientId = 0;
+        uint64_t    m_CompletedPchId = 0;   // Of a job built, or failed by its code
+        uint8_t     m_Flags = 0;
+        bool        m_PassOn = false;
+    };
+    void RouteResult( uint32_t workerIndex, const GatewayWire::ResultHeader & header, void * payload, uint32_t payloadSize, ResultRoute & outRoute, Actions & actions );
+    void OnLocalAttemptFailed( uint32_t attemptId, Actions & actions ); // It ended without a result
+    void ParkJobsWaitingForPch( uint64_t pchId, Actions & actions ); // It has gone from the store: the jobs wait for it again
     void ExpireHungAttempts( Actions & actions );
     // Waiting jobs that no worker can take for m_NoWorkerGiveUpSeconds are given up. Waiting behind busy workers is not.
     void GiveUpJobsNoWorkerCanTake( Actions & actions );
-    bool CanAnyWorkerTakeAJob() const; // Some ready worker has a slot in its pool that no expired attempt holds
+    // Some ready worker has a slot in its pool that no expired attempt holds. The local pool counts only if it can take
+    // one of the waiting jobs: a toolchain it does not have is not on its way to it, as downstream ones are.
+    bool CanAnyWorkerTakeAJob() const;
+    uint32_t CountExpiredAttempts( uint32_t workerIndex ) const;
+    // The local pool is in the scheduler while it has slots. Without, it finishes the jobs it runs.
+    void UpdateLocalWorker( Actions & actions );
     // A worker is in the scheduler, with its allowance as its slots, while its connection is ready and its pool
     // has slots. One whose pool falls to 0 leaves it, and finishes the jobs it runs.
     void UpdateWorker( Worker & worker, DownstreamConnection & connection, Actions & actions );
@@ -239,6 +268,7 @@ private:
     bool                    m_ShuttingDown = false;
     GatewayScheduler        m_Scheduler;
     Array<Worker>           m_Workers;          // Worker index - 1
+    uint32_t                m_LocalSlots = 0;   // The local pool's in the scheduler; 0: it is not there
     Array<Client>           m_Clients;
     Array<GatewayJob *>     m_Jobs;             // In the order they arrived
     Array<Attempt>          m_Attempts;

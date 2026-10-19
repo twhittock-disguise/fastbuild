@@ -80,11 +80,11 @@ using DistributedTest::MakeDistributedPchOptions;
 using DistributedTest::ClearWorkerPchStore;
 using DistributedTest::ReadStats;
 using DistributedTest::RemoteCpusForTest;
+using DistributedTest::CapturedJob;
 
 namespace
 {
     class RecordingWorker;
-    struct CapturedJob;
 }
 
 class TestDistributed : public FBuildTest
@@ -4528,53 +4528,6 @@ void TestDistributed::MSVCWorkerFailuresAreRetriedElsewhere() const
 //------------------------------------------------------------------------------
 namespace
 {
-    // A job as a client sends it to a worker, taken from a build
-    struct CapturedJob
-    {
-        uint64_t        m_ToolId = 0;
-        uint64_t        m_PchId = 0;
-        Array<char>     m_Data;     // The job, before it is compressed for the stream
-    };
-
-    // A worker that keeps the first job it is sent, and does not answer it
-    class JobCapturingWorker : public FakeWorker
-    {
-    public:
-        JobCapturingWorker() : FakeWorker( 4 ) {}
-        explicit JobCapturingWorker( const JobCapturingWorker & other ) = delete;
-        JobCapturingWorker & operator=( const JobCapturingWorker & other ) = delete;
-
-        bool HasJob() const { return m_HasJob.Load(); }
-        const CapturedJob & GetJob() const { return m_Job; } // Once there is one
-
-    private:
-        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage & message, void * payload, uint32_t payloadSize ) override
-        {
-            if ( ( message.GetType() != Protocol::MSG_JOB ) || m_HasJob.Load() )
-            {
-                return;
-            }
-            void * job = nullptr;
-            size_t jobSize = 0;
-            if ( m_Decoder.Decode( payload, payloadSize, job, jobSize ) == false )
-            {
-                return;
-            }
-            m_Job.m_ToolId = static_cast<const Protocol::MsgJob &>( message ).GetToolId();
-            m_Job.m_Data.SetSize( jobSize );
-            memcpy( m_Job.m_Data.Begin(), job, jobSize );
-            ConstMemoryStream ms( job, jobSize );
-            const Job parsed( ms );
-            m_Job.m_PchId = parsed.GetPchId();
-            FREE( job );
-            m_HasJob.Store( true );
-        }
-
-        JobStreamDecoder m_Decoder;
-        CapturedJob m_Job;
-        Atomic<bool> m_HasJob{ false };
-    };
-
     // The job as it would be sent if it used another PCH. A job that was read cannot be written again
     // (it has no node to write), so its id is replaced where Job::Serialize puts it, at the end.
     CapturedJob WithPch( const CapturedJob & job, uint64_t pchId )
@@ -4642,30 +4595,7 @@ namespace
 // Runs a build that sends a job for a PCH to a worker, and keeps the job
 void TestDistributed::CapturePchJob( CapturedJob & outJob ) const
 {
-    FBuildTestOptions options;
-    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
-    options.m_AllowDistributed = true;
-    options.m_NumWorkerThreads = 1;
-    options.m_NoLocalConsumptionOfRemoteJobs = true; // jobs stay queued for the remote worker
-    options.m_AllowLocalRace = false;
-    options.m_ForceCleanBuild = true;
-    FBuildForTest fBuild( options );
-    TEST_ASSERT( fBuild.Initialize() );
-
-    JobCapturingWorker worker;
-    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
-
-    auto reached = [ &worker ]() { return worker.HasJob(); };
-    BuildAborter aborter( reached, kWaitTimeoutSeconds );
-    fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
-    worker.ShutdownAllConnections();
-
-    TEST_ASSERT( aborter.HasReached() );
-    outJob.m_ToolId = worker.GetJob().m_ToolId;
-    outJob.m_PchId = worker.GetJob().m_PchId;
-    outJob.m_Data = worker.GetJob().m_Data;
-    TEST_ASSERT( outJob.m_ToolId != 0 );
-    TEST_ASSERT( outJob.m_PchId != 0 );
+    TEST_ASSERT( DistributedTest::CapturePchJob( outJob, kWaitTimeoutSeconds ) );
 }
 
 // The jobs waiting on all the connections of a worker

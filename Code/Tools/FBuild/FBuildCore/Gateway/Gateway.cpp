@@ -49,7 +49,11 @@ namespace
 
 // WorkerAffinity
 //------------------------------------------------------------------------------
-// The scheduler's view of a downstream worker. Called with m_Mutex held.
+// The scheduler's view of a worker, for one pass of the scheduler. Called with m_Mutex held.
+//
+// The local pool holds what a job needs once the job's toolchain is synchronized there, as its PCH is stored
+// before the job is scheduled. Which toolchains are synchronized is asked of the Server once per toolchain in
+// a pass, so a scheduler pass that looks at every waiting job takes the Server's toolchain lock a few times only.
 class Gateway::WorkerAffinity
 {
 public:
@@ -58,7 +62,12 @@ public:
 
     GatewayScheduler::Affinity operator()( uint32_t workerId, uint64_t pchId, uint64_t toolId ) const
     {
-        if ( ( workerId == kLocalWorkerIndex ) || ( workerId > m_Gateway.m_Workers.GetSize() ) )
+        if ( workerId == kLocalWorkerIndex )
+        {
+            return ( ( m_Gateway.m_LocalSlots > 0 ) && IsSynchronizedLocally( toolId ) ) ? GatewayScheduler::AFFINITY_HOLDS
+                                                                                         : GatewayScheduler::AFFINITY_UNABLE;
+        }
+        if ( workerId > m_Gateway.m_Workers.GetSize() )
         {
             return GatewayScheduler::AFFINITY_UNABLE;
         }
@@ -68,16 +77,58 @@ public:
     }
 
 private:
+    struct Toolchain
+    {
+        uint64_t    m_ToolId;
+        bool        m_Synchronized;
+    };
+
+    bool IsSynchronizedLocally( uint64_t toolId ) const
+    {
+        if ( toolId == 0 )
+        {
+            return false; // The local pool builds a job with the toolchain it names
+        }
+        for ( const Toolchain & toolchain : m_Toolchains )
+        {
+            if ( toolchain.m_ToolId == toolId )
+            {
+                return toolchain.m_Synchronized;
+            }
+        }
+        const bool synchronized = m_Gateway.m_Server->IsToolchainSynchronized( toolId );
+        m_Toolchains.Append( Toolchain{ toolId, synchronized } );
+        return synchronized;
+    }
+
     const Gateway & m_Gateway;
+    mutable Array<Toolchain> m_Toolchains;
 };
 
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
 Gateway::Gateway( const GatewayConfig & config )
+    : Gateway( config, 0, 0 )
+{
+}
+
+// CONSTRUCTOR
+//------------------------------------------------------------------------------
+Gateway::Gateway( const GatewayConfig & config, uint32_t localThreads, uint32_t prefetchBuffer )
     : m_Config( config )
     , m_Stash( GetStashDirectory( config.m_CacheDir ) )
 {
-    m_Server = FNEW( Server( *this, config.m_CacheDir ) );
+    m_Server = FNEW( Server( *this, config.m_CacheDir, localThreads, prefetchBuffer ) );
+
+    // The local pool's slots are in the pool before a client can connect
+    {
+        Actions actions;
+        {
+            MutexHolder mh( m_Mutex );
+            UpdateLocalWorker( actions );
+        }
+        Run( actions );
+    }
 
     // What the store held at start never reaches OnPchStored: its own thread measures it
     Array<uint64_t> pchIds;
@@ -450,9 +501,104 @@ void Gateway::GetStats( Stats & outStats ) const
 
 // OnLocalJobEnded
 //------------------------------------------------------------------------------
-/*virtual*/ void Gateway::OnLocalJobEnded( uint32_t /*jobId*/, bool /*hasResult*/, bool /*compressed*/, MemoryStream & /*payload*/ )
+/*virtual*/ void Gateway::OnLocalJobEnded( uint32_t jobId, bool hasResult, bool compressed, MemoryStream & payload )
 {
-    // Its Server is a pure forwarder, so it runs no local jobs
+    // The job id is the attempt's (Dispatch)
+    uint32_t payloadSize = 0;
+    void * data = nullptr;
+    GatewayWire::ResultHeader header;
+    bool readable = false;
+    if ( hasResult )
+    {
+        payloadSize = (uint32_t)payload.GetSize();
+        data = payload.Release();
+        readable = data && GatewayWire::ReadResultHeader( data, payloadSize, header ) && ( header.m_JobId == jobId );
+    }
+
+    Actions actions;
+    ResultRoute route;
+    {
+        MutexHolder mh( m_Mutex );
+        if ( m_ShuttingDown ) // Its jobs have gone, and so may the Server's clients
+        {
+            FREE( data );
+            return;
+        }
+        if ( readable )
+        {
+            RouteResult( kLocalWorkerIndex, header, data, payloadSize, route, actions );
+        }
+        else
+        {
+            OnLocalAttemptFailed( jobId, actions );
+        }
+        Dispatch( actions );
+    }
+
+    if ( route.m_PassOn )
+    {
+        MemoryStream result;
+        result.Replace( data, payloadSize );
+        m_Server->QueueResult( route.m_ClientId, compressed, Move( result ), route.m_Flags ); // Dropped if the client has gone
+    }
+    else
+    {
+        FREE( data );
+    }
+    Run( actions );
+}
+
+// OnLocalAttemptFailed
+//------------------------------------------------------------------------------
+void Gateway::OnLocalAttemptFailed( uint32_t attemptId, Actions & actions )
+{
+    Attempt * attempt = nullptr;
+    for ( Attempt & a : m_Attempts )
+    {
+        if ( ( a.m_AttemptId == attemptId ) && ( a.m_WorkerIndex == kLocalWorkerIndex ) )
+        {
+            attempt = &a;
+            break;
+        }
+    }
+    if ( attempt == nullptr )
+    {
+        return;
+    }
+    m_Scheduler.ReleaseSlot( kLocalWorkerIndex );
+    GatewayJob * job = attempt->m_Expired ? nullptr : FindJob( attempt->m_JobId );
+    m_Attempts.Erase( attempt );
+    if ( job == nullptr )
+    {
+        return;
+    }
+
+    // A fault of the local pool, retried as a downstream worker's is
+    const uint64_t pchId = job->m_PchId;
+    if ( FailAttempt( *job, kLocalWorkerIndex, "not-run", actions ) )
+    {
+        GiveUpWithoutResult( *job, actions );
+    }
+
+    // A PCH the local pool found damaged was dropped from the store, from which the gateway sends it on too
+    if ( ( pchId != 0 ) && ( IsPchStored( pchId ) == false ) )
+    {
+        ParkJobsWaitingForPch( pchId, actions );
+    }
+}
+
+// ParkJobsWaitingForPch
+//------------------------------------------------------------------------------
+void Gateway::ParkJobsWaitingForPch( uint64_t pchId, Actions & actions )
+{
+    // Those running keep their attempt: the PCH reached their worker, or their attempt fails
+    for ( GatewayJob * job : m_Jobs )
+    {
+        if ( ( job->m_PchId == pchId ) && ( job->m_Parked == false ) && m_Scheduler.RemoveWaitingJob( job->m_Id ) )
+        {
+            Park( *job, actions ); // Its client is asked for the PCH
+        }
+    }
 }
 
 // OnDownstreamReady
@@ -505,66 +651,69 @@ void Gateway::GetStats( Stats & outStats ) const
     }
 
     Actions actions;
-    uint32_t clientId = 0;
-    uint64_t completedPchId = 0;
-    bool passOn = false;
-    uint8_t flags = 0;
+    ResultRoute route;
     {
         MutexHolder mh( m_Mutex );
-        const uint32_t workerIndex = connection.GetIndex();
-        Attempt * attempt = nullptr;
-        for ( Attempt & a : m_Attempts )
-        {
-            if ( ( a.m_AttemptId == header.m_JobId ) && ( a.m_WorkerIndex == workerIndex ) )
-            {
-                attempt = &a;
-                break;
-            }
-        }
-
-        // A result for an attempt the gateway no longer waits for only frees its slot
-        if ( attempt )
-        {
-            m_Scheduler.ReleaseSlot( workerIndex );
-            GatewayJob * job = attempt->m_Expired ? nullptr : FindJob( attempt->m_JobId );
-            m_Attempts.Erase( attempt );
-            if ( job && header.m_SystemError )
-            {
-                // The worker's fault: retried, and only the last failure of a job given up goes up
-                GatewayWire::PatchResult( payload, payloadSize, header, job->m_ClientJobId, GatewayWire::MakeLane( workerIndex, header.m_ThreadIndex ) );
-                clientId = job->m_ClientId;
-                passOn = FailAttempt( *job, workerIndex, "system-error", actions );
-                flags = Protocol::kResultReturnedByGateway;
-            }
-            else if ( job )
-            {
-                // Built, or failed by the code: passed on as it is
-                m_Scheduler.OnCompleted( job->m_Id );
-                completedPchId = job->m_PchId;
-                GatewayWire::PatchResult( payload, payloadSize, header, job->m_ClientJobId, GatewayWire::MakeLane( workerIndex, header.m_ThreadIndex ) );
-                clientId = job->m_ClientId;
-                passOn = true;
-                RemoveJob( job, actions );
-            }
-            Dispatch( actions );
-        }
+        RouteResult( connection.GetIndex(), header, payload, payloadSize, route, actions );
+        Dispatch( actions );
     }
 
-    if ( completedPchId != 0 )
+    if ( route.m_CompletedPchId != 0 )
     {
-        connection.OnJobCompleted( completedPchId );
+        connection.OnJobCompleted( route.m_CompletedPchId );
     }
-    if ( passOn )
+    if ( route.m_PassOn )
     {
         MemoryStream result;
         result.Replace( payload, payloadSize );
-        m_Server->QueueResult( clientId, compressed, Move( result ), flags ); // Dropped if the client has gone
+        m_Server->QueueResult( route.m_ClientId, compressed, Move( result ), route.m_Flags ); // Dropped if the client has gone
     }
     else
     {
         FREE( payload );
     }
     Run( actions );
+}
+
+// RouteResult
+//------------------------------------------------------------------------------
+void Gateway::RouteResult( uint32_t workerIndex, const GatewayWire::ResultHeader & header, void * payload, uint32_t payloadSize, ResultRoute & outRoute, Actions & actions )
+{
+    Attempt * attempt = nullptr;
+    for ( Attempt & a : m_Attempts )
+    {
+        if ( ( a.m_AttemptId == header.m_JobId ) && ( a.m_WorkerIndex == workerIndex ) )
+        {
+            attempt = &a;
+            break;
+        }
+    }
+    if ( attempt == nullptr )
+    {
+        return;
+    }
+
+    m_Scheduler.ReleaseSlot( workerIndex );
+    GatewayJob * job = attempt->m_Expired ? nullptr : FindJob( attempt->m_JobId );
+    m_Attempts.Erase( attempt );
+    if ( job && header.m_SystemError )
+    {
+        // The worker's fault: retried, and only the last failure of a job given up goes up
+        GatewayWire::PatchResult( payload, payloadSize, header, job->m_ClientJobId, GatewayWire::MakeLane( workerIndex, header.m_ThreadIndex ) );
+        outRoute.m_ClientId = job->m_ClientId;
+        outRoute.m_PassOn = FailAttempt( *job, workerIndex, "system-error", actions );
+        outRoute.m_Flags = Protocol::kResultReturnedByGateway;
+    }
+    else if ( job )
+    {
+        // Built, or failed by the code: passed on as it is
+        m_Scheduler.OnCompleted( job->m_Id );
+        outRoute.m_CompletedPchId = job->m_PchId;
+        GatewayWire::PatchResult( payload, payloadSize, header, job->m_ClientJobId, GatewayWire::MakeLane( workerIndex, header.m_ThreadIndex ) );
+        outRoute.m_ClientId = job->m_ClientId;
+        outRoute.m_PassOn = true;
+        RemoveJob( job, actions );
+    }
 }
 
 // OnDownstreamLost
@@ -707,6 +856,10 @@ Gateway::Actions::~Actions()
     {
         FDELETE givenUp.m_Payload; // Unless Run sent it
     }
+    for ( const LocalJob & localJob : m_LocalJobs )
+    {
+        FREE( localJob.m_Data ); // Unless Run handed it over
+    }
 }
 
 // Run
@@ -729,6 +882,13 @@ void Gateway::Run( Actions & actions )
         }
         FREE( job->m_Data );
         FDELETE job; // And its PCH lease
+    }
+    for ( Actions::LocalJob & localJob : actions.m_LocalJobs )
+    {
+        // Takes the Server's toolchain, local job, PCH cache and job queue locks; Forwarder::OnLocalJobEnded follows
+        m_Server->RunLocalJob( Protocol::MsgJob( localJob.m_ToolId, localJob.m_ResultCompressionLevel ), localJob.m_Data, localJob.m_DataSize );
+        FREE( localJob.m_Data );
+        localJob.m_Data = nullptr;
     }
     for ( Actions::GivenUp & givenUp : actions.m_GivenUp )
     {
@@ -781,9 +941,10 @@ void Gateway::Dispatch( Actions & actions )
     GatewayScheduler::Assignment assignment;
     while ( m_Scheduler.Next( affinity, assignment ) )
     {
+        const bool local = ( assignment.m_WorkerId == kLocalWorkerIndex );
         GatewayJob * job = FindJob( assignment.m_JobId );
-        DownstreamConnection * connection = m_Workers[ assignment.m_WorkerId - 1 ].m_Connection;
-        ASSERT( job && connection );
+        DownstreamConnection * connection = local ? nullptr : m_Workers[ assignment.m_WorkerId - 1 ].m_Connection;
+        ASSERT( job && ( local || connection ) );
 
         const uint32_t attemptId = m_NextAttemptId++;
         ++job->m_NumAttempts;
@@ -796,6 +957,17 @@ void Gateway::Dispatch( Actions & actions )
         void * data = ALLOC( job->m_DataSize );
         memcpy( data, job->m_Data, job->m_DataSize );
         GatewayWire::SetJobId( data, job->m_DataSize, attemptId );
+        ++m_Forwarded;
+        AStackString<> line;
+        if ( local )
+        {
+            // Handed to the Server once m_Mutex is released
+            actions.m_LocalJobs.Append( Actions::LocalJob{ job->m_ToolId, job->m_ResultCompressionLevel, data, job->m_DataSize } );
+            line.Format( "gateway job-forward client=%u job=%u attempt=%u worker=local pch=0x%016" PRIx64,
+                         job->m_ClientId, job->m_ClientJobId, attemptId, job->m_PchId );
+            actions.m_LogLines.EmplaceBack( line.Get() );
+            continue;
+        }
         ConstMemoryStream stream;
         stream.Replace( data, job->m_DataSize, true );
 
@@ -805,8 +977,6 @@ void Gateway::Dispatch( Actions & actions )
         const bool sendsPch = hasPch && ( connection->GetAffinity( job->m_PchId, 0 ) == GatewayScheduler::AFFINITY_NONE );
         connection->SendJob( Protocol::MsgJob( job->m_ToolId, job->m_ResultCompressionLevel ), Move( stream ), hasPch ? &pch : nullptr, Move( lease ) );
 
-        ++m_Forwarded;
-        AStackString<> line;
         line.Format( "gateway job-forward client=%u job=%u attempt=%u worker=%s pch=0x%016" PRIx64,
                      job->m_ClientId, job->m_ClientJobId, attemptId, connection->GetAddress().Get(), job->m_PchId );
         actions.m_LogLines.EmplaceBack( line.Get() );
@@ -1081,7 +1251,8 @@ void Gateway::ExpireHungAttempts( Actions & actions )
         }
         const uint32_t workerIndex = attempt.m_WorkerIndex;
         const uint32_t jobId = attempt.m_JobId;
-        const bool inScheduler = ( workerIndex >= 1 ) && ( workerIndex <= m_Workers.GetSize() ) && m_Workers[ workerIndex - 1 ].m_Ready;
+        const bool inScheduler = ( workerIndex == kLocalWorkerIndex ) ? ( m_LocalSlots > 0 )
+                                                                      : ( ( workerIndex <= m_Workers.GetSize() ) && m_Workers[ workerIndex - 1 ].m_Ready );
         if ( inScheduler )
         {
             attempt.m_Expired = true;
@@ -1152,18 +1323,68 @@ bool Gateway::CanAnyWorkerTakeAJob() const
         {
             continue;
         }
-        const uint32_t index = (uint32_t)( i + 1 );
-        uint32_t hung = 0;
-        for ( const Attempt & attempt : m_Attempts )
-        {
-            hung += ( attempt.m_Expired && ( attempt.m_WorkerIndex == index ) ) ? 1 : 0;
-        }
-        if ( worker.m_Connection->GetPoolSlots() > hung ) // Its allowance follows the gateway's demand
+        if ( worker.m_Connection->GetPoolSlots() > CountExpiredAttempts( (uint32_t)( i + 1 ) ) ) // Its allowance follows the gateway's demand
         {
             return true;
         }
     }
+    if ( m_LocalSlots > CountExpiredAttempts( kLocalWorkerIndex ) )
+    {
+        const WorkerAffinity affinity( *this );
+        return ( m_Scheduler.GetNumWaitingFor( kLocalWorkerIndex, affinity ) > 0 );
+    }
     return false;
+}
+
+// CountExpiredAttempts
+//------------------------------------------------------------------------------
+uint32_t Gateway::CountExpiredAttempts( uint32_t workerIndex ) const
+{
+    uint32_t count = 0;
+    for ( const Attempt & attempt : m_Attempts )
+    {
+        count += ( attempt.m_Expired && ( attempt.m_WorkerIndex == workerIndex ) ) ? 1 : 0;
+    }
+    return count;
+}
+
+// UpdateLocalWorker
+//------------------------------------------------------------------------------
+void Gateway::UpdateLocalWorker( Actions & actions )
+{
+    // Its slots are what the worker settings give it now, not an allowance
+    const uint32_t slots = m_ShuttingDown ? 0 : m_Server->GetLocalSlots();
+    if ( slots == m_LocalSlots )
+    {
+        return;
+    }
+    AStackString<> line;
+    if ( slots > 0 )
+    {
+        m_Scheduler.SetWorkerSlots( kLocalWorkerIndex, slots ); // Its running jobs fill its slots
+        if ( m_LocalSlots == 0 )
+        {
+            line.Format( "gateway worker-ready worker=local slots=%u", slots );
+            actions.m_LogLines.EmplaceBack( line.Get() );
+        }
+    }
+    else
+    {
+        // Out of the scheduler, and its jobs run on. An expired attempt holds no slot once it is back, so it goes.
+        Array<uint32_t> runningJobIds;
+        m_Scheduler.RemoveWorker( kLocalWorkerIndex, runningJobIds );
+        for ( size_t i = m_Attempts.GetSize(); i > 0; --i )
+        {
+            if ( m_Attempts[ i - 1 ].m_Expired && ( m_Attempts[ i - 1 ].m_WorkerIndex == kLocalWorkerIndex ) )
+            {
+                m_Attempts.EraseIndex( i - 1 );
+            }
+        }
+        line.Format( "gateway worker-unready worker=local reason=no-slots running=%u", (uint32_t)runningJobIds.GetSize() );
+        actions.m_LogLines.EmplaceBack( line.Get() );
+    }
+    m_LocalSlots = slots;
+    UpdatePool();
 }
 
 // CollectDemands
@@ -1197,6 +1418,7 @@ void Gateway::UpdatePool()
     uint32_t slots = 0;
     if ( m_ShuttingDown == false )
     {
+        slots = m_LocalSlots;
         for ( const Worker & worker : m_Workers )
         {
             if ( worker.m_Ready && worker.m_Connection && ( worker.m_Connection->HasEnded() == false ) )
@@ -1290,6 +1512,12 @@ void Gateway::GetStatsLocked( Stats & outStats ) const
         outStats.m_ReadyWorkers += worker.m_Ready ? 1 : 0;
     }
     outStats.m_PoolSlots = m_PoolSlots.Load();
+    outStats.m_LocalSlots = m_LocalSlots;
+    outStats.m_RunningLocally = 0;
+    for ( const Attempt & attempt : m_Attempts )
+    {
+        outStats.m_RunningLocally += ( attempt.m_WorkerIndex == kLocalWorkerIndex ) ? 1 : 0;
+    }
     outStats.m_Waiting = m_Scheduler.GetNumWaiting();
     outStats.m_Parked = m_NumParked;
     outStats.m_Running = m_Scheduler.GetNumRunning();
@@ -1308,7 +1536,7 @@ void Gateway::FormatStats( AString & outLine ) const
 {
     Stats stats;
     GetStatsLocked( stats );
-    outLine.Format( "gateway stats clients=%u workers=%u/%u pool=%u waiting=%u parked=%u running=%u heldMiB=%u forwarded=%u retries=%u giveups=%u timeouts=%u pchMiB=%u",
+    outLine.Format( "gateway stats clients=%u workers=%u/%u pool=%u waiting=%u parked=%u running=%u heldMiB=%u forwarded=%u retries=%u giveups=%u timeouts=%u pchMiB=%u local=%u local-running=%u",
                     stats.m_Clients,
                     stats.m_ReadyWorkers,
                     stats.m_Workers,
@@ -1321,7 +1549,9 @@ void Gateway::FormatStats( AString & outLine ) const
                     stats.m_Retries,
                     stats.m_GiveUps,
                     stats.m_Timeouts,
-                    (uint32_t)( stats.m_PchBytesForwarded / MEGABYTE ) );
+                    (uint32_t)( stats.m_PchBytesForwarded / MEGABYTE ),
+                    stats.m_LocalSlots,
+                    stats.m_RunningLocally );
 }
 
 // HousekeepingThreadFuncStatic
@@ -1358,7 +1588,8 @@ void Gateway::HousekeepingThreadFunc()
             MutexHolder mh( m_Mutex );
             if ( m_ShuttingDown == false )
             {
-                ExpireHungAttempts( actions );
+                UpdateLocalWorker( actions );
+                ExpireHungAttempts( actions ); // And dispatches, so a toolchain the local pool has synchronized is used
                 GiveUpJobsNoWorkerCanTake( actions );
                 CollectDemands( actions );
             }

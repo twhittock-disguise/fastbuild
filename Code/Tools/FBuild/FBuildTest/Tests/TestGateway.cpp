@@ -275,7 +275,18 @@ namespace
             m_GoneClients.Append( clientId );
             m_QueuedWhenGone.Append( queued );
         }
-        virtual void OnLocalJobEnded( uint32_t /*jobId*/, bool /*hasResult*/, bool /*compressed*/, MemoryStream & /*payload*/ ) override {}
+        virtual void OnLocalJobEnded( uint32_t jobId, bool hasResult, bool /*compressed*/, MemoryStream & /*payload*/ ) override
+        {
+            MutexHolder mh( m_Mutex );
+            m_LocalJobsEnded.Append( LocalJobEnded{ jobId, hasResult } );
+        }
+        struct LocalJobEnded
+        {
+            uint32_t    m_JobId;
+            bool        m_HasResult;
+        };
+        void GetLocalJobsEnded( Array<LocalJobEnded> & out ) const { MutexHolder mh( m_Mutex ); out = m_LocalJobsEnded; }
+        size_t GetNumLocalJobsEnded() const { MutexHolder mh( m_Mutex ); return m_LocalJobsEnded.GetSize(); }
 
         // Set to have each OnClientGone try to queue a result for the client
         Server * m_Server = nullptr;
@@ -302,6 +313,7 @@ namespace
         Array<StoredPch> m_StoredPchs;
         Array<uint32_t> m_GoneClients;
         Array<bool> m_QueuedWhenGone;   // What QueueResult returned in each OnClientGone
+        Array<LocalJobEnded> m_LocalJobsEnded;
     };
 
     // A serialized job as far as the gateway reads it: the id first, the PCH id last, and the name
@@ -498,6 +510,18 @@ private:
     void LostWorkerWithoutSlotsHasItsJobsRetried() const;
     void GatewayWithALocalPoolKeepsItsJobQueue() const;
     void LocalJobHostIsTheGateway() const;
+    void GatewayWithItsOwnCacheDirHasNoLocalPool() const;
+#if defined( __WINDOWS__ )
+    void LocalJobThatCannotRunEndsWithoutAResult() const;
+#endif
+    void JobsTheLocalPoolCannotTakeAreReturned() const;
+    void RetryOfALocalJobWaitsForADroppedPch() const;
+    void LocalPoolIsOneMoreWorker() const;
+    void BuildOnTheGatewayAlone() const;
+#if defined( __WINDOWS__ )
+    void JobsFailingDownstreamAreBuiltOnTheGateway() const;
+    void GatewayRestartMidBuildWithALocalPool() const;
+#endif
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -669,6 +693,18 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( LostWorkerWithoutSlotsHasItsJobsRetried )
     REGISTER_TEST( GatewayWithALocalPoolKeepsItsJobQueue )
     REGISTER_TEST( LocalJobHostIsTheGateway )
+    REGISTER_TEST( GatewayWithItsOwnCacheDirHasNoLocalPool )
+#if defined( __WINDOWS__ ) // A job for a PCH, captured from a build
+    REGISTER_TEST( LocalJobThatCannotRunEndsWithoutAResult )
+#endif
+    REGISTER_TEST( JobsTheLocalPoolCannotTakeAreReturned )
+    REGISTER_TEST( RetryOfALocalJobWaitsForADroppedPch )
+    REGISTER_TEST( LocalPoolIsOneMoreWorker )
+    REGISTER_TEST( BuildOnTheGatewayAlone )
+#if defined( __WINDOWS__ ) // PCH distribution is for MSVC
+    REGISTER_TEST( JobsFailingDownstreamAreBuiltOnTheGateway )
+    REGISTER_TEST( GatewayRestartMidBuildWithALocalPool )
+#endif
 REGISTER_TESTS_END
 
 // PreTest
@@ -5335,9 +5371,10 @@ namespace
     class GatewayRestarter
     {
     public:
-        GatewayRestarter( UniquePtr<Gateway> & gateway, const GatewayConfig & config )
+        GatewayRestarter( UniquePtr<Gateway> & gateway, const GatewayConfig & config, uint32_t localThreads = 0 )
             : m_Gateway( gateway )
             , m_Config( config )
+            , m_LocalThreads( localThreads )
         {
             m_Thread.Start( ThreadFunc, "GatewayRestarter", this );
         }
@@ -5367,15 +5404,15 @@ namespace
                 if ( stats.m_Forwarded >= 1 )
                 {
                     r->m_Gateway.Replace( nullptr );
-                    r->m_Gateway.Replace( FNEW( Gateway( r->m_Config ) ) );
+                    r->m_Gateway.Replace( FNEW( Gateway( r->m_Config, r->m_LocalThreads, 0 ) ) );
 
-                    // Listening once its worker is ready, so the client is not refused for want of slots
+                    // Listening once it has slots, so the client is not refused for want of them
                     const Timer timer;
                     do
                     {
                         r->m_Gateway.Get()->GetStats( stats );
                         Thread::Sleep( 1 );
-                    } while ( ( stats.m_ReadyWorkers == 0 ) && ( timer.GetElapsed() < 30.0f ) );
+                    } while ( ( stats.m_PoolSlots == 0 ) && ( timer.GetElapsed() < 30.0f ) );
                     r->m_Restarted.Store( r->m_Gateway.Get()->Listen( Protocol::kTestPort ) );
                     break;
                 }
@@ -5386,6 +5423,7 @@ namespace
 
         UniquePtr<Gateway> & m_Gateway;
         const GatewayConfig & m_Config;
+        const uint32_t m_LocalThreads;
         Thread m_Thread;
         Atomic<bool> m_Stop{ false };
         Atomic<bool> m_Restarted{ false };
@@ -6777,5 +6815,480 @@ void TestGateway::LocalJobHostIsTheGateway() const
     Server::GetHostForJob( &job, hostName );
     TEST_ASSERT( hostName == "gateway" );
 }
+
+// The gateway's local pool
+//------------------------------------------------------------------------------
+namespace
+{
+    // The most of a gateway's local slots, and of the jobs it ran locally at once, while it is watched
+    class LocalPoolWatch
+    {
+    public:
+        explicit LocalPoolWatch( const Gateway & gateway ) : m_Gateway( gateway ) { m_Thread.Start( ThreadFunc, "LocalPoolWatch", this ); }
+        ~LocalPoolWatch() { Stop(); }
+        explicit LocalPoolWatch( const LocalPoolWatch & other ) = delete;
+        LocalPoolWatch & operator=( const LocalPoolWatch & other ) = delete;
+
+        void Stop()
+        {
+            if ( m_Thread.IsRunning() )
+            {
+                m_Stop.Store( true );
+                m_Thread.Join();
+            }
+        }
+        uint32_t GetMaxSlots() const { return m_MaxSlots.Load(); }
+        uint32_t GetMaxRunning() const { return m_MaxRunning.Load(); }
+
+    private:
+        static uint32_t ThreadFunc( void * param )
+        {
+            LocalPoolWatch * w = static_cast<LocalPoolWatch *>( param );
+            while ( w->m_Stop.Load() == false )
+            {
+                Gateway::Stats stats;
+                w->m_Gateway.GetStats( stats );
+                w->m_MaxSlots.Store( Math::Max( w->m_MaxSlots.Load(), stats.m_LocalSlots ) );
+                w->m_MaxRunning.Store( Math::Max( w->m_MaxRunning.Load(), stats.m_RunningLocally ) );
+                Thread::Sleep( 1 );
+            }
+            return 0;
+        }
+
+        const Gateway & m_Gateway;
+        Thread m_Thread;
+        Atomic<bool> m_Stop{ false };
+        Atomic<uint32_t> m_MaxSlots{ 0 };
+        Atomic<uint32_t> m_MaxRunning{ 0 };
+    };
+
+    // The job of each "gateway job-retry" line has a later "gateway job-forward" line for its local pool
+    bool AreRetriesBuiltLocally( const AString & log, uint32_t & outNumRetries )
+    {
+        outNumRetries = 0;
+        const char * const kRetry = "gateway job-retry client=";
+        for ( const char * line = log.Find( kRetry ); line; line = strstr( line + 1, kRetry ) )
+        {
+            char * end = nullptr;
+            const uint32_t clientId = (uint32_t)strtoul( line + strlen( kRetry ), &end, 10 );
+            const uint32_t jobId = ( strncmp( end, " job=", 5 ) == 0 ) ? (uint32_t)strtoul( end + 5, nullptr, 10 ) : 0;
+            AStackString<> forward;
+            forward.Format( "gateway job-forward client=%u job=%u attempt=", clientId, jobId );
+            bool builtLocally = false;
+            for ( const char * f = strstr( line, forward.Get() ); f && ( builtLocally == false ); f = strstr( f + 1, forward.Get() ) )
+            {
+                const char * lineEnd = strchr( f, '\n' );
+                const char * local = strstr( f, " worker=local " );
+                builtLocally = local && ( ( lineEnd == nullptr ) || ( local < lineEnd ) );
+            }
+            if ( builtLocally == false )
+            {
+                return false;
+            }
+            ++outNumRetries;
+        }
+        return true;
+    }
+}
+
+// GatewayWithItsOwnCacheDirHasNoLocalPool
+//------------------------------------------------------------------------------
+void TestGateway::GatewayWithItsOwnCacheDirHasNoLocalPool() const
+{
+    // Its toolchains would be in the worker cache and its PCHs elsewhere, so it is refused a local pool
+    StubForwarder forwarder( 4 );
+    AStackString<> cacheDir;
+    GetGatewayCacheDir( cacheDir );
+    AStackString<> logPath;
+    {
+        Server s( forwarder, cacheDir, 2, 0 );
+        TEST_ASSERT( JobQueueRemote::IsValid() == false );
+        TEST_ASSERT( s.GetLocalSlots() == 0 );
+        logPath = s.GetLogPath();
+    }
+    TEST_ASSERT( logPath.BeginsWith( cacheDir ) );
+    AString log;
+    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    TEST_ASSERT( log.Find( "has no local pool" ) );
+
+    // So the gateway is a pure forwarder
+    GatewayConfig config;
+    MakeGatewayConfig( 0, config );
+    Gateway gateway( config, 2, 0 );
+    const Gateway::Stats stats = GetGatewayStats( gateway );
+    TEST_ASSERT( ( stats.m_LocalSlots == 0 ) && ( stats.m_PoolSlots == 0 ) );
+    TEST_ASSERT( JobQueueRemote::IsValid() == false );
+}
+
+#if defined( __WINDOWS__ )
+// LocalJobThatCannotRunEndsWithoutAResult
+//------------------------------------------------------------------------------
+void TestGateway::LocalJobThatCannotRunEndsWithoutAResult() const
+{
+    // A real job, for a toolchain no Server of this test has
+    DistributedTest::CapturedJob captured;
+    TEST_ASSERT( DistributedTest::CapturePchJob( captured, kWaitTimeoutSeconds ) );
+    uint32_t jobId = 0;
+    uint64_t pchId = 0;
+    TEST_ASSERT( GatewayWire::PeekJob( captured.m_Data.Begin(), captured.m_Data.GetSize(), jobId, pchId ) );
+
+    // Ended without a result, so the gateway can send it elsewhere: by a gateway with a local pool, and by a pure one
+    AStackString<> pureCacheDir;
+    GetGatewayCacheDir( pureCacheDir );
+    for ( uint32_t localThreads = 0; localThreads <= 1; ++localThreads )
+    {
+        StubForwarder forwarder( 4 );
+        Server s( forwarder, ( localThreads > 0 ) ? AString::GetEmpty() : pureCacheDir, localThreads, 0 );
+        TEST_ASSERT( JobQueueRemote::IsValid() == ( localThreads > 0 ) );
+        s.RunLocalJob( Protocol::MsgJob( captured.m_ToolId, 0 ), captured.m_Data.Begin(), captured.m_Data.GetSize() );
+        TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumLocalJobsEnded() == 1 ); } ) );
+        Array<StubForwarder::LocalJobEnded> ended;
+        forwarder.GetLocalJobsEnded( ended );
+        TEST_ASSERT( ( ended[ 0 ].m_JobId == jobId ) && ( ended[ 0 ].m_HasResult == false ) );
+    }
+}
+#endif
+
+// JobsTheLocalPoolCannotTakeAreReturned
+//------------------------------------------------------------------------------
+void TestGateway::JobsTheLocalPoolCannotTakeAreReturned() const
+{
+    // The local pool, the gateway's only worker, has slots but not the job's toolchain: no worker can take
+    // the job, so it goes back to its client once the bound has passed
+    const DistributedTest::RemoteCpusForTest oneCpu( 1 );
+    GatewayConfig config;
+    config.m_NoWorkerGiveUpSeconds = 1.0f;
+    Gateway gateway( config, 1, 0 );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 1 );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return gateway.m_Stash.IsComplete( kGatewayTool ); } ) );
+    TEST_ASSERT( gateway.GetServer().IsToolchainSynchronized( kGatewayTool ) == false ); // Its files are not what a worker can use
+
+    const Timer timer;
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( timer.GetElapsed() >= ( config.m_NoWorkerGiveUpSeconds * 0.9f ) );
+    Array<uint32_t> jobIds;
+    TEST_ASSERT( AreAllGivenUp( probe, jobIds ) );
+    TEST_ASSERT( jobIds[ 0 ] == 5 );
+    const Gateway::Stats stats = GetGatewayStats( gateway );
+    TEST_ASSERT( ( stats.m_Forwarded == 0 ) && ( stats.m_GiveUps == 1 ) && ( stats.m_LocalSlots == 1 ) );
+    probe.ShutdownAllConnections();
+}
+
+// RetryOfALocalJobWaitsForADroppedPch
+//------------------------------------------------------------------------------
+void TestGateway::RetryOfALocalJobWaitsForADroppedPch() const
+{
+    // The local pool is the only worker until the echo worker listens
+    const DistributedTest::RemoteCpusForTest oneCpu( 1 );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    config.m_CacheDir.Clear();
+    config.m_ReconnectSeconds = 0.2f;
+    Gateway gateway( config, 1, 0 );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 1 );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 64 * 1024, 3, pch );
+    TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 1 ); } ) );
+
+    // As if the local pool had been given the job, and its unpack had found the PCH damaged: the PCH is dropped
+    // from the store, and the job ends without a result
+    uint32_t attemptId = 0;
+    {
+        MutexHolder mh( gateway.m_Mutex );
+        auto localOnly = []( uint32_t workerId, uint64_t, uint64_t ) { return ( workerId == Gateway::kLocalWorkerIndex ) ? GatewayScheduler::AFFINITY_HOLDS : GatewayScheduler::AFFINITY_UNABLE; };
+        GatewayScheduler::Assignment assignment;
+        TEST_ASSERT( gateway.m_Scheduler.Next( localOnly, assignment ) );
+        TEST_ASSERT( assignment.m_WorkerId == Gateway::kLocalWorkerIndex );
+        Gateway::GatewayJob * job = gateway.FindJob( assignment.m_JobId );
+        TEST_ASSERT( job );
+        ++job->m_NumAttempts;
+        Gateway::Attempt & attempt = gateway.m_Attempts.EmplaceBack();
+        attemptId = gateway.m_NextAttemptId++;
+        attempt.m_AttemptId = attemptId;
+        attempt.m_JobId = assignment.m_JobId;
+        attempt.m_WorkerIndex = Gateway::kLocalWorkerIndex;
+    }
+    gateway.GetServer().DropStoredPch( pch.m_Id );
+    const size_t numAsksBefore = probe.GetNumPchNeeded();
+    MemoryStream none;
+    gateway.OnLocalJobEnded( attemptId, false, false, none );
+
+    // The job is retried once its PCH is here again, which its client is asked for
+    TEST_ASSERT( WaitUntil( [ &probe, numAsksBefore ]() { return ( probe.GetNumPchNeeded() > numAsksBefore ); } ) );
+    TEST_ASSERT( probe.GetPchNeededId( probe.GetNumPchNeeded() - 1 ) == pch.m_Id );
+    Gateway::Stats stats = GetGatewayStats( gateway );
+    TEST_ASSERT( ( stats.m_Retries == 1 ) && ( stats.m_Parked == 1 ) && ( stats.m_Waiting == 0 ) && ( stats.m_Running == 0 ) );
+
+    // A worker that comes meanwhile is not sent the job without its PCH
+    EchoWorker echo( 4 );
+    echo.AskForMissingPchs();
+    TEST_ASSERT( echo.Listen( kGatewayTestDownstreamPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+    Thread::Sleep( 200 );
+    TEST_ASSERT( echo.GetNumJobs() == 0 );
+
+    TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    Array<GatewayWire::ResultHeader> results;
+    probe.GetResults( results );
+    TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
+    TEST_ASSERT( ( echo.GetNumJobs() == 1 ) && ( echo.GetNumPchCopies() == 1 ) && ( echo.GetNumPchAsks() == 0 ) );
+    probe.ShutdownAllConnections();
+}
+
+// LocalPoolIsOneMoreWorker
+//------------------------------------------------------------------------------
+void TestGateway::LocalPoolIsOneMoreWorker() const
+{
+    FBuildTestOptions options;
+    MakeRemoteBuildOptions( options );
+    const char * target = "../tmp/Test/Distributed/JobStream/JobStream.lib";
+
+    EchoWorker echo( 1, EchoWorker::ANSWER_SYSTEM_ERROR );
+    TEST_ASSERT( echo.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    config.m_CacheDir.Clear(); // A local pool keeps its PCHs next to its toolchains
+
+    // The jobs the echo worker fails are retried on the local pool, which has synchronized their toolchain
+    AStackString<> logPath;
+    {
+        const DistributedTest::RemoteCpusForTest twoCpus( 2 );
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+        DeleteDistributedTestOutputs();
+        Gateway gateway( config, 2, 0 );
+        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+        TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == ( 2 + 1 ) );
+        logPath = gateway.GetServer().GetLogPath();
+
+        LocalPoolWatch watch( gateway );
+        TEST_ASSERT( fBuild.Build( target ) );
+        TEST_ASSERT( FileIO::FileExists( target ) );
+        watch.Stop();
+        TEST_ASSERT( watch.GetMaxRunning() > 0 );
+        TEST_ASSERT( watch.GetMaxSlots() == 2 );
+
+        const Gateway::Stats stats = GetGatewayStats( gateway );
+        TEST_ASSERT( echo.GetNumJobs() >= 1 );
+        TEST_ASSERT( stats.m_Retries == echo.GetNumJobs() );
+        TEST_ASSERT( stats.m_GiveUps == 0 );
+    }
+    AString log;
+    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    uint32_t numRetries = 0;
+    TEST_ASSERT( AreRetriesBuiltLocally( log, numRetries ) );
+    TEST_ASSERT( numRetries == echo.GetNumJobs() );
+
+    // With no CPUs to give, it is a pure forwarder: the echo worker is given the jobs, and fails them
+    const uint64_t logSizeBefore = DistributedTest::GetStatsLogSize( logPath );
+    {
+        const DistributedTest::RemoteCpusForTest noCpus( 0 );
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+        DeleteDistributedTestOutputs();
+        Gateway gateway( config, 2, 0 );
+        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+        TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 1 );
+
+        LocalPoolWatch watch( gateway );
+        const size_t numEchoJobsBefore = echo.GetNumJobs();
+        auto failedOnce = [ &echo, numEchoJobsBefore ]() { return ( echo.GetNumJobs() > numEchoJobsBefore ); };
+        {
+            DistributedTest::BuildAborter aborter( failedOnce, 60.0f );
+            fBuild.Build( target );
+            TEST_ASSERT( aborter.HasReached() );
+        }
+        watch.Stop();
+        TEST_ASSERT( ( watch.GetMaxSlots() == 0 ) && ( watch.GetMaxRunning() == 0 ) );
+    }
+    uint32_t numLocal = 0;
+    TEST_ASSERT( DistributedTest::CountInStatsLogSince( logPath, logSizeBefore, "gateway job-forward client=", numLocal ) );
+    TEST_ASSERT( numLocal >= 1 );
+    TEST_ASSERT( DistributedTest::CountInStatsLogSince( logPath, logSizeBefore, " worker=local ", numLocal ) );
+    TEST_ASSERT( numLocal == 0 );
+}
+
+// BuildOnTheGatewayAlone
+//------------------------------------------------------------------------------
+void TestGateway::BuildOnTheGatewayAlone() const
+{
+    const DistributedTest::RemoteCpusForTest fourCpus( 4 );
+    FBuildTestOptions options;
+    MakeRemoteBuildOptions( options );
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    DeleteDistributedTestOutputs();
+
+    GatewayConfig config; // No worker
+    AStackString<> logPath;
+    {
+        Gateway gateway( config, 4, 0 );
+        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 4 );
+        logPath = gateway.GetServer().GetLogPath();
+
+        const char * target( "../tmp/Test/Distributed/dist.lib" );
+        TEST_ASSERT( fBuild.Build( target ) );
+        TEST_ASSERT( FileIO::FileExists( target ) );
+
+        const Gateway::Stats stats = GetGatewayStats( gateway );
+        TEST_ASSERT( ( stats.m_Forwarded == 3 ) && ( stats.m_Retries == 0 ) && ( stats.m_GiveUps == 0 ) && ( stats.m_LocalSlots == 4 ) );
+        TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_HeldJobBytes == 0 ) && ( s.m_RunningLocally == 0 ); } ) );
+    }
+
+    AString log;
+    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    uint32_t numLocal = 0;
+    for ( const char * line = log.Find( "gateway job-forward client=" ); line; line = strstr( line + 1, "gateway job-forward client=" ) )
+    {
+        const char * end = strchr( line, '\n' );
+        const char * local = strstr( line, " worker=local " );
+        numLocal += ( local && ( ( end == nullptr ) || ( local < end ) ) ) ? 1 : 0;
+    }
+    TEST_ASSERT( numLocal == 3 );
+    const char * stats = log.Find( "gateway stats clients=" );
+    TEST_ASSERT( stats && strstr( stats, " local=4 local-running=0" ) );
+}
+
+#if defined( __WINDOWS__ )
+// JobsFailingDownstreamAreBuiltOnTheGateway
+//------------------------------------------------------------------------------
+void TestGateway::JobsFailingDownstreamAreBuiltOnTheGateway() const
+{
+    const DistributedTest::RemoteCpusForTest fourCpus( 4 );
+    FBuildTestOptions options;
+    MakeRemoteBuildOptions( options );
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    DeleteDistributedTestOutputs();
+
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    config.m_CacheDir.Clear();
+    {
+        EchoWorker echo( 1, EchoWorker::ANSWER_SYSTEM_ERROR );
+        TEST_ASSERT( echo.Listen( kGatewayTestDownstreamPort ) );
+        Gateway gateway( config, 4, 0 );
+        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+        DistributedTest::DenyListPoller poller( fBuild );
+        TEST_ASSERT( fBuild.Build( "../tmp/Test/Distributed/distpch.lib" ) );
+        TEST_ASSERT( FileIO::FileExists( "../tmp/Test/Distributed/distpch.lib" ) );
+        TEST_ASSERT( poller.GetMax() == 0 );
+
+        const Gateway::Stats stats = GetGatewayStats( gateway );
+        TEST_ASSERT( echo.GetNumPchCopies() <= 1 );
+        TEST_ASSERT( stats.m_Retries == echo.GetNumJobs() );
+        TEST_ASSERT( stats.m_GiveUps == 0 );
+    }
+
+    // The client sent one copy of the PCH: the one the gateway stored
+    AStackString<> cacheDir;
+    VERIFY( FBuild::GetWorkerCacheDir( cacheDir ) ); // A local pool keeps its PCHs there
+    Array<uint64_t> storedSizes;
+    GetStoredPchSizes( cacheDir, storedSizes );
+    TEST_ASSERT( storedSizes.GetSize() == 1 );
+    AStackString<> statsLogPath;
+    DistributedTest::GetStatsLogPath( statsLogPath );
+    uint32_t numConnections = 0;
+    uint32_t numMessages = 0;
+    uint64_t rawBytes = 0;
+    uint64_t sentBytes = 0;
+    DistributedTest::ReadStats( statsLogPath, "  pch: ", numConnections, rawBytes, sentBytes, &numMessages );
+    TEST_ASSERT( numConnections == 1 );
+    TEST_ASSERT( numMessages == Protocol::MsgPchFile::GetNumChunks( (uint32_t)storedSizes[ 0 ], Protocol::kPchChunkSize ) );
+    TEST_ASSERT( IsLoggedSize( sentBytes, storedSizes[ 0 ] ) );
+}
+
+// GatewayRestartMidBuildWithALocalPool
+//------------------------------------------------------------------------------
+void TestGateway::GatewayRestartMidBuildWithALocalPool() const
+{
+    // One local slot and no downstream worker (a real one cannot share the process with a local pool), so the
+    // jobs are built one at a time
+    const DistributedTest::RemoteCpusForTest oneCpu( 1 );
+
+    FBuildTestOptions options;
+    MakeRemoteBuildOptions( options );
+    options.m_DistributionReconnectDelay = 0.1f; // The restarted gateway is connected to again within the build
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    DeleteDistributedTestOutputs();
+
+    GatewayConfig config; // No worker
+    UniquePtr<Gateway> gateway( FNEW( Gateway( config, 1, 0 ) ) );
+    TEST_ASSERT( gateway.Get()->Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( GetGatewayStats( *gateway.Get() ).m_PoolSlots == 1 );
+
+    bool built = false;
+    {
+        GatewayRestarter restarter( gateway, config, 1 );
+        DistributedTest::DenyListPoller poller( fBuild );
+        auto never = []() { return false; };
+        DistributedTest::BuildAborter aborter( never, 120.0f );
+        built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
+        TEST_ASSERT( aborter.HasTimedOut() == false );
+        TEST_ASSERT( poller.GetMax() == 0 );
+        restarter.Join();
+        TEST_ASSERT( restarter.HasRestarted() );
+    }
+    TEST_ASSERT( built );
+    TEST_ASSERT( FileIO::FileExists( "../tmp/Test/Distributed/distpch.lib" ) );
+
+    // The new gateway built the build's remaining jobs
+    TEST_ASSERT( GetGatewayStats( *gateway.Get() ).m_Forwarded >= 1 );
+    gateway.Replace( nullptr );
+
+    // The client sent the toolchain and the PCH once over both connections: the restarted gateway advertised
+    // what the first had stored
+    AStackString<> statsLogPath;
+    DistributedTest::GetStatsLogPath( statsLogPath );
+    Array<uint32_t> toolchainMessages;
+    uint32_t numSkippedToolchains = 0;
+    GetToolchainStats( statsLogPath, toolchainMessages, numSkippedToolchains );
+    TEST_ASSERT( toolchainMessages.GetSize() >= 2 );
+    TEST_ASSERT( toolchainMessages[ 0 ] >= 2 ); // The manifest and its files
+    for ( size_t i = 1; i < toolchainMessages.GetSize(); ++i )
+    {
+        TEST_ASSERT( toolchainMessages[ i ] == 0 );
+    }
+    TEST_ASSERT( numSkippedToolchains >= 1 );
+
+    AStackString<> cacheDir;
+    VERIFY( FBuild::GetWorkerCacheDir( cacheDir ) ); // A local pool keeps its PCHs there
+    Array<uint64_t> storedSizes;
+    GetStoredPchSizes( cacheDir, storedSizes );
+    TEST_ASSERT( storedSizes.GetSize() == 1 );
+    uint32_t numConnections = 0;
+    uint32_t numMessages = 0;
+    uint64_t rawBytes = 0;
+    uint64_t sentBytes = 0;
+    DistributedTest::ReadStats( statsLogPath, "  pch: ", numConnections, rawBytes, sentBytes, &numMessages );
+    TEST_ASSERT( numConnections >= 2 );
+    TEST_ASSERT( numMessages == Protocol::MsgPchFile::GetNumChunks( (uint32_t)storedSizes[ 0 ], Protocol::kPchChunkSize ) );
+    TEST_ASSERT( IsLoggedSize( sentBytes, storedSizes[ 0 ] ) );
+}
+#endif
 
 //------------------------------------------------------------------------------

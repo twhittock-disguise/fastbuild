@@ -66,7 +66,8 @@ public:
     // The forwarder outlives the Server.
     // - localThreads == 0, a pure forwarder: no JobQueueRemote, no toolchain extraction, no unpacking.
     // - localThreads > 0, with a local pool: jobs given to RunLocalJob are built here, as a worker builds them.
-    //   cacheDir must then be the worker cache dir, where ToolManifest keeps toolchains.
+    //   cacheDir must then be the worker cache dir, where ToolManifest keeps toolchains; with another, the
+    //   Server logs an error and has no local pool.
     Server( Forwarder & forwarder, const AString & cacheDir, uint32_t localThreads = 0, uint32_t prefetchBuffer = 0 );
     virtual ~Server() override;
 
@@ -79,8 +80,8 @@ public:
     uint32_t GetLocalSlots() const; // 0 if pure or if the worker gives no CPUs; else CPUs + prefetch
     bool IsToolchainSynchronized( uint64_t toolId ) const; // Takes only m_ToolManifestsMutex
     // Builds a decoded job (as Forwarder::OnClientJob has it) once its toolchain and PCH are here. Forwarder::
-    // OnLocalJobEnded follows, from the Server's thread. Takes m_LocalJobsMutex, then the PCH cache's and the
-    // job queue's locks.
+    // OnLocalJobEnded follows, from the Server's thread. Takes m_PchCacheMutex (the lease) and m_ToolManifestsMutex,
+    // each alone, then m_LocalJobsMutex and, under it, m_PchCacheMutex and the job queue's locks.
     void RunLocalJob( const Protocol::MsgJob & msg, const void * job, size_t jobSize );
 
     bool IsSynchingTool( AString & statusStr ) const;
