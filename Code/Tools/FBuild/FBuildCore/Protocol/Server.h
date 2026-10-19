@@ -18,6 +18,7 @@
 //------------------------------------------------------------------------------
 class Job;
 class JobQueueRemote;
+class MemoryStream;
 namespace Protocol
 {
     class IMessage;
@@ -35,6 +36,7 @@ class ToolManifest;
 class Server : public TCPConnectionPool, private PchLease::Owner
 {
     friend class TestDistributed;
+    friend class TestGateway;
 public:
     Server( uint32_t numThreadsInJobQueue = 0, uint32_t prefetchBuffer = 0 );
     virtual ~Server() override;
@@ -44,6 +46,12 @@ public:
     bool IsSynchingTool( AString & statusStr ) const;
 
     const AString & GetLogPath() const { return m_Log.GetPath(); }
+
+    // A result for the client's outbox (see ClientState::m_Id). False if the client has gone.
+    bool QueueResult( uint32_t clientId, bool compressed, MemoryStream && payload );
+    // Sends holding only the client's send mutex, which is taken before the client list is released.
+    // False if the client has gone or the send failed.
+    bool SendToClient( uint32_t clientId, const Protocol::IMessage & msg );
 
 private:
     // TCPConnection interface
@@ -71,6 +79,7 @@ private:
     void RecalculateCapacity();        // Takes m_ClientListMutex
     void RecalculateCapacityLocked();  // Caller must hold m_ClientListMutex
 
+    class ClientOutbox;
     struct ClientState
     {
         explicit ClientState( const ConnectionInfo * ci )
@@ -101,7 +110,46 @@ private:
         PchReceiver m_PchReceiver; // The chunks of the PCH being received, in order
         Array<ToolManifest *> m_KnownTools; // toolchains this client may send jobs for, each holding a use
         Array<uint64_t> m_PchNeededSent; // PCHs asked of this client that have not arrived yet (under m_Mutex)
+
+        uint32_t m_Id = 0;                  // From m_NextClientId; never reused
+        ClientOutbox * m_Outbox = nullptr;  // Under m_ClientListMutex. Null once the client is going.
     };
+
+    // A thread per client that sends what is queued for it, so a client that reads slowly holds back only itself.
+    // Lock order: m_ClientListMutex, then the outbox's own mutex; the thread sends holding only cs.m_SendMutex.
+    class ClientOutbox
+    {
+    public:
+        explicit ClientOutbox( ClientState & cs );
+        ~ClientOutbox(); // Stops and joins; what is queued is dropped
+
+        // Caller holds m_ClientListMutex. A result counts in cs.m_NumJobsActive until it is sent.
+        void PushResult( bool compressed, MemoryStream && payload );
+        void Wake();
+
+        explicit ClientOutbox( const ClientOutbox & other ) = delete;
+        ClientOutbox & operator=( const ClientOutbox & other ) = delete;
+
+    private:
+        struct QueuedResult
+        {
+            MemoryStream *  m_Payload;
+            uint32_t        m_AllocatedCapacity; // Of the client when the result was queued
+            bool            m_Compressed;
+        };
+
+        static uint32_t ThreadFuncStatic( void * param );
+        void ThreadFunc();
+        void Send( const QueuedResult & result );
+
+        ClientState & m_ClientState;
+        Mutex m_Mutex;
+        Array<QueuedResult> m_Results; // Under m_Mutex
+        Semaphore m_WakeSemaphore;
+        Atomic<bool> m_Quit;
+        Thread m_Thread;
+    };
+    uint32_t m_NextClientId = 1; // Under m_ClientListMutex
 
     // Messages for one connection come from the server thread (results), the connection's
     // receive thread (ack, inventories) and OnDisconnected (file requests), so every send

@@ -14,6 +14,7 @@
 #include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
 
 // Core
+#include "Core/Containers/Move.h"
 #include "Core/Containers/UniquePtr.h"
 #include "Core/Env/CPUInfo.h"
 #include "Core/Env/Env.h"
@@ -351,7 +352,11 @@ void Server::LogWarning( const char * fmtString, ... )
     TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
     m_Log.Write( "connect addr=%s", remoteAddr.Get() );
 
+    ClientOutbox * outbox = FNEW( ClientOutbox( *cs ) );
+
     MutexHolder mh( m_ClientListMutex );
+    cs->m_Id = m_NextClientId++;
+    cs->m_Outbox = outbox;
     m_ClientList.Append( cs );
 }
 
@@ -365,6 +370,17 @@ void Server::LogWarning( const char * fmtString, ... )
     AStackString<> remoteAddr;
     TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
     m_Log.Write( "disconnect addr=%s host=%s jobs=%u", remoteAddr.Get(), cs->m_HostName.Get(), cs->m_NumJobsActive.Load() );
+
+    // No result is queued for this client from here on. The connection is marked as closing first,
+    // so a send that waits for the client to read gives up, and the outbox thread can be joined.
+    ClientOutbox * outbox;
+    {
+        MutexHolder mh( m_ClientListMutex );
+        outbox = cs->m_Outbox;
+        cs->m_Outbox = nullptr;
+    }
+    Disconnect( connection );
+    FDELETE outbox;
 
     // Unhook any jobs which are queued or in progress for this client
     // - deletes the queued jobs
@@ -430,6 +446,9 @@ void Server::LogWarning( const char * fmtString, ... )
             delete job;
         }
 
+        // A SendToClient that found this client before it left the list finishes its send first
+        cs->m_SendMutex.Lock();
+        cs->m_SendMutex.Unlock();
         FDELETE cs;
 
         // Redistribute capacity among remaining coordinators
@@ -551,6 +570,158 @@ void Server::LogWarning( const char * fmtString, ... )
 {
     MutexHolder sendMH( cs.m_SendMutex );
     return msg.Send( cs.m_Connection, payload );
+}
+
+// QueueResult
+//------------------------------------------------------------------------------
+bool Server::QueueResult( uint32_t clientId, bool compressed, MemoryStream && payload )
+{
+    MutexHolder mh( m_ClientListMutex );
+    for ( ClientState * cs : m_ClientList )
+    {
+        if ( cs->m_Id == clientId )
+        {
+            if ( cs->m_Outbox == nullptr )
+            {
+                return false; // It is going
+            }
+            cs->m_Outbox->PushResult( compressed, Move( payload ) );
+            return true;
+        }
+    }
+    return false;
+}
+
+// SendToClient
+//------------------------------------------------------------------------------
+bool Server::SendToClient( uint32_t clientId, const Protocol::IMessage & msg )
+{
+    // Hand over hand: OnDisconnected takes the send mutex before it frees a client it has taken off the list
+    ClientState * found = nullptr;
+    {
+        MutexHolder mh( m_ClientListMutex );
+        for ( ClientState * cs : m_ClientList )
+        {
+            if ( cs->m_Id == clientId )
+            {
+                found = cs;
+                found->m_SendMutex.Lock();
+                break;
+            }
+        }
+    }
+    if ( found == nullptr )
+    {
+        return false;
+    }
+    const bool sent = msg.Send( found->m_Connection );
+    found->m_SendMutex.Unlock();
+    return sent;
+}
+
+// ClientOutbox
+//------------------------------------------------------------------------------
+Server::ClientOutbox::ClientOutbox( ClientState & cs )
+    : m_ClientState( cs )
+    , m_Quit( false )
+{
+    m_Thread.Start( ThreadFuncStatic, "ClientOutbox", this );
+}
+
+// ~ClientOutbox
+//------------------------------------------------------------------------------
+Server::ClientOutbox::~ClientOutbox()
+{
+    m_Quit.Store( true );
+    m_WakeSemaphore.Signal();
+    m_Thread.Join();
+
+    for ( const QueuedResult & result : m_Results )
+    {
+        FDELETE result.m_Payload;
+    }
+}
+
+// PushResult
+//------------------------------------------------------------------------------
+void Server::ClientOutbox::PushResult( bool compressed, MemoryStream && payload )
+{
+    QueuedResult result;
+    result.m_Payload = FNEW( MemoryStream( Move( payload ) ) );
+    result.m_AllocatedCapacity = m_ClientState.m_AllocatedCapacity;
+    result.m_Compressed = compressed;
+    {
+        MutexHolder mh( m_Mutex );
+        m_Results.Append( result );
+    }
+    m_WakeSemaphore.Signal();
+}
+
+// Wake
+//------------------------------------------------------------------------------
+void Server::ClientOutbox::Wake()
+{
+    m_WakeSemaphore.Signal();
+}
+
+// ThreadFuncStatic
+//------------------------------------------------------------------------------
+/*static*/ uint32_t Server::ClientOutbox::ThreadFuncStatic( void * param )
+{
+    PROFILE_SET_THREAD_NAME( "ClientOutbox" );
+
+    static_cast<ClientOutbox *>( param )->ThreadFunc();
+    return 0;
+}
+
+// ThreadFunc
+//------------------------------------------------------------------------------
+void Server::ClientOutbox::ThreadFunc()
+{
+    Array<QueuedResult> results;
+    while ( m_Quit.Load() == false )
+    {
+        m_WakeSemaphore.Wait();
+
+        {
+            MutexHolder mh( m_Mutex );
+            results.Swap( m_Results );
+        }
+        for ( const QueuedResult & result : results )
+        {
+            if ( m_Quit.Load() == false )
+            {
+                Send( result );
+            }
+            FDELETE result.m_Payload;
+        }
+        results.Clear();
+    }
+}
+
+// Send
+//------------------------------------------------------------------------------
+void Server::ClientOutbox::Send( const QueuedResult & result )
+{
+    // Before the send mutex is taken, so the result is no longer counted while it waits to be sent
+    ClientState & cs = m_ClientState;
+    ASSERT( cs.m_NumJobsActive.Load() > 0 );
+    cs.m_NumJobsActive.Decrement();
+
+    const uint32_t active = cs.m_NumJobsActive.Load();
+    const uint32_t allocated = result.m_AllocatedCapacity;
+    const uint8_t remaining = (uint8_t)( allocated > active ? allocated - active : 0 );
+
+    if ( result.m_Compressed )
+    {
+        const Protocol::MsgJobResultCompressed msg( remaining );
+        SendTo( cs, msg, *result.m_Payload );
+    }
+    else
+    {
+        const Protocol::MsgJobResult msg( remaining );
+        SendTo( cs, msg, *result.m_Payload );
+    }
 }
 
 // SendIdInventory
@@ -1990,30 +2161,11 @@ void Server::FinalizeCompletedJobs()
                 ms.Write( (uint32_t)job->GetDataSize() );
                 ms.WriteBuffer( job->GetData(), job->GetDataSize() );
 
-                // Holding the client list keeps the connection alive while we send. Only
-                // cs->m_Mutex is free during the send, so jobs can still arrive on this connection.
+                // The client's outbox sends it, so no lock is held while the client reads
                 MutexHolder mh( m_ClientListMutex );
-                if ( m_ClientList.Find( cs ) != nullptr )
+                if ( ( m_ClientList.Find( cs ) != nullptr ) && cs->m_Outbox )
                 {
-                    ASSERT( cs->m_NumJobsActive.Load() > 0 );
-                    cs->m_NumJobsActive.Decrement();
-
-                    const uint32_t active = cs->m_NumJobsActive.Load();
-                    const uint32_t allocated = cs->m_AllocatedCapacity;
-                    const uint8_t remaining = (uint8_t)( allocated > active ? allocated - active : 0 );
-
-                    if ( job->GetResultCompressionLevel() == 0 )
-                    {
-                        // Uncompressed
-                        const Protocol::MsgJobResult msg( remaining );
-                        SendTo( *cs, msg, ms );
-                    }
-                    else
-                    {
-                        // Compressed
-                        const Protocol::MsgJobResultCompressed msg( remaining );
-                        SendTo( *cs, msg, ms );
-                    }
+                    cs->m_Outbox->PushResult( job->GetResultCompressionLevel() != 0, Move( ms ) );
                 }
             }
         }

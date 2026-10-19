@@ -23,6 +23,7 @@
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
 #include "Core/Process/Mutex.h"
+#include "Core/Process/Semaphore.h"
 #include "Core/Process/Thread.h"
 #include "Core/Strings/AStackString.h"
 #include "Core/Time/Timer.h"
@@ -433,11 +434,25 @@ namespace DistributedTest
             MutexHolder mh( m_Mutex );
             outToolIds = m_ToolchainIds;
         }
+        // While set, what arrives is not read, so what the worker sends backs up
+        void StallReading( bool stall )
+        {
+            m_StallReading.Store( stall );
+            if ( stall == false )
+            {
+                m_StallSemaphore.Signal();
+            }
+        }
 
     private:
         virtual void OnReceive( const ConnectionInfo *, void * data, uint32_t size, bool & keepMemory ) override
         {
             keepMemory = true; // freed below
+
+            while ( m_StallReading.Load() )
+            {
+                m_StallSemaphore.Wait( 10 );
+            }
 
             void * payload = nullptr;
             if ( m_CurrentMessage == nullptr )
@@ -494,6 +509,8 @@ namespace DistributedTest
         Atomic<uint32_t> m_RefusedMajor{ 0 };
         Atomic<uint32_t> m_RefusedMinor{ 0 };
         Atomic<uint32_t> m_AckCapacity{ 0 };
+        Atomic<bool> m_StallReading{ false };
+        Semaphore m_StallSemaphore;
         const Protocol::IMessage * m_CurrentMessage = nullptr;
     };
 
