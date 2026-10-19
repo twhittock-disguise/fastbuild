@@ -46,6 +46,8 @@ const char * GetProtocolMessageDebugName( Protocol::MessageType msgType )
         "ToolchainInventory",
         "Refused",
         "PchNeeded",
+        "Demand",
+        "Capacity",
     };
     // clang-format on
     static_assert( ( sizeof( msgNames ) / sizeof( const char * ) ) == Protocol::NUM_MESSAGES, "msgNames item count doesn't match NUM_MESSAGES" );
@@ -287,6 +289,23 @@ Protocol::MsgToolchainInventory::MsgToolchainInventory( uint32_t numEntries )
 {
 }
 
+// MsgDemand
+//------------------------------------------------------------------------------
+Protocol::MsgDemand::MsgDemand( uint32_t demand )
+    : Protocol::IMessage( Protocol::MSG_DEMAND, sizeof( MsgDemand ), false )
+    , m_Demand( demand )
+{
+}
+
+// MsgCapacity
+//------------------------------------------------------------------------------
+Protocol::MsgCapacity::MsgCapacity( uint32_t allowance, uint32_t poolSlots )
+    : Protocol::IMessage( Protocol::MSG_CAPACITY, sizeof( MsgCapacity ), false )
+    , m_Allowance( allowance )
+    , m_PoolSlots( poolSlots )
+{
+}
+
 // GetMinMessageSize
 //------------------------------------------------------------------------------
 uint32_t Protocol::GetMinMessageSize( MessageType type )
@@ -307,6 +326,8 @@ uint32_t Protocol::GetMinMessageSize( MessageType type )
         case MSG_REQUEST_FILE:          return sizeof( MsgRequestFile );
         case MSG_TOOLCHAIN_INVENTORY:   return sizeof( MsgToolchainInventory );
         case MSG_PCH_NEEDED:            return sizeof( MsgPchNeeded );
+        case MSG_DEMAND:                return sizeof( MsgDemand );
+        case MSG_CAPACITY:              return sizeof( MsgCapacity );
         case NUM_MESSAGES:              break;
     }
     return 0;
@@ -332,6 +353,8 @@ Protocol::PayloadRule Protocol::GetPayloadRule( MessageType type )
         case MSG_REQUEST_FILE:          return PAYLOAD_NEVER;
         case MSG_TOOLCHAIN_INVENTORY:   return PAYLOAD_OPTIONAL;
         case MSG_PCH_NEEDED:            return PAYLOAD_NEVER;
+        case MSG_DEMAND:                return PAYLOAD_NEVER;
+        case MSG_CAPACITY:              return PAYLOAD_NEVER;
         case NUM_MESSAGES:              break;
     }
     return PAYLOAD_NEVER;

@@ -3766,6 +3766,8 @@ void TestDistributed::ShortMessagesAreRejected() const
         { Protocol::MSG_TOOLCHAIN_INVENTORY,    sizeof( Protocol::MsgToolchainInventory ),  Protocol::PAYLOAD_OPTIONAL },
         { Protocol::MSG_REFUSED,                kGoldenPrefixSize,                          Protocol::PAYLOAD_NEVER },
         { Protocol::MSG_PCH_NEEDED,             sizeof( Protocol::MsgPchNeeded ),           Protocol::PAYLOAD_NEVER },
+        { Protocol::MSG_DEMAND,                 sizeof( Protocol::MsgDemand ),              Protocol::PAYLOAD_NEVER },
+        { Protocol::MSG_CAPACITY,               sizeof( Protocol::MsgCapacity ),            Protocol::PAYLOAD_NEVER },
     };
     TEST_ASSERT( ( sizeof( expected ) / sizeof( expected[ 0 ] ) ) == ( Protocol::NUM_MESSAGES - 1 ) ); // A row for every type
     for ( const Expected & e : expected )

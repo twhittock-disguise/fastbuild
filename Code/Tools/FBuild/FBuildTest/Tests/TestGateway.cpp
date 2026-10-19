@@ -20,6 +20,8 @@
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
 #include "Tools/FBuild/FBuildCore/Protocol/WorkerSendQueue.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/DemandRamp.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/FairShareAllocator.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/JobQueueRemote.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/PchDispatch.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
@@ -458,6 +460,17 @@ private:
     void GatewayRestartMidBuildCompletesTheBuild() const;
 #endif
     void GatewayIsNoSlowerThanDirect() const;
+    void DemandAndCapacityLayouts() const;
+    void AllocatorSplitsByMaxMinFairness() const;
+    void AllocatorGivesNothingWithoutDemand() const;
+    void AllocatorRotatesScarceSlots() const;
+    void AllocatorGivesNoMoreThanTheDemand() const;
+    void AllocatorFollowsConnectsAndDisconnects() const;
+    void AllocatorKeepsSmallChanges() const;
+    void AllocatorFollowsThePool() const;
+    void RampStartsSmallAndGrows() const;
+    void RampFallsWhenNothingWaits() const;
+    void RampReportsOnlyRealChanges() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -600,6 +613,17 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( GatewayRestartMidBuildCompletesTheBuild )
 #endif
     REGISTER_TEST( GatewayIsNoSlowerThanDirect )
+    REGISTER_TEST( DemandAndCapacityLayouts )
+    REGISTER_TEST( AllocatorSplitsByMaxMinFairness )
+    REGISTER_TEST( AllocatorGivesNothingWithoutDemand )
+    REGISTER_TEST( AllocatorRotatesScarceSlots )
+    REGISTER_TEST( AllocatorGivesNoMoreThanTheDemand )
+    REGISTER_TEST( AllocatorFollowsConnectsAndDisconnects )
+    REGISTER_TEST( AllocatorKeepsSmallChanges )
+    REGISTER_TEST( AllocatorFollowsThePool )
+    REGISTER_TEST( RampStartsSmallAndGrows )
+    REGISTER_TEST( RampFallsWhenNothingWaits )
+    REGISTER_TEST( RampReportsOnlyRealChanges )
 REGISTER_TESTS_END
 
 // PreTest
@@ -5485,6 +5509,482 @@ void TestGateway::GatewayIsNoSlowerThanDirect() const
 
     OUTPUT( "GatewayIsNoSlowerThanDirect: direct %.2fs, through the gateway %.2fs\n", (double)direct, (double)throughGateway );
     TEST_ASSERT( throughGateway <= ( ( direct * 1.5f ) + 2.0f ) );
+}
+
+// DemandAndCapacityLayouts
+//------------------------------------------------------------------------------
+void TestGateway::DemandAndCapacityLayouts() const
+{
+    const Protocol::MsgDemand demand( 0x12345678 );
+    TEST_ASSERT( sizeof( demand ) == 8 );
+    uint8_t demandBytes[ sizeof( demand ) ];
+    memcpy( demandBytes, &demand, sizeof( demand ) );
+    const uint8_t expectedDemand[] = { 15 /*MSG_DEMAND*/, 8, 0 /*no payload*/, 0, 0x78, 0x56, 0x34, 0x12 };
+    TEST_ASSERT( memcmp( demandBytes, expectedDemand, sizeof( expectedDemand ) ) == 0 );
+    TEST_ASSERT( demand.GetDemand() == 0x12345678 );
+    TEST_ASSERT( demand.HasPayload() == false );
+
+    const Protocol::MsgCapacity capacity( 0x01020304, 0xA0B0C0D0 );
+    TEST_ASSERT( sizeof( capacity ) == 12 );
+    uint8_t capacityBytes[ sizeof( capacity ) ];
+    memcpy( capacityBytes, &capacity, sizeof( capacity ) );
+    const uint8_t expectedCapacity[] = { 16 /*MSG_CAPACITY*/, 12, 0, 0, 0x04, 0x03, 0x02, 0x01, 0xD0, 0xC0, 0xB0, 0xA0 };
+    TEST_ASSERT( memcmp( capacityBytes, expectedCapacity, sizeof( expectedCapacity ) ) == 0 );
+    TEST_ASSERT( capacity.GetAllowance() == 0x01020304 );
+    TEST_ASSERT( capacity.GetPoolSlots() == 0xA0B0C0D0 );
+    TEST_ASSERT( capacity.HasPayload() == false );
+
+    // A receiver accepts both
+    TEST_ASSERT( Protocol::IsValidHeader( demandBytes, sizeof( demandBytes ) ) );
+    TEST_ASSERT( Protocol::IsValidHeader( capacityBytes, sizeof( capacityBytes ) ) );
+}
+
+namespace
+{
+    // Recomputes, and whether exactly these clients changed, in this order
+    template <size_t N>
+    bool RecomputeChanges( FairShareAllocator & allocator, const uint32_t ( &expected )[ N ] )
+    {
+        Array<uint32_t> changed;
+        allocator.Recompute( changed );
+        if ( changed.GetSize() != N )
+        {
+            return false;
+        }
+        for ( size_t i = 0; i < N; ++i )
+        {
+            if ( changed[ i ] != expected[ i ] )
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool RecomputeChangesNothing( FairShareAllocator & allocator )
+    {
+        Array<uint32_t> changed;
+        allocator.Recompute( changed );
+        return changed.IsEmpty();
+    }
+
+    constexpr uint32_t kClientA = 11;
+    constexpr uint32_t kClientB = 12;
+    constexpr uint32_t kClientC = 13;
+}
+
+// AllocatorSplitsByMaxMinFairness
+//------------------------------------------------------------------------------
+void TestGateway::AllocatorSplitsByMaxMinFairness() const
+{
+    FairShareAllocator allocator;
+    allocator.SetPoolSlots( 100 );
+    allocator.AddClient( kClientA );
+    allocator.AddClient( kClientB );
+    allocator.AddClient( kClientC );
+    allocator.SetDemand( kClientA, 10 );
+    allocator.SetDemand( kClientB, 50 );
+    allocator.SetDemand( kClientC, 80 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB, kClientC } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 10 );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == 45 );
+    TEST_ASSERT( allocator.GetAllowance( kClientC ) == 45 );
+    TEST_ASSERT( allocator.IsScarce() == false );
+    TEST_ASSERT( allocator.GetPoolSlots() == 100 );
+
+    // The same again changes nothing
+    TEST_ASSERT( RecomputeChangesNothing( allocator ) );
+}
+
+// AllocatorGivesNothingWithoutDemand
+//------------------------------------------------------------------------------
+void TestGateway::AllocatorGivesNothingWithoutDemand() const
+{
+    FairShareAllocator allocator;
+    allocator.SetPoolSlots( 20 );
+    allocator.AddClient( kClientA );
+    allocator.AddClient( kClientB );
+    allocator.SetDemand( kClientA, 100 );
+    allocator.SetDemand( kClientB, 0 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 20 );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == 0 );
+
+    // A keeps 20 (19 is a reduction under the threshold), and B gets its one
+    allocator.SetDemand( kClientB, 1 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientB } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 20 );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == 1 );
+
+    // A drop to no demand is not held back
+    allocator.SetDemand( kClientB, 0 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientB } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == 0 );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 20 );
+
+    // Nor is one of a large allowance
+    allocator.SetDemand( kClientA, 0 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 0 );
+    TEST_ASSERT( allocator.IsScarce() == false );
+}
+
+// AllocatorRotatesScarceSlots
+//------------------------------------------------------------------------------
+void TestGateway::AllocatorRotatesScarceSlots() const
+{
+    {
+        FairShareAllocator allocator;
+        allocator.SetPoolSlots( 4 );
+        for ( uint32_t id = 1; id <= 5; ++id )
+        {
+            allocator.AddClient( id );
+            allocator.SetDemand( id, 10 );
+        }
+        TEST_ASSERT( allocator.IsScarce() );
+
+        // The first of the clients to get a slot moves on by one each time
+        const uint32_t leftOut[] = { 5, 1, 2, 3, 4, 5 };
+        bool everyClientServed[ 6 ] = {};
+        for ( const uint32_t expectedLeftOut : leftOut )
+        {
+            Array<uint32_t> changed;
+            allocator.Recompute( changed );
+            uint32_t sum = 0;
+            for ( uint32_t id = 1; id <= 5; ++id )
+            {
+                const uint32_t allowance = allocator.GetAllowance( id );
+                TEST_ASSERT( allowance == ( ( id == expectedLeftOut ) ? 0u : 1u ) );
+                everyClientServed[ id ] |= ( allowance == 1 );
+                sum += allowance;
+            }
+            TEST_ASSERT( sum == 4 );
+        }
+        for ( uint32_t id = 1; id <= 5; ++id )
+        {
+            TEST_ASSERT( everyClientServed[ id ] );
+        }
+
+        // The slot moves from the client left out next to the one left out last
+        TEST_ASSERT( RecomputeChanges( allocator, { 1, 5 } ) );
+        TEST_ASSERT( allocator.GetAllowance( 1 ) == 0 );
+        TEST_ASSERT( allocator.GetAllowance( 5 ) == 1 );
+
+        // With a slot each, nothing rotates
+        allocator.SetPoolSlots( 5 );
+        TEST_ASSERT( allocator.IsScarce() == false );
+        TEST_ASSERT( RecomputeChanges( allocator, { 1 } ) );
+        TEST_ASSERT( RecomputeChangesNothing( allocator ) );
+    }
+
+    // The remainder goes to the most unmet demand first, and rotates only between equals
+    {
+        FairShareAllocator allocator;
+        allocator.SetPoolSlots( 10 );
+        allocator.AddClient( kClientA );
+        allocator.AddClient( kClientB );
+        allocator.AddClient( kClientC );
+        allocator.SetDemand( kClientA, 100 );
+        allocator.SetDemand( kClientB, 100 );
+        allocator.SetDemand( kClientC, 5 );
+        const uint32_t expectedA[] = { 4, 3, 4 }; // The third would start at C, whose 3 of 5 leaves it less unmet
+        for ( const uint32_t a : expectedA )
+        {
+            Array<uint32_t> changed;
+            allocator.Recompute( changed );
+            TEST_ASSERT( allocator.GetAllowance( kClientA ) == a );
+            TEST_ASSERT( allocator.GetAllowance( kClientB ) == ( 7 - a ) );
+            TEST_ASSERT( allocator.GetAllowance( kClientC ) == 3 );
+        }
+    }
+}
+
+// AllocatorGivesNoMoreThanTheDemand
+//------------------------------------------------------------------------------
+void TestGateway::AllocatorGivesNoMoreThanTheDemand() const
+{
+    // Slots no one asks for stay unallocated
+    {
+        FairShareAllocator allocator;
+        allocator.SetPoolSlots( 100 );
+        allocator.AddClient( kClientA );
+        allocator.AddClient( kClientB );
+        allocator.SetDemand( kClientA, 10 );
+        allocator.SetDemand( kClientB, 20 );
+        TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB } ) );
+        TEST_ASSERT( allocator.GetAllowance( kClientA ) == 10 );
+        TEST_ASSERT( allocator.GetAllowance( kClientB ) == 20 );
+
+        allocator.AddClient( kClientC );
+        allocator.SetDemand( kClientC, 100 );
+        TEST_ASSERT( RecomputeChanges( allocator, { kClientC } ) );
+        TEST_ASSERT( allocator.GetAllowance( kClientC ) == 70 );
+    }
+
+    // The remainder of a scarce pool goes only to those who still want more
+    {
+        FairShareAllocator allocator;
+        allocator.SetPoolSlots( 10 );
+        allocator.AddClient( kClientA );
+        allocator.AddClient( kClientB );
+        allocator.AddClient( kClientC );
+        allocator.SetDemand( kClientA, 1 );
+        allocator.SetDemand( kClientB, 3 );
+        allocator.SetDemand( kClientC, 100 );
+        for ( uint32_t i = 0; i < 3; ++i )
+        {
+            Array<uint32_t> changed;
+            allocator.Recompute( changed );
+            TEST_ASSERT( allocator.GetAllowance( kClientA ) == 1 );
+            TEST_ASSERT( allocator.GetAllowance( kClientB ) == 3 );
+            TEST_ASSERT( allocator.GetAllowance( kClientC ) == 6 );
+        }
+    }
+
+    // A reduction held back by the hysteresis still stops at the demand
+    {
+        FairShareAllocator allocator;
+        allocator.SetPoolSlots( 100 );
+        allocator.AddClient( kClientA );
+        allocator.AddClient( kClientB );
+        allocator.SetDemand( kClientA, 100 );
+        allocator.SetDemand( kClientB, 100 );
+        TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB } ) );
+
+        // Both are due 48, two short of the 5 that 10% of 50 needs
+        allocator.SetDemand( kClientA, 49 );
+        allocator.SetPoolSlots( 96 );
+        TEST_ASSERT( RecomputeChanges( allocator, { kClientA } ) );
+        TEST_ASSERT( allocator.GetAllowance( kClientA ) == 49 );
+        TEST_ASSERT( allocator.GetAllowance( kClientB ) == 50 );
+    }
+}
+
+// AllocatorFollowsConnectsAndDisconnects
+//------------------------------------------------------------------------------
+void TestGateway::AllocatorFollowsConnectsAndDisconnects() const
+{
+    FairShareAllocator allocator;
+    allocator.SetPoolSlots( 100 );
+    allocator.AddClient( kClientA );
+    allocator.SetDemand( kClientA, 100 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 100 );
+
+    // A new client is assumed to want what a ramp starts at; A's 96 is a reduction under the threshold
+    allocator.AddClient( kClientB );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == 0 ); // Until the next Recompute
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientB } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == FairShareAllocator::kInitialDemand );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 100 );
+
+    allocator.SetDemand( kClientB, 100 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 50 );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == 50 );
+
+    allocator.RemoveClient( kClientB );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == 0 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 100 );
+}
+
+// AllocatorKeepsSmallChanges
+//------------------------------------------------------------------------------
+void TestGateway::AllocatorKeepsSmallChanges() const
+{
+    {
+        FairShareAllocator allocator;
+        allocator.SetPoolSlots( 100 );
+        allocator.AddClient( kClientA );
+        allocator.AddClient( kClientB );
+        allocator.SetDemand( kClientA, 50 );
+        allocator.SetDemand( kClientB, 50 );
+        TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB } ) );
+
+        // Due 48 each: a reduction of 2, under 10% of 50
+        allocator.AddClient( kClientC );
+        TEST_ASSERT( RecomputeChanges( allocator, { kClientC } ) );
+        TEST_ASSERT( allocator.GetAllowance( kClientA ) == 50 );
+        TEST_ASSERT( allocator.GetAllowance( kClientB ) == 50 );
+        TEST_ASSERT( allocator.GetAllowance( kClientC ) == 4 );
+
+        // Due 46: a reduction of 4 is still held back
+        allocator.SetDemand( kClientC, 8 );
+        TEST_ASSERT( RecomputeChanges( allocator, { kClientC } ) );
+        TEST_ASSERT( allocator.GetAllowance( kClientA ) == 50 );
+        TEST_ASSERT( allocator.GetAllowance( kClientC ) == 8 );
+
+        // Due 45: a reduction of 5 is 10%, and applies
+        allocator.SetDemand( kClientC, 10 );
+        TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB, kClientC } ) );
+        TEST_ASSERT( allocator.GetAllowance( kClientA ) == 45 );
+        TEST_ASSERT( allocator.GetAllowance( kClientB ) == 45 );
+        TEST_ASSERT( allocator.GetAllowance( kClientC ) == 10 );
+    }
+
+    // A reduction of 1 slot is held back even where it is 10%
+    {
+        FairShareAllocator allocator;
+        allocator.SetPoolSlots( 20 );
+        allocator.AddClient( kClientA );
+        allocator.AddClient( kClientB );
+        allocator.SetDemand( kClientA, 10 );
+        allocator.SetDemand( kClientB, 10 );
+        TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB } ) );
+
+        allocator.AddClient( kClientC );
+        allocator.SetDemand( kClientC, 2 );
+        TEST_ASSERT( RecomputeChanges( allocator, { kClientC } ) );
+        TEST_ASSERT( allocator.GetAllowance( kClientA ) == 10 );
+        TEST_ASSERT( allocator.GetAllowance( kClientB ) == 10 );
+        TEST_ASSERT( allocator.GetAllowance( kClientC ) == 2 );
+    }
+}
+
+// AllocatorFollowsThePool
+//------------------------------------------------------------------------------
+void TestGateway::AllocatorFollowsThePool() const
+{
+    FairShareAllocator allocator;
+    allocator.SetPoolSlots( 100 );
+    allocator.AddClient( kClientA );
+    allocator.AddClient( kClientB );
+    allocator.SetDemand( kClientA, 100 );
+    allocator.SetDemand( kClientB, 100 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 50 );
+
+    allocator.SetPoolSlots( 200 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 100 );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == 100 );
+
+    // Due 95 each: under the threshold
+    allocator.SetPoolSlots( 190 );
+    TEST_ASSERT( RecomputeChangesNothing( allocator ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 100 );
+
+    allocator.SetPoolSlots( 100 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 50 );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == 50 );
+
+    // A pool of nothing allows nothing
+    allocator.SetPoolSlots( 0 );
+    TEST_ASSERT( allocator.IsScarce() );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA, kClientB } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 0 );
+    TEST_ASSERT( allocator.GetAllowance( kClientB ) == 0 );
+
+    // An allowance held back by the hysteresis still stops at the pool
+    allocator.SetPoolSlots( 100 );
+    allocator.RemoveClient( kClientB );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 100 );
+    allocator.SetPoolSlots( 95 );
+    TEST_ASSERT( RecomputeChanges( allocator, { kClientA } ) );
+    TEST_ASSERT( allocator.GetAllowance( kClientA ) == 95 );
+    TEST_ASSERT( allocator.GetPoolSlots() == 95 );
+}
+
+// RampStartsSmallAndGrows
+//------------------------------------------------------------------------------
+void TestGateway::RampStartsSmallAndGrows() const
+{
+    DemandRamp ramp;
+    TEST_ASSERT( ramp.GetRamp() == DemandRamp::kStartSlots );
+    TEST_ASSERT( ramp.Update( 100, 0, 0.0f ) == 4 );
+    TEST_ASSERT( ramp.Update( 100, 3, 0.5f ) == 8 ); // 3 of 4 is 75%
+
+    // Not again within 0.5 s
+    TEST_ASSERT( ramp.Update( 100, 8, 0.6f ) == 8 );
+    TEST_ASSERT( ramp.Update( 100, 8, 0.99f ) == 8 );
+    TEST_ASSERT( ramp.Update( 100, 8, 1.0f ) == 16 );
+
+    // Not below 75% of the ramp in use (11 of 16)
+    TEST_ASSERT( ramp.Update( 100, 11, 2.0f ) == 16 );
+    // Not with nothing waiting
+    TEST_ASSERT( ramp.Update( 0, 16, 2.5f ) == 16 );
+    TEST_ASSERT( ramp.GetRamp() == 16 );
+
+    // Never more than what could run
+    TEST_ASSERT( ramp.Update( 2, 12, 3.0f ) == 14 );
+    TEST_ASSERT( ramp.GetRamp() == 32 );
+
+    // Up to the most a demand can be
+    for ( uint32_t i = 0; i < 20; ++i )
+    {
+        const uint32_t inFlight = ramp.GetRamp();
+        ramp.Update( 1000000, inFlight, 3.5f + ( 0.5f * (float)i ) );
+    }
+    TEST_ASSERT( ramp.GetRamp() == DemandRamp::kMaxDemand );
+    TEST_ASSERT( ramp.Update( 1000000, 1000000, 100.0f ) == DemandRamp::kMaxDemand );
+}
+
+// RampFallsWhenNothingWaits
+//------------------------------------------------------------------------------
+void TestGateway::RampFallsWhenNothingWaits() const
+{
+    DemandRamp ramp;
+    ramp.Update( 100, 0, 0.0f );
+    ramp.Update( 100, 4, 0.5f );
+    ramp.Update( 100, 8, 1.0f );
+    TEST_ASSERT( ramp.GetRamp() == 16 );
+
+    // 2 s from the first time nothing waits
+    TEST_ASSERT( ramp.Update( 0, 3, 2.0f ) == 3 );
+    TEST_ASSERT( ramp.Update( 0, 3, 3.9f ) == 3 );
+    TEST_ASSERT( ramp.GetRamp() == 16 );
+    TEST_ASSERT( ramp.Update( 0, 3, 4.1f ) == 3 );
+    TEST_ASSERT( ramp.GetRamp() == 4 );
+
+    // Then to what is in flight, if that is more
+    TEST_ASSERT( ramp.Update( 0, 6, 4.2f ) == 6 );
+    TEST_ASSERT( ramp.GetRamp() == 6 );
+
+    // A job waiting again restarts the idle time
+    TEST_ASSERT( ramp.Update( 1, 2, 4.3f ) == 3 );
+    TEST_ASSERT( ramp.Update( 0, 2, 4.4f ) == 2 );
+    TEST_ASSERT( ramp.Update( 0, 2, 6.3f ) == 2 );
+    TEST_ASSERT( ramp.GetRamp() == 6 );
+    ramp.Update( 0, 2, 6.5f );
+    TEST_ASSERT( ramp.GetRamp() == 4 );
+}
+
+// RampReportsOnlyRealChanges
+//------------------------------------------------------------------------------
+void TestGateway::RampReportsOnlyRealChanges() const
+{
+    DemandRamp ramp;
+
+    // The first demand is always sent, 0 included: the worker assumes a starting demand, and answers with the pool
+    TEST_ASSERT( ramp.ShouldSend( 0, 0.0f ) );
+    TEST_ASSERT( ramp.ShouldSend( 4, 0.0f ) );
+    ramp.OnSent( 4, 0.0f );
+    TEST_ASSERT( ramp.ShouldSend( 4, 1.0f ) == false );
+    TEST_ASSERT( ramp.ShouldSend( 5, 1.0f ) == false ); // Fewer than 2
+    TEST_ASSERT( ramp.ShouldSend( 6, 0.2f ) == false ); // Too soon
+    TEST_ASSERT( ramp.ShouldSend( 6, 1.0f ) );
+    TEST_ASSERT( ramp.ShouldSend( 2, 1.0f ) );
+
+    // At least 12% of the last demand sent, either way
+    ramp.OnSent( 100, 1.0f );
+    TEST_ASSERT( ramp.ShouldSend( 111, 2.0f ) == false );
+    TEST_ASSERT( ramp.ShouldSend( 112, 2.0f ) );
+    TEST_ASSERT( ramp.ShouldSend( 89, 2.0f ) == false );
+    TEST_ASSERT( ramp.ShouldSend( 88, 2.0f ) );
+
+    // At least 0.25 s apart
+    ramp.OnSent( 20, 3.0f );
+    TEST_ASSERT( ramp.ShouldSend( 40, 3.2f ) == false );
+    TEST_ASSERT( ramp.ShouldSend( 40, 3.25f ) );
+
+    // To and from 0 at once
+    TEST_ASSERT( ramp.ShouldSend( 0, 3.01f ) );
+    ramp.OnSent( 0, 3.01f );
+    TEST_ASSERT( ramp.ShouldSend( 0, 4.0f ) == false );
+    TEST_ASSERT( ramp.ShouldSend( 1, 3.02f ) );
 }
 
 //------------------------------------------------------------------------------

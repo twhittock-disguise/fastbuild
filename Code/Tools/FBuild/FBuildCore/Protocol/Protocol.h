@@ -62,6 +62,8 @@ namespace Protocol
         MSG_TOOLCHAIN_INVENTORY = 12,   // Worker -> Client : Advertise cached toolchain IDs
         MSG_REFUSED = 13,               // Worker -> Client : Handshake refused, with the version of the worker
         MSG_PCH_NEEDED = 14,            // Worker -> Client : A job needs a PCH the worker does not have
+        MSG_DEMAND = 15,                // Client -> Worker : How many jobs the client could run on this worker now
+        MSG_CAPACITY = 16,              // Worker -> Client : The client's slot allowance, and the worker's whole pool
 
         NUM_MESSAGES            // leave last
     };
@@ -373,6 +375,36 @@ namespace Protocol
         uint32_t m_NumEntries;
     };
     static_assert( sizeof( MsgToolchainInventory ) == sizeof( IMessage ) + 4, "MsgToolchainInventory message has incorrect size" );
+
+    // MsgDemand
+    //------------------------------------------------------------------------------
+    class MsgDemand : public IMessage
+    {
+    public:
+        explicit MsgDemand( uint32_t demand );
+
+        uint32_t GetDemand() const { return m_Demand; }
+
+    private:
+        uint32_t m_Demand;
+    };
+    static_assert( sizeof( MsgDemand ) == sizeof( IMessage ) + 4, "MsgDemand message has incorrect size" );
+
+    // MsgCapacity
+    //------------------------------------------------------------------------------
+    class MsgCapacity : public IMessage
+    {
+    public:
+        MsgCapacity( uint32_t allowance, uint32_t poolSlots );
+
+        uint32_t GetAllowance() const { return m_Allowance; }
+        uint32_t GetPoolSlots() const { return m_PoolSlots; }
+
+    private:
+        uint32_t m_Allowance;
+        uint32_t m_PoolSlots;
+    };
+    static_assert( sizeof( MsgCapacity ) == sizeof( IMessage ) + 8, "MsgCapacity message has incorrect size" );
 }
 
 //------------------------------------------------------------------------------
