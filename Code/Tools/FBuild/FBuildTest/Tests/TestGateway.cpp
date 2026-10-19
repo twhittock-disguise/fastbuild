@@ -9,6 +9,7 @@
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
+#include "Tools/FBuild/FBuildCore/Gateway/ToolchainStash.h"
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
@@ -367,6 +368,13 @@ private:
     void GatewayResultReachesOnlyALiveClient() const;
     void PureGatewayNeverTouchesTheJobQueue() const;
     void AskingASlowClientForAPchDoesNotHoldBackAnother() const;
+    void StashKeepsWhatTheClientSent() const;
+    void StashSurvivesARestart() const;
+    void PartialStashIsDroppedAtStart() const;
+    void StashRejectsWhatDoesNotMatch() const;
+    void DuplicateUploadsAreIgnored() const;
+    void StashEvictsTheLeastRecentlyUsedToolchainNotInUse() const;
+    void PinnedToolchainIsNeverEvicted() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -389,6 +397,8 @@ private:
     static uint32_t ConnectProbe( Server & server, DistributedTest::HandshakeProbe & probe, const ConnectionInfo ** outConnection = nullptr );
     // The cache root of a pure gateway that shares the process with a real Server
     static void GetGatewayCacheDir( AString & outDir );
+    // Where a test's stash lives; it is empty at the start of every test
+    static void GetStashDir( AString & outDir );
     static void AddActiveJobs( Server & server, uint32_t clientId, uint32_t numJobs );
     static uint32_t GetNumJobsActive( Server & server, uint32_t clientId );
     static size_t CountMessages( const DistributedTest::HandshakeProbe & probe, uint8_t type );
@@ -419,6 +429,13 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( GatewayResultReachesOnlyALiveClient )
     REGISTER_TEST( PureGatewayNeverTouchesTheJobQueue )
     REGISTER_TEST( AskingASlowClientForAPchDoesNotHoldBackAnother )
+    REGISTER_TEST( StashKeepsWhatTheClientSent )
+    REGISTER_TEST( StashSurvivesARestart )
+    REGISTER_TEST( PartialStashIsDroppedAtStart )
+    REGISTER_TEST( StashRejectsWhatDoesNotMatch )
+    REGISTER_TEST( DuplicateUploadsAreIgnored )
+    REGISTER_TEST( StashEvictsTheLeastRecentlyUsedToolchainNotInUse )
+    REGISTER_TEST( PinnedToolchainIsNeverEvicted )
 REGISTER_TESTS_END
 
 // PreTest
@@ -477,6 +494,19 @@ REGISTER_TESTS_END
 {
     VERIFY( FBuild::GetTempDir( outDir ) );
     outDir += "gateway_tmp";
+    outDir += NATIVE_SLASH;
+}
+
+// GetStashDir
+//------------------------------------------------------------------------------
+/*static*/ void TestGateway::GetStashDir( AString & outDir )
+{
+    VERIFY( FBuild::GetTempDir( outDir ) );
+    outDir += "stash_tmp";
+    outDir += NATIVE_SLASH;
+    outDir += "gateway";
+    outDir += NATIVE_SLASH;
+    outDir += "toolchains";
     outDir += NATIVE_SLASH;
 }
 
@@ -1316,6 +1346,419 @@ void TestGateway::AskingASlowClientForAPchDoesNotHoldBackAnother() const
 
     a.ShutdownAllConnections();
     b.ShutdownAllConnections();
+}
+
+// Toolchain stash helpers
+//------------------------------------------------------------------------------
+namespace
+{
+    // A manifest of numFiles files, as a client sends it (the stash reads only its header)
+    void MakeStashManifest( MemoryStream & ms, uint64_t toolId, uint32_t numFiles )
+    {
+        ms.Write( toolId );
+        ms.Write( AStackString( "C:\\toolchain\\" ) );
+        ms.Write( numFiles );
+        for ( uint32_t i = 0; i < numFiles; ++i )
+        {
+            AStackString<> name;
+            name.Format( "C:\\toolchain\\file%u.exe", i );
+            ms.Write( name );
+            ms.Write( (uint64_t)1 );
+            ms.Write( (uint64_t)( 100 + i ) );
+            ms.Write( (uint32_t)( 10 + i ) );
+        }
+        ms.Write( (uint32_t)0 );
+    }
+
+    ToolchainStash::Result AddStashManifest( ToolchainStash & stash, uint64_t toolId, uint32_t numFiles )
+    {
+        MemoryStream ms;
+        MakeStashManifest( ms, toolId, numFiles );
+        return stash.AddManifest( toolId, ms.GetData(), ms.GetSize() );
+    }
+
+    // What a test sends as a file of a toolchain
+    void FillStashFile( uint64_t toolId, uint32_t fileId, Array<char> & out )
+    {
+        out.SetSize( 100 + fileId );
+        memset( out.Begin(), (int)( 'a' + ( ( toolId + fileId ) % 26 ) ), out.GetSize() );
+    }
+
+    // A complete toolchain of numFiles files
+    void AddCompleteToStash( ToolchainStash & stash, uint64_t toolId, uint32_t numFiles = 1 )
+    {
+        TEST_ASSERT( AddStashManifest( stash, toolId, numFiles ) != ToolchainStash::STASH_INVALID );
+        for ( uint32_t i = 0; i < numFiles; ++i )
+        {
+            Array<char> bytes;
+            FillStashFile( toolId, i, bytes );
+            TEST_ASSERT( stash.AddFile( toolId, i, bytes.Begin(), bytes.GetSize() ) != ToolchainStash::STASH_INVALID );
+        }
+        TEST_ASSERT( stash.IsComplete( toolId ) );
+    }
+
+    bool StoredFileEquals( const AString & path, const void * expected, size_t expectedSize )
+    {
+        FileStream f;
+        if ( f.Open( path.Get() ) == false )
+        {
+            return false;
+        }
+        Array<char> bytes;
+        bytes.SetSize( (size_t)f.GetFileSize() );
+        return ( f.ReadBuffer( bytes.Begin(), bytes.GetSize() ) == bytes.GetSize() ) &&
+               ( bytes.GetSize() == expectedSize ) &&
+               ( memcmp( bytes.Begin(), expected, expectedSize ) == 0 );
+    }
+
+    bool StashHoldsFile( const ToolchainStash & stash, uint64_t toolId, uint32_t fileId, const Array<char> & expected )
+    {
+        AStackString<> path;
+        uint32_t size = 0;
+        return stash.GetFile( toolId, fileId, path, size ) &&
+               ( size == expected.GetSize() ) &&
+               StoredFileEquals( path, expected.Begin(), expected.GetSize() );
+    }
+
+    bool IsInList( const Array<uint64_t> & ids, uint64_t id )
+    {
+        return ( ids.Find( id ) != nullptr );
+    }
+
+    void GetStashToolchainDir( const AString & stashDir, uint64_t toolId, AString & outDir )
+    {
+        outDir = stashDir;
+        outDir.AppendFormat( "toolchain.%016" PRIx64, toolId );
+    }
+}
+
+// StashKeepsWhatTheClientSent
+//------------------------------------------------------------------------------
+void TestGateway::StashKeepsWhatTheClientSent() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+
+    const uint64_t toolId = 0x1234ABCD;
+    MemoryStream manifest;
+    MakeStashManifest( manifest, toolId, 2 );
+    TEST_ASSERT( stash.AddManifest( toolId, manifest.GetData(), manifest.GetSize() ) == ToolchainStash::STASH_INCOMPLETE );
+    TEST_ASSERT( stash.HasManifest( toolId ) );
+    TEST_ASSERT( stash.IsComplete( toolId ) == false );
+    TEST_ASSERT( stash.GetNumFiles( toolId ) == 2 );
+    Array<uint32_t> missing;
+    stash.GetMissingFiles( toolId, missing );
+    TEST_ASSERT( ( missing.GetSize() == 2 ) && ( missing[ 0 ] == 0 ) && ( missing[ 1 ] == 1 ) );
+    Array<uint64_t> complete;
+    stash.GetComplete( complete );
+    TEST_ASSERT( complete.IsEmpty() );
+
+    Array<char> file0;
+    Array<char> file1;
+    FillStashFile( toolId, 0, file0 );
+    FillStashFile( toolId, 1, file1 );
+    TEST_ASSERT( stash.AddFile( toolId, 1, file1.Begin(), file1.GetSize() ) == ToolchainStash::STASH_INCOMPLETE ); // In any order
+    stash.GetMissingFiles( toolId, missing );
+    TEST_ASSERT( ( missing.GetSize() == 1 ) && ( missing[ 0 ] == 0 ) );
+    TEST_ASSERT( stash.AddFile( toolId, 0, file0.Begin(), file0.GetSize() ) == ToolchainStash::STASH_COMPLETE );
+    TEST_ASSERT( stash.IsComplete( toolId ) );
+    stash.GetMissingFiles( toolId, missing );
+    TEST_ASSERT( missing.IsEmpty() );
+    stash.GetComplete( complete );
+    TEST_ASSERT( ( complete.GetSize() == 1 ) && ( complete[ 0 ] == toolId ) );
+
+    // The payloads as they arrived, in the layout the gateway sends them from
+    AStackString<> path;
+    uint32_t size = 0;
+    TEST_ASSERT( stash.GetManifestFile( toolId, path, size ) );
+    TEST_ASSERT( size == manifest.GetSize() );
+    TEST_ASSERT( path.BeginsWith( dir ) );
+    TEST_ASSERT( path.Find( "toolchain.000000001234abcd" ) );
+    TEST_ASSERT( path.EndsWith( "manifest.bin" ) );
+    TEST_ASSERT( StoredFileEquals( path, manifest.GetData(), manifest.GetSize() ) );
+    TEST_ASSERT( StashHoldsFile( stash, toolId, 0, file0 ) );
+    TEST_ASSERT( StashHoldsFile( stash, toolId, 1, file1 ) );
+    TEST_ASSERT( stash.GetFile( toolId, 1, path, size ) && path.EndsWith( "file.1.bin" ) );
+    TEST_ASSERT( stash.GetFile( toolId, 2, path, size ) == false );
+    TEST_ASSERT( stash.GetFile( toolId + 1, 0, path, size ) == false );
+    TEST_ASSERT( stash.GetManifestFile( toolId + 1, path, size ) == false );
+
+    // Only the payloads: no temporary file is left
+    TEST_ASSERT( CountFilesUnder( dir ) == 3 );
+}
+
+// StashSurvivesARestart
+//------------------------------------------------------------------------------
+void TestGateway::StashSurvivesARestart() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    {
+        ToolchainStash stash( dir );
+        AddCompleteToStash( stash, 0x11, 2 );
+        AddCompleteToStash( stash, 0x22, 1 );
+    }
+
+    ToolchainStash restarted( dir );
+    Array<uint64_t> complete;
+    restarted.GetComplete( complete );
+    TEST_ASSERT( complete.GetSize() == 2 );
+    TEST_ASSERT( IsInList( complete, 0x11 ) && IsInList( complete, 0x22 ) );
+    TEST_ASSERT( restarted.GetNumFiles( 0x11 ) == 2 );
+    TEST_ASSERT( restarted.IsComplete( 0x22 ) );
+    Array<char> file;
+    FillStashFile( 0x11, 1, file );
+    TEST_ASSERT( StashHoldsFile( restarted, 0x11, 1, file ) );
+    MemoryStream manifest;
+    MakeStashManifest( manifest, 0x11, 2 );
+    AStackString<> path;
+    uint32_t size = 0;
+    TEST_ASSERT( restarted.GetManifestFile( 0x11, path, size ) );
+    TEST_ASSERT( StoredFileEquals( path, manifest.GetData(), manifest.GetSize() ) );
+
+    // What arrives after the restart is a duplicate
+    TEST_ASSERT( restarted.AddFile( 0x11, 1, "other", 5 ) == ToolchainStash::STASH_COMPLETE );
+    TEST_ASSERT( StashHoldsFile( restarted, 0x11, 1, file ) );
+}
+
+// PartialStashIsDroppedAtStart
+//------------------------------------------------------------------------------
+void TestGateway::PartialStashIsDroppedAtStart() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    {
+        ToolchainStash stash( dir );
+        AddCompleteToStash( stash, 0xC0, 1 );
+        TEST_ASSERT( AddStashManifest( stash, 0xA0, 2 ) == ToolchainStash::STASH_INCOMPLETE ); // Manifest only
+        TEST_ASSERT( AddStashManifest( stash, 0xB0, 2 ) == ToolchainStash::STASH_INCOMPLETE ); // And a file
+        Array<char> file;
+        FillStashFile( 0xB0, 0, file );
+        TEST_ASSERT( stash.AddFile( 0xB0, 0, file.Begin(), file.GetSize() ) == ToolchainStash::STASH_INCOMPLETE );
+    }
+
+    // What a run that stopped in the middle of a write leaves
+    AStackString<> leftover;
+    GetStashToolchainDir( dir, 0xC0, leftover );
+    leftover += NATIVE_SLASH;
+    leftover += "file.0.bin.tmp";
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( leftover.Get(), FileStream::WRITE_ONLY ) );
+        TEST_ASSERT( f.Write( "x", 1 ) == 1 );
+    }
+    AStackString<> garbage;
+    GetStashToolchainDir( dir, 0xD0, garbage );
+    TEST_ASSERT( FileIO::EnsurePathExists( garbage ) );
+    garbage += NATIVE_SLASH;
+    garbage += "manifest.bin";
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( garbage.Get(), FileStream::WRITE_ONLY ) );
+        TEST_ASSERT( f.Write( "garbage", 7 ) == 7 );
+    }
+
+    ToolchainStash restarted( dir );
+    Array<uint64_t> complete;
+    restarted.GetComplete( complete );
+    TEST_ASSERT( ( complete.GetSize() == 1 ) && ( complete[ 0 ] == 0xC0 ) );
+    const uint64_t dropped[] = { 0xA0, 0xB0, 0xD0 };
+    for ( const uint64_t id : dropped )
+    {
+        TEST_ASSERT( restarted.HasManifest( id ) == false );
+        AStackString<> droppedDir;
+        GetStashToolchainDir( dir, id, droppedDir );
+        TEST_ASSERT( FileIO::DirectoryExists( droppedDir ) == false );
+    }
+    TEST_ASSERT( FileIO::FileExists( leftover.Get() ) == false );
+    TEST_ASSERT( CountFilesUnder( dir ) == 2 );
+}
+
+// StashRejectsWhatDoesNotMatch
+//------------------------------------------------------------------------------
+void TestGateway::StashRejectsWhatDoesNotMatch() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+
+    // Another tool id than the manifest carries
+    MemoryStream manifest;
+    MakeStashManifest( manifest, 0x11, 2 );
+    TEST_ASSERT( stash.AddManifest( 0x12, manifest.GetData(), manifest.GetSize() ) == ToolchainStash::STASH_INVALID );
+
+    // No files
+    MemoryStream empty;
+    MakeStashManifest( empty, 0x13, 0 );
+    TEST_ASSERT( stash.AddManifest( 0x13, empty.GetData(), empty.GetSize() ) == ToolchainStash::STASH_INVALID );
+
+    // Cut short
+    const size_t cuts[] = { 0, 7, 20 };
+    for ( const size_t cut : cuts )
+    {
+        TEST_ASSERT( stash.AddManifest( 0x11, manifest.GetData(), cut ) == ToolchainStash::STASH_INVALID );
+    }
+
+    // A file before its manifest, from a client that never sent one
+    TEST_ASSERT( stash.AddFile( 0x11, 0, "bytes", 5 ) == ToolchainStash::STASH_INVALID );
+    TEST_ASSERT( stash.HasManifest( 0x11 ) == false );
+    TEST_ASSERT( stash.GetNumFiles( 0x11 ) == 0 );
+    stash.DropIncomplete( 0x11 ); // Nothing to drop
+    stash.ReleaseUse( 0x11 );
+    TEST_ASSERT( CountFilesUnder( dir ) == 0 );
+
+    // A file the manifest does not list
+    TEST_ASSERT( stash.AddManifest( 0x11, manifest.GetData(), manifest.GetSize() ) == ToolchainStash::STASH_INCOMPLETE );
+    TEST_ASSERT( stash.AddFile( 0x11, 2, "bytes", 5 ) == ToolchainStash::STASH_INVALID );
+    TEST_ASSERT( stash.AddFile( 0x11, 0xFFFFFFFF, "bytes", 5 ) == ToolchainStash::STASH_INVALID );
+
+    // The same toolchain described with another number of files
+    MemoryStream other;
+    MakeStashManifest( other, 0x11, 3 );
+    TEST_ASSERT( stash.AddManifest( 0x11, other.GetData(), other.GetSize() ) == ToolchainStash::STASH_INVALID );
+
+    // None of it changed what is held
+    TEST_ASSERT( stash.GetNumFiles( 0x11 ) == 2 );
+    Array<uint32_t> missing;
+    stash.GetMissingFiles( 0x11, missing );
+    TEST_ASSERT( missing.GetSize() == 2 );
+    TEST_ASSERT( CountFilesUnder( dir ) == 1 );
+}
+
+// DuplicateUploadsAreIgnored
+//------------------------------------------------------------------------------
+void TestGateway::DuplicateUploadsAreIgnored() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+
+    const uint64_t toolId = 0x77;
+    MemoryStream manifest;
+    MakeStashManifest( manifest, toolId, 2 );
+    TEST_ASSERT( stash.AddManifest( toolId, manifest.GetData(), manifest.GetSize() ) == ToolchainStash::STASH_INCOMPLETE );
+    Array<char> file0;
+    Array<char> file1;
+    FillStashFile( toolId, 0, file0 );
+    FillStashFile( toolId, 1, file1 );
+    TEST_ASSERT( stash.AddFile( toolId, 0, file0.Begin(), file0.GetSize() ) == ToolchainStash::STASH_INCOMPLETE );
+
+    // Copies that differ, so that a replacement would show
+    MemoryStream otherManifest;
+    MakeStashManifest( otherManifest, toolId, 2 );
+    otherManifest.Write( (uint32_t)0x5555 ); // Trailing bytes
+    Array<char> otherFile;
+    otherFile.SetSize( 17 );
+    memset( otherFile.Begin(), 'Z', otherFile.GetSize() );
+
+    AStackString<> manifestPath;
+    uint32_t manifestSize = 0;
+    TEST_ASSERT( stash.GetManifestFile( toolId, manifestPath, manifestSize ) );
+    TEST_ASSERT( stash.AddManifest( toolId, otherManifest.GetData(), otherManifest.GetSize() ) == ToolchainStash::STASH_INCOMPLETE );
+    TEST_ASSERT( stash.AddFile( toolId, 0, otherFile.Begin(), otherFile.GetSize() ) == ToolchainStash::STASH_INCOMPLETE );
+    TEST_ASSERT( stash.IsComplete( toolId ) == false );
+    uint32_t size = 0;
+    TEST_ASSERT( stash.GetManifestFile( toolId, manifestPath, size ) && ( size == manifestSize ) );
+    TEST_ASSERT( StoredFileEquals( manifestPath, manifest.GetData(), manifest.GetSize() ) );
+    TEST_ASSERT( StashHoldsFile( stash, toolId, 0, file0 ) );
+
+    TEST_ASSERT( stash.AddFile( toolId, 1, file1.Begin(), file1.GetSize() ) == ToolchainStash::STASH_COMPLETE );
+    TEST_ASSERT( stash.AddFile( toolId, 1, otherFile.Begin(), otherFile.GetSize() ) == ToolchainStash::STASH_COMPLETE );
+    TEST_ASSERT( stash.AddManifest( toolId, otherManifest.GetData(), otherManifest.GetSize() ) == ToolchainStash::STASH_COMPLETE );
+    TEST_ASSERT( stash.AddFile( toolId, 0, otherFile.Begin(), otherFile.GetSize() ) == ToolchainStash::STASH_COMPLETE );
+    TEST_ASSERT( stash.GetManifestFile( toolId, manifestPath, size ) && ( size == manifestSize ) );
+    TEST_ASSERT( StoredFileEquals( manifestPath, manifest.GetData(), manifest.GetSize() ) );
+    TEST_ASSERT( StashHoldsFile( stash, toolId, 0, file0 ) );
+    TEST_ASSERT( StashHoldsFile( stash, toolId, 1, file1 ) );
+    TEST_ASSERT( CountFilesUnder( dir ) == 3 );
+}
+
+// StashEvictsTheLeastRecentlyUsedToolchainNotInUse
+//------------------------------------------------------------------------------
+void TestGateway::StashEvictsTheLeastRecentlyUsedToolchainNotInUse() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+
+    // Ids 1..kMaxToolchains, the first the least recently used
+    for ( uint64_t id = 1; id <= ToolchainStash::kMaxToolchains; ++id )
+    {
+        AddCompleteToStash( stash, id );
+    }
+    Array<uint64_t> complete;
+    stash.GetComplete( complete );
+    TEST_ASSERT( complete.GetSize() == ToolchainStash::kMaxToolchains );
+    TEST_ASSERT( complete[ 0 ] == ToolchainStash::kMaxToolchains ); // Most recently used first
+    TEST_ASSERT( complete[ ToolchainStash::kMaxToolchains - 1 ] == 1 );
+
+    // 1 is in use, and 2 is read: 3 is what is left to go
+    stash.AddUse( 1 );
+    AStackString<> path;
+    uint32_t size = 0;
+    TEST_ASSERT( stash.GetFile( 2, 0, path, size ) );
+    AddCompleteToStash( stash, 100 );
+
+    stash.GetComplete( complete );
+    TEST_ASSERT( complete.GetSize() == ToolchainStash::kMaxToolchains );
+    TEST_ASSERT( complete[ 0 ] == 100 );
+    TEST_ASSERT( IsInList( complete, 1 ) && IsInList( complete, 2 ) );
+    TEST_ASSERT( IsInList( complete, 3 ) == false );
+    TEST_ASSERT( stash.HasManifest( 3 ) == false );
+    AStackString<> evictedDir;
+    GetStashToolchainDir( dir, 3, evictedDir );
+    TEST_ASSERT( FileIO::DirectoryExists( evictedDir ) == false );
+    TEST_ASSERT( CountFilesUnder( dir ) == ( 2 * ToolchainStash::kMaxToolchains ) );
+
+    // One being received is never what goes, but it takes a place
+    TEST_ASSERT( AddStashManifest( stash, 200, 2 ) == ToolchainStash::STASH_INCOMPLETE );
+    stash.GetComplete( complete );
+    TEST_ASSERT( complete.GetSize() == ( ToolchainStash::kMaxToolchains - 1 ) );
+    TEST_ASSERT( stash.HasManifest( 200 ) );
+    TEST_ASSERT( IsInList( complete, 1 ) );
+}
+
+// PinnedToolchainIsNeverEvicted
+//------------------------------------------------------------------------------
+void TestGateway::PinnedToolchainIsNeverEvicted() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+
+    AddCompleteToStash( stash, 1000 );
+    stash.AddUse( 1000 );
+    stash.AddUse( 1000 ); // Two clients advertised it
+    for ( uint64_t id = 1; id <= ( 2 * ToolchainStash::kMaxToolchains ); ++id )
+    {
+        AddCompleteToStash( stash, id );
+    }
+    TEST_ASSERT( stash.IsComplete( 1000 ) );
+    Array<char> file;
+    FillStashFile( 1000, 0, file );
+    Array<uint64_t> complete;
+    stash.GetComplete( complete );
+    TEST_ASSERT( complete.GetSize() == ToolchainStash::kMaxToolchains );
+
+    // Held until the last use ends, then it goes like any other
+    stash.ReleaseUse( 1000 );
+    for ( uint64_t id = 5000; id < ( 5000 + ToolchainStash::kMaxToolchains ); ++id )
+    {
+        AddCompleteToStash( stash, id );
+    }
+    TEST_ASSERT( StashHoldsFile( stash, 1000, 0, file ) );
+    stash.ReleaseUse( 1000 );
+    for ( uint64_t id = 6000; id < ( 6000 + ToolchainStash::kMaxToolchains ); ++id )
+    {
+        AddCompleteToStash( stash, id );
+    }
+    TEST_ASSERT( stash.IsComplete( 1000 ) == false );
+    stash.GetComplete( complete );
+    TEST_ASSERT( complete.GetSize() == ToolchainStash::kMaxToolchains );
+    AStackString<> evictedDir;
+    GetStashToolchainDir( dir, 1000, evictedDir );
+    TEST_ASSERT( FileIO::DirectoryExists( evictedDir ) == false );
 }
 
 //------------------------------------------------------------------------------
