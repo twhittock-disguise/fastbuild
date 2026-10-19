@@ -375,6 +375,11 @@ private:
     void DuplicateUploadsAreIgnored() const;
     void StashEvictsTheLeastRecentlyUsedToolchainNotInUse() const;
     void PinnedToolchainIsNeverEvicted() const;
+    void FileWithTheManifestSlotIdIsRejected() const;
+    void AdvertisedPinSurvivesUntilTheToolchainArrives() const;
+    void ReleaseWithoutUseKeepsLaterPins() const;
+    void DroppingAnIncompleteToolchainKeepsItsPins() const;
+    void ReUploadDuringAPendingDeleteEndsIntact() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -436,6 +441,11 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( DuplicateUploadsAreIgnored )
     REGISTER_TEST( StashEvictsTheLeastRecentlyUsedToolchainNotInUse )
     REGISTER_TEST( PinnedToolchainIsNeverEvicted )
+    REGISTER_TEST( FileWithTheManifestSlotIdIsRejected )
+    REGISTER_TEST( AdvertisedPinSurvivesUntilTheToolchainArrives )
+    REGISTER_TEST( ReleaseWithoutUseKeepsLaterPins )
+    REGISTER_TEST( DroppingAnIncompleteToolchainKeepsItsPins )
+    REGISTER_TEST( ReUploadDuringAPendingDeleteEndsIntact )
 REGISTER_TESTS_END
 
 // PreTest
@@ -1759,6 +1769,219 @@ void TestGateway::PinnedToolchainIsNeverEvicted() const
     AStackString<> evictedDir;
     GetStashToolchainDir( dir, 1000, evictedDir );
     TEST_ASSERT( FileIO::DirectoryExists( evictedDir ) == false );
+}
+
+// FileWithTheManifestSlotIdIsRejected
+//------------------------------------------------------------------------------
+void TestGateway::FileWithTheManifestSlotIdIsRejected() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+
+    // For a toolchain nobody has sent a manifest of
+    TEST_ASSERT( stash.AddFile( 0x31, 0xFFFFFFFF, "bytes", 5 ) == ToolchainStash::STASH_INVALID );
+    TEST_ASSERT( stash.HasManifest( 0x31 ) == false );
+    TEST_ASSERT( stash.IsComplete( 0x31 ) == false );
+    TEST_ASSERT( stash.GetNumFiles( 0x31 ) == 0 );
+    Array<uint64_t> complete;
+    stash.GetComplete( complete );
+    TEST_ASSERT( complete.IsEmpty() );
+    TEST_ASSERT( CountFilesUnder( dir ) == 0 );
+
+    // And for one that exists
+    TEST_ASSERT( AddStashManifest( stash, 0x32, 1 ) == ToolchainStash::STASH_INCOMPLETE );
+    TEST_ASSERT( stash.AddFile( 0x32, 0xFFFFFFFF, "bytes", 5 ) == ToolchainStash::STASH_INVALID );
+    TEST_ASSERT( CountFilesUnder( dir ) == 1 );
+}
+
+// AdvertisedPinSurvivesUntilTheToolchainArrives
+//------------------------------------------------------------------------------
+namespace
+{
+    // Fills the stash past its limit with toolchains nobody uses
+    void AddPressureToStash( ToolchainStash & stash, uint64_t firstId )
+    {
+        for ( uint64_t id = firstId; id < ( firstId + ( 2 * ToolchainStash::kMaxToolchains ) ); ++id )
+        {
+            AddCompleteToStash( stash, id );
+        }
+    }
+}
+
+void TestGateway::AdvertisedPinSurvivesUntilTheToolchainArrives() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+
+    // A job pins its toolchain before the manifest arrives
+    stash.AddUse( 50 );
+    TEST_ASSERT( stash.HasManifest( 50 ) == false );
+    AddCompleteToStash( stash, 50 );
+    AddPressureToStash( stash, 1000 );
+    TEST_ASSERT( stash.IsComplete( 50 ) );
+
+    // Only the matching release lets it go
+    stash.ReleaseUse( 50 );
+    AddPressureToStash( stash, 2000 );
+    TEST_ASSERT( stash.IsComplete( 50 ) == false );
+}
+
+// ReleaseWithoutUseKeepsLaterPins
+//------------------------------------------------------------------------------
+void TestGateway::ReleaseWithoutUseKeepsLaterPins() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+
+    // A release with nothing to release leaves no debt for a later use to pay
+    stash.ReleaseUse( 60 );
+    stash.AddUse( 60 );
+    AddCompleteToStash( stash, 60 );
+    AddPressureToStash( stash, 1000 );
+    TEST_ASSERT( stash.IsComplete( 60 ) );
+
+    // Extra releases do not take a later pin with them
+    stash.AddUse( 61 );
+    AddCompleteToStash( stash, 61 );
+    stash.ReleaseUse( 61 );
+    stash.ReleaseUse( 61 );
+    stash.AddUse( 61 );
+    AddPressureToStash( stash, 2000 );
+    TEST_ASSERT( stash.IsComplete( 61 ) );
+    stash.ReleaseUse( 61 );
+    AddPressureToStash( stash, 3000 );
+    TEST_ASSERT( stash.IsComplete( 61 ) == false );
+}
+
+// DroppingAnIncompleteToolchainKeepsItsPins
+//------------------------------------------------------------------------------
+void TestGateway::DroppingAnIncompleteToolchainKeepsItsPins() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+
+    stash.AddUse( 80 );
+    TEST_ASSERT( AddStashManifest( stash, 80, 2 ) == ToolchainStash::STASH_INCOMPLETE );
+    stash.DropIncomplete( 80 );
+    TEST_ASSERT( stash.HasManifest( 80 ) == false );
+
+    // Another client sends it again
+    AddCompleteToStash( stash, 80, 2 );
+    AddPressureToStash( stash, 1000 );
+    TEST_ASSERT( stash.IsComplete( 80 ) );
+    stash.ReleaseUse( 80 );
+    AddPressureToStash( stash, 2000 );
+    TEST_ASSERT( stash.IsComplete( 80 ) == false );
+}
+
+// ReUploadDuringAPendingDeleteEndsIntact
+//------------------------------------------------------------------------------
+namespace
+{
+    struct StalledDelete
+    {
+        static void Hook( void * param )
+        {
+            StalledDelete * self = static_cast<StalledDelete *>( param );
+            self->m_Entered.Store( true );
+            while ( self->m_Release.Load() == false )
+            {
+                Thread::Sleep( 1 );
+            }
+        }
+
+        Atomic<bool> m_Entered{ false };
+        Atomic<bool> m_Release{ false };
+    };
+
+    struct StashUploader
+    {
+        static uint32_t EvictorFunc( void * param )
+        {
+            // Takes the place after the last one, which evicts toolchain 1
+            StashUploader * self = static_cast<StashUploader *>( param );
+            MemoryStream ms;
+            MakeStashManifest( ms, 500, 1 );
+            self->m_Stash->AddManifest( 500, ms.GetData(), ms.GetSize() );
+            Array<char> bytes;
+            FillStashFile( 500, 0, bytes );
+            self->m_Stash->AddFile( 500, 0, bytes.Begin(), bytes.GetSize() );
+            return 0;
+        }
+        static uint32_t ReUploadFunc( void * param )
+        {
+            StashUploader * self = static_cast<StashUploader *>( param );
+            MemoryStream ms;
+            MakeStashManifest( ms, 1, 2 );
+            self->m_ManifestResult = self->m_Stash->AddManifest( 1, ms.GetData(), ms.GetSize() );
+            Array<char> bytes;
+            for ( uint32_t i = 0; i < 2; ++i )
+            {
+                FillStashFile( 1, i, bytes );
+                self->m_FileResult = self->m_Stash->AddFile( 1, i, bytes.Begin(), bytes.GetSize() );
+            }
+            self->m_Done.Store( true );
+            return 0;
+        }
+
+        ToolchainStash *            m_Stash = nullptr;
+        ToolchainStash::Result      m_ManifestResult = ToolchainStash::STASH_INVALID;
+        ToolchainStash::Result      m_FileResult = ToolchainStash::STASH_INVALID;
+        Atomic<bool>                m_Done{ false };
+    };
+}
+
+void TestGateway::ReUploadDuringAPendingDeleteEndsIntact() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+    for ( uint64_t id = 1; id <= ToolchainStash::kMaxToolchains; ++id )
+    {
+        AddCompleteToStash( stash, id, 2 );
+    }
+
+    // Toolchain 1 is evicted, and its directory delete stalls
+    StalledDelete stall;
+    stash.SetBeforeDeleteHook( StalledDelete::Hook, &stall );
+    StashUploader uploader;
+    uploader.m_Stash = &stash;
+    Thread evictor;
+    evictor.Start( StashUploader::EvictorFunc, "StashEvictor", &uploader );
+    TEST_ASSERT( WaitUntil( [ &stall ]() { return stall.m_Entered.Load(); } ) );
+    TEST_ASSERT( stash.IsComplete( 1 ) == false );
+
+    // A client sends it again meanwhile
+    Thread reuploader;
+    reuploader.Start( StashUploader::ReUploadFunc, "StashReUpload", &uploader );
+    Thread::Sleep( 100 );
+    stall.m_Release.Store( true );
+    evictor.Join();
+    const bool done = WaitUntil( [ &uploader ]() { return uploader.m_Done.Load(); } );
+    reuploader.Join();
+    stash.SetBeforeDeleteHook( nullptr, nullptr );
+    TEST_ASSERT( done );
+
+    // What the delete removed is what was evicted, not what arrived
+    TEST_ASSERT( uploader.m_ManifestResult != ToolchainStash::STASH_INVALID );
+    TEST_ASSERT( uploader.m_FileResult == ToolchainStash::STASH_COMPLETE );
+    TEST_ASSERT( stash.IsComplete( 1 ) );
+    Array<char> file;
+    for ( uint32_t i = 0; i < 2; ++i )
+    {
+        FillStashFile( 1, i, file );
+        TEST_ASSERT( StashHoldsFile( stash, 1, i, file ) );
+    }
+    MemoryStream manifest;
+    MakeStashManifest( manifest, 1, 2 );
+    AStackString<> path;
+    uint32_t size = 0;
+    TEST_ASSERT( stash.GetManifestFile( 1, path, size ) );
+    TEST_ASSERT( StoredFileEquals( path, manifest.GetData(), manifest.GetSize() ) );
 }
 
 //------------------------------------------------------------------------------

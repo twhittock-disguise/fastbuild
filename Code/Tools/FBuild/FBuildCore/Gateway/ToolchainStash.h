@@ -42,6 +42,9 @@ public:
     void ReleaseUse( uint64_t toolId );
     void DropIncomplete( uint64_t toolId );
 
+    // Called, with no lock held, before the directories of removed toolchains are deleted (tests stall it)
+    void SetBeforeDeleteHook( void ( *hook )( void * ), void * userData ) { m_BeforeDelete = hook; m_BeforeDeleteUserData = userData; }
+
 private:
     enum SlotState : uint8_t { SLOT_EMPTY, SLOT_WRITING, SLOT_HELD };
 
@@ -65,18 +68,25 @@ private:
     static constexpr uint32_t kManifestSlot = 0xFFFFFFFF;
 
     Result Write( uint64_t toolId, uint32_t slot, uint32_t numFiles, const void * payload, size_t payloadSize );
+    Result Claim( uint64_t toolId, uint32_t slot, uint32_t numFiles, Array<uint64_t> & outToDelete, bool & outClaimed, bool & outMustWait );
+    uint32_t GetNumPins( uint64_t toolId ) const;
     Entry * Find( uint64_t toolId ) const;
-    void Remove( Entry * entry, Array<AString> & outDirectories );
-    void Trim( Array<AString> & outDirectories );
+    void Remove( Entry * entry, Array<uint64_t> & outToolIds );
+    void Trim( Array<uint64_t> & outToolIds );
     void GetToolchainDirectory( uint64_t toolId, AString & outDirectory ) const;
     void GetSlotPath( uint64_t toolId, uint32_t slot, AString & outPath ) const;
-    static void DeleteDirectories( const Array<AString> & directories );
+    void DeleteToolchains( const Array<uint64_t> & toolIds );
     void Scan();
 
     AString             m_Directory;    // With a trailing slash
     mutable Mutex       m_Mutex;
     Array<Entry>        m_Entries;
+    Array<uint64_t>     m_PinIds;       // Pins are per toolchain id, and outlive the entry
+    Array<uint32_t>     m_PinCounts;
+    Array<uint64_t>     m_Deleting;     // Removed toolchains whose directory is not yet deleted
     mutable uint64_t    m_Clock = 0;
+    void ( *m_BeforeDelete )( void * ) = nullptr;
+    void *              m_BeforeDeleteUserData = nullptr;
 };
 
 //------------------------------------------------------------------------------

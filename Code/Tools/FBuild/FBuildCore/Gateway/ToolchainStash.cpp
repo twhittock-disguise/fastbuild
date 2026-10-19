@@ -7,6 +7,7 @@
 
 // Core
 #include "Core/Env/Assert.h"
+#include "Core/Process/Thread.h"
 #include "Core/FileIO/ConstMemoryStream.h"
 #include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/FileStream.h"
@@ -26,6 +27,9 @@ namespace
 
     // A manifest claiming more files than this is not one a client has
     constexpr uint32_t kMaxFilesPerToolchain = 65536;
+
+    // How long a manifest waits for the directory of the same toolchain to finish being deleted
+    constexpr uint32_t kMaxDeleteWaitMs = 30000;
 
     // The part of a manifest the stash reads (ToolManifest::DeserializeFromRemote)
     bool ReadManifestHeader( const void * payload, size_t payloadSize, uint64_t toolId, uint32_t & outNumFiles )
@@ -158,7 +162,66 @@ ToolchainStash::Result ToolchainStash::AddManifest( uint64_t toolId, const void 
 //------------------------------------------------------------------------------
 ToolchainStash::Result ToolchainStash::AddFile( uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize )
 {
+    if ( fileId == kManifestSlot )
+    {
+        return STASH_INVALID;
+    }
     return Write( toolId, fileId, 0, payload, payloadSize );
+}
+
+// Claim
+//------------------------------------------------------------------------------
+// Takes the slot for a write, creating the toolchain for a manifest. Not claimed: the
+// result is the answer (a duplicate, or invalid), or mustWait says to try again.
+ToolchainStash::Result ToolchainStash::Claim( uint64_t toolId, uint32_t slot, uint32_t numFiles, Array<uint64_t> & outToDelete, bool & outClaimed, bool & outMustWait )
+{
+    MutexHolder mh( m_Mutex );
+    Entry * entry = Find( toolId );
+    if ( slot == kManifestSlot )
+    {
+        if ( entry == nullptr )
+        {
+            if ( m_Deleting.Find( toolId ) )
+            {
+                outMustWait = true;
+                return STASH_INVALID;
+            }
+            Entry & added = m_Entries.EmplaceBack();
+            added.m_ToolId = toolId;
+            added.m_NumFiles = numFiles;
+            added.m_FileStates.SetSize( numFiles );
+            added.m_FileSizes.SetSize( numFiles );
+            for ( SlotState & state : added.m_FileStates )
+            {
+                state = SLOT_EMPTY;
+            }
+            for ( uint32_t & size : added.m_FileSizes )
+            {
+                size = 0;
+            }
+            Trim( outToDelete );
+            entry = Find( toolId ); // Trim does not remove it, but it may have moved the array
+        }
+        else if ( entry->m_NumFiles != numFiles )
+        {
+            return STASH_INVALID;
+        }
+    }
+    else if ( ( entry == nullptr ) || ( slot >= entry->m_NumFiles ) )
+    {
+        return STASH_INVALID; // A file with no manifest to say it belongs
+    }
+    entry->m_LastUse = ++m_Clock;
+
+    SlotState & state = ( slot == kManifestSlot ) ? entry->m_ManifestState : entry->m_FileStates[ slot ];
+    if ( state != SLOT_EMPTY )
+    {
+        return entry->IsComplete() ? STASH_COMPLETE : STASH_INCOMPLETE; // Already held, or being written
+    }
+    state = SLOT_WRITING;
+    ++entry->m_NumWrites;
+    outClaimed = true;
+    return STASH_INCOMPLETE;
 }
 
 // Write
@@ -172,51 +235,30 @@ ToolchainStash::Result ToolchainStash::Write( uint64_t toolId, uint32_t slot, ui
         return STASH_INVALID;
     }
 
-    Array<AString> toDelete;
+    Array<uint64_t> toDelete;
+    for ( uint32_t attempt = 0;; ++attempt )
     {
-        MutexHolder mh( m_Mutex );
-        Entry * entry = Find( toolId );
-        if ( slot == kManifestSlot )
+        bool claimed = false;
+        bool mustWait = false;
+        const Result early = Claim( toolId, slot, numFiles, toDelete, claimed, mustWait );
+        DeleteToolchains( toDelete );
+        toDelete.Clear();
+        if ( mustWait )
         {
-            if ( entry == nullptr )
-            {
-                Entry & added = m_Entries.EmplaceBack();
-                added.m_ToolId = toolId;
-                added.m_NumFiles = numFiles;
-                added.m_FileStates.SetSize( numFiles );
-                added.m_FileSizes.SetSize( numFiles );
-                for ( SlotState & state : added.m_FileStates )
-                {
-                    state = SLOT_EMPTY;
-                }
-                for ( uint32_t & size : added.m_FileSizes )
-                {
-                    size = 0;
-                }
-                Trim( toDelete );
-                entry = Find( toolId ); // Trim does not remove it, but it may have moved the array
-            }
-            else if ( entry->m_NumFiles != numFiles )
+            // The toolchain was just evicted and its directory is still being deleted
+            if ( attempt >= kMaxDeleteWaitMs )
             {
                 return STASH_INVALID;
             }
+            Thread::Sleep( 1 );
+            continue;
         }
-        else if ( ( entry == nullptr ) || ( slot >= entry->m_NumFiles ) )
+        if ( claimed == false )
         {
-            return STASH_INVALID; // A file with no manifest to say it belongs
+            return early;
         }
-        entry->m_LastUse = ++m_Clock;
-
-        SlotState & state = ( slot == kManifestSlot ) ? entry->m_ManifestState : entry->m_FileStates[ slot ];
-        if ( state != SLOT_EMPTY )
-        {
-            return entry->IsComplete() ? STASH_COMPLETE : STASH_INCOMPLETE; // Already held, or being written
-        }
-        state = SLOT_WRITING;
-        ++entry->m_NumWrites;
+        break;
     }
-    DeleteDirectories( toDelete );
-    toDelete.Clear();
 
     AStackString<> directory;
     AStackString<> path;
@@ -262,7 +304,7 @@ ToolchainStash::Result ToolchainStash::Write( uint64_t toolId, uint32_t slot, ui
             Trim( toDelete );
         }
     }
-    DeleteDirectories( toDelete );
+    DeleteToolchains( toDelete );
     return result;
 }
 
@@ -370,10 +412,19 @@ uint32_t ToolchainStash::GetNumFiles( uint64_t toolId ) const
 void ToolchainStash::AddUse( uint64_t toolId )
 {
     MutexHolder mh( m_Mutex );
+    for ( size_t i = 0; i < m_PinIds.GetSize(); ++i )
+    {
+        if ( m_PinIds[ i ] == toolId )
+        {
+            ++m_PinCounts[ i ];
+            return;
+        }
+    }
+    m_PinIds.Append( toolId );
+    m_PinCounts.Append( 1 );
     Entry * entry = Find( toolId );
     if ( entry )
     {
-        ++entry->m_NumUses;
         entry->m_LastUse = ++m_Clock;
     }
 }
@@ -382,25 +433,31 @@ void ToolchainStash::AddUse( uint64_t toolId )
 //------------------------------------------------------------------------------
 void ToolchainStash::ReleaseUse( uint64_t toolId )
 {
-    Array<AString> toDelete;
+    Array<uint64_t> toDelete;
     {
         MutexHolder mh( m_Mutex );
-        Entry * entry = Find( toolId );
-        if ( ( entry == nullptr ) || ( entry->m_NumUses == 0 ) )
+        for ( size_t i = 0; i < m_PinIds.GetSize(); ++i )
         {
-            return;
+            if ( m_PinIds[ i ] == toolId )
+            {
+                if ( --m_PinCounts[ i ] == 0 )
+                {
+                    m_PinIds.EraseIndex( i );
+                    m_PinCounts.EraseIndex( i );
+                }
+                Trim( toDelete );
+                break;
+            }
         }
-        --entry->m_NumUses;
-        Trim( toDelete );
     }
-    DeleteDirectories( toDelete );
+    DeleteToolchains( toDelete );
 }
 
 // DropIncomplete
 //------------------------------------------------------------------------------
 void ToolchainStash::DropIncomplete( uint64_t toolId )
 {
-    Array<AString> toDelete;
+    Array<uint64_t> toDelete;
     {
         MutexHolder mh( m_Mutex );
         Entry * entry = Find( toolId );
@@ -417,7 +474,7 @@ void ToolchainStash::DropIncomplete( uint64_t toolId )
             Remove( entry, toDelete );
         }
     }
-    DeleteDirectories( toDelete );
+    DeleteToolchains( toDelete );
 }
 
 // Find
@@ -434,17 +491,32 @@ ToolchainStash::Entry * ToolchainStash::Find( uint64_t toolId ) const
     return nullptr;
 }
 
+// GetNumPins
+//------------------------------------------------------------------------------
+uint32_t ToolchainStash::GetNumPins( uint64_t toolId ) const
+{
+    for ( size_t i = 0; i < m_PinIds.GetSize(); ++i )
+    {
+        if ( m_PinIds[ i ] == toolId )
+        {
+            return m_PinCounts[ i ];
+        }
+    }
+    return 0;
+}
+
 // Remove
 //------------------------------------------------------------------------------
-void ToolchainStash::Remove( Entry * entry, Array<AString> & outDirectories )
+void ToolchainStash::Remove( Entry * entry, Array<uint64_t> & outToolIds )
 {
-    GetToolchainDirectory( entry->m_ToolId, outDirectories.EmplaceBack() );
+    outToolIds.Append( entry->m_ToolId );
+    m_Deleting.Append( entry->m_ToolId ); // Until its directory is gone, the id is not taken again
     m_Entries.Erase( entry );
 }
 
 // Trim
 //------------------------------------------------------------------------------
-void ToolchainStash::Trim( Array<AString> & outDirectories )
+void ToolchainStash::Trim( Array<uint64_t> & outToolIds )
 {
     while ( m_Entries.GetSize() > kMaxToolchains )
     {
@@ -452,7 +524,7 @@ void ToolchainStash::Trim( Array<AString> & outDirectories )
         for ( Entry & entry : m_Entries )
         {
             // One being received is kept: its client is still sending it
-            if ( entry.IsComplete() && ( entry.m_NumUses == 0 ) && ( ( oldest == nullptr ) || ( entry.m_LastUse < oldest->m_LastUse ) ) )
+            if ( entry.IsComplete() && ( GetNumPins( entry.m_ToolId ) == 0 ) && ( ( oldest == nullptr ) || ( entry.m_LastUse < oldest->m_LastUse ) ) )
             {
                 oldest = &entry;
             }
@@ -461,7 +533,7 @@ void ToolchainStash::Trim( Array<AString> & outDirectories )
         {
             return;
         }
-        Remove( oldest, outDirectories );
+        Remove( oldest, outToolIds );
     }
 }
 
@@ -488,24 +560,29 @@ void ToolchainStash::GetSlotPath( uint64_t toolId, uint32_t slot, AString & outP
     }
 }
 
-// DeleteDirectories
+// DeleteToolchains
 //------------------------------------------------------------------------------
-/*static*/ void ToolchainStash::DeleteDirectories( const Array<AString> & directories )
+void ToolchainStash::DeleteToolchains( const Array<uint64_t> & toolIds )
 {
-    for ( const AString & directory : directories )
+    if ( m_BeforeDelete && ( toolIds.IsEmpty() == false ) )
     {
+        m_BeforeDelete( m_BeforeDeleteUserData );
+    }
+    for ( const uint64_t toolId : toolIds )
+    {
+        AStackString<> directory;
+        GetToolchainDirectory( toolId, directory );
         Array<AString> files;
         FileIO::GetFiles( directory, AStackString<>( "*" ), false, &files );
         for ( const AString & file : files )
         {
             FileIO::FileDelete( file.Get() );
         }
-        AStackString<> withoutSlash( directory );
-        if ( withoutSlash.EndsWith( NATIVE_SLASH ) )
-        {
-            withoutSlash.Trim( 0, 1 );
-        }
-        FileIO::DirectoryDelete( withoutSlash );
+        directory.Trim( 0, 1 ); // The slash
+        FileIO::DirectoryDelete( directory );
+
+        MutexHolder mh( m_Mutex );
+        m_Deleting.FindAndErase( toolId );
     }
 }
 
@@ -578,7 +655,7 @@ void ToolchainStash::Scan()
     }
 
     Array<uint64_t> times; // Of each held toolchain's manifest, parallel to m_Entries
-    Array<AString> unusable;
+    Array<uint64_t> unusable;
     for ( const ScannedToolchain & toolchain : found )
     {
         Entry entry;
@@ -634,10 +711,10 @@ void ToolchainStash::Scan()
         }
         else
         {
-            GetToolchainDirectory( toolchain.m_ToolId, unusable.EmplaceBack() );
+            unusable.Append( toolchain.m_ToolId );
         }
     }
-    DeleteDirectories( unusable );
+    DeleteToolchains( unusable );
 
     // The one written longest ago counts as the least recently used
     Array<size_t> order;
@@ -651,9 +728,9 @@ void ToolchainStash::Scan()
         m_Entries[ i ].m_LastUse = ++m_Clock;
     }
 
-    Array<AString> toDelete;
+    Array<uint64_t> toDelete;
     Trim( toDelete );
-    DeleteDirectories( toDelete );
+    DeleteToolchains( toDelete );
 }
 
 //------------------------------------------------------------------------------
