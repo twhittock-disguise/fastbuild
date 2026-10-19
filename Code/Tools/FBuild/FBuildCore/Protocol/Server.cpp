@@ -588,25 +588,19 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     SendTo( *cs, ack );
 
     // Send PCH inventory so coordinator knows what's already cached
-    if ( capabilities & Protocol::CAP_PCH_INVENTORY )
+    Array<uint64_t> pchIds;
     {
-        Array<uint64_t> pchIds;
+        MutexHolder mh( m_PchCacheMutex );
+        for ( const PchCacheEntry & e : m_PchCache )
         {
-            MutexHolder mh( m_PchCacheMutex );
-            for ( const PchCacheEntry & e : m_PchCache )
-            {
-                pchIds.Append( e.pchId );
-            }
+            pchIds.Append( e.pchId );
         }
-        SendIdInventory<Protocol::MsgPchInventory>( *cs, pchIds );
     }
+    SendIdInventory<Protocol::MsgPchInventory>( *cs, pchIds );
 
     // Send toolchain inventory so coordinator can skip sending toolchains we already have.
     // It follows the PCH inventory, so the coordinator knows both have arrived.
-    if ( capabilities & Protocol::CAP_TOOLCHAIN_INVENTORY )
-    {
-        SendToolchainInventory( *cs );
-    }
+    SendToolchainInventory( *cs );
 }
 
 // Process( MsgJob )
@@ -888,10 +882,6 @@ void Server::ReleaseReadyWaitingJobs()
 //------------------------------------------------------------------------------
 void Server::RequestPchIfMissing( ClientState & cs, uint64_t pchId )
 {
-    if ( ( cs.m_Capabilities & Protocol::CAP_PCH_REQUEST ) == 0 )
-    {
-        return; // This client would not know the message
-    }
     if ( cs.m_PchNeededSent.Find( pchId ) || IsPchCached( pchId ) || IsPchBeingReceived( pchId ) )
     {
         return;
@@ -1730,14 +1720,13 @@ void Server::UnpackPch( uint64_t pchId )
     }
     else if ( result == PchBlob::UNPACK_CORRUPT )
     {
-        // A client that can is asked for it again. The others cannot be, so their jobs go back to them.
+        // Clients are asked for it again when a job needs it
         FLOG_WARN( "PCH 0x%016" PRIx64 " is damaged: dropping it\n", pchId );
-        DisconnectClientsWaitingForPch( pchId, true /*onlyThoseThatCannotAsk*/ );
     }
     else
     {
         FLOG_WARN( "PCH 0x%016" PRIx64 " cannot be unpacked, as its working copy cannot be written: returning the jobs that need it to their clients\n", pchId );
-        DisconnectClientsWaitingForPch( pchId, false );
+        DisconnectClientsWaitingForPch( pchId );
         return; // Nothing changed for the jobs of other clients: they would only ask for it to be unpacked again
     }
 
@@ -1747,7 +1736,7 @@ void Server::UnpackPch( uint64_t pchId )
 
 // DisconnectClientsWaitingForPch
 //------------------------------------------------------------------------------
-void Server::DisconnectClientsWaitingForPch( uint64_t pchId, bool onlyThoseThatCannotAsk )
+void Server::DisconnectClientsWaitingForPch( uint64_t pchId )
 {
     // Their jobs are cancelled and so go back to the clients, to be built elsewhere
     Array<const ConnectionInfo *> connections;
@@ -1756,10 +1745,6 @@ void Server::DisconnectClientsWaitingForPch( uint64_t pchId, bool onlyThoseThatC
         for ( ClientState * cs : m_ClientList )
         {
             MutexHolder mh( cs->m_Mutex );
-            if ( onlyThoseThatCannotAsk && ( cs->m_Capabilities & Protocol::CAP_PCH_REQUEST ) )
-            {
-                continue;
-            }
             for ( const Job * job : cs->m_WaitingJobs )
             {
                 if ( ( job->GetPchId() == pchId ) && job->GetPchCachePath().IsEmpty() )

@@ -225,9 +225,8 @@ private:
     uint64_t CountRawPchBytes() const; // Caller holds m_PchCacheMutex
     PchRawEntry * FindRawPch( uint64_t pchId ); // Caller holds m_PchCacheMutex
 
-    // Disconnects the clients with jobs waiting for the PCH, so that the jobs go back to them. Only the
-    // clients that cannot ask for a PCH again, or all of them.
-    void DisconnectClientsWaitingForPch( uint64_t pchId, bool onlyThoseThatCannotAsk );
+    // Disconnects the clients with jobs waiting for the PCH, so that the jobs go back to them.
+    void DisconnectClientsWaitingForPch( uint64_t pchId );
 
     // Oldest entries first, skipping those in pchIdsInUse, until the entries are within budgetBytes
     // and kMaxCachedPchEntries (but not below minEntries because of the bytes)

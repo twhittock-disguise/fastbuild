@@ -82,11 +82,10 @@ public:
     // with no entry, are dropped from pending. READY ones are dropped and returned in outReady,
     // in the order they were pending. Ones still compressing are skipped and stay pending, so a
     // slow one does not hold up the rest. Returns false if any failed for good (those are dropped).
-    // allowTransform is whether the worker reads a PCH that was transformed (see GetCompressed).
+    // The transformed form is tried for each (see GetCompressed).
     bool TakeReadyPchs( Array<uint64_t> & pending,
                         const Array<uint64_t> & onWorker,
-                        Array<ReadyPch> & outReady,
-                        bool allowTransform = false );
+                        Array<ReadyPch> & outReady );
 
     // Clear all cached entries and delete their compressed files (call at build end)
     void Clear();

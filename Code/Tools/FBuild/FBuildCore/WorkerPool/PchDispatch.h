@@ -36,7 +36,7 @@ public:
 
     // The PCH has reached the worker: it was reported, or was handed to the socket in full.
     // The worker evicts PCHs the coordinator cannot see, so this can stop being true: a worker that
-    // can (CAP_PCH_REQUEST) asks for the PCH again when a job needs it (OnNeeded).
+    // asks for the PCH again when a job needs it (OnNeeded).
     void OnDelivered( uint64_t pchId )
     {
         m_Sending.FindAndErase( pchId );

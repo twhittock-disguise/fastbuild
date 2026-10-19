@@ -94,7 +94,6 @@ private:
     void PchThatCannotBeWrittenIsKept() const;
     void PchThatCannotBeWrittenReturnsItsJobs() const;
     void CorruptPchIsAskedForAgain() const;
-    void CorruptPchIsReturnedToAClientThatCannotAsk() const;
     void PchUnpackIsSingleFlight() const;
     void UnpackSkipsAPchNoJobNeeds() const;
     void UnpackedCopyLivesWithItsJobs() const;
@@ -149,10 +148,7 @@ private:
 #if defined( __WINDOWS__ )
     void HostNameIsBoundedByTheFrame() const;
 #endif
-    void CapabilitiesAreExchanged() const;
-    void PchNeededMessageAndCapability() const;
     void WorkerAsksForAMissingPch() const;
-    void WorkerDoesNotAskAClientWithoutTheCapability() const;
     void WorkerDoesNotAskForAPchBeingReceived() const;
     void WorkerAsksAgainWhenAPchItHadIsNeededAgain() const;
     void ClientSendsAPchAgainWhenAsked() const;
@@ -161,17 +157,16 @@ private:
     void EvictedPchIsSentAgain() const;
     void MSVCWorkerFailuresAreRetriedElsewhere() const;
     void MSVCFailureOfARemoteJobIsASystemError() const;
-    void ServerSendsOnlyWhatTheClientAdvertises() const;
+    void ServerSendsBothInventoriesAfterTheAck() const;
     void ClientRefusesAWorkerThatRefusesIt() const;
     void ClientRefusesAnAckOfAnotherMajor() const;
     void ClientRejectsAShortAck() const;
     void ClientRejectsAnAckWithAPayload() const;
-    void ClientDoesNotWaitForInventoriesTheWorkerLacks() const;
-    void ClientIgnoresCapabilitiesItDidNotAdvertise() const;
+    void ClientSendsJobsOnceTheInventoriesHaveArrived() const;
+    void ClientNeverHangsWithoutInventories() const;
     void ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend() const;
     void ClientIsNotStuckWhenTheConnectionEndsBeforeAPchIsDelivered() const;
     void JobPushedAsTheConnectionEndsIsReturned() const;
-    void PchTransformCapabilityIsNegotiated() const;
     void PchIsCompressedInTheFormsWorkersRead() const;
     void PchTransformThatFailsIsNotSent() const;
     void PchIsCompressedWithTheWindowOfItsSize() const;
@@ -180,8 +175,7 @@ private:
     void WorkerRejectsATransformedPchThatIsNotValid() const;
     void StoredTransformedPchThatCannotBeInvertedIsDropped() const;
 #if defined( __WINDOWS__ )
-    void ClientSendsTheTransformedPchOnlyToWorkersThatReadIt() const;
-    void WorkersOfBothKindsAreSentTheirForms() const;
+    void ClientSendsTheTransformedPch() const;
     void PchTransformedThroughTheBuild() const;
     void PchTransformFallsBackThroughTheBuild() const;
 #endif
@@ -326,9 +320,6 @@ private:
     static uint32_t GetBlobType( const Array<char> & blob ); // The first word of its header
     static uint64_t GetStatsLogSize(); // The log is shared by every FBuild on the machine, and a test looks at what is added to it
     static bool CountInStatsLogSince( uint64_t sizeBefore, const char * text, uint32_t & outCount ); // False if the log was rotated
-    // The PCH of the header of the fixture (Data/TestDistributed/PrecompiledHeader.h) is made of a few hundred KB of classes and
-    // templates, and what the transform makes of it is about 57% of what it was, a long way below the 95% that is chosen
-    static constexpr uint32_t kWideMarginPercent = 75;
     static constexpr const char * kDistributedConfig = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
     static void MakeDistributedPchOptions( FBuildTestOptions & options, const char * configFile = kDistributedConfig ); // The jobs are built on the worker
     static void ClearWorkerPchStore();
@@ -414,11 +405,8 @@ REGISTER_TESTS_BEGIN( TestDistributed )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( HostNameIsBoundedByTheFrame )
 #endif
-    REGISTER_TEST( CapabilitiesAreExchanged )
-    REGISTER_TEST( PchNeededMessageAndCapability )
 #if defined( __WINDOWS__ ) // PCH distribution is for MSVC
     REGISTER_TEST( WorkerAsksForAMissingPch )
-    REGISTER_TEST( WorkerDoesNotAskAClientWithoutTheCapability )
     REGISTER_TEST( WorkerDoesNotAskForAPchBeingReceived )
     REGISTER_TEST( WorkerAsksAgainWhenAPchItHadIsNeededAgain )
     REGISTER_TEST( ClientSendsAPchAgainWhenAsked )
@@ -427,23 +415,21 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( EvictedPchIsSentAgain )
     REGISTER_TEST( PchThatCannotBeWrittenReturnsItsJobs )
     REGISTER_TEST( CorruptPchIsAskedForAgain )
-    REGISTER_TEST( CorruptPchIsReturnedToAClientThatCannotAsk )
     REGISTER_TEST( PchStoreIsUsedThroughTheBuild )
     REGISTER_TEST( PchLeasesAreReleasedByEveryEnd )
     REGISTER_TEST( MSVCFailureOfARemoteJobIsASystemError )
 #endif
     REGISTER_TEST( MSVCWorkerFailuresAreRetriedElsewhere )
-    REGISTER_TEST( ServerSendsOnlyWhatTheClientAdvertises )
+    REGISTER_TEST( ServerSendsBothInventoriesAfterTheAck )
     REGISTER_TEST( ClientRefusesAWorkerThatRefusesIt )
     REGISTER_TEST( ClientRefusesAnAckOfAnotherMajor )
     REGISTER_TEST( ClientRejectsAShortAck )
     REGISTER_TEST( ClientRejectsAnAckWithAPayload )
-    REGISTER_TEST( ClientDoesNotWaitForInventoriesTheWorkerLacks )
-    REGISTER_TEST( ClientIgnoresCapabilitiesItDidNotAdvertise )
+    REGISTER_TEST( ClientSendsJobsOnceTheInventoriesHaveArrived )
+    REGISTER_TEST( ClientNeverHangsWithoutInventories )
     REGISTER_TEST( ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend )
     REGISTER_TEST( ClientIsNotStuckWhenTheConnectionEndsBeforeAPchIsDelivered )
     REGISTER_TEST( JobPushedAsTheConnectionEndsIsReturned )
-    REGISTER_TEST( PchTransformCapabilityIsNegotiated )
     REGISTER_TEST( PchIsCompressedInTheFormsWorkersRead )
     REGISTER_TEST( PchTransformThatFailsIsNotSent )
     REGISTER_TEST( PchIsCompressedWithTheWindowOfItsSize )
@@ -452,8 +438,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( WorkerRejectsATransformedPchThatIsNotValid )
     REGISTER_TEST( StoredTransformedPchThatCannotBeInvertedIsDropped )
 #if defined( __WINDOWS__ )
-    REGISTER_TEST( ClientSendsTheTransformedPchOnlyToWorkersThatReadIt )
-    REGISTER_TEST( WorkersOfBothKindsAreSentTheirForms )
+    REGISTER_TEST( ClientSendsTheTransformedPch )
     REGISTER_TEST( PchTransformedThroughTheBuild )
     REGISTER_TEST( PchTransformFallsBackThroughTheBuild )
 #endif
@@ -577,25 +562,6 @@ void TestDistributed::WithPCHMacroUndefs() const
     // because /Yu restores the macro state and re-expands the function name.
     const char * target( "../tmp/Test/Distributed/PCHMacro/distpchmacro.lib" );
     TestHelper( target, 4 );
-}
-
-// PchNeededMessageAndCapability
-//------------------------------------------------------------------------------
-void TestDistributed::PchNeededMessageAndCapability() const
-{
-    // 24.1 adds a message and a capability to 24.0, which a 24.0 peer does not know and never gets
-    TEST_ASSERT( ( Protocol::kCapabilities & Protocol::CAP_PCH_REQUEST ) != 0 );
-
-    // Only both sides advertising it makes it available
-    TEST_ASSERT( Protocol::Negotiate( Protocol::kCapabilities, Protocol::kCapabilities ) == Protocol::kCapabilities );
-    TEST_ASSERT( ( Protocol::Negotiate( Protocol::CAP_PCH_INVENTORY | Protocol::CAP_TOOLCHAIN_INVENTORY, Protocol::kCapabilities ) & Protocol::CAP_PCH_REQUEST ) == 0 );
-
-    const Protocol::MsgPchNeeded msg( 0x1122334455667788ull );
-    TEST_ASSERT( msg.GetType() == Protocol::MSG_PCH_NEEDED );
-    TEST_ASSERT( msg.HasPayload() == false );
-    TEST_ASSERT( msg.GetSize() == sizeof( Protocol::MsgPchNeeded ) );
-    TEST_ASSERT( msg.GetPchId() == 0x1122334455667788ull );
-    TEST_ASSERT( Protocol::IsValidHeader( &msg, sizeof( msg ) ) );
 }
 
 // PchCacheBudget
@@ -1051,10 +1017,11 @@ void TestDistributed::PchTakeReadyPchs() const
     AStackString<> filePath;
     uint64_t dataSize = 0;
     PchDataCache::Entry goodEntry;
+    bool transformed = false;
     TEST_ASSERT( cache.Find( kGood, goodEntry ) );
-    TEST_ASSERT( WaitForCompression( cache, goodEntry, filePath, dataSize ) == PchDataCache::READY );
+    TEST_ASSERT( WaitForForm( cache, goodEntry, true, filePath, dataSize, transformed ) == PchDataCache::READY );
     TEST_ASSERT( cache.Find( kGoodToo, goodEntry ) );
-    TEST_ASSERT( WaitForCompression( cache, goodEntry, filePath, dataSize ) == PchDataCache::READY );
+    TEST_ASSERT( WaitForForm( cache, goodEntry, true, filePath, dataSize, transformed ) == PchDataCache::READY );
 
     // One still compressing does not hold up the PCHs after it, and stays pending
     Array<uint64_t> pending;
@@ -3929,65 +3896,25 @@ void TestDistributed::HostNameIsBoundedByTheFrame() const
 }
 #endif
 
-// CapabilitiesAreExchanged
+// ServerSendsBothInventoriesAfterTheAck
 //------------------------------------------------------------------------------
-void TestDistributed::CapabilitiesAreExchanged() const
-{
-    // The worker tells the client what both have: what the client advertised and the worker knows
-    {
-        Server s( 1 );
-        TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-        HandshakeProbe probe;
-        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-        TEST_ASSERT( ci );
-        HandshakeBytes handshake( Protocol::CAP_TOOLCHAIN_INVENTORY | ( 1u << 31 ) ); // One it has, and one nobody does
-        TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
-        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 1 ); } ) );
-        TEST_ASSERT( probe.GetAckCapabilities() == Protocol::CAP_TOOLCHAIN_INVENTORY );
-        probe.ShutdownAllConnections();
-    }
-
-    // The client has to say what it has: the worker does not assume anything
-    {
-        NoCapacityWorker worker;
-        TEST_ASSERT( BuildPchLocal( worker ).m_Built );
-        TEST_ASSERT( worker.GetNumConnections() >= 1 );
-        TEST_ASSERT( worker.GetClientCapabilities() == Protocol::kCapabilities );
-    }
-    {
-        NoCapacityWorker worker;
-        TEST_ASSERT( BuildPchLocal( worker, 10.0f, Protocol::CAP_PCH_INVENTORY ).m_Built );
-        TEST_ASSERT( worker.GetClientCapabilities() == Protocol::CAP_PCH_INVENTORY );
-    }
-}
-
-// ServerSendsOnlyWhatTheClientAdvertises
-//------------------------------------------------------------------------------
-void TestDistributed::ServerSendsOnlyWhatTheClientAdvertises() const
+void TestDistributed::ServerSendsBothInventoriesAfterTheAck() const
 {
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
-    struct Case { uint32_t capabilities; size_t numMessages; };
-    const Case cases[] = {
-        { 0, 1 },                                                                           // The ack alone
-        { Protocol::CAP_PCH_INVENTORY, 2 },                                                 // and the PCH inventory
-        { Protocol::CAP_PCH_INVENTORY | Protocol::CAP_TOOLCHAIN_INVENTORY, 3 },             // and the toolchain inventory
-        { Protocol::CAP_TOOLCHAIN_INVENTORY | ( 1u << 31 ), 2 },                            // A bit nobody knows is ignored
-    };
-    for ( const Case & c : cases )
-    {
-        HandshakeProbe probe;
-        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-        TEST_ASSERT( ci );
-        HandshakeBytes handshake( c.capabilities );
-        TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
-        TEST_ASSERT( WaitUntil( [ & ]() { return ( probe.GetNumMessages() >= c.numMessages ); } ) );
-        Thread::Sleep( 200 ); // Anything more would have come by now
-        TEST_ASSERT( probe.GetNumMessages() == c.numMessages );
-        TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
-        probe.ShutdownAllConnections();
-    }
+    HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    TEST_ASSERT( ci );
+    HandshakeBytes handshake;
+    TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
+    TEST_ASSERT( WaitUntil( [ & ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
+    Thread::Sleep( 200 ); // Anything more would have come by now
+    TEST_ASSERT( probe.GetNumMessages() == 3 );
+    TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
+    TEST_ASSERT( probe.GetMessageType( 1 ) == Protocol::MSG_PCH_INVENTORY );
+    TEST_ASSERT( probe.GetMessageType( 2 ) == Protocol::MSG_TOOLCHAIN_INVENTORY );
+    probe.ShutdownAllConnections();
 }
 
 // ClientRefusesAWorkerThatRefusesIt, ClientRefusesAnAckOfAnotherMajor, ClientRejectsAShortAck, ClientRejectsAnAckWithAPayload
@@ -4082,56 +4009,19 @@ void TestDistributed::ClientRejectsAnAckWithAPayload() const
     TEST_ASSERT( AreSpacedByTheReconnectDelay( worker ) );
 }
 
-// ClientDoesNotWaitForInventoriesTheWorkerLacks
+// ClientSendsJobsOnceTheInventoriesHaveArrived
 //------------------------------------------------------------------------------
-void TestDistributed::ClientDoesNotWaitForInventoriesTheWorkerLacks() const
+void TestDistributed::ClientSendsJobsOnceTheInventoriesHaveArrived() const
 {
-    // A worker that does not have an inventory does not send it, so jobs must not wait for it
-    const uint32_t workerCapabilities[] = {
-        0,
-        Protocol::CAP_PCH_INVENTORY,
-        Protocol::CAP_TOOLCHAIN_INVENTORY,
-        Protocol::CAP_PCH_INVENTORY | Protocol::CAP_TOOLCHAIN_INVENTORY,
-    };
-    for ( const uint32_t capabilities : workerCapabilities )
-    {
-        FBuildTestOptions options;
-        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
-        options.m_AllowDistributed = true;
-        options.m_NumWorkerThreads = 1;
-        options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
-        FBuildForTest fBuild( options );
-        TEST_ASSERT( fBuild.Initialize() );
-
-        CorruptResultWorker worker( capabilities );
-        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
-
-        auto never = []() { return false; };
-        BuildAborter aborter( never, 20.0f );
-        fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
-        worker.ShutdownAllConnections();
-
-        TEST_ASSERT( aborter.HasTimedOut() == false );
-        TEST_ASSERT( worker.GetNumResultsSent() >= 1 ); // A job reached the worker
-    }
-}
-
-// ClientIgnoresCapabilitiesItDidNotAdvertise
-//------------------------------------------------------------------------------
-void TestDistributed::ClientIgnoresCapabilitiesItDidNotAdvertise() const
-{
-    // A worker that claims more than the client advertised, but sends only what was asked for, must not
-    // be waited on for the rest
     FBuildTestOptions options;
     options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
     options.m_AllowDistributed = true;
     options.m_NumWorkerThreads = 1;
-    options.m_NoLocalConsumptionOfRemoteJobs = true;
-    options.m_DistributionCapabilities = Protocol::CAP_PCH_INVENTORY;
+    options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
-    CorruptResultWorker worker( Protocol::CAP_PCH_INVENTORY, Protocol::kCapabilities ); // Sends one, claims both
+    CorruptResultWorker worker;
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
     auto never = []() { return false; };
@@ -4140,8 +4030,80 @@ void TestDistributed::ClientIgnoresCapabilitiesItDidNotAdvertise() const
     worker.ShutdownAllConnections();
 
     TEST_ASSERT( aborter.HasTimedOut() == false );
-    TEST_ASSERT( worker.GetClientCapabilities() == Protocol::CAP_PCH_INVENTORY );
-    TEST_ASSERT( worker.GetNumResultsSent() >= 1 );
+    TEST_ASSERT( worker.GetNumResultsSent() >= 1 ); // A job reached the worker
+}
+
+// ClientNeverHangsWithoutInventories
+//------------------------------------------------------------------------------
+namespace
+{
+    // A worker that acks and sends no inventories, and counts the jobs it is sent
+    class InventorylessWorker : public FakeWorker
+    {
+    public:
+        InventorylessWorker() : FakeWorker( 4 ) {}
+        explicit InventorylessWorker( const InventorylessWorker & other ) = delete;
+        InventorylessWorker & operator=( const InventorylessWorker & other ) = delete;
+
+        uint32_t GetNumJobs() const { return m_NumJobs.Load(); }
+
+    private:
+        virtual void Handshake( const ConnectionInfo * connection ) override
+        {
+            const Protocol::MsgConnectionAck ack( 4, 0 );
+            ack.Send( connection );
+        }
+        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage & message, void *, uint32_t ) override
+        {
+            if ( message.GetType() == Protocol::MSG_JOB )
+            {
+                m_NumJobs.Increment();
+            }
+        }
+
+        Atomic<uint32_t> m_NumJobs{ 0 };
+    };
+}
+
+void TestDistributed::ClientNeverHangsWithoutInventories() const
+{
+    // The jobs wait for inventories that never come, so none is sent to the worker. The build is not held up by it: what
+    // the worker would have been given is built here.
+    for ( uint32_t noLocalConsumption = 0; noLocalConsumption < 2; ++noLocalConsumption )
+    {
+        FBuildTestOptions options;
+        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+        options.m_AllowDistributed = true;
+        options.m_NumWorkerThreads = 1;
+        options.m_ForceCleanBuild = true;
+        options.m_NoLocalConsumptionOfRemoteJobs = ( noLocalConsumption != 0 );
+        FBuildForTest fBuild( options );
+        TEST_ASSERT( fBuild.Initialize() );
+
+        InventorylessWorker worker;
+        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+        if ( noLocalConsumption )
+        {
+            // Nothing else builds the jobs: the build waits, and is stopped when a job reaches the worker or after a while
+            auto jobSent = [ &worker ]() { return ( worker.GetNumJobs() >= 1 ); };
+            BuildAborter aborter( jobSent, 3.0f );
+            fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
+            worker.ShutdownAllConnections();
+            TEST_ASSERT( aborter.HasReached() == false );
+        }
+        else
+        {
+            auto never = []() { return false; };
+            BuildAborter aborter( never, kWaitTimeoutSeconds );
+            const bool built = fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
+            worker.ShutdownAllConnections();
+            TEST_ASSERT( aborter.HasTimedOut() == false );
+            TEST_ASSERT( built ); // Built here
+        }
+        TEST_ASSERT( worker.GetNumConnections() >= 1 );
+        TEST_ASSERT( worker.GetNumJobs() == 0 );
+    }
 }
 
 // MSVCWorkerFailuresAreRetriedElsewhere
@@ -4265,7 +4227,7 @@ namespace
         return msg.Send( connection, payload );
     }
 
-    // Sends the handshake of a client advertising the capabilities and waits for the ack and inventories
+    // Sends the handshake of a client advertising the capabilities and waits for the ack and the inventories
     // that answer it. Sent after other messages it also says they have been dealt with, as a connection
     // is served in order: whatever they made the worker send came before the ack.
     bool Handshake( HandshakeProbe & probe, const ConnectionInfo * connection, uint32_t capabilities, float timeoutSeconds )
@@ -4277,7 +4239,7 @@ namespace
             return false;
         }
         const Timer timer;
-        const size_t numExpected = 1u + ( ( capabilities & Protocol::CAP_PCH_INVENTORY ) ? 1u : 0u ) + ( ( capabilities & Protocol::CAP_TOOLCHAIN_INVENTORY ) ? 1u : 0u );
+        const size_t numExpected = 3u; // The ack and the two inventories
         while ( probe.GetNumMessages() < ( numBefore + numExpected ) )
         {
             if ( timer.GetElapsed() > timeoutSeconds )
@@ -4397,29 +4359,6 @@ void TestDistributed::WorkerAsksForAMissingPch() const
     TEST_ASSERT( Handshake( probe, ci, Protocol::kCapabilities, kWaitTimeoutSeconds ) ); // Answered after the jobs
     TEST_ASSERT( CountWaitingJobs( s ) == 3 );
     TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
-    probe.ShutdownAllConnections();
-}
-
-// WorkerDoesNotAskAClientWithoutTheCapability
-//------------------------------------------------------------------------------
-void TestDistributed::WorkerDoesNotAskAClientWithoutTheCapability() const
-{
-    CapturedJob job;
-    CapturePchJob( job );
-
-    Server s( 1 );
-    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-
-    // A client of 24.0 does not know the message, so it must never be sent one
-    HandshakeProbe probe;
-    const ConnectionInfo * ci = nullptr;
-    const uint32_t capabilities24_0 = ( Protocol::CAP_PCH_INVENTORY | Protocol::CAP_TOOLCHAIN_INVENTORY );
-    TEST_ASSERT( ConnectAndHandshake( probe, capabilities24_0, ci, kWaitTimeoutSeconds ) );
-    JobStreamEncoder encoder;
-    TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( Handshake( probe, ci, capabilities24_0, kWaitTimeoutSeconds ) ); // Answered after the job
-    TEST_ASSERT( CountWaitingJobs( s ) == 1 ); // It has the job, and the PCH is missing
-    TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
     probe.ShutdownAllConnections();
 }
 
@@ -5499,45 +5438,6 @@ void TestDistributed::CorruptPchIsAskedForAgain() const
     TEST_ASSERT( Handshake( probe, ci, Protocol::kCapabilities, kWaitTimeoutSeconds ) );
     TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
     probe.ShutdownAllConnections();
-}
-
-// CorruptPchIsReturnedToAClientThatCannotAsk
-//------------------------------------------------------------------------------
-void TestDistributed::CorruptPchIsReturnedToAClientThatCannotAsk() const
-{
-    CapturedJob captured;
-    CapturePchJob( captured );
-    CompressedPch pch;
-    MakeCompressedPch( 200000, 9, pch );
-    const CapturedJob job = WithPch( captured, pch.m_Id );
-
-    Server s( 1 );
-    TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-    Array<char> damaged;
-    damaged.SetSize( pch.m_CompressedSize );
-    memcpy( damaged.Begin(), pch.m_Compressed.GetResult(), pch.m_CompressedSize );
-    for ( size_t i = ( Compressor::kHeaderSize + 50 ); i < damaged.GetSize(); i += ( damaged.GetSize() / 7 ) )
-    {
-        damaged[ i ] = (char)( damaged[ i ] ^ 0x33 );
-    }
-    AStackString<> storedFile;
-    AddStoredBlob( s, pch.m_Id, damaged.Begin(), damaged.GetSize(), true, storedFile );
-
-    // A client of 24.0 cannot be asked for the PCH, so it would wait for ever: its jobs are given back
-    HandshakeProbe probe;
-    const ConnectionInfo * ci = nullptr;
-    const uint32_t capabilities24_0 = ( Protocol::CAP_PCH_INVENTORY | Protocol::CAP_TOOLCHAIN_INVENTORY );
-    TEST_ASSERT( ConnectAndHandshake( probe, capabilities24_0, ci, kWaitTimeoutSeconds ) );
-    JobStreamEncoder encoder;
-    TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
-    TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
-
-    // The PCH that is not good is gone, and the jobs and their hold on it with the connection
-    TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 1 );
-    TEST_ASSERT( s.IsPchCached( pch.m_Id ) == false );
-    TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) == false );
-    TEST_ASSERT( WaitUntil( [ & ]() { return ( CountWaitingJobs( s ) == 0 ) && ( TotalLeases( s ) == 0 ); } ) );
 }
 
 // PchUnpackIsSingleFlight
@@ -6810,42 +6710,6 @@ namespace
     }
 }
 
-// PchTransformCapabilityIsNegotiated
-//------------------------------------------------------------------------------
-void TestDistributed::PchTransformCapabilityIsNegotiated() const
-{
-    // The bit is one that is advertised (CapabilitiesAreExchanged is of how the bits are negotiated)
-    const uint32_t bit = Protocol::CAP_PCH_TRANSFORM;
-    TEST_ASSERT( ( Protocol::kCapabilities & bit ) != 0 );
-
-    // The worker tells a client that has it that it can be used, and one that does not that it cannot
-    struct Case { uint32_t m_Client; uint32_t m_Ack; };
-    const Case cases[] = {
-        { bit | Protocol::CAP_PCH_REQUEST, bit | Protocol::CAP_PCH_REQUEST },
-        { Protocol::CAP_PCH_REQUEST, Protocol::CAP_PCH_REQUEST },
-        { 0, 0 },
-        { bit | ( 1u << 31 ), bit },
-    };
-    for ( const Case & c : cases )
-    {
-        Server s( 1 );
-        TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-        HandshakeProbe probe;
-        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-        TEST_ASSERT( ci );
-        HandshakeBytes handshake( c.m_Client );
-        TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
-        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 1 ); } ) );
-        TEST_ASSERT( probe.GetAckCapabilities() == c.m_Ack );
-        probe.ShutdownAllConnections();
-    }
-
-    // The client says it has it
-    NoCapacityWorker worker;
-    TEST_ASSERT( BuildPchLocal( worker ).m_Built );
-    TEST_ASSERT( ( worker.GetClientCapabilities() & bit ) != 0 );
-}
-
 // PchIsCompressedInTheFormsWorkersRead
 //------------------------------------------------------------------------------
 void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
@@ -6901,19 +6765,18 @@ void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
         TEST_ASSERT( cache.GetNumCompressions() == 2 );
     }
 
-    // What a connection takes is the form its worker reads
-    for ( uint32_t allow = 0; allow < 2; ++allow )
+    // What a connection takes is the transformed form
     {
         Array<uint64_t> pending;
         pending.Append( entry.pchId );
         Array<uint64_t> onWorker;
         Array<PchDataCache::ReadyPch> ready;
-        TEST_ASSERT( cache.TakeReadyPchs( pending, onWorker, ready, ( allow != 0 ) ) );
+        TEST_ASSERT( cache.TakeReadyPchs( pending, onWorker, ready ) );
         TEST_ASSERT( pending.IsEmpty() );
         TEST_ASSERT( ready.GetSize() == 1 );
-        TEST_ASSERT( ready[ 0 ].transformed == ( allow != 0 ) );
-        TEST_ASSERT( ready[ 0 ].filePath == ( allow ? transformedPath : plainPath ) );
-        TEST_ASSERT( ready[ 0 ].dataSize == ( allow ? transformedSize : plainSize ) );
+        TEST_ASSERT( ready[ 0 ].transformed );
+        TEST_ASSERT( ready[ 0 ].filePath == transformedPath );
+        TEST_ASSERT( ready[ 0 ].dataSize == transformedSize );
         TEST_ASSERT( ready[ 0 ].uncompressedSize == fileSize );
     }
 
@@ -7294,155 +7157,22 @@ void TestDistributed::StoredTransformedPchThatCannotBeInvertedIsDropped() const
 
 #if defined( __WINDOWS__ )
 
-// ClientSendsTheTransformedPchOnlyToWorkersThatReadIt
+// ClientSendsTheTransformedPch
 //------------------------------------------------------------------------------
-void TestDistributed::ClientSendsTheTransformedPchOnlyToWorkersThatReadIt() const
+void TestDistributed::ClientSendsTheTransformedPch() const
 {
-    const uint32_t withoutTransform = ( Protocol::kCapabilities & ~Protocol::CAP_PCH_TRANSFORM );
     const uint64_t statsLogSize = GetStatsLogSize();
     uint32_t numLogged = 0;
 
-    // A worker of this version, and a client of it: the PCH is sent after the transform
-    uint32_t transformedSize = 0;
-    uint32_t uncompressedSize = 0;
+    // The PCH is sent after the transform
     {
-        NoCapacityWorker worker( Protocol::kCapabilities );
+        NoCapacityWorker worker;
         BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES );
         TEST_ASSERT( worker.GetPchType() == kTransformedBlobType );
-        transformedSize = worker.GetPchCompressedSize();
-        uncompressedSize = worker.GetPchUncompressedSize();
+        TEST_ASSERT( worker.GetPchCompressedSize() < worker.GetPchUncompressedSize() );
     }
     const bool isLogComplete = CountInStatsLogSince( statsLogSize, "pch-transform:", numLogged );
     TEST_ASSERT( ( isLogComplete == false ) || ( numLogged == 1 ) ); // The connection says so in its stats
-
-    // A worker of 24.0, which does not advertise the capability: it is sent what it reads
-    uint32_t plainSize = 0;
-    {
-        NoCapacityWorker worker( withoutTransform );
-        BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES );
-        TEST_ASSERT( worker.GetPchType() == Compressor::eZstd );
-        TEST_ASSERT( worker.GetPchUncompressedSize() == uncompressedSize );
-        plainSize = worker.GetPchCompressedSize();
-    }
-    OUTPUT( "ClientSendsTheTransformedPchOnlyToWorkersThatReadIt: PCH of %u bytes, %u sent, %u with the transform (%.1f%%)\n",
-            uncompressedSize, plainSize, transformedSize, ( 100.0 * transformedSize ) / plainSize );
-    TEST_ASSERT( ( (uint64_t)transformedSize * 100 ) < ( (uint64_t)plainSize * kWideMarginPercent ) );
-
-    // A client that does not advertise it is not sent it by a worker that has it
-    {
-        NoCapacityWorker worker( Protocol::kCapabilities );
-        BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES, withoutTransform );
-        TEST_ASSERT( worker.GetClientCapabilities() == withoutTransform );
-        TEST_ASSERT( worker.GetPchType() == Compressor::eZstd );
-    }
-    TEST_ASSERT( ( CountInStatsLogSince( statsLogSize, "pch-transform:", numLogged ) == false ) || ( numLogged == 1 ) ); // Only the first
-}
-
-// Workers of two kinds
-//------------------------------------------------------------------------------
-namespace
-{
-    // A worker that is of two kinds, as a fleet is while it is updated: the first connection it is given has the PCH
-    // transform, and the next has not. It takes no job, and notes what each connection is sent for a PCH.
-    class TwoKindsOfWorker : public FakeWorker
-    {
-    public:
-        struct Received
-        {
-            uint32_t m_Capabilities; // Of the connection it came on
-            uint32_t m_Type;         // In the header of the data
-            uint32_t m_CompressedSize;
-            uint32_t m_UncompressedSize;
-        };
-
-        TwoKindsOfWorker() : FakeWorker( 0 ) {}
-        explicit TwoKindsOfWorker( const TwoKindsOfWorker & other ) = delete;
-        TwoKindsOfWorker & operator=( const TwoKindsOfWorker & other ) = delete;
-
-        size_t GetNumReceived() const
-        {
-            MutexHolder mh( m_ReceivedMutex );
-            return m_Received.GetSize();
-        }
-        Received GetReceived( size_t index ) const
-        {
-            MutexHolder mh( m_ReceivedMutex );
-            return m_Received[ index ];
-        }
-
-    private:
-        virtual void GetConnectionCapabilities( uint32_t connectionIndex, uint32_t & outCapabilities, uint32_t & outAckCapabilities ) const override
-        {
-            outCapabilities = ( connectionIndex == 0 ) ? Protocol::kCapabilities : ( Protocol::kCapabilities & ~Protocol::CAP_PCH_TRANSFORM );
-            outAckCapabilities = outCapabilities;
-        }
-
-        virtual void OnMessage( const ConnectionInfo * connection, const Protocol::IMessage & message, void * payload, uint32_t payloadSize ) override
-        {
-            if ( message.GetType() != Protocol::MSG_PCH_FILE )
-            {
-                return;
-            }
-            const Protocol::MsgPchFile & pchFile = static_cast<const Protocol::MsgPchFile &>( message );
-            if ( ( pchFile.GetChunkIndex() == 0 ) && ( payloadSize >= Compressor::kHeaderSize ) )
-            {
-                Received received;
-                memcpy( &received.m_Type, payload, sizeof( received.m_Type ) );
-                received.m_Capabilities = GetAckCapabilities( connection );
-                received.m_CompressedSize = pchFile.GetCompressedSize();
-                received.m_UncompressedSize = pchFile.GetUncompressedSize();
-                MutexHolder mh( m_ReceivedMutex );
-                m_Received.Append( received );
-            }
-        }
-
-        mutable Mutex m_ReceivedMutex;
-        Array<Received> m_Received;
-    };
-}
-
-// WorkersOfBothKindsAreSentTheirForms
-//------------------------------------------------------------------------------
-void TestDistributed::WorkersOfBothKindsAreSentTheirForms() const
-{
-    // One build with two workers, one that reads the transform and one that does not. The PCH is made in both forms.
-    FBuildTestOptions options;
-    MakeDistributedPchOptions( options, "Tools/FBuild/FBuildTest/Data/TestPchTransform/fbuild.bff" );
-    options.m_ForceCleanBuild = true;
-    FBuildForTest fBuild( options );
-    TEST_ASSERT( fBuild.Initialize() );
-
-    TwoKindsOfWorker worker;
-    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
-    auto bothReceived = [ &worker ]() { return ( worker.GetNumReceived() >= 2 ); };
-    BuildAborter aborter( bothReceived, kWaitTimeoutSeconds );
-    const bool built = fBuild.Build( "../tmp/Test/PchTransform/TwoWorkers/twoworkers.lib" );
-    worker.ShutdownAllConnections();
-    TEST_ASSERT( built == false ); // Aborted
-    TEST_ASSERT( aborter.HasReached() );
-    TEST_ASSERT( worker.GetNumConnections() == 2 );
-
-    // The one that has the transform is sent the PCH after it, and the other is sent what it reads
-    uint32_t transformedSize = 0;
-    uint32_t plainSize = 0;
-    for ( size_t i = 0; i < 2; ++i )
-    {
-        const TwoKindsOfWorker::Received received = worker.GetReceived( i );
-        if ( received.m_Capabilities & Protocol::CAP_PCH_TRANSFORM )
-        {
-            TEST_ASSERT( received.m_Type == kTransformedBlobType );
-            transformedSize = received.m_CompressedSize;
-        }
-        else
-        {
-            TEST_ASSERT( received.m_Type == Compressor::eZstd );
-            plainSize = received.m_CompressedSize;
-        }
-        TEST_ASSERT( received.m_UncompressedSize == worker.GetReceived( 0 ).m_UncompressedSize );
-    }
-    TEST_ASSERT( transformedSize != 0 );
-    TEST_ASSERT( plainSize != 0 );
-    TEST_ASSERT( ( (uint64_t)transformedSize * 100 ) < ( (uint64_t)plainSize * kWideMarginPercent ) );
 }
 
 // PchTransformedThroughTheBuild
@@ -7511,7 +7241,6 @@ void TestDistributed::PchTransformedThroughTheBuild() const
     Array<char> clientPch;
     AStackString<> storedFile;
     uint64_t pchId = 0;
-    uint64_t transformedStoredSize = 0;
     {
         FBuildTestOptions options;
         MakeDistributedPchOptions( options );
@@ -7540,7 +7269,6 @@ void TestDistributed::PchTransformedThroughTheBuild() const
         TEST_ASSERT( ReadFile( storedFile, stored ) );
         TEST_ASSERT( GetBlobType( stored ) == kTransformedBlobType );
         TEST_ASSERT( BlobDecodesTo( stored, clientPch ) );
-        transformedStoredSize = stored.GetSize();
 
         // What the compiler was given is the PCH of the client, byte for byte
         AStackString<> rawFile;
@@ -7566,40 +7294,6 @@ void TestDistributed::PchTransformedThroughTheBuild() const
         TEST_ASSERT( fBuild.Build( target ) );
         TEST_ASSERT( worker.m_NumPchChunksReceived.Load() == 0 );
         TEST_ASSERT( worker.m_NumPchsUnpacked.Load() >= 1 ); // Made from the transformed store, for the jobs
-        for ( uint32_t i = 0; i < 3; ++i )
-        {
-            Array<char> built;
-            readObject( objects[ i ], built );
-            TEST_ASSERT( IsSameObject( built, first[ i ] ) );
-        }
-    }
-
-    // A client that does not advertise the capability sends the PCH as 24.0 does, which is kept as it came and is bigger. The objects are the same.
-    ClearWorkerPchStore();
-    {
-        FBuildTestOptions options;
-        MakeDistributedPchOptions( options );
-        options.m_DistributionCapabilities = ( Protocol::kCapabilities & ~Protocol::CAP_PCH_TRANSFORM );
-        FBuildForTest fBuild( options );
-        TEST_ASSERT( fBuild.Initialize( dbFile.Get() ) );
-        deleteObjects();
-
-        Server worker( 1 );
-        SetPchCacheLimits( worker, ( 1ull << 30 ), 0, ( 1ull << 30 ) );
-        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
-        TEST_ASSERT( worker.IsPchCached( pchId ) == false );
-        TEST_ASSERT( fBuild.Build( target ) );
-        TEST_ASSERT( worker.m_NumPchChunksReceived.Load() >= 1 );
-        AStackString<> plainStoredFile;
-        uint64_t plainPchId = 0;
-        storedFileOf( worker, plainStoredFile, plainPchId );
-        TEST_ASSERT( plainPchId == pchId );
-        Array<char> stored;
-        TEST_ASSERT( ReadFile( plainStoredFile, stored ) );
-        TEST_ASSERT( GetBlobType( stored ) == Compressor::eZstd );
-        TEST_ASSERT( DecodesToFile( plainStoredFile, clientPch ) );
-        OUTPUT( "PchTransformedThroughTheBuild: stored %zu bytes, %" PRIu64 " with the transform (%.1f%%)\n", stored.GetSize(), transformedStoredSize, ( 100.0 * (double)transformedStoredSize ) / (double)stored.GetSize() );
-        TEST_ASSERT( ( transformedStoredSize * 100 ) < ( stored.GetSize() * kWideMarginPercent ) );
         for ( uint32_t i = 0; i < 3; ++i )
         {
             Array<char> built;

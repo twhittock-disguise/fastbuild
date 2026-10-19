@@ -423,8 +423,7 @@ size_t PchDataCache::GetNumCompressions() const
 //------------------------------------------------------------------------------
 bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
                                   const Array<uint64_t> & onWorker,
-                                  Array<ReadyPch> & outReady,
-                                  bool allowTransform )
+                                  Array<ReadyPch> & outReady )
 {
     bool allOk = true;
 
@@ -440,7 +439,7 @@ bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
             AStackString<> filePath;
             uint64_t fileSize = 0;
             bool transformed = false;
-            switch ( GetCompressed( entry, filePath, fileSize, allowTransform, &transformed ) )
+            switch ( GetCompressed( entry, filePath, fileSize, true /*allowTransform*/, &transformed ) )
             {
                 case COMPRESSING:
                     stillPending.Append( pchId );

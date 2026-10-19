@@ -224,7 +224,6 @@ private:
 
     // Info returned by worker
     Atomic<uint16_t> m_WorkerVersion;
-    Atomic<uint32_t> m_WorkerCapabilities{ 0 }; // What the worker and this client both have
     Atomic<bool> m_HandshakeDone{ false };
     Atomic<bool> m_ShuttingDown{ false };
 
@@ -741,11 +740,8 @@ void ClientToWorkerConnection::Process( const ConnectionInfo * connection, const
         return;
     }
 
-    // Take note of additional server info. The worker advertises what both sides have, which it works
-    // out from what this client advertised, so only that is used here.
-    const uint32_t capabilities = Protocol::Negotiate( msg->GetCapabilities(), FBuild::Get().GetOptions().m_DistributionCapabilities );
+    // Take note of additional server info
     m_WorkerVersion.Store( msg->GetWorkerVersion() );
-    m_WorkerCapabilities.Store( capabilities );
     m_WorkerCapacity.Store( msg->GetWorkerCapacity() );
     m_HandshakeDone.Store( true );
     AStackString<> protocolVersion;
@@ -757,12 +753,7 @@ void ClientToWorkerConnection::Process( const ConnectionInfo * connection, const
                protocolVersion.Get(),
                msg->GetWorkerCapacity() );
 
-    // The initial batch of jobs waits for the last inventory the worker sends. It follows the ack,
-    // so without one there is nothing to wait for.
-    if ( ( capabilities & ( Protocol::CAP_PCH_INVENTORY | Protocol::CAP_TOOLCHAIN_INVENTORY ) ) == 0 )
-    {
-        OnInventoriesComplete();
-    }
+    // The initial batch of jobs waits for the toolchain inventory, the last the worker sends after the ack
 }
 
 // Process( MsgRefused )
@@ -823,12 +814,6 @@ void ClientToWorkerConnection::Process( const Protocol::MsgPchInventory * msg,
         }
         DIST_INFO( " - Worker %s has %u cached PCH entries\n",
                    m_Worker->m_Address.Get(), numEntries );
-    }
-
-    // The toolchain inventory follows this one when the worker has it
-    if ( ( m_WorkerCapabilities.Load() & Protocol::CAP_TOOLCHAIN_INVENTORY ) == 0 )
-    {
-        OnInventoriesComplete();
     }
 }
 
@@ -1164,8 +1149,7 @@ void ClientToWorkerConnection::SendPendingPchs()
     }
 
     Array<PchDataCache::ReadyPch> ready;
-    const bool allowTransform = ( ( m_WorkerCapabilities.Load() & Protocol::CAP_PCH_TRANSFORM ) != 0 );
-    bool allOk = PchDataCache::Get().TakeReadyPchs( m_PendingPchIds, m_PchState.GetOnWorker(), ready, allowTransform );
+    bool allOk = PchDataCache::Get().TakeReadyPchs( m_PendingPchIds, m_PchState.GetOnWorker(), ready );
     const uint32_t chunkSize = Math::Clamp( FBuild::Get().GetOptions().m_DistributionPchChunkSize,
                                             Protocol::kMinPchChunkSize,
                                             Protocol::kMaxPchChunkSize );
