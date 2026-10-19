@@ -248,9 +248,22 @@ namespace
         }
         virtual void OnClientGone( uint32_t clientId ) override
         {
+            // No Server lock is held here, so the server can be called back
+            bool queued = false;
+            if ( m_Server )
+            {
+                MemoryStream payload;
+                payload.Write( clientId );
+                queued = m_Server->QueueResult( clientId, false, Move( payload ) );
+            }
             MutexHolder mh( m_Mutex );
             m_GoneClients.Append( clientId );
+            m_QueuedWhenGone.Append( queued );
         }
+
+        // Set to have each OnClientGone try to queue a result for the client
+        Server * m_Server = nullptr;
+        void GetQueuedWhenGone( Array<bool> & out ) const { MutexHolder mh( m_Mutex ); out = m_QueuedWhenGone; }
 
     private:
         static void Record( Array<Received> & to, uint32_t clientId, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize )
@@ -272,6 +285,7 @@ namespace
         Array<Received> m_Files;
         Array<StoredPch> m_StoredPchs;
         Array<uint32_t> m_GoneClients;
+        Array<bool> m_QueuedWhenGone;   // What QueueResult returned in each OnClientGone
     };
 
     // A serialized job as far as the gateway reads it: the id first, the PCH id last, and the name
@@ -1142,6 +1156,7 @@ void TestGateway::GatewayResultReachesOnlyALiveClient() const
     AStackString<> cacheDir;
     GetGatewayCacheDir( cacheDir );
     Server s( forwarder, cacheDir );
+    forwarder.m_Server = &s;
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -1169,6 +1184,9 @@ void TestGateway::GatewayResultReachesOnlyALiveClient() const
     Array<uint32_t> gone;
     forwarder.GetGoneClients( gone );
     TEST_ASSERT( gone[ 0 ] == id );
+    Array<bool> queuedWhenGone;
+    forwarder.GetQueuedWhenGone( queuedWhenGone );
+    TEST_ASSERT( queuedWhenGone[ 0 ] == false ); // Tried within OnClientGone itself
     MemoryStream late;
     MakeResult( late, 7, 1001, "obj", 3 );
     TEST_ASSERT( s.QueueResult( id, false, Move( late ) ) == false );
