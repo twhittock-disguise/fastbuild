@@ -572,19 +572,17 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     }
 
     // take note of initial status of client
-    const uint32_t capabilities = Protocol::Negotiate( msg->GetCapabilities(), Protocol::kCapabilities );
     {
         MutexHolder mh( cs->m_Mutex );
         cs->m_HostName = hostName;
-        cs->m_Capabilities = capabilities;
     }
 
     // Recalculate capacity across all connected coordinators
     // (takes m_ClientListMutex, so cs->m_Mutex must not be held)
     RecalculateCapacity();
 
-    // Send ack with allocated capacity, and what both sides have
-    const Protocol::MsgConnectionAck ack( (uint8_t)cs->m_AllocatedCapacity, capabilities );
+    // Send ack with allocated capacity
+    const Protocol::MsgConnectionAck ack( (uint8_t)cs->m_AllocatedCapacity );
     SendTo( *cs, ack );
 
     // Send PCH inventory so coordinator knows what's already cached

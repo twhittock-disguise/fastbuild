@@ -114,12 +114,11 @@ bool Protocol::IMessage::Broadcast( TCPConnectionPool * pool ) const
 // The version fields of the handshake messages are where every major puts them, so a peer of another
 // major can tell the versions apart. A change to the offsets is a change to every later major.
 PRAGMA_DISABLE_PUSH_CLANG( "-Winvalid-offsetof" )
-Protocol::MsgConnection::MsgConnection( uint32_t capabilities )
+Protocol::MsgConnection::MsgConnection()
     : Protocol::IMessage( Protocol::MSG_CONNECTION, sizeof( MsgConnection ), false )
     , m_ProtocolVersion( kVersionMajor )
     , m_Platform( Env::GetPlatform() )
     , m_ProtocolVersionMinor( kVersionMinor )
-    , m_Capabilities( capabilities )
 {
     static_assert( offsetof( MsgConnection, m_ProtocolVersion ) == 4, "MsgConnection major moved" );
     static_assert( offsetof( MsgConnection, m_HostName ) == 12, "MsgConnection host name moved" );
@@ -143,13 +142,12 @@ void Protocol::MsgConnection::GetHostName( uint32_t frameSize, AString & outName
 
 // MsgConnectionAck
 //------------------------------------------------------------------------------
-Protocol::MsgConnectionAck::MsgConnectionAck( uint8_t capacity, uint32_t capabilities )
+Protocol::MsgConnectionAck::MsgConnectionAck( uint8_t capacity )
     : Protocol::IMessage( Protocol::MSG_CONNECTION_ACK, sizeof( MsgConnectionAck ), false )
     , m_WorkerVersion( static_cast<uint16_t>( GetVersionIdentifier() ) )
     , m_ProtocolVersionMajor( kVersionMajor )
     , m_ProtocolVersionMinor( kVersionMinor )
     , m_WorkerCapacity( capacity )
-    , m_Capabilities( capabilities )
 {
     static_assert( offsetof( MsgConnectionAck, m_WorkerVersion ) == 4, "MsgConnectionAck worker version moved" );
     static_assert( offsetof( MsgConnectionAck, m_ProtocolVersionMajor ) == 6, "MsgConnectionAck major moved" );

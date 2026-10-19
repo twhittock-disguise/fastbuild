@@ -94,7 +94,6 @@ private:
         JobStreamDecoder m_JobDecoder;
         PchReceiver m_PchReceiver; // The chunks of the PCH being received, in order
         Array<ToolManifest *> m_KnownTools; // toolchains this client may send jobs for, each holding a use
-        uint32_t m_Capabilities = 0; // What this client and the worker both have (under m_Mutex)
         Array<uint64_t> m_PchNeededSent; // PCHs asked of this client that have not arrived yet (under m_Mutex)
     };
 

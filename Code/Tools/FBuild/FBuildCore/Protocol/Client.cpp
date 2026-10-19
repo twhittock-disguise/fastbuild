@@ -1804,7 +1804,7 @@ void ClientToWorkerConnection::SendQueueThreadFunc()
     DIST_INFO( " - connection: %s (OK)\n", m_Worker->m_Address.Get() );
 
     // Send initial connection handshake
-    const Protocol::MsgConnection msg( FBuild::Get().GetOptions().m_DistributionCapabilities );
+    const Protocol::MsgConnection msg;
     if ( msg.Send( ci ) )
     {
         SendQueueMainLoop( ci );

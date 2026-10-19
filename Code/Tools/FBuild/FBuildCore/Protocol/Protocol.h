@@ -34,23 +34,9 @@ namespace Protocol
     // Major: a change to the wire format or to what a message means. Peers of different majors refuse
     //   each other at the handshake, whose version fields keep their place in every major.
     // Minor: an additive change that an older peer can safely ignore.
-    // Capabilities: optional features negotiated for each connection. One is used only if both sides
-    //   advertise its bit, and a bit is added together with the feature (and the fallback) it stands for.
-    // A receiver ignores the trailing bytes of a message it knows and the capability bits it does not.
+    // A receiver ignores the trailing bytes of a message it knows.
     inline static const uint32_t kVersionMajor = 24;
     inline static const uint8_t kVersionMinor = 1;
-
-    enum Capability : uint32_t
-    {
-        CAP_PCH_INVENTORY = ( 1u << 0 ),        // The worker sends MSG_PCH_INVENTORY after the ack
-        CAP_TOOLCHAIN_INVENTORY = ( 1u << 1 ),  // The worker sends MSG_TOOLCHAIN_INVENTORY after the PCH inventory
-        CAP_PCH_REQUEST = ( 1u << 2 ),          // The worker sends MSG_PCH_NEEDED for a PCH a job needs and it does not have
-        CAP_PCH_TRANSFORM = ( 1u << 3 ),        // The worker reads a PCH sent with a transform applied (the type of its blob header, see Compressor)
-    };
-    inline static const uint32_t kCapabilities = ( CAP_PCH_INVENTORY | CAP_TOOLCHAIN_INVENTORY | CAP_PCH_REQUEST | CAP_PCH_TRANSFORM );
-
-    // The capabilities in use when one side advertises ours and the other theirs
-    inline uint32_t Negotiate( uint32_t ours, uint32_t theirs ) { return ( ours & theirs & kCapabilities ); }
 
     inline static const uint16_t kTestPort = kPort + 1; // Different port for use by tests
 
@@ -75,7 +61,7 @@ namespace Protocol
         MSG_REQUEST_FILE = 11,          // Worker -> Client : Request file (disconnect recovery)
         MSG_TOOLCHAIN_INVENTORY = 12,   // Worker -> Client : Advertise cached toolchain IDs
         MSG_REFUSED = 13,               // Worker -> Client : Handshake refused, with the version of the worker
-        MSG_PCH_NEEDED = 14,            // Worker -> Client : A job needs a PCH the worker does not have (CAP_PCH_REQUEST)
+        MSG_PCH_NEEDED = 14,            // Worker -> Client : A job needs a PCH the worker does not have
 
         NUM_MESSAGES            // leave last
     };
@@ -120,12 +106,11 @@ namespace Protocol
     class MsgConnection : public IMessage
     {
     public:
-        explicit MsgConnection( uint32_t capabilities = kCapabilities );
+        MsgConnection();
 
         uint32_t GetProtocolVersion() const { return m_ProtocolVersion; }
         uint8_t GetPlatform() const { return m_Platform; }
         uint8_t GetProtocolVersionMinor() const { return m_ProtocolVersionMinor; }
-        uint32_t GetCapabilities() const { return m_Capabilities; }
 
         // The host name, read only as far as a frame of this many bytes goes
         void GetHostName( uint32_t frameSize, AString & outName ) const;
@@ -136,22 +121,20 @@ namespace Protocol
         uint8_t m_ProtocolVersionMinor;
         uint8_t m_Padding2[ 2 ];
         char m_HostName[ 64 ];
-        uint32_t m_Capabilities;
     };
-    static_assert( sizeof( MsgConnection ) == sizeof( IMessage ) + 76, "MsgConnection message has incorrect size" );
+    static_assert( sizeof( MsgConnection ) == sizeof( IMessage ) + 72, "MsgConnection message has incorrect size" );
 
     // MsgConnectionAck
     //------------------------------------------------------------------------------
     class MsgConnectionAck : public IMessage
     {
     public:
-        explicit MsgConnectionAck( uint8_t capacity, uint32_t capabilities = kCapabilities );
+        explicit MsgConnectionAck( uint8_t capacity );
 
         uint16_t GetWorkerVersion() const { return m_WorkerVersion; }
         uint8_t GetProtocolVersionMajor() const { return m_ProtocolVersionMajor; }
         uint8_t GetProtocolVersionMinor() const { return m_ProtocolVersionMinor; }
         uint8_t GetWorkerCapacity() const { return m_WorkerCapacity; }
-        uint32_t GetCapabilities() const { return m_Capabilities; }
 
     private:
         uint16_t m_WorkerVersion;
@@ -159,9 +142,8 @@ namespace Protocol
         uint8_t m_ProtocolVersionMinor;
         uint8_t m_WorkerCapacity;
         char m_Padding2[ 3 ];
-        uint32_t m_Capabilities;
     };
-    static_assert( sizeof( MsgConnectionAck ) == sizeof( IMessage ) + 12, "MsgConnectionAck message has incorrect size" );
+    static_assert( sizeof( MsgConnectionAck ) == sizeof( IMessage ) + 8, "MsgConnectionAck message has incorrect size" );
 
     // MsgRefused
     //------------------------------------------------------------------------------

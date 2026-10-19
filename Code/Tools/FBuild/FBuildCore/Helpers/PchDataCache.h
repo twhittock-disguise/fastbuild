@@ -59,12 +59,10 @@ public:
     // starts compression on a background thread, however many connections ask. Reading or compressing
     // is retried after a short delay when it fails. When READY, the file stays until Clear().
     //
-    // There are two forms of the copy: the PCH compressed as it is, and compressed after it was transformed
-    // (see PchTransform), which is smaller. Only a worker that reads the second (allowTransform) is given it,
-    // and it is only made when one asks, if it is worth it, and if it gives the PCH back. When it is not
-    // made, the copy is the first form, and outTransformed says which one it is. A form made for one worker
-    // is used for every one that wants it.
-    CompressedState GetCompressed( const Entry & entry, AString & outFilePath, uint64_t & outFileSize, bool allowTransform = false, bool * outTransformed = nullptr );
+    // The copy is the PCH compressed after it was transformed (see PchTransform), which is smaller, if that
+    // is worth it and gives the PCH back. When it is not, the copy is the PCH compressed as it is. outTransformed
+    // says which one it is.
+    CompressedState GetCompressed( const Entry & entry, AString & outFilePath, uint64_t & outFileSize, bool * outTransformed = nullptr );
     uint32_t GetFailedAttempts( uint64_t pchId ) const;
     bool HasCompressionFailed( uint64_t pchId ) const;
     size_t GetNumCompressions() const; // PCHs for which compression was started

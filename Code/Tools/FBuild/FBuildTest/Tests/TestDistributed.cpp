@@ -311,11 +311,11 @@ private:
         Atomic<bool>    m_ResultDeliveredWhileHeld{ false };
     };
     static uint32_t HoldSendMutexOnFirstJob( void * param );
-    void BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when, uint32_t clientCapabilities = Protocol::kCapabilities ) const;
+    void BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when ) const;
 
     // PCH transform helpers
     static bool WritePchLikeFile( const char * path, uint32_t size, uint32_t seed, Array<char> & outContent );
-    static PchDataCache::CompressedState WaitForForm( PchDataCache & cache, const PchDataCache::Entry & entry, bool allowTransform, AString & outFilePath, uint64_t & outSize, bool & outTransformed );
+    static PchDataCache::CompressedState WaitForForm( PchDataCache & cache, const PchDataCache::Entry & entry, AString & outFilePath, uint64_t & outSize, bool & outTransformed );
     static bool BlobDecodesTo( const Array<char> & blob, const Array<char> & content ); // As a worker decodes a PCH: the transform is undone
     static uint32_t GetBlobType( const Array<char> & blob ); // The first word of its header
     static uint64_t GetStatsLogSize(); // The log is shared by every FBuild on the machine, and a test looks at what is added to it
@@ -1019,9 +1019,9 @@ void TestDistributed::PchTakeReadyPchs() const
     PchDataCache::Entry goodEntry;
     bool transformed = false;
     TEST_ASSERT( cache.Find( kGood, goodEntry ) );
-    TEST_ASSERT( WaitForForm( cache, goodEntry, true, filePath, dataSize, transformed ) == PchDataCache::READY );
+    TEST_ASSERT( WaitForForm( cache, goodEntry, filePath, dataSize, transformed ) == PchDataCache::READY );
     TEST_ASSERT( cache.Find( kGoodToo, goodEntry ) );
-    TEST_ASSERT( WaitForForm( cache, goodEntry, true, filePath, dataSize, transformed ) == PchDataCache::READY );
+    TEST_ASSERT( WaitForForm( cache, goodEntry, filePath, dataSize, transformed ) == PchDataCache::READY );
 
     // One still compressing does not hold up the PCHs after it, and stays pending
     Array<uint64_t> pending;
@@ -2562,25 +2562,15 @@ namespace
     class FakeWorker : public TCPConnectionPool
     {
     public:
-        explicit FakeWorker( uint8_t capacity,
-                             const Array<uint64_t> & toolchainInventory = Array<uint64_t>(),
-                             uint32_t capabilities = Protocol::kCapabilities )
-            : FakeWorker( capacity, toolchainInventory, capabilities, capabilities )
-        {
-        }
-        // The capabilities it sends the inventories for, and the ones it claims in the ack
-        FakeWorker( uint8_t capacity, const Array<uint64_t> & toolchainInventory, uint32_t capabilities, uint32_t ackCapabilities )
+        explicit FakeWorker( uint8_t capacity, const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
             : m_Capacity( capacity )
             , m_ToolchainInventory( toolchainInventory )
-            , m_Capabilities( capabilities )
-            , m_AckCapabilities( ackCapabilities )
         {
         }
         explicit FakeWorker( const FakeWorker & other ) = delete;
         FakeWorker & operator=( const FakeWorker & other ) = delete;
 
         uint32_t GetNumConnections() const { return m_NumConnections.Load(); }
-        uint32_t GetClientCapabilities() const { return m_ClientCapabilities.Load(); }
 
         // Ends the connections it has, as when a worker goes away, and listens for the next
         void DisconnectConnections()
@@ -2607,68 +2597,26 @@ namespace
         }
 
     protected:
-        // The capabilities of the connection that is the connectionIndex-th this worker is given (from 0): the ones it
-        // sends the inventories for, and the ones it claims in the ack. A worker that is of different kinds on its
-        // connections, as a fleet is while it is updated, says so here.
-        virtual void GetConnectionCapabilities( uint32_t /*connectionIndex*/, uint32_t & outCapabilities, uint32_t & outAckCapabilities ) const
-        {
-            outCapabilities = m_Capabilities;
-            outAckCapabilities = m_AckCapabilities;
-        }
-
-        // The ack capabilities of a connection that has been handshaken
-        uint32_t GetAckCapabilities( const ConnectionInfo * connection ) const
-        {
-            MutexHolder mh( m_ConnectionsMutex );
-            for ( const ConnectionState & state : m_Connections )
-            {
-                if ( state.m_Connection == connection )
-                {
-                    return state.m_AckCapabilities;
-                }
-            }
-            return 0;
-        }
-
-        // The reply to the client's handshake: the ack, then the inventories the capabilities have
+        // The reply to the client's handshake: the ack, then the two inventories
         virtual void Handshake( const ConnectionInfo * connection )
         {
-            uint32_t capabilities = 0;
-            uint32_t ackCapabilities = 0;
-            {
-                MutexHolder mh( m_ConnectionsMutex );
-                for ( const ConnectionState & state : m_Connections )
-                {
-                    if ( state.m_Connection == connection )
-                    {
-                        capabilities = state.m_Capabilities;
-                        ackCapabilities = state.m_AckCapabilities;
-                    }
-                }
-            }
-            const Protocol::MsgConnectionAck ack( m_Capacity, ackCapabilities );
+            const Protocol::MsgConnectionAck ack( m_Capacity );
             ack.Send( connection );
-            if ( capabilities & Protocol::CAP_PCH_INVENTORY )
+            const Protocol::MsgPchInventory pchInventory( 0 );
+            pchInventory.Send( connection );
+            const Protocol::MsgToolchainInventory toolchainInventory( (uint32_t)m_ToolchainInventory.GetSize() );
+            if ( m_ToolchainInventory.IsEmpty() )
             {
-                const Protocol::MsgPchInventory pchInventory( 0 );
-                pchInventory.Send( connection );
+                toolchainInventory.Send( connection );
             }
-            if ( capabilities & Protocol::CAP_TOOLCHAIN_INVENTORY )
+            else
             {
-                const Protocol::MsgToolchainInventory toolchainInventory( (uint32_t)m_ToolchainInventory.GetSize() );
-                if ( m_ToolchainInventory.IsEmpty() )
+                MemoryStream ids;
+                for ( const uint64_t toolId : m_ToolchainInventory )
                 {
-                    toolchainInventory.Send( connection );
+                    ids.Write( toolId );
                 }
-                else
-                {
-                    MemoryStream ids;
-                    for ( const uint64_t toolId : m_ToolchainInventory )
-                    {
-                        ids.Write( toolId );
-                    }
-                    toolchainInventory.Send( connection, ids );
-                }
+                toolchainInventory.Send( connection, ids );
             }
         }
 
@@ -2706,10 +2654,6 @@ namespace
                 if ( state->m_Message == nullptr )
                 {
                     state->m_Message = static_cast<const Protocol::IMessage *>( data );
-                    if ( state->m_Message->GetType() == Protocol::MSG_CONNECTION )
-                    {
-                        GetConnectionCapabilities( m_NextConnectionIndex++, state->m_Capabilities, state->m_AckCapabilities );
-                    }
                     if ( state->m_Message->HasPayload() )
                     {
                         return;
@@ -2730,7 +2674,6 @@ namespace
                     m_ConnectionTimes.Append( m_Timer.GetElapsed() );
                 }
                 m_NumConnections.Increment();
-                m_ClientCapabilities.Store( static_cast<const Protocol::MsgConnection *>( message )->GetCapabilities() );
                 Handshake( connection );
             }
             else
@@ -2744,20 +2687,14 @@ namespace
 
         const uint8_t m_Capacity;
         const Array<uint64_t> m_ToolchainInventory;
-        const uint32_t m_Capabilities;
-        const uint32_t m_AckCapabilities;
         struct ConnectionState
         {
             const ConnectionInfo *      m_Connection = nullptr;
-            uint32_t                    m_Capabilities = 0;
-            uint32_t                    m_AckCapabilities = 0;
             const Protocol::IMessage *  m_Message = nullptr; // Its header, until its payload arrives
         };
         mutable Mutex m_ConnectionsMutex;
         Array<ConnectionState> m_Connections;
-        uint32_t m_NextConnectionIndex = 0; // Protected by m_ConnectionsMutex
         Atomic<uint32_t> m_NumConnections{ 0 };
-        Atomic<uint32_t> m_ClientCapabilities{ 0 };
         const Timer m_Timer;
         mutable Mutex m_ConnectionTimesMutex;
         Array<float> m_ConnectionTimes;
@@ -2767,8 +2704,7 @@ namespace
     class CorruptResultWorker : public FakeWorker
     {
     public:
-        explicit CorruptResultWorker( uint32_t capabilities = Protocol::kCapabilities ) : FakeWorker( 4, Array<uint64_t>(), capabilities ) {}
-        CorruptResultWorker( uint32_t capabilities, uint32_t ackCapabilities ) : FakeWorker( 4, Array<uint64_t>(), capabilities, ackCapabilities ) {}
+        CorruptResultWorker() : FakeWorker( 4 ) {}
         explicit CorruptResultWorker( const CorruptResultWorker & other ) = delete;
         CorruptResultWorker & operator=( const CorruptResultWorker & other ) = delete;
 
@@ -3068,7 +3004,7 @@ namespace
 
     // Builds the library that compiles here, with distribution allowed and a worker listening that is
     // given no job. The reconnect delay is short so that a worker that is tried again shows within the build.
-    LocalBuildResult BuildPchLocal( FakeWorker & worker, float reconnectDelay = 10.0f, uint32_t capabilities = Protocol::kCapabilities )
+    LocalBuildResult BuildPchLocal( FakeWorker & worker, float reconnectDelay = 10.0f )
     {
         LocalBuildResult result;
         FBuildTestOptions options;
@@ -3077,7 +3013,6 @@ namespace
         options.m_NumWorkerThreads = 1;
         options.m_ForceCleanBuild = true;
         options.m_DistributionReconnectDelay = reconnectDelay;
-        options.m_DistributionCapabilities = capabilities;
         FBuildForTest fBuild( options );
         if ( ( fBuild.Initialize() == false ) || ( worker.Listen( Protocol::kTestPort ) == false ) )
         {
@@ -3105,10 +3040,6 @@ namespace
 
         explicit NoCapacityWorker( const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
             : FakeWorker( kNoCapacity, toolchainInventory )
-        {
-        }
-        explicit NoCapacityWorker( uint32_t capabilities )
-            : FakeWorker( kNoCapacity, Array<uint64_t>(), capabilities )
         {
         }
         explicit NoCapacityWorker( const NoCapacityWorker & other ) = delete;
@@ -3176,11 +3107,10 @@ namespace
 }
 
 // Builds the library with a PCH against a worker that never gets a job, until the build is stopped
-void TestDistributed::BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when, uint32_t clientCapabilities ) const
+void TestDistributed::BuildPchLibraryUntilStopped( NoCapacityWorker & worker, int when ) const
 {
     FBuildTestOptions options;
     MakeDistributedPchOptions( options );
-    options.m_DistributionCapabilities = clientCapabilities;
     options.m_ForceCleanBuild = true;
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
@@ -3290,7 +3220,6 @@ namespace
         bool IsDisconnected() const { return m_Disconnected.Load(); }
         uint32_t GetRefusedMajor() const { return m_RefusedMajor.Load(); }
         uint32_t GetRefusedMinor() const { return m_RefusedMinor.Load(); }
-        uint32_t GetAckCapabilities() const { return m_AckCapabilities.Load(); }
         void GetToolchainIds( Array<uint64_t> & outToolIds ) const
         {
             MutexHolder mh( m_Mutex );
@@ -3329,10 +3258,6 @@ namespace
                 {
                     m_PchNeededIds.Append( static_cast<const Protocol::MsgPchNeeded *>( m_CurrentMessage )->GetPchId() );
                 }
-                if ( m_CurrentMessage->GetType() == Protocol::MSG_CONNECTION_ACK )
-                {
-                    m_AckCapabilities.Store( static_cast<const Protocol::MsgConnectionAck *>( m_CurrentMessage )->GetCapabilities() );
-                }
                 if ( ( m_CurrentMessage->GetType() == Protocol::MSG_TOOLCHAIN_INVENTORY ) && payload )
                 {
                     const uint64_t * toolIds = static_cast<const uint64_t *>( payload );
@@ -3356,31 +3281,28 @@ namespace
         Atomic<bool> m_Disconnected{ false };
         Atomic<uint32_t> m_RefusedMajor{ 0 };
         Atomic<uint32_t> m_RefusedMinor{ 0 };
-        Atomic<uint32_t> m_AckCapabilities{ 0 };
         const Protocol::IMessage * m_CurrentMessage = nullptr;
     };
 
     // The layout of the handshake messages that every major keeps, as numbers: what peers of another
     // major find by (see Protocol.h). A change to the protocol that moves one of them has to change these too.
-    constexpr uint32_t kGoldenConnectionSize = 80;
-    constexpr uint32_t kGoldenMajor23ConnectionSize = 76;   // 23.x had no capabilities
+    constexpr uint32_t kGoldenConnectionSize = 76;
+    constexpr uint32_t kGoldenAckSize = 12;
     constexpr uint32_t kGoldenPrefixSize = 8;               // Header and version fields
     constexpr uint32_t kGoldenConnectionMajorOffset = 4;    // uint32_t
     constexpr uint32_t kGoldenHostNameOffset = 12;          // char[ 64 ]
-    constexpr uint32_t kGoldenCapabilitiesOffset = 76;      // uint32_t
     constexpr uint32_t kGoldenAckMajorOffset = 6;           // uint8_t, also in MsgRefused
 
     // The handshake of a client of this version, as bytes a test can change
     struct HandshakeBytes
     {
-        explicit HandshakeBytes( uint32_t capabilities = Protocol::kCapabilities )
+        HandshakeBytes()
         {
-            const Protocol::MsgConnection msg( capabilities );
+            const Protocol::MsgConnection msg;
             static_assert( sizeof( bytes ) == sizeof( msg ), "Size of the handshake" );
             memcpy( bytes, &msg, sizeof( msg ) );
         }
         void SetMajor( uint32_t major ) { memcpy( bytes + kGoldenConnectionMajorOffset, &major, sizeof( major ) ); }
-        void SetCapabilities( uint32_t capabilities ) { memcpy( bytes + kGoldenCapabilitiesOffset, &capabilities, sizeof( capabilities ) ); }
         void SetHostName( const char * name ) // Zero terminated if it is shorter than the 64 bytes there are
         {
             memset( bytes + kGoldenHostNameOffset, 0, 64 );
@@ -3591,10 +3513,10 @@ void TestDistributed::FramesOfAnotherMajorAreRefused() const
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
-    // The handshake of a 23.x client is shorter than this version's, and a frame of another major is
-    // only read as far as it goes: past its version fields, to the host name, and no further
+    // A frame of another major is only read as far as it goes: past its version fields, to the host
+    // name, and no further
     const uint32_t frameSizes[] = {
-        kGoldenMajor23ConnectionSize,
+        kGoldenConnectionSize,
         kGoldenHostNameOffset,  // Stops before the host name
         kGoldenPrefixSize,      // Only the header and the version
     };
@@ -3624,6 +3546,7 @@ void TestDistributed::HandshakeLayoutIsFrozen() const
     uint8_t connectionBytes[ sizeof( connection ) ];
     memcpy( connectionBytes, &connection, sizeof( connection ) );
     TEST_ASSERT( sizeof( connection ) == kGoldenConnectionSize );
+    TEST_ASSERT( sizeof( Protocol::MsgConnectionAck ) == kGoldenAckSize );
     const uint8_t connectionHeader[] = { 1 /*MSG_CONNECTION*/, kGoldenConnectionSize, 0 /*no payload*/, 0 };
     TEST_ASSERT( memcmp( connectionBytes, connectionHeader, sizeof( connectionHeader ) ) == 0 );
     TEST_ASSERT( connectionBytes[ kGoldenConnectionMajorOffset ] == Protocol::kVersionMajor );
@@ -3632,7 +3555,7 @@ void TestDistributed::HandshakeLayoutIsFrozen() const
     const Protocol::MsgConnectionAck ack( 4 );
     uint8_t ackBytes[ sizeof( ack ) ];
     memcpy( ackBytes, &ack, sizeof( ack ) );
-    const uint8_t ackHeader[] = { 7 /*MSG_CONNECTION_ACK*/, 16, 0, 0 };
+    const uint8_t ackHeader[] = { 7 /*MSG_CONNECTION_ACK*/, kGoldenAckSize, 0, 0 };
     TEST_ASSERT( memcmp( ackBytes, ackHeader, sizeof( ackHeader ) ) == 0 );
     TEST_ASSERT( ackBytes[ kGoldenAckMajorOffset ] == Protocol::kVersionMajor );
     TEST_ASSERT( ackBytes[ kGoldenAckMajorOffset + 1 ] == Protocol::kVersionMinor );
@@ -3647,7 +3570,7 @@ void TestDistributed::HandshakeLayoutIsFrozen() const
     TEST_ASSERT( refusedBytes[ kGoldenAckMajorOffset + 1 ] == Protocol::kVersionMinor );
 
     // and the handshake a 23.x peer sends is found by them
-    alignas( 8 ) uint8_t connection23[ kGoldenMajor23ConnectionSize ] = { 1, kGoldenMajor23ConnectionSize, 0, 0, 23, 0, 0, 0, 1 /*platform*/, 6 /*minor*/ };
+    alignas( 8 ) uint8_t connection23[ kGoldenConnectionSize ] = { 1, kGoldenConnectionSize, 0, 0, 23, 0, 0, 0, 1 /*platform*/, 6 /*minor*/ };
     memcpy( connection23 + kGoldenHostNameOffset, "old-client", 11 );
     TEST_ASSERT( Protocol::IsValidHeader( connection23, sizeof( connection23 ) ) );
     const Protocol::MsgConnection * old = reinterpret_cast<const Protocol::MsgConnection *>( connection23 );
@@ -3872,7 +3795,6 @@ void TestDistributed::HostNameIsBoundedByTheFrame() const
     const Case cases[] = {
         { 0, "" }, { 8, "" }, { kGoldenHostNameOffset, "" },    // Stops before the host name
         { kGoldenHostNameOffset + 4, "buil" },                  // or in the middle of it
-        { kGoldenMajor23ConnectionSize, "build-pc" },
         { kGoldenConnectionSize, "build-pc" },
     };
     for ( const Case & c : cases )
@@ -3886,10 +3808,10 @@ void TestDistributed::HostNameIsBoundedByTheFrame() const
 
     // and a name that is not terminated stops where the message does
     handshake.FillHostName( 'A' );
-    char * frame = ( pages + pageSize - kGoldenMajor23ConnectionSize );
-    memcpy( frame, handshake.bytes, kGoldenMajor23ConnectionSize );
+    char * frame = ( pages + pageSize - kGoldenConnectionSize );
+    memcpy( frame, handshake.bytes, kGoldenConnectionSize );
     AStackString<> name;
-    reinterpret_cast<const Protocol::MsgConnection *>( frame )->GetHostName( kGoldenMajor23ConnectionSize, name );
+    reinterpret_cast<const Protocol::MsgConnection *>( frame )->GetHostName( kGoldenConnectionSize, name );
     TEST_ASSERT( name.GetLength() == 64 );
 
     ::VirtualFree( pages, 0, MEM_RELEASE );
@@ -4050,7 +3972,7 @@ namespace
     private:
         virtual void Handshake( const ConnectionInfo * connection ) override
         {
-            const Protocol::MsgConnectionAck ack( 4, 0 );
+            const Protocol::MsgConnectionAck ack( 4 );
             ack.Send( connection );
         }
         virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage & message, void *, uint32_t ) override
@@ -4227,13 +4149,13 @@ namespace
         return msg.Send( connection, payload );
     }
 
-    // Sends the handshake of a client advertising the capabilities and waits for the ack and the inventories
+    // Sends the handshake of a client and waits for the ack and the inventories
     // that answer it. Sent after other messages it also says they have been dealt with, as a connection
     // is served in order: whatever they made the worker send came before the ack.
-    bool Handshake( HandshakeProbe & probe, const ConnectionInfo * connection, uint32_t capabilities, float timeoutSeconds )
+    bool Handshake( HandshakeProbe & probe, const ConnectionInfo * connection, float timeoutSeconds )
     {
         const size_t numBefore = probe.GetNumMessages();
-        const HandshakeBytes handshake( capabilities );
+        const HandshakeBytes handshake;
         if ( probe.Send( connection, handshake.bytes, sizeof( handshake.bytes ) ) == false )
         {
             return false;
@@ -4251,11 +4173,11 @@ namespace
         return true;
     }
 
-    // Connects to a worker and completes the handshake, as a client advertising the capabilities would
-    bool ConnectAndHandshake( HandshakeProbe & probe, uint32_t capabilities, const ConnectionInfo * & outConnection, float timeoutSeconds )
+    // Connects to a worker and completes the handshake.
+    bool ConnectAndHandshake( HandshakeProbe & probe, const ConnectionInfo * & outConnection, float timeoutSeconds )
     {
         outConnection = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-        return ( outConnection != nullptr ) && Handshake( probe, outConnection, capabilities, timeoutSeconds );
+        return ( outConnection != nullptr ) && Handshake( probe, outConnection, timeoutSeconds );
     }
 }
 
@@ -4345,7 +4267,7 @@ void TestDistributed::WorkerAsksForAMissingPch() const
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
     HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( probe, Protocol::kCapabilities, ci, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( ConnectAndHandshake( probe, ci, kWaitTimeoutSeconds ) );
 
     // A job for a PCH the worker does not have: it asks for it, naming it
     JobStreamEncoder encoder;
@@ -4356,7 +4278,7 @@ void TestDistributed::WorkerAsksForAMissingPch() const
     // More jobs for it do not make it ask again, as it is not here yet
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( Handshake( probe, ci, Protocol::kCapabilities, kWaitTimeoutSeconds ) ); // Answered after the jobs
+    TEST_ASSERT( Handshake( probe, ci, kWaitTimeoutSeconds ) ); // Answered after the jobs
     TEST_ASSERT( CountWaitingJobs( s ) == 3 );
     TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
     probe.ShutdownAllConnections();
@@ -4375,7 +4297,7 @@ void TestDistributed::WorkerDoesNotAskForAPchBeingReceived() const
     // One connection is in the middle of sending the PCH: the first of three chunks has arrived
     HandshakeProbe receiving;
     const ConnectionInfo * receivingConnection = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( receiving, Protocol::kCapabilities, receivingConnection, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( ConnectAndHandshake( receiving, receivingConnection, kWaitTimeoutSeconds ) );
     Array<char> chunk;
     chunk.SetSize( Protocol::kMinPchChunkSize );
     memset( chunk.Begin(), 0, chunk.GetSize() );
@@ -4397,10 +4319,10 @@ void TestDistributed::WorkerDoesNotAskForAPchBeingReceived() const
     // A job for the PCH arrives on another connection: it is on its way, so it is not asked for
     HandshakeProbe waiting;
     const ConnectionInfo * waitingConnection = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( waiting, Protocol::kCapabilities, waitingConnection, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( ConnectAndHandshake( waiting, waitingConnection, kWaitTimeoutSeconds ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( waitingConnection, encoder, job ) );
-    TEST_ASSERT( Handshake( waiting, waitingConnection, Protocol::kCapabilities, kWaitTimeoutSeconds ) ); // Answered after the job
+    TEST_ASSERT( Handshake( waiting, waitingConnection, kWaitTimeoutSeconds ) ); // Answered after the job
     TEST_ASSERT( CountWaitingJobs( s ) == 1 );
     TEST_ASSERT( waiting.GetNumPchNeeded() == 0 );
     TEST_ASSERT( receiving.GetNumPchNeeded() == 0 );
@@ -4434,7 +4356,7 @@ void TestDistributed::WorkerAsksAgainWhenAPchItHadIsNeededAgain() const
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
     HandshakeProbe client;
     const ConnectionInfo * ci = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( client, Protocol::kCapabilities, ci, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( ConnectAndHandshake( client, ci, kWaitTimeoutSeconds ) );
 
     // The PCH is asked for
     JobStreamEncoder encoder;
@@ -4458,7 +4380,7 @@ void TestDistributed::WorkerAsksAgainWhenAPchItHadIsNeededAgain() const
     // A job for the first one again: the worker asks again, as the PCH has arrived since it asked
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
     TEST_ASSERT( WaitUntil( [ &client ]() { return ( client.GetNumPchNeeded() >= 2 ); } ) );
-    TEST_ASSERT( Handshake( client, ci, Protocol::kCapabilities, kWaitTimeoutSeconds ) ); // Answered after the job
+    TEST_ASSERT( Handshake( client, ci, kWaitTimeoutSeconds ) ); // Answered after the job
     TEST_ASSERT( client.GetNumPchNeeded() == 2 );
     TEST_ASSERT( client.GetPchNeededId( 1 ) == pchs[ 0 ].m_Id );
     client.ShutdownAllConnections();
@@ -5373,7 +5295,7 @@ void TestDistributed::PchThatCannotBeWrittenReturnsItsJobs() const
     // be as good as the one the worker has, and no better
     HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( probe, Protocol::kCapabilities, ci, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( ConnectAndHandshake( probe, ci, kWaitTimeoutSeconds ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
     TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
@@ -5414,7 +5336,7 @@ void TestDistributed::CorruptPchIsAskedForAgain() const
     // A job for it finds out, and the client is asked for the PCH
     HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( probe, Protocol::kCapabilities, ci, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( ConnectAndHandshake( probe, ci, kWaitTimeoutSeconds ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
     TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() >= 1 ); } ) );
@@ -5435,7 +5357,7 @@ void TestDistributed::CorruptPchIsAskedForAgain() const
     TEST_ASSERT( s.IsPchCached( pch.m_Id ) );
 
     // and the client is not asked again: whatever the worker sent before it answers this was sent by then
-    TEST_ASSERT( Handshake( probe, ci, Protocol::kCapabilities, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( Handshake( probe, ci, kWaitTimeoutSeconds ) );
     TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
     probe.ShutdownAllConnections();
 }
@@ -6613,7 +6535,6 @@ namespace
 
 /*static*/ PchDataCache::CompressedState TestDistributed::WaitForForm( PchDataCache & cache,
                                                                         const PchDataCache::Entry & entry,
-                                                                        bool allowTransform,
                                                                         AString & outFilePath,
                                                                         uint64_t & outSize,
                                                                         bool & outTransformed )
@@ -6621,7 +6542,7 @@ namespace
     PchDataCache::CompressedState state = PchDataCache::COMPRESSING;
     WaitUntil( [ & ]()
     {
-        state = cache.GetCompressed( entry, outFilePath, outSize, allowTransform, &outTransformed );
+        state = cache.GetCompressed( entry, outFilePath, outSize, &outTransformed );
         return ( state != PchDataCache::COMPRESSING );
     } );
     return state;
@@ -6729,7 +6650,7 @@ void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
     AStackString<> transformedPath;
     uint64_t transformedSize = 0;
     bool isTransformed = false;
-    TEST_ASSERT( WaitForForm( cache, entry, true, transformedPath, transformedSize, isTransformed ) == PchDataCache::READY );
+    TEST_ASSERT( WaitForForm( cache, entry, transformedPath, transformedSize, isTransformed ) == PchDataCache::READY );
     TEST_ASSERT( isTransformed );
     Array<char> transformedBlob;
     TEST_ASSERT( ReadFile( transformedPath, transformedBlob ) );
@@ -6738,14 +6659,16 @@ void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
     TEST_ASSERT( BlobDecodesTo( transformedBlob, content ) );
     TEST_ASSERT( cache.GetNumCompressions() == 1 );
 
-    // One that does not is given what 24.0 sends: it is made when it is asked for
+    // The plain form, as it is sent when the transform does not work out, is what a worker of 24.0 reads
+    PchDataCache plainCache;
+    plainCache.SetTransformFault( PchTransform::Encoder::FAULT_REFUSE );
+    plainCache.Store( entry );
     AStackString<> plainPath;
     uint64_t plainSize = 0;
     bool plainIsTransformed = true;
-    TEST_ASSERT( WaitForForm( cache, entry, false, plainPath, plainSize, plainIsTransformed ) == PchDataCache::READY );
+    TEST_ASSERT( WaitForForm( plainCache, entry, plainPath, plainSize, plainIsTransformed ) == PchDataCache::READY );
     TEST_ASSERT( plainIsTransformed == false );
     TEST_ASSERT( plainPath != transformedPath );
-    TEST_ASSERT( cache.GetNumCompressions() == 2 );
     Array<char> plainBlob;
     TEST_ASSERT( ReadFile( plainPath, plainBlob ) );
     TEST_ASSERT( GetBlobType( plainBlob ) == Compressor::eZstd );
@@ -6753,16 +6676,14 @@ void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
     OUTPUT( "PchIsCompressedInTheFormsWorkersRead: %" PRIu64 " bytes, %" PRIu64 " with the transform (%.1f%%)\n", plainSize, transformedSize, ( 100.0 * (double)transformedSize ) / (double)plainSize );
     TEST_ASSERT( ( transformedSize * 100 ) < ( plainSize * 90 ) );
 
-    // Each is made once, however often it is asked for
+    // It is made once, however often it is asked for
     {
         AStackString<> again;
         uint64_t againSize = 0;
         bool againTransformed = false;
-        TEST_ASSERT( cache.GetCompressed( entry, again, againSize, true, &againTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( cache.GetCompressed( entry, again, againSize, &againTransformed ) == PchDataCache::READY );
         TEST_ASSERT( ( again == transformedPath ) && ( againSize == transformedSize ) && againTransformed );
-        TEST_ASSERT( cache.GetCompressed( entry, again, againSize, false, &againTransformed ) == PchDataCache::READY );
-        TEST_ASSERT( ( again == plainPath ) && ( againSize == plainSize ) && ( againTransformed == false ) );
-        TEST_ASSERT( cache.GetNumCompressions() == 2 );
+        TEST_ASSERT( cache.GetNumCompressions() == 1 );
     }
 
     // What a connection takes is the transformed form
@@ -6793,13 +6714,13 @@ void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
         AStackString<> asked;
         uint64_t askedSize = 0;
         bool askedTransformed = true;
-        TEST_ASSERT( WaitForForm( cache, notAPchEntry, true, asked, askedSize, askedTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( WaitForForm( cache, notAPchEntry, asked, askedSize, askedTransformed ) == PchDataCache::READY );
         TEST_ASSERT( askedTransformed == false );
         TEST_ASSERT( DecodesToFile( asked, notAPch ) );
-        TEST_ASSERT( cache.GetNumCompressions() == 3 );
+        TEST_ASSERT( cache.GetNumCompressions() == 2 );
     }
 
-    // A PCH the transform does not help is sent as it is to a worker that reads the transform, and is made once
+    // A PCH the transform does not help is sent as it is, and is made once
     {
         Array<char> random;
         MakeRandomBytes( ( 2 * MEGABYTE ) + 3, 9, random );
@@ -6819,20 +6740,20 @@ void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
         AStackString<> asked;
         uint64_t askedSize = 0;
         bool askedTransformed = true;
-        TEST_ASSERT( WaitForForm( cache, randomEntry, true, asked, askedSize, askedTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( WaitForForm( cache, randomEntry, asked, askedSize, askedTransformed ) == PchDataCache::READY );
         TEST_ASSERT( askedTransformed == false );
         Array<char> askedBlob;
         TEST_ASSERT( ReadFile( asked, askedBlob ) );
         TEST_ASSERT( ( GetBlobType( askedBlob ) & ~0xFFu ) == 0 ); // Not of a transform
         TEST_ASSERT( DecodesToFile( asked, random ) );
-        TEST_ASSERT( cache.GetNumCompressions() == 4 );
+        TEST_ASSERT( cache.GetNumCompressions() == 3 );
 
         AStackString<> other;
         uint64_t otherSize = 0;
         bool otherTransformed = true;
-        TEST_ASSERT( cache.GetCompressed( randomEntry, other, otherSize, false, &otherTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( cache.GetCompressed( randomEntry, other, otherSize, &otherTransformed ) == PchDataCache::READY );
         TEST_ASSERT( ( other == asked ) && ( otherSize == askedSize ) && ( otherTransformed == false ) );
-        TEST_ASSERT( cache.GetNumCompressions() == 4 );
+        TEST_ASSERT( cache.GetNumCompressions() == 3 );
     }
 }
 
@@ -6859,7 +6780,7 @@ void TestDistributed::PchTransformThatFailsIsNotSent() const
         AStackString<> filePath;
         uint64_t size = 0;
         bool isTransformed = true;
-        TEST_ASSERTM( WaitForForm( cache, entry, true, filePath, size, isTransformed ) == PchDataCache::READY, "fault %u", (uint32_t)fault );
+        TEST_ASSERTM( WaitForForm( cache, entry, filePath, size, isTransformed ) == PchDataCache::READY, "fault %u", (uint32_t)fault );
 
         // What is sent is the PCH compressed as it was before there was a transform, and nothing of the other is left.
         // The PCH has not failed: that is for the form every worker can read.
@@ -6876,14 +6797,6 @@ void TestDistributed::PchTransformThatFailsIsNotSent() const
         Array<AString> files;
         FileIO::GetFiles( sendDir, AStackString( "*" ), true, &files );
         TEST_ASSERT( files.GetSize() == 1 );
-
-        // A worker that does not read the transform is given the same copy, which is not made again
-        AStackString<> plainPath;
-        uint64_t plainSize = 0;
-        bool plainIsTransformed = true;
-        TEST_ASSERT( cache.GetCompressed( entry, plainPath, plainSize, false, &plainIsTransformed ) == PchDataCache::READY );
-        TEST_ASSERT( ( plainPath == filePath ) && ( plainSize == size ) && ( plainIsTransformed == false ) );
-        TEST_ASSERT( cache.GetNumCompressions() == 1 );
     }
 
     // The same PCH is sent after the transform when it inverts
@@ -6893,7 +6806,7 @@ void TestDistributed::PchTransformThatFailsIsNotSent() const
         AStackString<> filePath;
         uint64_t size = 0;
         bool isTransformed = false;
-        TEST_ASSERT( WaitForForm( cache, entry, true, filePath, size, isTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( WaitForForm( cache, entry, filePath, size, isTransformed ) == PchDataCache::READY );
         TEST_ASSERT( isTransformed );
     }
 }
@@ -6905,7 +6818,6 @@ void TestDistributed::PchIsCompressedWithTheWindowOfItsSize() const
     // What a client sends is compressed with the window of Compressor::kZstdPchWindowLog at most, and with no more than
     // holds the PCH: a worker allocates the window to read it. That is what a PCH of this size says in both forms. (The
     // blobs of PCHs that are larger than the window are in TestPchBlob::PchBlobsUseTheWideWindow.)
-    PchDataCache cache;
     Array<char> content;
     const AStackString<> path( "../tmp/Test/Distributed/PchWindow/pchlike.pch" );
     const uint32_t fileSize = ( 3 * MEGABYTE ) + 3;
@@ -6914,19 +6826,25 @@ void TestDistributed::PchIsCompressedWithTheWindowOfItsSize() const
     entry.pchId = PchId::Calc( content.Begin(), fileSize );
     entry.uncompressedSize = fileSize;
     entry.filePath = path;
-    cache.Store( entry );
     const uint32_t expectedLog = 22; // The smallest window that holds 3 MiB and a few bytes: 4 MiB
-    for ( uint32_t allow = 0; allow < 2; ++allow )
+    for ( uint32_t transform = 0; transform < 2; ++transform )
     {
+        // The plain form is what is sent when the transform does not work out
+        PchDataCache cache;
+        if ( transform == 0 )
+        {
+            cache.SetTransformFault( PchTransform::Encoder::FAULT_REFUSE );
+        }
+        cache.Store( entry );
         AStackString<> filePath;
         uint64_t size = 0;
         bool isTransformed = false;
-        TEST_ASSERT( WaitForForm( cache, entry, ( allow != 0 ), filePath, size, isTransformed ) == PchDataCache::READY );
-        TEST_ASSERT( isTransformed == ( allow != 0 ) );
+        TEST_ASSERT( WaitForForm( cache, entry, filePath, size, isTransformed ) == PchDataCache::READY );
+        TEST_ASSERT( isTransformed == ( transform != 0 ) );
         Array<char> blob;
         TEST_ASSERT( ReadFile( filePath, blob ) );
         const uint32_t log = GetBlobWindowLog( blob );
-        if ( allow )
+        if ( transform )
         {
             TEST_ASSERT( log == expectedLog );
         }

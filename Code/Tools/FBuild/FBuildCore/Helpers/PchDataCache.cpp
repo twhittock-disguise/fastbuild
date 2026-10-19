@@ -53,10 +53,9 @@ namespace
 class PchDataCache::CompressedPch
 {
 public:
-    CompressedPch( const Entry & entry, PchDataCache & owner, bool wantTransform )
+    CompressedPch( const Entry & entry, PchDataCache & owner )
         : m_Entry( entry )
         , m_Owner( owner )
-        , m_WantTransform( wantTransform )
     {
         // A dedicated thread: build worker threads are busy compiling, and a small
         // stack is enough as the file is read and compressed in pieces
@@ -81,14 +80,6 @@ public:
     uint64_t GetPchId() const { return m_Entry.pchId; }
     bool IsTransformed() const { return m_Transformed; } // Known when READY
 
-    // Whether this copy is what a worker that does (allowTransform) or does not read a transformed PCH is given:
-    // one made for the same kind of worker, or one made for a worker that reads it and that is the plain form
-    // because the transform was not worth it or did not give the PCH back
-    bool IsFormFor( bool allowTransform ) const
-    {
-        return ( ( m_WantTransform == allowTransform ) ||
-                 ( ( allowTransform == false ) && ( GetState() == READY ) && ( m_Transformed == false ) ) );
-    }
     CompressedState GetState() const { return static_cast<CompressedState>( m_State.Load() ); }
     uint32_t GetFailedAttempts() const { return m_FailedAttempts.Load(); }
     const AString & GetFilePath() const { return m_FilePath; }
@@ -154,10 +145,10 @@ private:
         AStackString<> tempPath;
         TempFiles::MakeName( dir, kTempFilePrefix, kTempFileExtension, tempPath );
 
-        // The transformed form if it is wanted and works out, else the plain one. Only a failure of the plain
-        // one is a failure of the PCH: a worker that cannot read the transformed one is sent the plain one.
+        // The transformed form if it works out, else the plain one. Only a failure of the plain one is a
+        // failure of the PCH.
         uint64_t compressedFileSize = 0;
-        bool transformed = ( m_WantTransform && WriteTransformed( tempPath, compressedFileSize ) );
+        bool transformed = WriteTransformed( tempPath, compressedFileSize );
         if ( m_Cancel.Load() )
         {
             return false;
@@ -223,7 +214,6 @@ private:
 
     Entry m_Entry;
     PchDataCache & m_Owner;
-    const bool m_WantTransform;
     Thread m_Thread;
     Atomic<uint32_t> m_State{ COMPRESSING };
     Atomic<uint32_t> m_FailedAttempts{ 0 };
@@ -349,16 +339,13 @@ bool PchDataCache::Record( const AString & filePath, Entry & outEntry )
 PchDataCache::CompressedState PchDataCache::GetCompressed( const Entry & entry,
                                                            AString & outFilePath,
                                                            uint64_t & outFileSize,
-                                                           bool allowTransform,
                                                            bool * outTransformed )
 {
     MutexHolder mh( m_Mutex );
 
     for ( const CompressedPch * c : m_Compressed )
     {
-        // There is a copy for each kind of worker. One that asks while the copy of the other kind is being made
-        // is not made to wait for it: that is likely to be transformed, which it cannot read, so its own starts at once.
-        if ( ( c->GetPchId() == entry.pchId ) && c->IsFormFor( allowTransform ) )
+        if ( c->GetPchId() == entry.pchId )
         {
             const CompressedState state = c->GetState();
             if ( state == READY )
@@ -374,7 +361,7 @@ PchDataCache::CompressedState PchDataCache::GetCompressed( const Entry & entry,
         }
     }
 
-    m_Compressed.Append( FNEW( CompressedPch( entry, *this, allowTransform ) ) );
+    m_Compressed.Append( FNEW( CompressedPch( entry, *this ) ) );
     return COMPRESSING;
 }
 
@@ -439,7 +426,7 @@ bool PchDataCache::TakeReadyPchs( Array<uint64_t> & pending,
             AStackString<> filePath;
             uint64_t fileSize = 0;
             bool transformed = false;
-            switch ( GetCompressed( entry, filePath, fileSize, true /*allowTransform*/, &transformed ) )
+            switch ( GetCompressed( entry, filePath, fileSize, &transformed ) )
             {
                 case COMPRESSING:
                     stillPending.Append( pchId );

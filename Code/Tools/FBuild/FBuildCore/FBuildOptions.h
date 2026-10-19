@@ -82,7 +82,6 @@ public:
     bool m_AllowLocalRace = true;
     uint16_t m_DistributionPort = Protocol::kPort;
     uint32_t m_DistributionPchChunkSize = Protocol::kPchChunkSize; // The pieces a PCH is sent in, within the protocol's bounds. Set by tests only.
-    uint32_t m_DistributionCapabilities = Protocol::kCapabilities; // What the client advertises to workers. Set by tests only.
     float m_DistributionReconnectDelay = 10.0f; // Seconds before a worker that dropped or failed is tried again. Set by tests only.
 
     // General Output
