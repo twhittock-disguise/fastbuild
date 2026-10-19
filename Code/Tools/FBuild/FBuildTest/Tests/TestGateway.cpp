@@ -15,6 +15,7 @@
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
 #include "Tools/FBuild/FBuildCore/Gateway/ToolchainStash.h"
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
@@ -421,6 +422,8 @@ private:
     void ThreadLanesOfTwoWorkersDoNotCollide() const;
     void ClientsAreServedInTurn() const;
     void GatewayLogsForwarding() const;
+    void StoredPchThatFailsMeasurementIsDropped() const;
+    void StoredPchOfAnotherIdIsDropped() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -452,6 +455,8 @@ private:
     static void MakeGatewayConfig( uint32_t numWorkers, GatewayConfig & outConfig );
     static Gateway::Stats GetGatewayStats( const Gateway & gateway );
     static bool WaitForReadyWorkers( const Gateway & gateway, uint32_t numWorkers );
+    // A stored PCH that does not hold what its id says is dropped at start, and asked of the client
+    static void CheckStoredPchIsDropped( const void * storedData, size_t storedSize, const DistributedTest::CompressedPch & pch );
 
     mutable SyntheticToolchain::ScratchWorkerCache m_WorkerCache;
 };
@@ -525,6 +530,8 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( ThreadLanesOfTwoWorkersDoNotCollide )
     REGISTER_TEST( ClientsAreServedInTurn )
     REGISTER_TEST( GatewayLogsForwarding )
+    REGISTER_TEST( StoredPchThatFailsMeasurementIsDropped )
+    REGISTER_TEST( StoredPchOfAnotherIdIsDropped )
 REGISTER_TESTS_END
 
 // PreTest
@@ -3889,6 +3896,76 @@ void TestGateway::GatewayLogsForwarding() const
     const char * stats = log.Find( "gateway stats clients=" );
     TEST_ASSERT( stats );
     TEST_ASSERT( strstr( stats, " workers=1/1 pool=4 waiting=0 parked=0 running=0 heldMiB=0 forwarded=1 retries=0 giveups=0 timeouts=0 pchMiB=0" ) );
+}
+
+// CheckStoredPchIsDropped
+//------------------------------------------------------------------------------
+/*static*/ void TestGateway::CheckStoredPchIsDropped( const void * storedData, size_t storedSize, const DistributedTest::CompressedPch & pch )
+{
+    // Left in the gateway's store by an earlier run
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    AStackString<> storedFile( config.m_CacheDir );
+    storedFile.AppendFormat( "pch.%016" PRIx64, pch.m_Id );
+    TEST_ASSERT( FileIO::EnsurePathExists( storedFile ) );
+    storedFile.AppendFormat( "%c%s", (char)NATIVE_SLASH, PchBlob::kStoredFileName );
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( storedFile.Get(), FileStream::WRITE_ONLY ) );
+        TEST_ASSERT( f.Write( storedData, storedSize ) == storedSize );
+    }
+
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    // It goes from the store once it has been measured, so it is not advertised
+    TEST_ASSERT( WaitUntil( [ &gateway, &pch ]() { AStackString<> path; return ( gateway.GetServer().FindCachedPch( pch.m_Id, path ) == false ); } ) );
+    TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) == false );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    Array<uint64_t> advertised;
+    probe.GetPchInventoryIds( advertised );
+    TEST_ASSERT( advertised.Find( pch.m_Id ) == nullptr );
+
+    // A job that needs it makes the gateway ask for it
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() == 1 ); } ) );
+    TEST_ASSERT( probe.GetPchNeededId( 0 ) == pch.m_Id );
+    TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+    Array<GatewayWire::ResultHeader> results;
+    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
+    TEST_ASSERT( worker.GetPchBytes() == pch.m_CompressedSize );
+    probe.ShutdownAllConnections();
+}
+
+// StoredPchThatFailsMeasurementIsDropped
+//------------------------------------------------------------------------------
+void TestGateway::StoredPchThatFailsMeasurementIsDropped() const
+{
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 64 * 1024, 6, pch );
+    const char corrupt[] = "not a compressed PCH";
+    CheckStoredPchIsDropped( corrupt, sizeof( corrupt ), pch );
+}
+
+// StoredPchOfAnotherIdIsDropped
+//------------------------------------------------------------------------------
+void TestGateway::StoredPchOfAnotherIdIsDropped() const
+{
+    // A whole, valid PCH, but not the one its directory names
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 64 * 1024, 7, pch );
+    DistributedTest::CompressedPch other;
+    DistributedTest::MakeCompressedPch( 64 * 1024, 8, other );
+    TEST_ASSERT( other.m_Id != pch.m_Id );
+    CheckStoredPchIsDropped( other.m_Compressed.GetResult(), other.m_CompressedSize, pch );
 }
 
 //------------------------------------------------------------------------------

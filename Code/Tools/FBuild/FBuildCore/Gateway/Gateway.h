@@ -129,7 +129,6 @@ private:
         uint32_t    m_UncompressedSize = 0;
         uint32_t    m_CompressedSize = 0;
         bool        m_Measured = false;
-        bool        m_Unusable = false;     // Its measurement failed
     };
 
     // A client that is sending a toolchain the stash does not hold whole yet
@@ -150,6 +149,7 @@ private:
         Array<uint64_t>         m_DropIncomplete;
         Array<uint64_t>         m_ReleaseUses;
         Array<GatewayJob *>     m_FreeJobs;
+        Array<uint64_t>         m_DropPchs;     // From the Server's store
         Array<uint32_t>         m_Disconnects;
         Array<PchAsk>           m_PchAsks;
         Array<ToolchainRequest> m_ToolchainRequests;

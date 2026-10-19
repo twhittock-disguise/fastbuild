@@ -31,6 +31,9 @@ public:
     // The same for a blob in a file, read in pieces
     [[nodiscard]] static bool VerifyFile( const char * blobFile, uint64_t pchId, uint32_t uncompressedSize, const Atomic<bool> * abort );
 
+    // The same, for a PCH whose size is not known: the size it decompresses to, if it is the PCH with this id
+    [[nodiscard]] static bool MeasureFile( const char * blobFile, uint64_t pchId, const Atomic<bool> * abort, uint32_t & outUncompressedSize );
+
     enum UnpackResult
     {
         UNPACK_OK,

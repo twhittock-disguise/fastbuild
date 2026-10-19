@@ -72,6 +72,15 @@ namespace
              ( sink.GetId() == pchId ) );
 }
 
+// MeasureFile
+//------------------------------------------------------------------------------
+/*static*/ bool PchBlob::MeasureFile( const char * blobFile, uint64_t pchId, const Atomic<bool> * abort, uint32_t & outUncompressedSize )
+{
+    PchSink sink( nullptr );
+    return ( StreamDecompressor::DecompressFile( blobFile, abort, sink, outUncompressedSize ) &&
+             ( sink.GetId() == pchId ) );
+}
+
 // Unpack
 //------------------------------------------------------------------------------
 /*static*/ PchBlob::UnpackResult PchBlob::Unpack( const AString & storedFile,

@@ -442,6 +442,11 @@ namespace DistributedTest
             MutexHolder mh( m_Mutex );
             outToolIds = m_ToolchainIds;
         }
+        void GetPchInventoryIds( Array<uint64_t> & outPchIds ) const
+        {
+            MutexHolder mh( m_Mutex );
+            outPchIds = m_PchInventoryIds;
+        }
         // While set, what arrives is not read, so what the worker sends backs up
         void StallReading( bool stall )
         {
@@ -527,6 +532,14 @@ namespace DistributedTest
                 {
                     m_PchNeededIds.Append( static_cast<const Protocol::MsgPchNeeded *>( m_CurrentMessage )->GetPchId() );
                 }
+                if ( ( m_CurrentMessage->GetType() == Protocol::MSG_PCH_INVENTORY ) && payload )
+                {
+                    const uint64_t * pchIds = static_cast<const uint64_t *>( payload );
+                    for ( size_t i = 0; i < ( size / sizeof( uint64_t ) ); ++i )
+                    {
+                        m_PchInventoryIds.Append( pchIds[ i ] );
+                    }
+                }
                 if ( ( m_CurrentMessage->GetType() == Protocol::MSG_TOOLCHAIN_INVENTORY ) && payload )
                 {
                     const uint64_t * toolIds = static_cast<const uint64_t *>( payload );
@@ -576,6 +589,7 @@ namespace DistributedTest
         mutable Mutex m_Mutex;
         Array<uint8_t> m_MessageTypes;
         Array<uint64_t> m_ToolchainIds;
+        Array<uint64_t> m_PchInventoryIds;
         Array<uint64_t> m_PchNeededIds;
         Array<GatewayWire::ResultHeader> m_Results;
         Array<ToolchainRequest> m_ToolchainRequests;

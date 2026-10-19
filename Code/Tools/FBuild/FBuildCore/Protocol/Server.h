@@ -79,6 +79,7 @@ public:
     bool FindCachedPch( uint64_t pchId, AString & outPath ); // The compressed PCH. Refreshes LRU recency.
     PchLease AcquirePchLease( uint64_t pchId );
     void GetCachedPchIds( Array<uint64_t> & outPchIds ) const; // Those in the store now, as the PCH inventory sends them
+    void DropStoredPch( uint64_t pchId ); // A stored PCH that is not what its id says: removed, so it can be asked for again
 
     // Asks the client for a PCH that is not cached, once until it arrives (see RequestPchIfMissing).
     // Sent by the client's outbox, so it never waits for a client that reads slowly.

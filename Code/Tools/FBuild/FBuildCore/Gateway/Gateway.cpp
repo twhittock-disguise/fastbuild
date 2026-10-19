@@ -9,7 +9,7 @@
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/FLog.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
-#include "Tools/FBuild/FBuildCore/Helpers/StreamDecompressor.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 
 // Core
@@ -44,13 +44,6 @@ namespace
         directory.AppendFormat( "gateway%ctoolchains%c", (char)NATIVE_SLASH, (char)NATIVE_SLASH );
         return AString( directory );
     }
-
-    // Decompresses a stored PCH only to learn its size
-    class PchMeasureSink : public StreamDecompressor::Sink
-    {
-    public:
-        virtual bool OnPiece( const void * /*data*/, size_t /*size*/ ) override { return true; }
-    };
 }
 
 // WorkerAffinity
@@ -335,7 +328,6 @@ void Gateway::GetStats( Stats & outStats ) const
         pch->m_UncompressedSize = uncompressedSize;
         pch->m_CompressedSize = compressedSize;
         pch->m_Measured = true;
-        pch->m_Unusable = false;
         ReleaseParked();
         Dispatch( actions );
     }
@@ -586,6 +578,10 @@ void Gateway::Run( Actions & actions )
         }
         FREE( job->m_Data );
         FDELETE job; // And its PCH lease
+    }
+    for ( const uint64_t pchId : actions.m_DropPchs )
+    {
+        m_Server->DropStoredPch( pchId );
     }
     for ( const uint32_t clientId : actions.m_Disconnects )
     {
@@ -1038,7 +1034,7 @@ void Gateway::MeasureStoredPchs()
             MutexHolder mh( m_Mutex );
             for ( const KnownPch & known : m_Pchs )
             {
-                if ( ( known.m_Measured == false ) && ( known.m_Unusable == false ) )
+                if ( known.m_Measured == false )
                 {
                     pchId = known.m_Id;
                     break;
@@ -1054,11 +1050,10 @@ void Gateway::MeasureStoredPchs()
         PchLease lease = m_Server->AcquirePchLease( pchId );
         AStackString<> path;
         FileIO::FileInfo info;
-        PchMeasureSink sink;
         uint32_t uncompressedSize = 0;
         const bool found = m_Server->FindCachedPch( pchId, path );
         const bool measured = found && FileIO::GetFileInfo( path, info ) &&
-                              StreamDecompressor::DecompressFile( path.Get(), &m_Quit, sink, uncompressedSize );
+                              PchBlob::MeasureFile( path.Get(), pchId, &m_Quit, uncompressedSize );
         if ( m_Quit.Load() )
         {
             return;
@@ -1076,7 +1071,8 @@ void Gateway::MeasureStoredPchs()
                 }
                 else if ( measured == false )
                 {
-                    known->m_Unusable = true;
+                    m_Pchs.Erase( known ); // Not what its id says
+                    actions.m_DropPchs.Append( pchId );
                 }
                 else
                 {
@@ -1089,6 +1085,23 @@ void Gateway::MeasureStoredPchs()
             }
         }
         Run( actions );
+
+        // Once it has gone from the store, the clients of the jobs waiting for it can be asked for it
+        if ( actions.m_DropPchs.IsEmpty() == false )
+        {
+            Actions asks;
+            {
+                MutexHolder mh( m_Mutex );
+                for ( const GatewayJob * job : m_Jobs )
+                {
+                    if ( job->m_Parked && ( job->m_PchId == pchId ) )
+                    {
+                        asks.m_PchAsks.Append( Actions::PchAsk{ job->m_ClientId, pchId } );
+                    }
+                }
+            }
+            Run( asks );
+        }
     }
 }
 

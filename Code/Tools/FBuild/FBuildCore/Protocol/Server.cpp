@@ -1836,6 +1836,25 @@ bool Server::FindCachedPch( uint64_t pchId, AString & outPath )
     return true;
 }
 
+// DropStoredPch
+//------------------------------------------------------------------------------
+void Server::DropStoredPch( uint64_t pchId )
+{
+    PchCacheEntry dropped;
+    {
+        MutexHolder mh( m_PchCacheMutex );
+        PchCacheEntry * stored = FindStoredPch( pchId );
+        if ( stored == nullptr )
+        {
+            return;
+        }
+        dropped = Move( *stored );
+        m_PchCache.Erase( stored );
+    }
+    RemovePchFiles( dropped ); // The disk is written with no lock held
+    m_Log.Write( "pch dropped id=0x%016" PRIx64, pchId );
+}
+
 // GetCachedPchIds
 //------------------------------------------------------------------------------
 void Server::GetCachedPchIds( Array<uint64_t> & outPchIds ) const
