@@ -35,8 +35,8 @@ namespace Protocol
     //   each other at the handshake, whose version fields keep their place in every major.
     // Minor: an additive change that an older peer can safely ignore.
     // A receiver ignores the trailing bytes of a message it knows.
-    inline static const uint32_t kVersionMajor = 24;
-    inline static const uint8_t kVersionMinor = 1;
+    inline static const uint32_t kVersionMajor = 25;
+    inline static const uint8_t kVersionMinor = 0;
 
     inline static const uint16_t kTestPort = kPort + 1; // Different port for use by tests
 
@@ -183,10 +183,10 @@ namespace Protocol
     // follows is a payload only if the header says so.
     bool IsValidHeader( const void * frame, uint32_t size );
 
-    // "v24.1"
+    // "v25.0"
     void FormatVersion( AString & outText, uint32_t major, uint32_t minor );
 
-    // "v24.1" for this version
+    // "v25.0" for this version
     void GetVersionString( AString & outText );
 
     // MsgJob
