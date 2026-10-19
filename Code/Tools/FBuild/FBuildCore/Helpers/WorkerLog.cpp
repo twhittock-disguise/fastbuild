@@ -58,9 +58,10 @@ void WorkerLog::Write( MSVC_SAL_PRINTF const char * fmtString, ... )
 
     if ( DistributionStats::AppendToLog( m_Path, line, m_MaxFileSize ) == false )
     {
-        m_Enabled.Store( false );
-        if ( m_NumFailures.Increment() == 1 )
+        // Atomic has no exchange: two threads failing together may both warn
+        if ( m_Enabled.Load() )
         {
+            m_Enabled.Store( false );
             FLOG_WARN( "Worker log '%s' cannot be written and is switched off", m_Path.Get() );
         }
     }

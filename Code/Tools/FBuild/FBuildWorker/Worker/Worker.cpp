@@ -49,6 +49,7 @@ Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart, ui
     m_WorkerSettings = FNEW( WorkerSettings );
     m_NetworkStartupHelper = FNEW( NetworkStartupHelper );
     m_ConnectionPool = FNEW( Server( numThreadsInJobQueue, prefetchBuffer ) );
+    OUTPUT( "Log: %s\n", m_ConnectionPool->GetLogPath().Get() );
 
     Env::GetExePath( m_BaseExeName );
 #if defined( __WINDOWS__ )

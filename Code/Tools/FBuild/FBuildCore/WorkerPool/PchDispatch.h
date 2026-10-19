@@ -35,8 +35,8 @@ public:
     }
 
     // The PCH has reached the worker: it was reported, or was handed to the socket in full.
-    // The worker evicts PCHs the coordinator cannot see, so this can stop being true: a worker that
-    // asks for the PCH again when a job needs it (OnNeeded).
+    // The worker evicts PCHs the coordinator cannot see, so this can stop being true. A worker asks
+    // for it again (OnNeeded) when a job needs it.
     void OnDelivered( uint64_t pchId )
     {
         m_Sending.FindAndErase( pchId );
@@ -139,16 +139,10 @@ struct PchDemand
 
 // PchDispatch
 //------------------------------------------------------------------------------
-// A worker can only start a job once the PCH it uses has arrived, and over a slow link that
-// takes a long time. The uplink is kept busy for the first copy of each PCH: it is queued as soon
-// as fewer than kMaxSendingPchs are queued, whether or not a job for it has been taken yet, so
-// every PCH with waiting jobs has a holder. A further copy is sent only when the jobs waiting
-// for it, shared among the workers that would then hold it, are at least kMinJobsPerPchCopy each:
-// a copy that serves a few jobs costs more uplink than those jobs save. PCHs with the largest
-// share of jobs go first (ties go to the lowest id, so workers sharing an uplink choose alike).
-// That is done only while the worker has a free job slot: a PCH sent to a worker that cannot take
-// a job is wasted uplink. Jobs that can run now go to a worker first. A few more are given to it
-// for the PCHs it is receiving, so it does not wait for the next job once one lands.
+// The first copy of a PCH always goes; a further copy needs kMinJobsPerPchCopy waiting jobs per
+// holder. Nothing is queued for a worker without a free slot. Ties go to the lowest id, so workers
+// sharing an uplink choose alike. Jobs that can run now go to a worker first, then a few for the
+// PCHs it is receiving.
 namespace PchDispatch
 {
     // Tuning choices, not derived: the next PCH is queued behind the one being sent so the link
@@ -157,24 +151,18 @@ namespace PchDispatch
     static constexpr uint32_t kMaxSendingPchs = 2;
     inline uint32_t MaxHeldJobs( uint32_t capacity ) { return Math::Max( 1u, capacity / 2u ); }
 
-    // Workers that ran 3 or fewer jobs of a PCH took 51 of 69 pairs of 5 or fewer in the build
-    // data and about 0.8 of 1.1 GB: 4 is the smallest bound that rules those out
+    // A copy that serves fewer jobs costs more uplink than those jobs save
     static constexpr uint32_t kMinJobsPerPchCopy = 4;
 
-    // A worker with no free slot that has returned no result for this long is not counted as a
-    // holder, so the jobs waiting on its PCH can reach another worker
+    // A worker with no free slot that has made no progress (a job sent or a result returned) for
+    // this long is not counted as a holder, so the jobs waiting on its PCH can reach another worker
     static constexpr float kHolderStallSeconds = 60.0f;
-
-    inline bool IsActiveHolder( uint32_t freeSlots, float secondsSinceLastResult )
-    {
-        return ( freeSlots > 0 ) || ( secondsSinceLastResult < kHolderStallSeconds );
-    }
 
     // Whether a connection's PCHs count as held: not one that still awaits its inventories or that
     // can never take a job, as the jobs waiting on its PCH could not run there
-    inline bool CountsAsHolder( bool awaitingInventory, uint32_t capacity, uint32_t freeSlots, float secondsSinceLastResult )
+    inline bool CountsAsHolder( bool awaitingInventory, uint32_t capacity, uint32_t freeSlots, float secondsSinceProgress )
     {
-        return ( awaitingInventory == false ) && ( capacity > 0 ) && IsActiveHolder( freeSlots, secondsSinceLastResult );
+        return ( awaitingInventory == false ) && ( capacity > 0 ) && ( ( freeSlots > 0 ) || ( secondsSinceProgress < kHolderStallSeconds ) );
     }
 
     // The PCH to queue for sending next, or 0. "Sending" counts the PCHs queued on the connection

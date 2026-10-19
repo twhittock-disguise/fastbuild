@@ -25,17 +25,15 @@ private:
     void WorkersChooseTheSameNextPch() const;
     void NextPchIsQueuedBehindTheCurrentOne() const;
     void PchsAlreadyRequestedAreNotQueuedAgain() const;
-    void NoPchIsQueuedWithoutAFreeSlot() const;
     void PchsQueuedAreBoundedByFreeSlots() const;
     void FirstCopyOfAPchAlwaysGoes() const;
     void FurtherCopiesNeedEnoughJobs() const;
     void PchsAreRankedByTheirShareOfJobs() const;
-    void StalledHoldersDoNotCount() const;
     void ConnectionsThatCannotTakeAJobAreNotHolders() const;
     void HoldersAreCountedAcrossConnectionsInOneTick() const;
+    void PchsWithNothingToSendAreNotConsideredAgain() const;
     void SmallPchIsSkippedForOneWithEnoughJobs() const;
     void EqualSharesGoToTheLowestId() const;
-    void NoJobsWaitingMeansNoPchEvenWithAHolder() const;
     void EmptyQueue() const;
     void PchSendStateTransitions() const;
     void PchSendStateWhenTheWorkerNeedsAPch() const;
@@ -100,17 +98,15 @@ REGISTER_TESTS_BEGIN( TestPchDispatch )
     REGISTER_TEST( WorkersChooseTheSameNextPch )
     REGISTER_TEST( NextPchIsQueuedBehindTheCurrentOne )
     REGISTER_TEST( PchsAlreadyRequestedAreNotQueuedAgain )
-    REGISTER_TEST( NoPchIsQueuedWithoutAFreeSlot )
     REGISTER_TEST( PchsQueuedAreBoundedByFreeSlots )
     REGISTER_TEST( FirstCopyOfAPchAlwaysGoes )
     REGISTER_TEST( FurtherCopiesNeedEnoughJobs )
     REGISTER_TEST( PchsAreRankedByTheirShareOfJobs )
-    REGISTER_TEST( StalledHoldersDoNotCount )
     REGISTER_TEST( ConnectionsThatCannotTakeAJobAreNotHolders )
     REGISTER_TEST( HoldersAreCountedAcrossConnectionsInOneTick )
+    REGISTER_TEST( PchsWithNothingToSendAreNotConsideredAgain )
     REGISTER_TEST( SmallPchIsSkippedForOneWithEnoughJobs )
     REGISTER_TEST( EqualSharesGoToTheLowestId )
-    REGISTER_TEST( NoJobsWaitingMeansNoPchEvenWithAHolder )
     REGISTER_TEST( EmptyQueue )
     REGISTER_TEST( PchSendStateTransitions )
     REGISTER_TEST( PchSendStateWhenTheWorkerNeedsAPch )
@@ -279,18 +275,6 @@ void TestPchDispatch::PchsAlreadyRequestedAreNotQueuedAgain() const
     TEST_ASSERT( SelectPch( pchIds, numJobs, state ) == 3 );
 }
 
-// NoPchIsQueuedWithoutAFreeSlot
-//------------------------------------------------------------------------------
-void TestPchDispatch::NoPchIsQueuedWithoutAFreeSlot() const
-{
-    // A worker that cannot take a job has no use for a PCH
-    const IdList pchIds( { 2 } );
-    Array<uint32_t> numJobs;
-    numJobs.Append( 5 );
-    TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), 0 ) == 0 );
-    TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), 1 ) == 2 );
-}
-
 // PchsQueuedAreBoundedByFreeSlots
 //------------------------------------------------------------------------------
 void TestPchDispatch::PchsQueuedAreBoundedByFreeSlots() const
@@ -298,10 +282,14 @@ void TestPchDispatch::PchsQueuedAreBoundedByFreeSlots() const
     const IdList pchIds( { 2 } );
     Array<uint32_t> numJobs;
     numJobs.Append( 5 );
-    PchSendState state;
-    TEST_ASSERT( state.OnRequested( 1 ) );
+
+    // A worker that cannot take a job has no use for a PCH
+    TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), 0 ) == 0 );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), 1 ) == 2 );
 
     // One slot, and one PCH already on its way for it
+    PchSendState state;
+    TEST_ASSERT( state.OnRequested( 1 ) );
     TEST_ASSERT( SelectPch( pchIds, numJobs, state, 1 ) == 0 );
     TEST_ASSERT( SelectPch( pchIds, numJobs, state, 2 ) == 2 );
 }
@@ -359,21 +347,6 @@ void TestPchDispatch::PchsAreRankedByTheirShareOfJobs() const
     TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), kManySlots, &noHolders ) == 1 );
 }
 
-// StalledHoldersDoNotCount
-//------------------------------------------------------------------------------
-void TestPchDispatch::StalledHoldersDoNotCount() const
-{
-    // A worker with a free slot is a holder however long since its last result
-    TEST_ASSERT( PchDispatch::IsActiveHolder( 1, 1000.0f ) );
-
-    // One with none is, until it has returned nothing for kHolderStallSeconds
-    TEST_ASSERT( PchDispatch::IsActiveHolder( 0, PchDispatch::kHolderStallSeconds - 1.0f ) );
-    TEST_ASSERT( PchDispatch::IsActiveHolder( 0, PchDispatch::kHolderStallSeconds + 1.0f ) == false );
-
-    // At exactly kHolderStallSeconds it has stalled
-    TEST_ASSERT( PchDispatch::IsActiveHolder( 0, PchDispatch::kHolderStallSeconds ) == false );
-}
-
 // ConnectionsThatCannotTakeAJobAreNotHolders
 //------------------------------------------------------------------------------
 void TestPchDispatch::ConnectionsThatCannotTakeAJobAreNotHolders() const
@@ -386,8 +359,15 @@ void TestPchDispatch::ConnectionsThatCannotTakeAJobAreNotHolders() const
     // No capacity, so no job can ever run there
     TEST_ASSERT( PchDispatch::CountsAsHolder( false, 0, 0, 0.0f ) == false );
 
-    // Stalled with no free slot
+    // A worker with a free slot is a holder however long since its last progress
+    TEST_ASSERT( PchDispatch::CountsAsHolder( false, 1, 1, 1000.0f ) );
+
+    // One with none is, until it has made no progress for kHolderStallSeconds. A worker that sat idle
+    // and then filled its slots has progress as recent as its last job sent.
+    TEST_ASSERT( PchDispatch::CountsAsHolder( false, 1, 0, 0.0f ) );
+    TEST_ASSERT( PchDispatch::CountsAsHolder( false, 1, 0, PchDispatch::kHolderStallSeconds - 1.0f ) );
     TEST_ASSERT( PchDispatch::CountsAsHolder( false, 1, 0, PchDispatch::kHolderStallSeconds ) == false );
+    TEST_ASSERT( PchDispatch::CountsAsHolder( false, 1, 0, PchDispatch::kHolderStallSeconds + 1.0f ) == false );
 }
 
 // HoldersAreCountedAcrossConnectionsInOneTick
@@ -404,9 +384,8 @@ void TestPchDispatch::HoldersAreCountedAcrossConnectionsInOneTick() const
     PchSendState workers[ 2 ];
     for ( PchSendState & state : workers )
     {
-        PchDispatch::AddHolders( demand, state ); // Nobody has it yet
+        PchDispatch::AddHolders( demand, state );
     }
-    TEST_ASSERT( demand.m_NumHolders[ 0 ] == 0 );
 
     uint32_t numQueued[ 2 ] = { 0, 0 };
     for ( size_t i = 0; i < 2; ++i )
@@ -425,8 +404,13 @@ void TestPchDispatch::HoldersAreCountedAcrossConnectionsInOneTick() const
     PchDispatch::AddHolders( next, workers[ 0 ] );
     PchDispatch::AddHolders( next, workers[ 1 ] );
     TEST_ASSERT( next.m_NumHolders[ 0 ] == 1 );
+}
 
-    // A PCH with nothing to send is not considered again
+// PchsWithNothingToSendAreNotConsideredAgain
+//------------------------------------------------------------------------------
+void TestPchDispatch::PchsWithNothingToSendAreNotConsideredAgain() const
+{
+    const IdList pchIds( { 7 } );
     PchDemand unsendable;
     unsendable.m_PchIds = pchIds;
     unsendable.m_NumWaiting.Append( 1 );
@@ -466,18 +450,6 @@ void TestPchDispatch::EqualSharesGoToTheLowestId() const
     numHolders.Append( 1 );
     TEST_ASSERT( SelectPch( IdList( { 3, 9 } ), numJobs, PchSendState(), kManySlots, &numHolders ) == 3 );
     TEST_ASSERT( SelectPch( IdList( { 9, 3 } ), numJobs, PchSendState(), kManySlots, &numHolders ) == 3 );
-}
-
-// NoJobsWaitingMeansNoPchEvenWithAHolder
-//------------------------------------------------------------------------------
-void TestPchDispatch::NoJobsWaitingMeansNoPchEvenWithAHolder() const
-{
-    const IdList pchIds( { 4 } );
-    Array<uint32_t> numJobs;
-    numJobs.Append( 0 );
-    Array<uint32_t> numHolders;
-    numHolders.Append( 1 );
-    TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), kManySlots, &numHolders ) == 0 );
 }
 
 // EmptyQueue

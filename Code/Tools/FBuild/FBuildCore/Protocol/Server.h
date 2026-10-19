@@ -119,7 +119,7 @@ private:
     bool IsPchBeingReceived( uint64_t pchId ) const; // Caller holds m_ClientListMutex
     bool IsPchCached( uint64_t pchId ); // Does not refresh LRU recency
 
-    WorkerLog m_Log; // Constructed from FBuild::GetWorkerCacheDir, before anything is logged
+    WorkerLog m_Log;
     uint32_t m_PrefetchBuffer = 0;
     JobQueueRemote * m_JobQueueRemote;
 

@@ -66,17 +66,15 @@ namespace
     constexpr uint64_t kNoLimit = ~(uint64_t)0;
 
     // Where the worker log is kept: with the caches. Empty (so no log) if there is no such place.
-    class WorkerLogDirectory : public AStackString<>
+    AString GetWorkerLogDirectory()
     {
-    public:
-        WorkerLogDirectory()
+        AStackString<> directory;
+        if ( FBuild::GetWorkerCacheDir( directory ) == false )
         {
-            if ( FBuild::GetWorkerCacheDir( *this ) == false )
-            {
-                Clear();
-            }
+            directory.Clear();
         }
-    };
+        return AString( directory );
+    }
 
     struct LruLimits
     {
@@ -245,7 +243,7 @@ namespace
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
 Server::Server( uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
-    : m_Log( WorkerLogDirectory() )
+    : m_Log( GetWorkerLogDirectory() )
     , m_PrefetchBuffer( prefetchBuffer )
     , m_ShouldExit( false )
 {
@@ -671,7 +669,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
     // Lock order: m_ClientListMutex before cs->m_Mutex, so asking for a PCH comes after this scope
     uint64_t missingPchId = 0;
     AStackString<> jobName;
-    uint64_t jobPchId = 0;
+    uint64_t pchId = 0;
     bool isJobWaiting = true;
     {
         MutexHolder mh( cs->m_Mutex );
@@ -683,11 +681,10 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
         job->SetUserData( cs );
         job->SetResultCompressionLevel( msg->GetResultCompressionLevel(), true /*allowZstdUse*/ );
         jobName = job->GetRemoteName(); // The job may be finished and gone as soon as it is queued
-        jobPchId = job->GetPchId();
 
         // Resolve PCH cache path if job was bundled with PCH distribution data. The job holds the PCH
         // from here to its end, so it is not evicted or unpacked and deleted while the job waits.
-        const uint64_t pchId = job->GetPchId();
+        pchId = job->GetPchId();
         bool pchReady = true;
         if ( pchId != 0 )
         {
@@ -747,7 +744,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
         }
     }
 
-    m_Log.Write( "job received name=%s pch=0x%016" PRIx64 " waiting=%u", jobName.Get(), jobPchId, isJobWaiting ? 1u : 0u );
+    m_Log.Write( "job received name=%s pch=0x%016" PRIx64 " waiting=%u", jobName.Get(), pchId, isJobWaiting ? 1u : 0u );
 
     if ( missingPchId != 0 )
     {
@@ -1950,7 +1947,7 @@ void Server::FinalizeCompletedJobs()
     Node::BuildResult result;
     while ( Job * job = jcr.GetCompletedJob( result ) )
     {
-        const char * outcome = "cancelled";
+        const char * outcome = "aborted";
         if ( result == Node::BuildResult::eOk )
         {
             outcome = "ok";
@@ -1960,7 +1957,7 @@ void Server::FinalizeCompletedJobs()
             outcome = ( job->GetSystemErrorCount() > 0 ) ? "system-error" : "failed";
         }
         const Node * node = job->GetNode();
-        m_Log.Write( "job finished name=%s ms=%u result=%s", job->GetRemoteName().Get(), node ? node->GetLastBuildTime() : 0u, outcome );
+        m_Log.Write( "job finished name=%s ms=%u result=%s", job->GetRemoteName().Get(), node->GetLastBuildTime(), outcome );
 
         // Jobs that ended in a useful state are reported to the Client
         // Other jobs (like those that were cancelled) are not
@@ -1982,11 +1979,11 @@ void Server::FinalizeCompletedJobs()
                 // Build the message before taking any lock, as the result can be large
                 MemoryStream ms;
                 ms.Write( job->GetJobId() );
-                ms.Write( job->GetNode()->GetName() );
+                ms.Write( node->GetName() );
                 ms.Write( result == Node::BuildResult::eOk );
                 ms.Write( job->GetSystemErrorCount() > 0 );
                 ms.Write( job->GetMessages() );
-                ms.Write( job->GetNode()->GetLastBuildTime() );
+                ms.Write( node->GetLastBuildTime() );
                 ms.Write( job->GetRemoteThreadIndex() ); // The thread used to build the job to assist with visualization
 
                 // write the data - build result for success, or output+errors for failure

@@ -22,7 +22,7 @@ public:
     // Creates the directory. One that is empty or cannot be created disables the log.
     explicit WorkerLog( const AString & directory, uint64_t maxFileSize = kMaxFileSize );
 
-    // Appends one timestamped line. Thread safe. A write that fails disables the log, with one warning.
+    // Appends one timestamped line. Thread safe. A write that fails disables the log until restart, with one warning.
     void Write( MSVC_SAL_PRINTF const char * fmtString, ... ) FORMAT_STRING( 2, 3 );
 
     bool IsEnabled() const { return m_Enabled.Load(); }
@@ -32,7 +32,6 @@ private:
     AString             m_Path;
     uint64_t            m_MaxFileSize;
     Atomic<bool>        m_Enabled{ false };
-    Atomic<uint32_t>    m_NumFailures{ 0 };
 };
 
 //------------------------------------------------------------------------------

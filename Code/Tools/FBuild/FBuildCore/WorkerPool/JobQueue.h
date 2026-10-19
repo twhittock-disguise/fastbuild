@@ -69,6 +69,7 @@ public:
 
     // access state
     size_t GetNumDistributableJobsAvailable() const;
+    void CountDistributableJobsByPch( Array<uint64_t> & outPchIds, Array<uint32_t> & outNumJobs );
 
     void GetJobStats( uint32_t & numJobs,
                       uint32_t & numJobsActive,
@@ -89,9 +90,7 @@ private:
 
     // client side of protocol consumes jobs via this interface
     friend class ClientToWorkerConnection;
-    friend class Client; // Counts the jobs waiting for each PCH
     Job * GetDistributableJobToProcess( bool remote, const PchWorkerState * pchState = nullptr );
-    void CountDistributableJobsByPch( Array<uint64_t> & outPchIds, Array<uint32_t> & outNumJobs );
     Job * OnReturnRemoteJob( uint32_t jobId,
                              bool systemError,
                              bool & outRaceLost,

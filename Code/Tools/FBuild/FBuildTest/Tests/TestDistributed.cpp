@@ -124,6 +124,7 @@ private:
     void WorkerLogRotates() const;
     void WorkerLogConcurrentWriters() const;
     void WorkerLogInAnUnwritableDirectoryIsDisabled() const;
+    void WorkerLogWriteFailureDisablesTheLog() const;
     void WorkerLogRecordsABuild() const;
     void PayloadsAcceptedByWorker() const;
     void PchChunksReachTheWorker() const;
@@ -141,6 +142,8 @@ private:
     void SendMutexHoldsBackResults() const;
     void ToolchainIsSentBeforeAnyJob() const;
     void PchIsNotSentToAWorkerWithoutAFreeSlot() const;
+    void PchIsSentToAWorkerWithAFreeSlot() const;
+    void BuildUntilPchSettles( uint8_t capacity, uint32_t & outNumPchFiles, bool & outJobWaited ) const;
     void CachedToolchainIsNotSent() const;
     void ToolchainIsNotSentWhenNothingIsDistributed() const;
     void MismatchedProtocolVersionIsRefused() const;
@@ -168,12 +171,13 @@ private:
     void ClientRefusesAnAckOfAnotherMajor() const;
     void ClientRejectsAShortAck() const;
     void ClientRejectsAnAckWithAPayload() const;
-    void ClientSendsJobsOnceTheInventoriesHaveArrived() const;
-    void ClientNeverHangsWithoutInventories() const;
+    void ClientWaitsForTheInventoriesBeforeSendingJobs() const;
+    void ClientSendsNoJobToAWorkerWithoutInventories() const;
+    void ClientBuildsLocallyWhenAWorkerSendsNoInventories() const;
     void ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend() const;
     void ClientIsNotStuckWhenTheConnectionEndsBeforeAPchIsDelivered() const;
     void JobPushedAsTheConnectionEndsIsReturned() const;
-    void PchIsCompressedInTheFormsWorkersRead() const;
+    void PchDataCacheMakesThePlainAndTheTransformedForm() const;
     void PchTransformThatFailsIsNotSent() const;
     void PchIsCompressedWithTheWindowOfItsSize() const;
     void WorkerStoresATransformedPch() const;
@@ -327,8 +331,7 @@ private:
     static void GetStatsLogPath( AString & outPath );
     static uint64_t GetStatsLogSize( const AString & logPath ); // A log is shared by every FBuild on the machine, and a test looks at what is added to it
     static bool CountInStatsLogSince( const AString & logPath, uint64_t sizeBefore, const char * text, uint32_t & outCount ); // False if the log was rotated
-    static constexpr const char * kDistributedConfig = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
-    static void MakeDistributedPchOptions( FBuildTestOptions & options, const char * configFile = kDistributedConfig ); // The jobs are built on the worker
+    static void MakeDistributedPchOptions( FBuildTestOptions & options ); // The jobs are built on the worker
     static void ClearWorkerPchStore();
 
     // Totals over the lines starting with linePrefix in the client's stats log, for lines like
@@ -385,6 +388,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( WorkerLogRotates )
     REGISTER_TEST( WorkerLogConcurrentWriters )
     REGISTER_TEST( WorkerLogInAnUnwritableDirectoryIsDisabled )
+    REGISTER_TEST( WorkerLogWriteFailureDisablesTheLog )
     REGISTER_TEST( WorkerLogRecordsABuild )
     REGISTER_TEST( PayloadsAcceptedByWorker )
     REGISTER_TEST( PchChunksReachTheWorker )
@@ -403,6 +407,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( ToolchainIsSentBeforeAnyJob )
     REGISTER_TEST( PchIsNotSentToAWorkerWithoutAFreeSlot )
+    REGISTER_TEST( PchIsSentToAWorkerWithAFreeSlot )
     REGISTER_TEST( CachedToolchainIsNotSent )
     REGISTER_TEST( ToolchainIsNotSentWhenNothingIsDistributed )
 #endif
@@ -437,12 +442,13 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ClientRefusesAnAckOfAnotherMajor )
     REGISTER_TEST( ClientRejectsAShortAck )
     REGISTER_TEST( ClientRejectsAnAckWithAPayload )
-    REGISTER_TEST( ClientSendsJobsOnceTheInventoriesHaveArrived )
-    REGISTER_TEST( ClientNeverHangsWithoutInventories )
+    REGISTER_TEST( ClientWaitsForTheInventoriesBeforeSendingJobs )
+    REGISTER_TEST( ClientSendsNoJobToAWorkerWithoutInventories )
+    REGISTER_TEST( ClientBuildsLocallyWhenAWorkerSendsNoInventories )
     REGISTER_TEST( ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend )
     REGISTER_TEST( ClientIsNotStuckWhenTheConnectionEndsBeforeAPchIsDelivered )
     REGISTER_TEST( JobPushedAsTheConnectionEndsIsReturned )
-    REGISTER_TEST( PchIsCompressedInTheFormsWorkersRead )
+    REGISTER_TEST( PchDataCacheMakesThePlainAndTheTransformedForm )
     REGISTER_TEST( PchTransformThatFailsIsNotSent )
     REGISTER_TEST( PchIsCompressedWithTheWindowOfItsSize )
     REGISTER_TEST( WorkerStoresATransformedPch )
@@ -2283,22 +2289,19 @@ void TestDistributed::WorkerLogRecordsABuild() const
 
         TEST_ASSERT( FileIO::FileExists( logPath.Get() ) );
         isLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] connect ", numConnects );
-        VERIFY( CountInStatsLogSince( logPath, sizeBefore, "] pch received id=0x", numPchsReceived ) );
-        VERIFY( CountInStatsLogSince( logPath, sizeBefore, "] job received ", numJobsReceived ) );
-        VERIFY( CountInStatsLogSince( logPath, sizeBefore, "] job finished ", numJobsFinished ) );
+        isLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] pch received id=0x", numPchsReceived ) && isLogComplete;
+        isLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] job received ", numJobsReceived ) && isLogComplete;
+        isLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] job finished ", numJobsFinished ) && isLogComplete;
     }
     const bool isDisconnectLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] disconnect ", numDisconnects );
 
-    // A log that was rotated since is not all there
-    if ( isLogComplete )
+    // A log that was rotated since is not all there: nothing is asserted of it
+    if ( isLogComplete && isDisconnectLogComplete )
     {
         TEST_ASSERT( numConnects >= 1 );
         TEST_ASSERT( numPchsReceived >= 1 );
         TEST_ASSERT( numJobsReceived >= 1 );
         TEST_ASSERT( numJobsFinished >= 1 );
-    }
-    if ( isDisconnectLogComplete )
-    {
         TEST_ASSERT( numDisconnects >= 1 );
     }
 }
@@ -3447,15 +3450,13 @@ void TestDistributed::ToolchainIsSentBeforeAnyJob() const
     TEST_ASSERT( worker.GetNumJobs() == 0 );
 }
 
-// PchIsNotSentToAWorkerWithoutAFreeSlot
+// PchIsNotSentToAWorkerWithoutAFreeSlot, PchIsSentToAWorkerWithAFreeSlot
 //------------------------------------------------------------------------------
-void TestDistributed::PchIsNotSentToAWorkerWithoutAFreeSlot() const
+// Builds against a worker of the capacity until its PCH is sent, or has had time to be once a job
+// that needs it waits
+void TestDistributed::BuildUntilPchSettles( uint8_t capacity, uint32_t & outNumPchFiles, bool & outJobWaited ) const
 {
-    // The worker has no capacity, so it cannot take a job and has no use for the PCH. The
-    // connection gets past the inventories and the toolchain is sent, but the PCH is not.
-    // The PCH is given this long to be sent once it is built and demanded, which is far longer than a
-    // gate that sends it takes
-    constexpr float kSettleSeconds = 5.0f;
+    constexpr float kSettleSeconds = 5.0f; // Far longer than a client that sends the PCH takes
     constexpr float kBuildTimeoutSeconds = 60.0f;
     FBuildTestOptions options;
     MakeDistributedPchOptions( options );
@@ -3463,32 +3464,61 @@ void TestDistributed::PchIsNotSentToAWorkerWithoutAFreeSlot() const
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
-    RecordingWorker worker( RecordingWorker::kNoCapacity );
+    RecordingWorker worker( capacity );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
-    // The PCH is built and recorded for sending (it is compressed once queued, which it is not)
-    const uint32_t numHashedBefore = PchDataCache::Get().GetNumFilesHashed();
-    bool sawPch = false;
-    Timer sinceSawPch;
-    auto pchSent = [ &worker, &sawPch, &sinceSawPch, numHashedBefore ]()
+    bool jobWaited = false;
+    Timer sinceJobWaited;
+    auto settled = [ &worker, &jobWaited, &sinceJobWaited ]()
     {
-        if ( ( sawPch == false ) && ( PchDataCache::Get().GetNumFilesHashed() > numHashedBefore ) )
+        if ( ( jobWaited == false ) && JobQueue::IsValid() )
         {
-            sawPch = true;
-            sinceSawPch.Restart();
+            Array<uint64_t> pchIds;
+            Array<uint32_t> numJobs;
+            JobQueue::Get().CountDistributableJobsByPch( pchIds, numJobs );
+            if ( pchIds.IsEmpty() == false )
+            {
+                jobWaited = true;
+                sinceJobWaited.Restart();
+            }
         }
-        // Stop when it is sent, or when it has had the settle period to be
-        return ( worker.GetNumPchFiles() >= 1 ) || ( sawPch && ( sinceSawPch.GetElapsed() >= kSettleSeconds ) );
+        return ( worker.GetNumPchFiles() >= 1 ) || ( jobWaited && ( sinceJobWaited.GetElapsed() >= kSettleSeconds ) );
     };
-    BuildAborter aborter( pchSent, kBuildTimeoutSeconds );
-    const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
-    worker.ShutdownAllConnections();
+    bool built = true;
+    bool reached = false;
+    {
+        BuildAborter aborter( settled, kBuildTimeoutSeconds );
+        built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
+        worker.ShutdownAllConnections();
+        reached = aborter.HasReached();
+    }
 
     TEST_ASSERT( built == false ); // Aborted
-    TEST_ASSERT( aborter.HasReached() );
+    TEST_ASSERT( reached );
     TEST_ASSERT( worker.GetNumManifests() >= 1 );
-    TEST_ASSERT( sawPch );
-    TEST_ASSERT( worker.GetNumPchFiles() == 0 );
+    outNumPchFiles = worker.GetNumPchFiles();
+    outJobWaited = jobWaited;
+}
+
+void TestDistributed::PchIsNotSentToAWorkerWithoutAFreeSlot() const
+{
+    // The worker has no capacity, so it cannot take a job and has no use for the PCH. The
+    // connection gets past the inventories and the toolchain is sent, but the PCH is not, though
+    // a job that needs it waits.
+    uint32_t numPchFiles = 0;
+    bool jobWaited = false;
+    BuildUntilPchSettles( RecordingWorker::kNoCapacity, numPchFiles, jobWaited );
+    TEST_ASSERT( jobWaited );
+    TEST_ASSERT( numPchFiles == 0 );
+}
+
+void TestDistributed::PchIsSentToAWorkerWithAFreeSlot() const
+{
+    // The same build against a worker that can take a job is sent the PCH
+    uint32_t numPchFiles = 0;
+    bool jobWaited = false;
+    BuildUntilPchSettles( 1, numPchFiles, jobWaited );
+    TEST_ASSERT( numPchFiles >= 1 );
 }
 
 // CachedToolchainIsNotSent
@@ -3625,6 +3655,7 @@ namespace
     // The layout of the handshake messages that every major keeps, as numbers: what peers of another
     // major find by (see Protocol.h). A change to the protocol that moves one of them has to change these too.
     constexpr uint32_t kGoldenConnectionSize = 76;
+    constexpr uint32_t kGolden23ConnectionSize = 76;       // The handshake of major 23, which this version reads
     constexpr uint32_t kGoldenAckSize = 12;
     constexpr uint32_t kGoldenPrefixSize = 8;               // Header and version fields
     constexpr uint32_t kGoldenConnectionMajorOffset = 4;    // uint32_t
@@ -3818,11 +3849,39 @@ void TestDistributed::ToolchainInventoryIsBounded() const
     }
 }
 
+// WorkerLogWriteFailureDisablesTheLog
+//------------------------------------------------------------------------------
+void TestDistributed::WorkerLogWriteFailureDisablesTheLog() const
+{
+    AStackString<> dir;
+    MakeWorkerLogDir( "WorkerLogWriteFailureDisablesTheLog", dir );
+    WorkerLog log( dir );
+    TEST_ASSERT( log.IsEnabled() );
+
+    // A directory where the log file would be: it cannot be written
+    AStackString<> blocker( log.GetPath() );
+    blocker += NATIVE_SLASH;
+    TEST_ASSERT( FileIO::EnsurePathExists( blocker ) );
+
+    const char * warning = "cannot be written and is switched off";
+    const uint32_t numWarningsBefore = CountOccurrences( GetRecordedOutput(), warning );
+    log.Write( "connect %s", "10.0.0.7" );
+    TEST_ASSERT( log.IsEnabled() == false );
+    TEST_ASSERT( CountOccurrences( GetRecordedOutput(), warning ) == ( numWarningsBefore + 1 ) );
+
+    // The next write does nothing, and says nothing
+    log.Write( "connect %s", "10.0.0.8" );
+    TEST_ASSERT( log.IsEnabled() == false );
+    TEST_ASSERT( CountOccurrences( GetRecordedOutput(), warning ) == ( numWarningsBefore + 1 ) );
+}
+
 // MismatchedProtocolVersionIsRefused
 //------------------------------------------------------------------------------
 void TestDistributed::MismatchedProtocolVersionIsRefused() const
 {
     Server s( 1 );
+    const AStackString<> logPath( s.GetLogPath() );
+    const uint64_t logSizeBefore = GetStatsLogSize( logPath );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     HandshakeProbe probe;
@@ -3840,6 +3899,13 @@ void TestDistributed::MismatchedProtocolVersionIsRefused() const
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_REFUSED );
     TEST_ASSERT( probe.GetRefusedMajor() == Protocol::kVersionMajor );
     TEST_ASSERT( probe.GetRefusedMinor() == Protocol::kVersionMinor );
+
+    // and the worker's log says so (nothing is asserted of a log that was rotated since)
+    uint32_t numRefusals = 0;
+    if ( CountInStatsLogSince( logPath, logSizeBefore, "] refused ", numRefusals ) )
+    {
+        TEST_ASSERT( numRefusals == 1 );
+    }
 
     probe.ShutdownAllConnections();
 }
@@ -3908,7 +3974,7 @@ void TestDistributed::HandshakeLayoutIsFrozen() const
     TEST_ASSERT( refusedBytes[ kGoldenAckMajorOffset + 1 ] == Protocol::kVersionMinor );
 
     // and the handshake a 23.x peer sends is found by them
-    alignas( 8 ) uint8_t connection23[ kGoldenConnectionSize ] = { 1, kGoldenConnectionSize, 0, 0, 23, 0, 0, 0, 1 /*platform*/, 6 /*minor*/ };
+    alignas( 8 ) uint8_t connection23[ kGolden23ConnectionSize ] = { 1, kGolden23ConnectionSize, 0, 0, 23, 0, 0, 0, 1 /*platform*/, 6 /*minor*/ };
     memcpy( connection23 + kGoldenHostNameOffset, "old-client", 11 );
     TEST_ASSERT( Protocol::IsValidHeader( connection23, sizeof( connection23 ) ) );
     const Protocol::MsgConnection * old = reinterpret_cast<const Protocol::MsgConnection *>( connection23 );
@@ -4269,31 +4335,104 @@ void TestDistributed::ClientRejectsAnAckWithAPayload() const
     TEST_ASSERT( AreSpacedByTheReconnectDelay( worker ) );
 }
 
-// ClientSendsJobsOnceTheInventoriesHaveArrived
+// ClientWaitsForTheInventoriesBeforeSendingJobs
 //------------------------------------------------------------------------------
-void TestDistributed::ClientSendsJobsOnceTheInventoriesHaveArrived() const
+namespace
+{
+    // How long a worker holds back its inventories, and how long a build is given to send a job to a
+    // worker that sends none
+    constexpr uint32_t kInventoryDelayMS = 500;
+    constexpr float kNoInventoryWindowSeconds = 3.0f;
+
+    // A worker that acks at once and sends the inventories after a delay, from a thread of its own so
+    // that it reads the client's messages meanwhile. It counts the jobs that arrive before them.
+    class LateInventoryWorker : public FakeWorker
+    {
+    public:
+        LateInventoryWorker() : FakeWorker( 4 ) {}
+        ~LateInventoryWorker() override
+        {
+            if ( m_Started.Load() )
+            {
+                m_Thread.Join();
+            }
+        }
+        explicit LateInventoryWorker( const LateInventoryWorker & other ) = delete;
+        LateInventoryWorker & operator=( const LateInventoryWorker & other ) = delete;
+
+        uint32_t GetNumJobs() const { return m_NumJobs.Load(); }
+        uint32_t GetNumJobsBeforeInventories() const { return m_NumJobsBeforeInventories.Load(); }
+
+    private:
+        virtual void Handshake( const ConnectionInfo * connection ) override
+        {
+            const Protocol::MsgConnectionAck ack( 4 );
+            ack.Send( connection );
+            if ( m_Started.Load() == false )
+            {
+                m_Started.Store( true );
+                m_Connection = connection;
+                m_Thread.Start( SendInventories, "LateInventories", this );
+            }
+        }
+        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage & message, void *, uint32_t ) override
+        {
+            if ( message.GetType() == Protocol::MSG_JOB )
+            {
+                m_NumJobs.Increment();
+                if ( m_InventoriesSent.Load() == false )
+                {
+                    m_NumJobsBeforeInventories.Increment();
+                }
+            }
+        }
+
+        static uint32_t SendInventories( void * param )
+        {
+            LateInventoryWorker * worker = static_cast<LateInventoryWorker *>( param );
+            Thread::Sleep( kInventoryDelayMS );
+            const Protocol::MsgPchInventory pchInventory( 0 );
+            pchInventory.Send( worker->m_Connection );
+            const Protocol::MsgToolchainInventory toolchainInventory( 0 );
+            worker->m_InventoriesSent.Store( true ); // Before the last: a job can follow it at once
+            toolchainInventory.Send( worker->m_Connection );
+            return 0;
+        }
+
+        Thread m_Thread;
+        const ConnectionInfo * m_Connection = nullptr;
+        Atomic<bool> m_Started{ false };
+        Atomic<bool> m_InventoriesSent{ false };
+        Atomic<uint32_t> m_NumJobs{ 0 };
+        Atomic<uint32_t> m_NumJobsBeforeInventories{ 0 };
+    };
+}
+
+void TestDistributed::ClientWaitsForTheInventoriesBeforeSendingJobs() const
 {
     FBuildTestOptions options;
     options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
     options.m_AllowDistributed = true;
     options.m_NumWorkerThreads = 1;
-    options.m_NoLocalConsumptionOfRemoteJobs = true; // ensure all jobs happen on the remote worker
+    options.m_ForceCleanBuild = true;
+    options.m_NoLocalConsumptionOfRemoteJobs = true; // Only the worker can take the jobs
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
 
-    CorruptResultWorker worker;
+    LateInventoryWorker worker;
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
-    auto never = []() { return false; };
-    BuildAborter aborter( never, 20.0f );
+    auto jobSent = [ &worker ]() { return ( worker.GetNumJobs() >= 1 ); };
+    BuildAborter aborter( jobSent, kWaitTimeoutSeconds );
     fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
     worker.ShutdownAllConnections();
 
-    TEST_ASSERT( aborter.HasTimedOut() == false );
-    TEST_ASSERT( worker.GetNumResultsSent() >= 1 ); // A job reached the worker
+    // The jobs reached the worker once it had sent the inventories, not while the client waited for them
+    TEST_ASSERT( aborter.HasReached() );
+    TEST_ASSERT( worker.GetNumJobsBeforeInventories() == 0 );
 }
 
-// ClientNeverHangsWithoutInventories
+// ClientSendsNoJobToAWorkerWithoutInventories, ClientBuildsLocallyWhenAWorkerSendsNoInventories
 //------------------------------------------------------------------------------
 namespace
 {
@@ -4325,45 +4464,55 @@ namespace
     };
 }
 
-void TestDistributed::ClientNeverHangsWithoutInventories() const
+void TestDistributed::ClientSendsNoJobToAWorkerWithoutInventories() const
 {
-    // The jobs wait for inventories that never come, so none is sent to the worker. The build is not held up by it: what
-    // the worker would have been given is built here.
-    for ( uint32_t noLocalConsumption = 0; noLocalConsumption < 2; ++noLocalConsumption )
-    {
-        FBuildTestOptions options;
-        options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
-        options.m_AllowDistributed = true;
-        options.m_NumWorkerThreads = 1;
-        options.m_ForceCleanBuild = true;
-        options.m_NoLocalConsumptionOfRemoteJobs = ( noLocalConsumption != 0 );
-        FBuildForTest fBuild( options );
-        TEST_ASSERT( fBuild.Initialize() );
+    // Nothing else builds the jobs, so the build waits: it is stopped when a job reaches the worker, or after the window
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_ForceCleanBuild = true;
+    options.m_NoLocalConsumptionOfRemoteJobs = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
 
-        InventorylessWorker worker;
-        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+    InventorylessWorker worker;
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
-        if ( noLocalConsumption )
-        {
-            // Nothing else builds the jobs: the build waits, and is stopped when a job reaches the worker or after a while
-            auto jobSent = [ &worker ]() { return ( worker.GetNumJobs() >= 1 ); };
-            BuildAborter aborter( jobSent, 3.0f );
-            fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
-            worker.ShutdownAllConnections();
-            TEST_ASSERT( aborter.HasReached() == false );
-        }
-        else
-        {
-            auto never = []() { return false; };
-            BuildAborter aborter( never, kWaitTimeoutSeconds );
-            const bool built = fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
-            worker.ShutdownAllConnections();
-            TEST_ASSERT( aborter.HasTimedOut() == false );
-            TEST_ASSERT( built ); // Built here
-        }
-        TEST_ASSERT( worker.GetNumConnections() >= 1 );
-        TEST_ASSERT( worker.GetNumJobs() == 0 );
-    }
+    auto jobSent = [ &worker ]() { return ( worker.GetNumJobs() >= 1 ); };
+    BuildAborter aborter( jobSent, kNoInventoryWindowSeconds );
+    fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
+    worker.ShutdownAllConnections();
+
+    TEST_ASSERT( aborter.HasTimedOut() ); // The window passed with no job sent
+    TEST_ASSERT( worker.GetNumConnections() >= 1 );
+    TEST_ASSERT( worker.GetNumJobs() == 0 );
+}
+
+void TestDistributed::ClientBuildsLocallyWhenAWorkerSendsNoInventories() const
+{
+    // The jobs wait for inventories that never come. The build is not held up by it: what the worker
+    // would have been given is built here.
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    InventorylessWorker worker;
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    auto never = []() { return false; };
+    BuildAborter aborter( never, kWaitTimeoutSeconds );
+    const bool built = fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
+    worker.ShutdownAllConnections();
+
+    TEST_ASSERT( aborter.HasTimedOut() == false );
+    TEST_ASSERT( built );
+    TEST_ASSERT( worker.GetNumConnections() >= 1 );
+    TEST_ASSERT( worker.GetNumJobs() == 0 );
 }
 
 // MSVCWorkerFailuresAreRetriedElsewhere
@@ -4602,6 +4751,8 @@ void TestDistributed::WorkerAsksForAMissingPch() const
     CapturePchJob( job );
 
     Server s( 1 );
+    const AStackString<> logPath( s.GetLogPath() );
+    const uint64_t logSizeBefore = GetStatsLogSize( logPath );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
     HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
@@ -4619,6 +4770,13 @@ void TestDistributed::WorkerAsksForAMissingPch() const
     TEST_ASSERT( Handshake( probe, ci, kWaitTimeoutSeconds ) ); // Answered after the jobs
     TEST_ASSERT( CountWaitingJobs( s ) == 3 );
     TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
+
+    // The worker's log has the one request (nothing is asserted of a log that was rotated since)
+    uint32_t numLogged = 0;
+    if ( CountInStatsLogSince( logPath, logSizeBefore, "] pch needed ", numLogged ) )
+    {
+        TEST_ASSERT( numLogged == 1 );
+    }
     probe.ShutdownAllConnections();
 }
 
@@ -6945,9 +7103,9 @@ namespace
     return true;
 }
 
-/*static*/ void TestDistributed::MakeDistributedPchOptions( FBuildTestOptions & options, const char * configFile )
+/*static*/ void TestDistributed::MakeDistributedPchOptions( FBuildTestOptions & options )
 {
-    options.m_ConfigFile = configFile;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
     options.m_AllowDistributed = true;
     options.m_NumWorkerThreads = 1;
     options.m_NoLocalConsumptionOfRemoteJobs = true; // The jobs need the PCH on the worker
@@ -6969,9 +7127,9 @@ namespace
     }
 }
 
-// PchIsCompressedInTheFormsWorkersRead
+// PchDataCacheMakesThePlainAndTheTransformedForm
 //------------------------------------------------------------------------------
-void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
+void TestDistributed::PchDataCacheMakesThePlainAndTheTransformedForm() const
 {
     PchDataCache cache;
     Array<char> content;
@@ -6997,7 +7155,7 @@ void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
     TEST_ASSERT( BlobDecodesTo( transformedBlob, content ) );
     TEST_ASSERT( cache.GetNumCompressions() == 1 );
 
-    // The plain form, as it is sent when the transform does not work out, is what a worker of 24.0 reads
+    // The plain form, as it is sent when the transform does not work out, is a plain zstd stream
     PchDataCache plainCache;
     plainCache.SetTransformFault( PchTransform::Encoder::FAULT_REFUSE );
     plainCache.Store( entry );
@@ -7010,8 +7168,8 @@ void TestDistributed::PchIsCompressedInTheFormsWorkersRead() const
     Array<char> plainBlob;
     TEST_ASSERT( ReadFile( plainPath, plainBlob ) );
     TEST_ASSERT( GetBlobType( plainBlob ) == Compressor::eZstd );
-    TEST_ASSERT( DecodesToFile( plainPath, content ) ); // As a worker of 24.0 decodes it
-    OUTPUT( "PchIsCompressedInTheFormsWorkersRead: %" PRIu64 " bytes, %" PRIu64 " with the transform (%.1f%%)\n", plainSize, transformedSize, ( 100.0 * (double)transformedSize ) / (double)plainSize );
+    TEST_ASSERT( DecodesToFile( plainPath, content ) ); // As any zstd decoder reads it
+    OUTPUT( "PchDataCacheMakesThePlainAndTheTransformedForm: %" PRIu64 " bytes, %" PRIu64 " with the transform (%.1f%%)\n", plainSize, transformedSize, ( 100.0 * (double)transformedSize ) / (double)plainSize );
     TEST_ASSERT( ( transformedSize * 100 ) < ( plainSize * 90 ) );
 
     // It is made once, however often it is asked for
@@ -7247,7 +7405,7 @@ void TestDistributed::WorkerStoresATransformedPch() const
 //------------------------------------------------------------------------------
 void TestDistributed::WorkerAcceptsAPlainPchFromAnOldClient() const
 {
-    // A client of 24.0 sends the PCH compressed, and the worker keeps and unpacks it as before
+    // A client that sends the PCH as a plain zstd stream: the worker keeps and unpacks it as before
     Array<char> content;
     MakePchLikeBytes( ( 3 * MEGABYTE ) + 5, 4, content );
     Array<char> blob;
@@ -7427,7 +7585,7 @@ void TestDistributed::ClientSendsTheTransformedPch() const
         RecordingWorker worker( 1 );
         BuildPchLibraryUntilStopped( worker, BuildStop::PCH_ARRIVES );
         TEST_ASSERT( worker.GetPchType() == kTransformedBlobType );
-        TEST_ASSERT( worker.GetPchCompressedSize() < worker.GetPchUncompressedSize() );
+        TEST_ASSERT( ( (uint64_t)worker.GetPchCompressedSize() * 100 ) < ( (uint64_t)worker.GetPchUncompressedSize() * 90 ) );
     }
     const bool isLogComplete = CountInStatsLogSince( statsLogPath, statsLogSize, "pch-transform:", numLogged );
     TEST_ASSERT( ( isLogComplete == false ) || ( numLogged == 1 ) ); // The connection says so in its stats

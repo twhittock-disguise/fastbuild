@@ -156,6 +156,8 @@ public:
     ClientWorkerInfo * GetWorker() const { return m_Worker; }
 
     void PushToolchainsToWorker();
+    uint32_t GetFreeSlots() const;
+    void MarkProgress() { m_LastProgressTime.Store( (uint64_t)Timer::GetNow() ); }
     void CountHolders( PchDemand & demand ) const;
     void QueuePchsToWorker( PchDemand & demand );
     void PushJobsToWorker();
@@ -245,7 +247,7 @@ private:
     DistributionSendStats m_SendStats[ (size_t)SendKind::NumKinds ]; // Send thread only
     Timer m_ConnectionTimer;
     Atomic<uint32_t> m_ResultsReceived{ 0 };
-    Atomic<uint32_t> m_LastResultMS{ 0 }; // m_ConnectionTimer at the last result, or the handshake
+    Atomic<uint64_t> m_LastProgressTime{ 0 }; // Timer::GetNow() at the handshake, the last job sent or the last result
     Atomic<uint64_t> m_ResultBytesReceived{ 0 };
     Atomic<uint64_t> m_ResultRawBytes{ 0 }; // Result data once decompressed
 
@@ -759,7 +761,7 @@ void ClientToWorkerConnection::Process( const ConnectionInfo * connection, const
     // Take note of additional server info
     m_WorkerVersion.Store( msg->GetWorkerVersion() );
     m_WorkerCapacity.Store( msg->GetWorkerCapacity() );
-    m_LastResultMS.Store( (uint32_t)m_ConnectionTimer.GetElapsedMS() );
+    MarkProgress();
     m_HandshakeDone.Store( true );
     AStackString<> protocolVersion;
     Protocol::FormatVersion( protocolVersion, Protocol::kVersionMajor, msg->GetProtocolVersionMinor() );
@@ -769,8 +771,6 @@ void ClientToWorkerConnection::Process( const ConnectionInfo * connection, const
                ( m_WorkerVersion.Load() % 100U ),
                protocolVersion.Get(),
                msg->GetWorkerCapacity() );
-
-    // The initial batch of jobs waits for the toolchain inventory, the last the worker sends after the ack
 }
 
 // Process( MsgRefused )
@@ -986,6 +986,15 @@ void ClientToWorkerConnection::PushToolchainsToWorker()
     }
 }
 
+// GetFreeSlots
+//------------------------------------------------------------------------------
+uint32_t ClientToWorkerConnection::GetFreeSlots() const
+{
+    const uint32_t capacity = m_WorkerCapacity.Load();
+    const uint32_t inFlight = m_JobsInFlight.Load();
+    return ( inFlight >= capacity ) ? 0 : ( capacity - inFlight );
+}
+
 // CountHolders
 //------------------------------------------------------------------------------
 void ClientToWorkerConnection::CountHolders( PchDemand & demand ) const
@@ -995,11 +1004,8 @@ void ClientToWorkerConnection::CountHolders( PchDemand & demand ) const
         return;
     }
 
-    const uint32_t capacity = m_WorkerCapacity.Load();
-    const uint32_t inFlight = m_JobsInFlight.Load();
-    const uint32_t freeSlots = ( inFlight >= capacity ) ? 0 : ( capacity - inFlight );
-    const float secondsSinceLastResult = ( m_ConnectionTimer.GetElapsedMS() - (float)m_LastResultMS.Load() ) / 1000.0f;
-    if ( PchDispatch::CountsAsHolder( m_AwaitingInventory.Load(), capacity, freeSlots, secondsSinceLastResult ) == false )
+    const float secondsSinceProgress = (float)( Timer::GetNow() - (int64_t)m_LastProgressTime.Load() ) * Timer::GetFrequencyInvFloat();
+    if ( PchDispatch::CountsAsHolder( m_AwaitingInventory.Load(), m_WorkerCapacity.Load(), GetFreeSlots(), secondsSinceProgress ) == false )
     {
         return;
     }
@@ -1019,20 +1025,10 @@ void ClientToWorkerConnection::QueuePchsToWorker( PchDemand & demand )
 
     // A worker with no free slot cannot use a PCH yet. The PCHs for jobs it already holds are
     // on their way, or are sent when it asks for them.
-    const uint32_t capacity = m_WorkerCapacity.Load();
-    const uint32_t inFlight = m_JobsInFlight.Load();
-    const uint32_t freeSlots = ( inFlight >= capacity ) ? 0 : ( capacity - inFlight );
+    const uint32_t freeSlots = GetFreeSlots();
     if ( freeSlots == 0 )
     {
         return;
-    }
-
-    {
-        MutexHolder mh( m_Mutex );
-        if ( m_PchState.GetSending().GetSize() >= Math::Min( PchDispatch::kMaxSendingPchs, freeSlots ) )
-        {
-            return;
-        }
     }
 
     // Keep the uplink busy: queue the next PCH while the current is sent, rather than once a job
@@ -1056,19 +1052,16 @@ void ClientToWorkerConnection::PushJobsToWorker()
 {
     PROFILE_SECTION( "PushJobsToWorker" );
 
-    const uint32_t capacity = m_WorkerCapacity.Load();
-    const uint32_t inFlight = m_JobsInFlight.Load();
-    if ( ( inFlight >= capacity ) || m_Worker->m_DenyListed.Load() || ( capacity == 0 ) || m_SendThreadQuit.Load() || m_AwaitingInventory.Load() )
+    uint32_t toSend = GetFreeSlots();
+    if ( ( toSend == 0 ) || m_Worker->m_DenyListed.Load() || m_SendThreadQuit.Load() || m_AwaitingInventory.Load() )
     {
         return;
     }
 
-    uint32_t toSend = capacity - inFlight;
-
     // The jobs already on the worker that wait for their PCH, and the PCHs on the worker or on
     // their way. Kept up to date locally as jobs are taken.
     PchWorkerState pchState;
-    pchState.m_MaxHeld = PchDispatch::MaxHeldJobs( capacity );
+    pchState.m_MaxHeld = PchDispatch::MaxHeldJobs( m_WorkerCapacity.Load() );
     {
         MutexHolder mh( m_Mutex );
         pchState.m_OnWorker = m_PchState.GetOnWorker();
@@ -1139,6 +1132,7 @@ void ClientToWorkerConnection::PushJobsToWorker()
             break;
         }
         m_JobsInFlight.Increment();
+        MarkProgress();
 
         if ( FBuild::Get().GetOptions().m_ShowCommandSummary )
         {
@@ -1243,7 +1237,7 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
     m_JobsInFlight.Decrement();
 
     m_ResultsReceived.Increment();
-    m_LastResultMS.Store( (uint32_t)m_ConnectionTimer.GetElapsedMS() );
+    MarkProgress();
     m_ResultBytesReceived.Add( payloadSize );
 
     ConstMemoryStream ms( payload, payloadSize );
