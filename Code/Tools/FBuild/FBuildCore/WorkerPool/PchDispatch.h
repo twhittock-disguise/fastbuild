@@ -170,6 +170,13 @@ namespace PchDispatch
         return ( freeSlots > 0 ) || ( secondsSinceLastResult < kHolderStallSeconds );
     }
 
+    // Whether a connection's PCHs count as held: not one that still awaits its inventories or that
+    // can never take a job, as the jobs waiting on its PCH could not run there
+    inline bool CountsAsHolder( bool awaitingInventory, uint32_t capacity, uint32_t freeSlots, float secondsSinceLastResult )
+    {
+        return ( awaitingInventory == false ) && ( capacity > 0 ) && IsActiveHolder( freeSlots, secondsSinceLastResult );
+    }
+
     // The PCH to queue for sending next, or 0. "Sending" counts the PCHs queued on the connection
     // and not yet handed to the socket, so the next one is queued while the current is sent.
     // freeSlots is the worker's capacity less its jobs in flight; no more PCHs are queued than it
@@ -206,6 +213,50 @@ namespace PchDispatch
             }
         }
         return best;
+    }
+
+    // The PCHs a counted connection has, or has on its way, are held
+    inline void AddHolders( PchDemand & demand, const PchSendState & state )
+    {
+        for ( size_t i = 0; i < demand.m_PchIds.GetSize(); ++i )
+        {
+            if ( state.IsRequested( demand.m_PchIds[ i ] ) )
+            {
+                ++demand.m_NumHolders[ i ];
+            }
+        }
+    }
+
+    // Queues PCHs for one worker until none is selected. canSend says whether there is anything to
+    // send for a PCH (otherwise it is not considered again) and onQueued is told of each one queued.
+    // The worker queued for is counted as a holder, for the workers queued for after it.
+    template <class CAN_SEND, class ON_QUEUED>
+    void QueuePchs( PchDemand & demand,
+                    PchSendState & state,
+                    uint32_t freeSlots,
+                    const CAN_SEND & canSend,
+                    const ON_QUEUED & onQueued )
+    {
+        for ( ;; )
+        {
+            const uint64_t pchId = SelectPchToQueue( demand, state, freeSlots );
+            if ( pchId == 0 )
+            {
+                break;
+            }
+
+            const size_t index = (size_t)( demand.m_PchIds.Find( pchId ) - demand.m_PchIds.Begin() );
+            if ( canSend( pchId ) )
+            {
+                state.OnRequested( pchId );
+                onQueued( pchId );
+                ++demand.m_NumHolders[ index ];
+            }
+            else
+            {
+                demand.m_NumWaiting[ index ] = 0;
+            }
+        }
     }
 
     // Returns the index of the job to give the worker, or -1. Jobs at the end of the queue are

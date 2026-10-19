@@ -999,19 +999,13 @@ void ClientToWorkerConnection::CountHolders( PchDemand & demand ) const
     const uint32_t inFlight = m_JobsInFlight.Load();
     const uint32_t freeSlots = ( inFlight >= capacity ) ? 0 : ( capacity - inFlight );
     const float secondsSinceLastResult = ( m_ConnectionTimer.GetElapsedMS() - (float)m_LastResultMS.Load() ) / 1000.0f;
-    if ( PchDispatch::IsActiveHolder( freeSlots, secondsSinceLastResult ) == false )
+    if ( PchDispatch::CountsAsHolder( m_AwaitingInventory.Load(), capacity, freeSlots, secondsSinceLastResult ) == false )
     {
         return;
     }
 
     MutexHolder mh( m_Mutex );
-    for ( size_t i = 0; i < demand.m_PchIds.GetSize(); ++i )
-    {
-        if ( m_PchState.IsRequested( demand.m_PchIds[ i ] ) )
-        {
-            ++demand.m_NumHolders[ i ];
-        }
-    }
+    PchDispatch::AddHolders( demand, m_PchState );
 }
 
 // QueuePchsToWorker
@@ -1044,28 +1038,16 @@ void ClientToWorkerConnection::QueuePchsToWorker( PchDemand & demand )
     // Keep the uplink busy: queue the next PCH while the current is sent, rather than once a job
     // that needs it has been taken
     MutexHolder mh( m_Mutex );
-    for ( ;; )
-    {
-        const uint64_t pchId = PchDispatch::SelectPchToQueue( demand, m_PchState, freeSlots );
-        if ( pchId == 0 )
+    PchDispatch::QueuePchs(
+        demand,
+        m_PchState,
+        freeSlots,
+        []( uint64_t pchId )
         {
-            break;
-        }
-
-        const size_t index = (size_t)( demand.m_PchIds.Find( pchId ) - demand.m_PchIds.Begin() );
-        PchDataCache::Entry entry;
-        if ( PchDataCache::Get().Find( pchId, entry ) && ( PchDataCache::Get().HasCompressionFailed( pchId ) == false ) )
-        {
-            m_PchState.OnRequested( pchId );
-            m_PendingPchIds.Append( pchId );
-            ++demand.m_NumHolders[ index ];
-        }
-        else
-        {
-            // Nothing to send for it: not considered again
-            demand.m_NumWaiting[ index ] = 0;
-        }
-    }
+            PchDataCache::Entry entry;
+            return PchDataCache::Get().Find( pchId, entry ) && ( PchDataCache::Get().HasCompressionFailed( pchId ) == false );
+        },
+        [ this ]( uint64_t pchId ) { m_PendingPchIds.Append( pchId ); } );
 }
 
 // PushJobsToWorker

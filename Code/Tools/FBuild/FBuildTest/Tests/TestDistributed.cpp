@@ -3453,7 +3453,10 @@ void TestDistributed::PchIsNotSentToAWorkerWithoutAFreeSlot() const
 {
     // The worker has no capacity, so it cannot take a job and has no use for the PCH. The
     // connection gets past the inventories and the toolchain is sent, but the PCH is not.
-    constexpr float kNoPchWaitSeconds = 10.0f;
+    // The PCH is given this long to be sent once it is built and demanded, which is far longer than a
+    // gate that sends it takes
+    constexpr float kSettleSeconds = 5.0f;
+    constexpr float kBuildTimeoutSeconds = 60.0f;
     FBuildTestOptions options;
     MakeDistributedPchOptions( options );
     options.m_ForceCleanBuild = true;
@@ -3466,17 +3469,23 @@ void TestDistributed::PchIsNotSentToAWorkerWithoutAFreeSlot() const
     // The PCH is built and recorded for sending (it is compressed once queued, which it is not)
     const uint32_t numHashedBefore = PchDataCache::Get().GetNumFilesHashed();
     bool sawPch = false;
-    auto pchSent = [ &worker, &sawPch, numHashedBefore ]()
+    Timer sinceSawPch;
+    auto pchSent = [ &worker, &sawPch, &sinceSawPch, numHashedBefore ]()
     {
-        sawPch = sawPch || ( PchDataCache::Get().GetNumFilesHashed() > numHashedBefore );
-        return ( worker.GetNumPchFiles() >= 1 );
+        if ( ( sawPch == false ) && ( PchDataCache::Get().GetNumFilesHashed() > numHashedBefore ) )
+        {
+            sawPch = true;
+            sinceSawPch.Restart();
+        }
+        // Stop when it is sent, or when it has had the settle period to be
+        return ( worker.GetNumPchFiles() >= 1 ) || ( sawPch && ( sinceSawPch.GetElapsed() >= kSettleSeconds ) );
     };
-    BuildAborter aborter( pchSent, kNoPchWaitSeconds );
+    BuildAborter aborter( pchSent, kBuildTimeoutSeconds );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
     worker.ShutdownAllConnections();
 
     TEST_ASSERT( built == false ); // Aborted
-    TEST_ASSERT( aborter.HasTimedOut() );
+    TEST_ASSERT( aborter.HasReached() );
     TEST_ASSERT( worker.GetNumManifests() >= 1 );
     TEST_ASSERT( sawPch );
     TEST_ASSERT( worker.GetNumPchFiles() == 0 );
