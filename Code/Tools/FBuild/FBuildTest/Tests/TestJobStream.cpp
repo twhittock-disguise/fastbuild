@@ -27,6 +27,7 @@ private:
     void RejectsBadChunks() const;
     void RejectsHostileSizes() const;
     void RejectsLargerWindow() const;
+    void LanSettingIsReadByTheWorkerDecoder() const;
 
     static constexpr uint32_t kSharedSize = ( 1024 * 1024 );
     static constexpr uint32_t kUniqueSize = ( 20 * 1024 );
@@ -56,6 +57,7 @@ REGISTER_TESTS_BEGIN( TestJobStream )
     REGISTER_TEST( RejectsBadChunks )
     REGISTER_TEST( RejectsHostileSizes )
     REGISTER_TEST( RejectsLargerWindow )
+    REGISTER_TEST( LanSettingIsReadByTheWorkerDecoder )
 REGISTER_TESTS_END
 
 // Fill
@@ -299,6 +301,28 @@ void TestJobStream::RejectsLargerWindow() const
         EncodeWithWindow( JobStream::kWindowLog + 1, jobs[ 0 ], chunk );
         TEST_ASSERT( IsRefused( chunk.Begin(), chunk.GetSize() ) );
     }
+}
+
+// LanSettingIsReadByTheWorkerDecoder
+//------------------------------------------------------------------------------
+void TestJobStream::LanSettingIsReadByTheWorkerDecoder() const
+{
+    Array<Array<char>> jobs;
+    MakeJobs( 4, jobs );
+
+    JobStreamEncoder encoder( JobStream::kLanCompressionLevel, JobStream::kLanWindowLog );
+    Array<Array<char>> chunks;
+    EncodeAll( encoder, jobs, chunks );
+
+    // The decoder is the one every worker has, and it keeps the history across the chunks
+    JobStreamDecoder decoder;
+    DecodeAll( decoder, chunks, jobs );
+    TEST_ASSERT( chunks[ 1 ].GetSize() < ( chunks[ 0 ].GetSize() / 10 ) );
+
+    // The setting changes the stream: the default encoder makes a different first chunk
+    JobStreamEncoder normal;
+    TEST_ASSERT( normal.Encode( jobs[ 0 ].Begin(), jobs[ 0 ].GetSize() ) );
+    TEST_ASSERT( normal.GetResultSize() != chunks[ 0 ].GetSize() );
 }
 
 //------------------------------------------------------------------------------

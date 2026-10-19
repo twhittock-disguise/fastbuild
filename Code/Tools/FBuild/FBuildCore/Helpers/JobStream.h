@@ -28,7 +28,10 @@ namespace JobStream
     // History shared between jobs. Each connection costs about 70 MiB on the coordinator
     // (compressor) and 64 MiB on the worker (decompressor).
     constexpr int kWindowLog = 26;
-    constexpr int kLdmHashLog = 16;     // Long distance matching table (windowLog - 10)
+
+    // For a link that has bandwidth to spare, where the time spent compressing matters more than the size
+    constexpr int kLanCompressionLevel = 1;
+    constexpr int kLanWindowLog = 23;   // Within the decoder's limit (kWindowLog)
 
     // A preprocessed job is a few MiB. The size comes from the sender, so it is bounded.
     constexpr size_t kMaxChunkSize = ( 64u * 1024u * 1024u );
@@ -39,7 +42,7 @@ namespace JobStream
 class JobStreamEncoder
 {
 public:
-    JobStreamEncoder() = default;
+    explicit JobStreamEncoder( int compressionLevel = JobStream::kCompressionLevel, int windowLog = JobStream::kWindowLog );
     ~JobStreamEncoder();
 
     // Non-copyable
@@ -54,6 +57,8 @@ public:
     size_t GetResultSize() const { return m_ResultSize; }
 
 private:
+    int m_CompressionLevel;
+    int m_WindowLog;
     ZSTD_CCtx_s * m_Context = nullptr;
     char * m_Buffer = nullptr;
     size_t m_BufferSize = 0;

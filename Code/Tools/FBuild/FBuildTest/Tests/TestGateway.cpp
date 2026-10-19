@@ -8,6 +8,7 @@
 #include "Tools/FBuild/FBuildTest/Tests/SyntheticToolchain.h"
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
+#include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
@@ -183,6 +184,12 @@ private:
     void SendQueueReadsFileSlicesAtSendTime() const;
     void SendQueueStreamCompressesJobs() const;
     void SendQueueStopsOnAFileItCannotRead() const;
+    void PeekJobReadsTheIdsOfASerializedJob() const;
+    void SetJobIdChangesOnlyTheFirstFourBytes() const;
+    void ResultHeaderIsReadAndPatched() const;
+    void ResultCutShortIsRejected() const;
+    void LanesUseRealThreadIndexes() const;
+    void LostResultIsASystemError() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -218,6 +225,12 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( SendQueueReadsFileSlicesAtSendTime )
     REGISTER_TEST( SendQueueStreamCompressesJobs )
     REGISTER_TEST( SendQueueStopsOnAFileItCannotRead )
+    REGISTER_TEST( PeekJobReadsTheIdsOfASerializedJob )
+    REGISTER_TEST( SetJobIdChangesOnlyTheFirstFourBytes )
+    REGISTER_TEST( ResultHeaderIsReadAndPatched )
+    REGISTER_TEST( ResultCutShortIsRejected )
+    REGISTER_TEST( LanesUseRealThreadIndexes )
+    REGISTER_TEST( LostResultIsASystemError )
 REGISTER_TESTS_END
 
 // PreTest
@@ -503,6 +516,193 @@ void TestGateway::SendQueueStopsOnAFileItCannotRead() const
     runner.Stop();
     TEST_ASSERT( recorder.GetNumMessages() == 0 );
     TEST_ASSERT( listener.m_PchIds.IsEmpty() );
+}
+
+// MakeResult
+//------------------------------------------------------------------------------
+// The layout Server::FinalizeCompletedJobs writes
+namespace
+{
+    void MakeResult( MemoryStream & ms, uint32_t jobId, uint16_t threadIndex, const char * data, uint32_t dataSize )
+    {
+        ms.Write( jobId );
+        ms.Write( AStackString( "obj/file.obj" ) );
+        ms.Write( true );
+        ms.Write( false );
+        Array<AString> messages;
+        messages.EmplaceBack( "first message" );
+        messages.EmplaceBack( "second" );
+        ms.Write( messages );
+        ms.Write( (uint32_t)1234 );
+        ms.Write( threadIndex );
+        ms.Write( dataSize );
+        ms.WriteBuffer( data, dataSize );
+    }
+}
+
+// PeekJobReadsTheIdsOfASerializedJob
+//------------------------------------------------------------------------------
+void TestGateway::PeekJobReadsTheIdsOfASerializedJob() const
+{
+    // The layout Job::Serialize writes: id, name, working dir, node properties, data, pch id
+    MemoryStream ms;
+    ms.Write( (uint32_t)0xA1B2C3D4 );
+    ms.Write( AStackString( "obj/file.obj" ) );
+    ms.Write( AStackString( "C:\\work" ) );
+    ms.Write( (uint32_t)777 ); // Node properties
+    ms.Write( (uint32_t)5 );
+    ms.WriteBuffer( "hello", 5 );
+    ms.Write( (uint64_t)0x1122334455667788ull );
+
+    uint32_t jobId = 0;
+    uint64_t pchId = 0;
+    TEST_ASSERT( GatewayWire::PeekJob( ms.GetData(), ms.GetSize(), jobId, pchId ) );
+    TEST_ASSERT( jobId == 0xA1B2C3D4 );
+    TEST_ASSERT( pchId == 0x1122334455667788ull );
+
+    // Too short to hold both
+    TEST_ASSERT( GatewayWire::PeekJob( ms.GetData(), GatewayWire::kMinJobSize - 1, jobId, pchId ) == false );
+    TEST_ASSERT( GatewayWire::PeekJob( ms.GetData(), GatewayWire::kMinJobSize, jobId, pchId ) );
+}
+
+// SetJobIdChangesOnlyTheFirstFourBytes
+//------------------------------------------------------------------------------
+void TestGateway::SetJobIdChangesOnlyTheFirstFourBytes() const
+{
+    char job[ 32 ];
+    for ( size_t i = 0; i < sizeof( job ); ++i )
+    {
+        job[ i ] = (char)( i + 1 );
+    }
+    char expected[ sizeof( job ) ];
+    memcpy( expected, job, sizeof( job ) );
+    const uint32_t newId = 0x0A0B0C0D;
+    memcpy( expected, &newId, sizeof( newId ) );
+
+    GatewayWire::SetJobId( job, sizeof( job ), newId );
+    TEST_ASSERT( memcmp( job, expected, sizeof( job ) ) == 0 );
+
+    uint32_t jobId = 0;
+    uint64_t pchId = 0;
+    TEST_ASSERT( GatewayWire::PeekJob( job, sizeof( job ), jobId, pchId ) );
+    TEST_ASSERT( jobId == newId );
+}
+
+// ResultHeaderIsReadAndPatched
+//------------------------------------------------------------------------------
+void TestGateway::ResultHeaderIsReadAndPatched() const
+{
+    const char data[] = "result data bytes";
+    MemoryStream ms;
+    MakeResult( ms, 42, 1003, data, sizeof( data ) );
+
+    GatewayWire::ResultHeader header;
+    TEST_ASSERT( GatewayWire::ReadResultHeader( ms.GetData(), ms.GetSize(), header ) );
+    TEST_ASSERT( header.m_JobId == 42 );
+    TEST_ASSERT( header.m_Name == "obj/file.obj" );
+    TEST_ASSERT( header.m_Ok );
+    TEST_ASSERT( header.m_SystemError == false );
+    TEST_ASSERT( header.m_ThreadIndex == 1003 );
+
+    // Only the job id and the thread index change
+    Array<char> patched;
+    patched.SetSize( ms.GetSize() );
+    memcpy( patched.Begin(), ms.GetData(), ms.GetSize() );
+    GatewayWire::PatchResult( patched.Begin(), patched.GetSize(), header, 7, 1260 );
+
+    GatewayWire::ResultHeader after;
+    TEST_ASSERT( GatewayWire::ReadResultHeader( patched.Begin(), patched.GetSize(), after ) );
+    TEST_ASSERT( after.m_JobId == 7 );
+    TEST_ASSERT( after.m_ThreadIndex == 1260 );
+    TEST_ASSERT( after.m_Name == header.m_Name );
+    TEST_ASSERT( after.m_Ok == header.m_Ok );
+    TEST_ASSERT( after.m_SystemError == header.m_SystemError );
+    TEST_ASSERT( after.m_ThreadIndexOffset == header.m_ThreadIndexOffset );
+
+    Array<char> expected;
+    expected.SetSize( ms.GetSize() );
+    memcpy( expected.Begin(), ms.GetData(), ms.GetSize() );
+    const uint32_t newJobId = 7;
+    const uint16_t newThread = 1260;
+    memcpy( expected.Begin(), &newJobId, sizeof( newJobId ) );
+    memcpy( expected.Begin() + header.m_ThreadIndexOffset, &newThread, sizeof( newThread ) );
+    TEST_ASSERT( memcmp( patched.Begin(), expected.Begin(), expected.GetSize() ) == 0 );
+    TEST_ASSERT( memcmp( patched.Begin() + patched.GetSize() - sizeof( data ), data, sizeof( data ) ) == 0 );
+}
+
+// ResultCutShortIsRejected
+//------------------------------------------------------------------------------
+void TestGateway::ResultCutShortIsRejected() const
+{
+    const char data[] = "result data bytes";
+    MemoryStream ms;
+    MakeResult( ms, 42, 1003, data, sizeof( data ) );
+
+    // Every cut that loses part of the header or of the data is refused
+    GatewayWire::ResultHeader header;
+    for ( size_t size = 0; size < ms.GetSize(); ++size )
+    {
+        TEST_ASSERT( GatewayWire::ReadResultHeader( ms.GetData(), size, header ) == false );
+    }
+    TEST_ASSERT( GatewayWire::ReadResultHeader( ms.GetData(), ms.GetSize(), header ) );
+
+    // A name that claims more than the message holds
+    MemoryStream hostile;
+    hostile.Write( (uint32_t)1 );
+    hostile.Write( (uint32_t)0xFFFFFFF0 );
+    hostile.WriteBuffer( "abc", 3 );
+    TEST_ASSERT( GatewayWire::ReadResultHeader( hostile.GetData(), hostile.GetSize(), header ) == false );
+}
+
+// LanesUseRealThreadIndexes
+//------------------------------------------------------------------------------
+void TestGateway::LanesUseRealThreadIndexes() const
+{
+    TEST_ASSERT( GatewayWire::MakeLane( 0, 1001 ) == 1001 ); // The gateway's own pool keeps its indexes
+    TEST_ASSERT( GatewayWire::MakeLane( 1, 1001 ) == 1257 );
+    TEST_ASSERT( GatewayWire::MakeLane( 1, 1000 + 999 ) == 1511 ); // Clamped
+    TEST_ASSERT( GatewayWire::MakeLane( 2, 1001 ) == 1513 );
+
+    uint32_t previousHighest = 0;
+    for ( uint32_t worker = 0; worker <= GatewayWire::kMaxWorkerIndex; ++worker )
+    {
+        uint32_t lowest = 0xFFFFFFFF;
+        uint32_t highest = 0;
+        for ( uint32_t thread = 0; thread <= 0xFFFF; thread += 7 )
+        {
+            const uint32_t lane = GatewayWire::MakeLane( worker, (uint16_t)thread );
+            TEST_ASSERT( lane >= 1001 );
+            lowest = ( lane < lowest ) ? lane : lowest;
+            highest = ( lane > highest ) ? lane : highest;
+        }
+        TEST_ASSERT( ( worker == 0 ) || ( lowest > previousHighest ) );
+        previousHighest = highest;
+    }
+    TEST_ASSERT( previousHighest <= 0xFFFF );
+}
+
+// LostResultIsASystemError
+//------------------------------------------------------------------------------
+void TestGateway::LostResultIsASystemError() const
+{
+    MemoryStream ms;
+    GatewayWire::WriteLostResult( ms, 99, "lost on worker" );
+
+    GatewayWire::ResultHeader header;
+    TEST_ASSERT( GatewayWire::ReadResultHeader( ms.GetData(), ms.GetSize(), header ) );
+    TEST_ASSERT( header.m_JobId == 99 );
+    TEST_ASSERT( header.m_Ok == false );
+    TEST_ASSERT( header.m_SystemError );
+
+    // The client reads it with its own layout, and finds the message
+    ConstMemoryStream reader( ms.GetData(), ms.GetSize() );
+    uint32_t jobId;
+    AStackString name;
+    bool ok;
+    bool systemError;
+    Array<AString> messages;
+    TEST_ASSERT( reader.Read( jobId ) && reader.Read( name ) && reader.Read( ok ) && reader.Read( systemError ) && reader.Read( messages ) );
+    TEST_ASSERT( ( messages.GetSize() == 1 ) && ( messages[ 0 ] == "lost on worker" ) );
 }
 
 //------------------------------------------------------------------------------

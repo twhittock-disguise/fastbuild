@@ -18,9 +18,10 @@
 
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
-WorkerSendQueue::WorkerSendQueue( Listener & listener, const AString & peerName )
+WorkerSendQueue::WorkerSendQueue( Listener & listener, const AString & peerName, int jobCompressionLevel, int jobWindowLog )
     : m_Listener( listener )
     , m_PeerName( peerName )
+    , m_JobEncoder( jobCompressionLevel, jobWindowLog )
 {
 }
 

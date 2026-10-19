@@ -116,7 +116,10 @@ public:
         ~Listener() = default;
     };
 
-    WorkerSendQueue( Listener & listener, const AString & peerName );
+    WorkerSendQueue( Listener & listener,
+                     const AString & peerName,
+                     int jobCompressionLevel = JobStream::kCompressionLevel,
+                     int jobWindowLog = JobStream::kWindowLog );
     ~WorkerSendQueue();
 
     // Non-copyable

@@ -14,6 +14,14 @@
 
 #include <string.h>
 
+// CONSTRUCTOR
+//------------------------------------------------------------------------------
+JobStreamEncoder::JobStreamEncoder( int compressionLevel, int windowLog )
+    : m_CompressionLevel( compressionLevel )
+    , m_WindowLog( windowLog )
+{
+}
+
 // DESTRUCTOR
 //------------------------------------------------------------------------------
 JobStreamEncoder::~JobStreamEncoder()
@@ -40,10 +48,10 @@ bool JobStreamEncoder::Encode( const void * data, size_t dataSize )
             return false;
         }
         const bool paramsOk =
-            !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_compressionLevel, JobStream::kCompressionLevel ) ) &&
-            !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_windowLog, JobStream::kWindowLog ) ) &&
+            !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_compressionLevel, m_CompressionLevel ) ) &&
+            !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_windowLog, m_WindowLog ) ) &&
             !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_enableLongDistanceMatching, 1 ) ) &&
-            !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_ldmHashLog, JobStream::kLdmHashLog ) );
+            !ZSTD_isError( ZSTD_CCtx_setParameter( m_Context, ZSTD_c_ldmHashLog, m_WindowLog - 10 ) );
         if ( paramsOk == false )
         {
             ZSTD_freeCCtx( m_Context );
