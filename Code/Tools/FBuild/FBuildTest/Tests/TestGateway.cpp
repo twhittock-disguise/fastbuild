@@ -405,6 +405,7 @@ private:
     void DownstreamResultIsHandedOver() const;
     void DownstreamAskingForAPchGetsItAgain() const;
     void DownstreamAskingTooOftenIsClosed() const;
+    void DownstreamCompletingJobsMayAskForAPchAgain() const;
     void DownstreamAskingForAnUnknownPchIsClosed() const;
     void DownstreamOfAnotherMajorIsLost() const;
     void UnreachableDownstreamIsLost() const;
@@ -493,6 +494,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( DownstreamResultIsHandedOver )
     REGISTER_TEST( DownstreamAskingForAPchGetsItAgain )
     REGISTER_TEST( DownstreamAskingTooOftenIsClosed )
+    REGISTER_TEST( DownstreamCompletingJobsMayAskForAPchAgain )
     REGISTER_TEST( DownstreamAskingForAnUnknownPchIsClosed )
     REGISTER_TEST( DownstreamOfAnotherMajorIsLost )
     REGISTER_TEST( UnreachableDownstreamIsLost )
@@ -3204,6 +3206,37 @@ void TestGateway::DownstreamAskingTooOftenIsClosed() const
     TEST_ASSERT( strcmp( connection.GetCloseReason(), "pch" ) == 0 );
     TEST_ASSERT( worker.GetNumPchCopies() == ( PchSendState::kMaxResends + 1 ) );
     TEST_ASSERT( owner.GetNumLeases() == 0 );
+}
+
+// DownstreamCompletingJobsMayAskForAPchAgain
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamCompletingJobsMayAskForAPchAgain() const
+{
+    Array<uint64_t> tools;
+    tools.Append( kDownstreamTool );
+    EchoWorker worker( 4, EchoWorker::ANSWER_OK, Array<uint64_t>(), tools );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    const StoredPch pch = WriteDownstreamPch( 0xB601, 5000 );
+    owner.AddPch( pch );
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+    SendDownstreamJob( connection, owner, 5, "m5", &pch );
+    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
+
+    // A healthy worker that evicts a hot PCH again and again, with jobs for it completing in between
+    const uint32_t numAsks = ( 2 * PchSendState::kMaxResends ) + 1;
+    for ( uint32_t i = 1; i <= numAsks; ++i )
+    {
+        TEST_ASSERT( worker.AskForPch( pch.m_Id ) );
+        TEST_ASSERT( WaitUntil( [ &worker, i ]() { return ( worker.GetNumPchCopies() == ( i + 1 ) ); } ) );
+        connection.OnJobCompleted( pch.m_Id );
+    }
+    TEST_ASSERT( connection.HasEnded() == false );
+    TEST_ASSERT( owner.GetNumLost() == 0 );
+    TEST_ASSERT( owner.GetNumPchLookups() == numAsks );
 }
 
 // DownstreamAskingForAnUnknownPchIsClosed

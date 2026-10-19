@@ -203,6 +203,14 @@ void DownstreamConnection::SendJob( const Protocol::MsgJob & msg, ConstMemoryStr
     }
 }
 
+// OnJobCompleted
+//------------------------------------------------------------------------------
+void DownstreamConnection::OnJobCompleted( uint64_t pchId )
+{
+    MutexHolder mh( m_Mutex );
+    m_PchState.OnJobCompleted( pchId );
+}
+
 // OnDisconnected
 //------------------------------------------------------------------------------
 /*virtual*/ void DownstreamConnection::OnDisconnected( const ConnectionInfo * /*connection*/ )

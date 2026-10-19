@@ -83,6 +83,10 @@ public:
     // files are asked of the owner (GetToolchainNumFiles, FindToolchainFile) on the caller's thread.
     void SendJob( const Protocol::MsgJob & msg, ConstMemoryStream && job, const StoredPch * pch, PchLease && pchLease );
 
+    // A job that used the PCH completed on the worker: the PCH was there, so the times it was sent again
+    // before do not count against it any more
+    void OnJobCompleted( uint64_t pchId );
+
 private:
     virtual void OnDisconnected( const ConnectionInfo * connection ) override;
     virtual void OnReceive( const ConnectionInfo * connection, void * data, uint32_t size, bool & keepMemory ) override;
