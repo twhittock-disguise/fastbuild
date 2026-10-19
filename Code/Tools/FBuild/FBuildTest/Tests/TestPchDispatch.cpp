@@ -27,6 +27,10 @@ private:
     void PchsAlreadyRequestedAreNotQueuedAgain() const;
     void NoPchIsQueuedWithoutAFreeSlot() const;
     void PchsQueuedAreBoundedByFreeSlots() const;
+    void FirstCopyOfAPchAlwaysGoes() const;
+    void FurtherCopiesNeedEnoughJobs() const;
+    void PchsAreRankedByTheirShareOfJobs() const;
+    void StalledHoldersDoNotCount() const;
     void EmptyQueue() const;
     void PchSendStateTransitions() const;
     void PchSendStateWhenTheWorkerNeedsAPch() const;
@@ -52,9 +56,17 @@ private:
     static uint64_t SelectPch( const Array<uint64_t> & pchIds,
                                const Array<uint32_t> & numJobs,
                                const PchSendState & state,
-                               uint32_t freeSlots = kManySlots )
+                               uint32_t freeSlots = kManySlots,
+                               const Array<uint32_t> * numHolders = nullptr )
     {
-        return PchDispatch::SelectPchToQueue( pchIds, numJobs, state, freeSlots );
+        PchDemand demand;
+        demand.m_PchIds = pchIds;
+        demand.m_NumWaiting = numJobs;
+        for ( size_t i = 0; i < pchIds.GetSize(); ++i )
+        {
+            demand.m_NumHolders.Append( numHolders ? ( *numHolders )[ i ] : 0u );
+        }
+        return PchDispatch::SelectPchToQueue( demand, state, freeSlots );
     }
 
     static int32_t Select( const Array<uint64_t> & queue,
@@ -85,6 +97,10 @@ REGISTER_TESTS_BEGIN( TestPchDispatch )
     REGISTER_TEST( PchsAlreadyRequestedAreNotQueuedAgain )
     REGISTER_TEST( NoPchIsQueuedWithoutAFreeSlot )
     REGISTER_TEST( PchsQueuedAreBoundedByFreeSlots )
+    REGISTER_TEST( FirstCopyOfAPchAlwaysGoes )
+    REGISTER_TEST( FurtherCopiesNeedEnoughJobs )
+    REGISTER_TEST( PchsAreRankedByTheirShareOfJobs )
+    REGISTER_TEST( StalledHoldersDoNotCount )
     REGISTER_TEST( EmptyQueue )
     REGISTER_TEST( PchSendStateTransitions )
     REGISTER_TEST( PchSendStateWhenTheWorkerNeedsAPch )
@@ -278,6 +294,71 @@ void TestPchDispatch::PchsQueuedAreBoundedByFreeSlots() const
     // One slot, and one PCH already on its way for it
     TEST_ASSERT( SelectPch( pchIds, numJobs, state, 1 ) == 0 );
     TEST_ASSERT( SelectPch( pchIds, numJobs, state, 2 ) == 2 );
+}
+
+// FirstCopyOfAPchAlwaysGoes
+//------------------------------------------------------------------------------
+void TestPchDispatch::FirstCopyOfAPchAlwaysGoes() const
+{
+    // Nobody has the PCH, so it goes however few jobs wait: otherwise those jobs would never run
+    const IdList pchIds( { 5 } );
+    Array<uint32_t> numJobs;
+    numJobs.Append( 1 );
+    Array<uint32_t> numHolders;
+    numHolders.Append( 0 );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), 1, &numHolders ) == 5 );
+}
+
+// FurtherCopiesNeedEnoughJobs
+//------------------------------------------------------------------------------
+void TestPchDispatch::FurtherCopiesNeedEnoughJobs() const
+{
+    const IdList pchIds( { 5 } );
+    Array<uint32_t> numHolders;
+    numHolders.Append( 1 );
+
+    // The jobs, shared with the holder, must be kMinJobsPerPchCopy each
+    Array<uint32_t> fewJobs;
+    fewJobs.Append( ( 2 * PchDispatch::kMinJobsPerPchCopy ) - 1 );
+    TEST_ASSERT( SelectPch( pchIds, fewJobs, PchSendState(), kManySlots, &numHolders ) == 0 );
+
+    Array<uint32_t> enoughJobs;
+    enoughJobs.Append( 2 * PchDispatch::kMinJobsPerPchCopy );
+    TEST_ASSERT( SelectPch( pchIds, enoughJobs, PchSendState(), kManySlots, &numHolders ) == 5 );
+}
+
+// PchsAreRankedByTheirShareOfJobs
+//------------------------------------------------------------------------------
+void TestPchDispatch::PchsAreRankedByTheirShareOfJobs() const
+{
+    const IdList pchIds( { 1, 2 } );
+    Array<uint32_t> numJobs;
+    numJobs.Append( 12 );
+    numJobs.Append( 6 );
+
+    // 12 jobs among 3 workers is 4 each, 6 jobs for the first copy is 6
+    Array<uint32_t> numHolders;
+    numHolders.Append( 2 );
+    numHolders.Append( 0 );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), kManySlots, &numHolders ) == 2 );
+
+    // With no holders it is the one with the most jobs
+    Array<uint32_t> noHolders;
+    noHolders.Append( 0 );
+    noHolders.Append( 0 );
+    TEST_ASSERT( SelectPch( pchIds, numJobs, PchSendState(), kManySlots, &noHolders ) == 1 );
+}
+
+// StalledHoldersDoNotCount
+//------------------------------------------------------------------------------
+void TestPchDispatch::StalledHoldersDoNotCount() const
+{
+    // A worker with a free slot is a holder however long since its last result
+    TEST_ASSERT( PchDispatch::IsActiveHolder( 1, 1000.0f ) );
+
+    // One with none is, until it has returned nothing for kHolderStallSeconds
+    TEST_ASSERT( PchDispatch::IsActiveHolder( 0, PchDispatch::kHolderStallSeconds - 1.0f ) );
+    TEST_ASSERT( PchDispatch::IsActiveHolder( 0, PchDispatch::kHolderStallSeconds + 1.0f ) == false );
 }
 
 // EmptyQueue

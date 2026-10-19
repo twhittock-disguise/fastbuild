@@ -156,7 +156,8 @@ public:
     ClientWorkerInfo * GetWorker() const { return m_Worker; }
 
     void PushToolchainsToWorker();
-    void QueuePchsToWorker();
+    void CountHolders( PchDemand & demand ) const;
+    void QueuePchsToWorker( PchDemand & demand );
     void PushJobsToWorker();
     void SendPendingPchs();
 
@@ -244,6 +245,7 @@ private:
     DistributionSendStats m_SendStats[ (size_t)SendKind::NumKinds ]; // Send thread only
     Timer m_ConnectionTimer;
     Atomic<uint32_t> m_ResultsReceived{ 0 };
+    Atomic<uint32_t> m_LastResultMS{ 0 }; // m_ConnectionTimer at the last result, or the handshake
     Atomic<uint64_t> m_ResultBytesReceived{ 0 };
     Atomic<uint64_t> m_ResultRawBytes{ 0 }; // Result data once decompressed
 
@@ -563,11 +565,25 @@ void Client::CommunicateJobAvailability()
 {
     PROFILE_FUNCTION;
 
+    // The PCHs the queued jobs need, and who has them. A PCH queued for one worker counts for the
+    // workers after it.
+    PchDemand demand;
+    JobQueue::Get().CountDistributableJobsByPch( demand.m_PchIds, demand.m_NumWaiting );
+    demand.m_NumHolders.SetSize( demand.m_PchIds.GetSize() );
+    for ( uint32_t & numHolders : demand.m_NumHolders )
+    {
+        numHolders = 0;
+    }
+    for ( const UniquePtr<ClientToWorkerConnection> & ss : m_ActiveConnections )
+    {
+        ss->CountHolders( demand );
+    }
+
     // Toolchains and PCHs are sent whether or not jobs are waiting
     for ( UniquePtr<ClientToWorkerConnection> & ss : m_ActiveConnections )
     {
         ss->PushToolchainsToWorker();
-        ss->QueuePchsToWorker();
+        ss->QueuePchsToWorker( demand );
         ss->SendPendingPchs();
     }
 
@@ -743,6 +759,7 @@ void ClientToWorkerConnection::Process( const ConnectionInfo * connection, const
     // Take note of additional server info
     m_WorkerVersion.Store( msg->GetWorkerVersion() );
     m_WorkerCapacity.Store( msg->GetWorkerCapacity() );
+    m_LastResultMS.Store( (uint32_t)m_ConnectionTimer.GetElapsedMS() );
     m_HandshakeDone.Store( true );
     AStackString<> protocolVersion;
     Protocol::FormatVersion( protocolVersion, Protocol::kVersionMajor, msg->GetProtocolVersionMinor() );
@@ -969,9 +986,37 @@ void ClientToWorkerConnection::PushToolchainsToWorker()
     }
 }
 
+// CountHolders
+//------------------------------------------------------------------------------
+void ClientToWorkerConnection::CountHolders( PchDemand & demand ) const
+{
+    if ( m_Worker->m_DenyListed.Load() || m_SendThreadQuit.Load() )
+    {
+        return;
+    }
+
+    const uint32_t capacity = m_WorkerCapacity.Load();
+    const uint32_t inFlight = m_JobsInFlight.Load();
+    const uint32_t freeSlots = ( inFlight >= capacity ) ? 0 : ( capacity - inFlight );
+    const float secondsSinceLastResult = ( m_ConnectionTimer.GetElapsedMS() - (float)m_LastResultMS.Load() ) / 1000.0f;
+    if ( PchDispatch::IsActiveHolder( freeSlots, secondsSinceLastResult ) == false )
+    {
+        return;
+    }
+
+    MutexHolder mh( m_Mutex );
+    for ( size_t i = 0; i < demand.m_PchIds.GetSize(); ++i )
+    {
+        if ( m_PchState.IsRequested( demand.m_PchIds[ i ] ) )
+        {
+            ++demand.m_NumHolders[ i ];
+        }
+    }
+}
+
 // QueuePchsToWorker
 //------------------------------------------------------------------------------
-void ClientToWorkerConnection::QueuePchsToWorker()
+void ClientToWorkerConnection::QueuePchsToWorker( PchDemand & demand )
 {
     if ( m_AwaitingInventory.Load() || m_Worker->m_DenyListed.Load() || m_SendThreadQuit.Load() )
     {
@@ -998,29 +1043,27 @@ void ClientToWorkerConnection::QueuePchsToWorker()
 
     // Keep the uplink busy: queue the next PCH while the current is sent, rather than once a job
     // that needs it has been taken
-    Array<uint64_t> waitingPchIds;
-    Array<uint32_t> numWaiting;
-    JobQueue::Get().CountDistributableJobsByPch( waitingPchIds, numWaiting );
-
     MutexHolder mh( m_Mutex );
     for ( ;; )
     {
-        const uint64_t pchId = PchDispatch::SelectPchToQueue( waitingPchIds, numWaiting, m_PchState, freeSlots );
+        const uint64_t pchId = PchDispatch::SelectPchToQueue( demand, m_PchState, freeSlots );
         if ( pchId == 0 )
         {
             break;
         }
 
+        const size_t index = (size_t)( demand.m_PchIds.Find( pchId ) - demand.m_PchIds.Begin() );
         PchDataCache::Entry entry;
         if ( PchDataCache::Get().Find( pchId, entry ) && ( PchDataCache::Get().HasCompressionFailed( pchId ) == false ) )
         {
             m_PchState.OnRequested( pchId );
             m_PendingPchIds.Append( pchId );
+            ++demand.m_NumHolders[ index ];
         }
         else
         {
             // Nothing to send for it: not considered again
-            numWaiting[ (size_t)( waitingPchIds.Find( pchId ) - waitingPchIds.Begin() ) ] = 0;
+            demand.m_NumWaiting[ index ] = 0;
         }
     }
 }
@@ -1218,6 +1261,7 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
     m_JobsInFlight.Decrement();
 
     m_ResultsReceived.Increment();
+    m_LastResultMS.Store( (uint32_t)m_ConnectionTimer.GetElapsedMS() );
     m_ResultBytesReceived.Add( payloadSize );
 
     ConstMemoryStream ms( payload, payloadSize );
