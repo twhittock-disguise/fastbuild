@@ -49,6 +49,9 @@ public:
     // <path>.old, replacing any earlier one.
     static bool AppendToLog( const AString & path, const AString & text, uint64_t maxLogSize );
 
+    // "YYYY-MM-DD HH:MM:SS", empty if the local time is unknown
+    static void GetLocalTimestamp( AString & outTimestamp );
+
     // Appends a summary of a closed connection to the log in the temp directory
     // (best effort)
     static void WriteToTempLog( const DistributionConnectionStats & stats );

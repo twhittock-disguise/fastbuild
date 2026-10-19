@@ -125,6 +125,25 @@ namespace
     return f.Seek( size ) && f.WriteFromString( text );
 }
 
+// GetLocalTimestamp
+//------------------------------------------------------------------------------
+/*static*/ void DistributionStats::GetLocalTimestamp( AString & outTimestamp )
+{
+    outTimestamp.Clear();
+    const time_t now = time( nullptr );
+    PRAGMA_DISABLE_PUSH_MSVC( 4996 ) // This function or variable may be unsafe...
+    PRAGMA_DISABLE_PUSH_CLANG_WINDOWS( "-Wdeprecated-declarations" )
+    const struct tm * localTime = localtime( &now );
+    PRAGMA_DISABLE_POP_CLANG_WINDOWS
+    PRAGMA_DISABLE_POP_MSVC
+    if ( localTime )
+    {
+        char timestamp[ 32 ] = "";
+        strftime( timestamp, sizeof( timestamp ), "%Y-%m-%d %H:%M:%S", localTime );
+        outTimestamp = timestamp;
+    }
+}
+
 // WriteToTempLog
 //------------------------------------------------------------------------------
 /*static*/ void DistributionStats::WriteToTempLog( const DistributionConnectionStats & stats )
@@ -136,20 +155,11 @@ namespace
     }
     path += "FBuild-distribution-stats.log";
 
-    const time_t now = time( nullptr );
-    char timestamp[ 32 ] = "";
-    PRAGMA_DISABLE_PUSH_MSVC( 4996 ) // This function or variable may be unsafe...
-    PRAGMA_DISABLE_PUSH_CLANG_WINDOWS( "-Wdeprecated-declarations" )
-    const struct tm * localTime = localtime( &now );
-    PRAGMA_DISABLE_POP_CLANG_WINDOWS
-    PRAGMA_DISABLE_POP_MSVC
-    if ( localTime )
-    {
-        strftime( timestamp, sizeof( timestamp ), "%Y-%m-%d %H:%M:%S", localTime );
-    }
+    AStackString<> timestamp;
+    GetLocalTimestamp( timestamp );
 
     AStackString<> text;
-    Format( stats, timestamp, text );
+    Format( stats, timestamp.Get(), text );
     const uint64_t kMaxLogSize = ( 4 * MEGABYTE );
     (void)AppendToLog( path, text, kMaxLogSize );
 }

@@ -35,6 +35,8 @@
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/TempFiles.h"
 
+#include <stdarg.h>
+
 // Defines
 //------------------------------------------------------------------------------
 #if defined( __OSX__ ) || defined( __LINUX__ )
@@ -62,6 +64,19 @@ namespace
     };
 
     constexpr uint64_t kNoLimit = ~(uint64_t)0;
+
+    // Where the worker log is kept: with the caches. Empty (so no log) if there is no such place.
+    class WorkerLogDirectory : public AStackString<>
+    {
+    public:
+        WorkerLogDirectory()
+        {
+            if ( FBuild::GetWorkerCacheDir( *this ) == false )
+            {
+                Clear();
+            }
+        }
+    };
 
     struct LruLimits
     {
@@ -230,7 +245,8 @@ namespace
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
 Server::Server( uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer )
-    : m_PrefetchBuffer( prefetchBuffer )
+    : m_Log( WorkerLogDirectory() )
+    , m_PrefetchBuffer( prefetchBuffer )
     , m_ShouldExit( false )
 {
     m_ClientList.SetCapacity( 32 );
@@ -308,12 +324,34 @@ bool Server::IsSynchingTool( AString & statusStr ) const
     return false; // no toolchain is currently synching
 }
 
+// LogWarning
+//------------------------------------------------------------------------------
+void Server::LogWarning( const char * fmtString, ... )
+{
+    AStackString<> message;
+    va_list args;
+    va_start( args, fmtString );
+    message.VFormat( fmtString, args );
+    va_end( args );
+
+    FLOG_WARN( "%s", message.Get() );
+    while ( message.EndsWith( '\n' ) )
+    {
+        message.Trim( 0, 1 );
+    }
+    m_Log.Write( "error %s", message.Get() );
+}
+
 // OnConnected
 //------------------------------------------------------------------------------
 /*virtual*/ void Server::OnConnected( const ConnectionInfo * connection )
 {
     ClientState * cs = FNEW( ClientState( connection ) );
     connection->SetUserData( cs );
+
+    AStackString<> remoteAddr;
+    TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
+    m_Log.Write( "connect addr=%s", remoteAddr.Get() );
 
     MutexHolder mh( m_ClientListMutex );
     m_ClientList.Append( cs );
@@ -325,6 +363,10 @@ bool Server::IsSynchingTool( AString & statusStr ) const
     ASSERT( connection );
     ClientState * cs = (ClientState *)connection->GetUserData();
     ASSERT( cs );
+
+    AStackString<> remoteAddr;
+    TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
+    m_Log.Write( "disconnect addr=%s host=%s jobs=%u", remoteAddr.Get(), cs->m_HostName.Get(), cs->m_NumJobsActive.Load() );
 
     // Unhook any jobs which are queued or in progress for this client
     // - deletes the queued jobs
@@ -422,7 +464,7 @@ bool Server::IsSynchingTool( AString & statusStr ) const
         {
             AStackString remoteAddr;
             TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-            FLOG_WARN( "Disconnecting '%s' as it sent an invalid message (%u bytes)\n", remoteAddr.Get(), size );
+            LogWarning( "Disconnecting '%s' as it sent an invalid message (%u bytes)\n", remoteAddr.Get(), size );
             FREE( data );
             Disconnect( connection );
             return;
@@ -485,7 +527,7 @@ bool Server::IsSynchingTool( AString & statusStr ) const
             ASSERT( false ); // this indicates a protocol bug
             AStackString remoteAddr;
             TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-            FLOG_WARN( "Disconnecting '%s' as it sent an unknown message (type %u)\n", remoteAddr.Get(), (uint32_t)messageType );
+            LogWarning( "Disconnecting '%s' as it sent an unknown message (type %u)\n", remoteAddr.Get(), (uint32_t)messageType );
             Disconnect( connection );
             break;
         }
@@ -551,6 +593,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
         Protocol::GetVersionString( ourVersion );
         FLOG_WARN( "Refusing '%s' (%s): it runs protocol v%u, this worker runs %s. FBuild and FBuildWorker must be updated together.\n",
                    remoteAddr.Get(), hostName.Get(), msg->GetProtocolVersion(), ourVersion.Get() );
+        m_Log.Write( "refused addr=%s host=%s reason=protocol-version", remoteAddr.Get(), hostName.Get() );
         const Protocol::MsgRefused refused;
         SendTo( *cs, refused );
         Disconnect( connection );
@@ -559,6 +602,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     if ( size < sizeof( Protocol::MsgConnection ) )
     {
         FLOG_WARN( "Disconnecting '%s' as its handshake is too short (%u bytes)\n", remoteAddr.Get(), size );
+        m_Log.Write( "refused addr=%s host=%s reason=handshake-too-short", remoteAddr.Get(), hostName.Get() );
         Disconnect( connection );
         return;
     }
@@ -567,6 +611,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
     if ( msg->GetPlatform() != Env::GetPlatform() )
     {
         FLOG_WARN( "Disconnecting '%s' (%s) due to mismatched platform\n", remoteAddr.Get(), hostName.Get() );
+        m_Log.Write( "refused addr=%s host=%s reason=platform-mismatch", remoteAddr.Get(), hostName.Get() );
         Disconnect( connection );
         return;
     }
@@ -576,6 +621,8 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
         MutexHolder mh( cs->m_Mutex );
         cs->m_HostName = hostName;
     }
+
+    m_Log.Write( "handshake addr=%s host=%s", remoteAddr.Get(), hostName.Get() );
 
     // Recalculate capacity across all connected coordinators
     // (takes m_ClientListMutex, so cs->m_Mutex must not be held)
@@ -614,7 +661,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
     {
         AStackString remoteAddr;
         TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-        FLOG_WARN( "Disconnecting '%s' (%s) as its job data could not be decoded (corrupt, out of order or window above %u MiB)\n",
+        LogWarning( "Disconnecting '%s' (%s) as its job data could not be decoded (corrupt, out of order or window above %u MiB)\n",
                    remoteAddr.Get(), cs->m_HostName.Get(), ( 1u << JobStream::kWindowLog ) / (uint32_t)MEGABYTE );
         Disconnect( connection );
         return;
@@ -623,6 +670,9 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
 
     // Lock order: m_ClientListMutex before cs->m_Mutex, so asking for a PCH comes after this scope
     uint64_t missingPchId = 0;
+    AStackString<> jobName;
+    uint64_t jobPchId = 0;
+    bool isJobWaiting = true;
     {
         MutexHolder mh( cs->m_Mutex );
 
@@ -632,6 +682,8 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
         FREE( jobData );
         job->SetUserData( cs );
         job->SetResultCompressionLevel( msg->GetResultCompressionLevel(), true /*allowZstdUse*/ );
+        jobName = job->GetRemoteName(); // The job may be finished and gone as soon as it is queued
+        jobPchId = job->GetPchId();
 
         // Resolve PCH cache path if job was bundled with PCH distribution data. The job holds the PCH
         // from here to its end, so it is not evicted or unpacked and deleted while the job waits.
@@ -671,12 +723,11 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
             if ( manifest->IsSynchronized() && pchReady )
             {
                 JobQueueRemote::Get().QueueJob( job );
-                return;
+                isJobWaiting = false;
             }
-
-            // Wait for synchronization to complete
-            if ( manifest->GetUserData() == nullptr )
+            else if ( manifest->GetUserData() == nullptr )
             {
+                // Wait for synchronization to complete
                 manifest->SetUserData( (void *)connection );
             }
         }
@@ -690,8 +741,13 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgJob 
         }
 
         // Can't start job yet - put it on hold (waiting for toolchain and/or PCH)
-        cs->m_WaitingJobs.Append( job );
+        if ( isJobWaiting )
+        {
+            cs->m_WaitingJobs.Append( job );
+        }
     }
+
+    m_Log.Write( "job received name=%s pch=0x%016" PRIx64 " waiting=%u", jobName.Get(), jobPchId, isJobWaiting ? 1u : 0u );
 
     if ( missingPchId != 0 )
     {
@@ -732,7 +788,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgMani
 
             AStackString remoteAddr;
             TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-            FLOG_WARN( "Disconnecting '%s' (%s) due to corrupt MsgManifest\n",
+            LogWarning( "Disconnecting '%s' (%s) due to corrupt MsgManifest\n",
                        remoteAddr.Get(),
                        cs->m_HostName.Get() );
             Disconnect( connection );
@@ -799,7 +855,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgFile
                 ClientState * cs = (ClientState *)connection->GetUserData();
                 AStackString remoteAddr;
                 TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-                FLOG_WARN( "Disconnecting '%s' (%s) due to corrupt MsgFile\n",
+                LogWarning( "Disconnecting '%s' (%s) due to corrupt MsgFile\n",
                            remoteAddr.Get(),
                            cs->m_HostName.Get() );
             }
@@ -808,7 +864,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgFile
                 // something went wrong storing the file
                 AStackString fileName;
                 manifest->GetRemoteFilePath( fileId, fileName );
-                FLOG_WARN( "Failed to store fileId %u for manifest 0x%" PRIx64 "\n"
+                LogWarning( "Failed to store fileId %u for manifest 0x%" PRIx64 "\n"
                            " - %s\n",
                            fileId,
                            toolId,
@@ -889,6 +945,7 @@ void Server::RequestPchIfMissing( ClientState & cs, uint64_t pchId )
     cs.m_PchNeededSent.Append( pchId );
     FLOG_VERBOSE( "PCH 0x%016" PRIx64 " is needed by a job from '%s' and is not cached: asking for it\n",
                   pchId, cs.m_HostName.Get() );
+    m_Log.Write( "pch needed id=0x%016" PRIx64 " host=%s", pchId, cs.m_HostName.Get() );
     const Protocol::MsgPchNeeded msg( pchId );
     SendTo( cs, msg );
 }
@@ -928,7 +985,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
     AStackString pchFilePath;
     if ( BuildPchFilePath( pchId, pchFilePath ) == false )
     {
-        FLOG_WARN( "Failed to get temp dir for PCH cache\n" );
+        LogWarning( "Failed to get temp dir for PCH cache\n" );
         Disconnect( connection );
         return;
     }
@@ -960,6 +1017,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
 
     // Add to in-memory cache
     bool newlyCached = true;
+    Array<uint64_t> evictedIds;
     {
         MutexHolder mh( m_PchCacheMutex );
 
@@ -992,7 +1050,6 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
                     pchIdsInUse.Append( raw.pchId );
                 }
             }
-            Array<uint64_t> evictedIds;
             EvictPchs( m_PchCache, limits.m_Bytes, limits.m_MinEntries, pchIdsInUse, &evictedIds );
             for ( const uint64_t evictedId : evictedIds )
             {
@@ -1006,6 +1063,12 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
         }
     }
     cs->m_PchReceiver.EndReceiving(); // Jobs find it in the cache from here on
+
+    m_Log.Write( "pch received id=0x%016" PRIx64 " bytes=%u seconds=%.1f", pchId, msg->GetCompressedSize(), (double)cs->m_PchReceiver.GetSecondsReceiving() );
+    for ( const uint64_t evictedId : evictedIds )
+    {
+        m_Log.Write( "pch evicted id=0x%016" PRIx64, evictedId );
+    }
 
     // It is here, so no connection needs to ask for it again if it is evicted later
     {
@@ -1098,7 +1161,12 @@ void Server::ScanPchCache()
 
     // No jobs exist yet at startup, so nothing is in use
     const PchCacheLimits limits = GetPchCacheLimits( CountPchBytes( scannedEntries ) );
-    EvictPchs( scannedEntries, limits.m_Bytes, limits.m_MinEntries, Array<uint64_t>() );
+    Array<uint64_t> evictedIds;
+    EvictPchs( scannedEntries, limits.m_Bytes, limits.m_MinEntries, Array<uint64_t>(), &evictedIds );
+    for ( const uint64_t evictedId : evictedIds )
+    {
+        m_Log.Write( "pch evicted id=0x%016" PRIx64, evictedId );
+    }
 
     // Populate in-memory cache
     {
@@ -1664,7 +1732,7 @@ void Server::UnpackPch( uint64_t pchId )
             }
             if ( attempt == 0 )
             {
-                FLOG_WARN( "PCH 0x%016" PRIx64 ": the working copy cannot be written, dropping those nothing uses and trying again\n", pchId );
+                LogWarning( "PCH 0x%016" PRIx64 ": the working copy cannot be written, dropping those nothing uses and trying again\n", pchId );
                 DropUnusedRawPchs();
             }
         }
@@ -1719,11 +1787,11 @@ void Server::UnpackPch( uint64_t pchId )
     else if ( result == PchBlob::UNPACK_CORRUPT )
     {
         // Clients are asked for it again when a job needs it
-        FLOG_WARN( "PCH 0x%016" PRIx64 " is damaged: dropping it\n", pchId );
+        LogWarning( "PCH 0x%016" PRIx64 " is damaged: dropping it\n", pchId );
     }
     else
     {
-        FLOG_WARN( "PCH 0x%016" PRIx64 " cannot be unpacked, as its working copy cannot be written: returning the jobs that need it to their clients\n", pchId );
+        LogWarning( "PCH 0x%016" PRIx64 " cannot be unpacked, as its working copy cannot be written: returning the jobs that need it to their clients\n", pchId );
         DisconnectClientsWaitingForPch( pchId );
         return; // Nothing changed for the jobs of other clients: they would only ask for it to be unpacked again
     }
@@ -1882,6 +1950,18 @@ void Server::FinalizeCompletedJobs()
     Node::BuildResult result;
     while ( Job * job = jcr.GetCompletedJob( result ) )
     {
+        const char * outcome = "cancelled";
+        if ( result == Node::BuildResult::eOk )
+        {
+            outcome = "ok";
+        }
+        else if ( result == Node::BuildResult::eFailed )
+        {
+            outcome = ( job->GetSystemErrorCount() > 0 ) ? "system-error" : "failed";
+        }
+        const Node * node = job->GetNode();
+        m_Log.Write( "job finished name=%s ms=%u result=%s", job->GetRemoteName().Get(), node ? node->GetLastBuildTime() : 0u, outcome );
+
         // Jobs that ended in a useful state are reported to the Client
         // Other jobs (like those that were cancelled) are not
         if ( ( result == Node::BuildResult::eOk ) || ( result == Node::BuildResult::eFailed ) )

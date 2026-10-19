@@ -74,6 +74,7 @@ PchReceiver::Result PchReceiver::OnChunk( const Protocol::MsgPchFile & msg,
         m_CompressedSize = msg.GetCompressedSize();
         m_ChunkSize = msg.GetChunkSize();
         m_NextIndex = 0;
+        m_ReceiveTimer.Restart();
 
         // The id identifies the content, so a stored file is the PCH however it was compressed
         m_AlreadyCached = FileIO::FileExists( pchFile.Get() );

@@ -20,6 +20,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/StreamDecompressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/TempFiles.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
+#include "Tools/FBuild/FBuildCore/Helpers/WorkerLog.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Client.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Server.h"
@@ -119,6 +120,11 @@ private:
     void PchEvictionRemovesTheDirectory() const;
     void PchStartupScanRemovesEmptyDirectories() const;
     void DistributionStatsLog() const;
+    void WorkerLogLinesAreTimestamped() const;
+    void WorkerLogRotates() const;
+    void WorkerLogConcurrentWriters() const;
+    void WorkerLogInAnUnwritableDirectoryIsDisabled() const;
+    void WorkerLogRecordsABuild() const;
     void PayloadsAcceptedByWorker() const;
     void PchChunksReachTheWorker() const;
     void PchLeftHalfSentIsDropped() const;
@@ -318,8 +324,9 @@ private:
     static PchDataCache::CompressedState WaitForForm( PchDataCache & cache, const PchDataCache::Entry & entry, AString & outFilePath, uint64_t & outSize, bool & outTransformed );
     static bool BlobDecodesTo( const Array<char> & blob, const Array<char> & content ); // As a worker decodes a PCH: the transform is undone
     static uint32_t GetBlobType( const Array<char> & blob ); // The first word of its header
-    static uint64_t GetStatsLogSize(); // The log is shared by every FBuild on the machine, and a test looks at what is added to it
-    static bool CountInStatsLogSince( uint64_t sizeBefore, const char * text, uint32_t & outCount ); // False if the log was rotated
+    static void GetStatsLogPath( AString & outPath );
+    static uint64_t GetStatsLogSize( const AString & logPath ); // A log is shared by every FBuild on the machine, and a test looks at what is added to it
+    static bool CountInStatsLogSince( const AString & logPath, uint64_t sizeBefore, const char * text, uint32_t & outCount ); // False if the log was rotated
     static constexpr const char * kDistributedConfig = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
     static void MakeDistributedPchOptions( FBuildTestOptions & options, const char * configFile = kDistributedConfig ); // The jobs are built on the worker
     static void ClearWorkerPchStore();
@@ -374,6 +381,11 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( PchEvictionRemovesTheDirectory )
     REGISTER_TEST( PchStartupScanRemovesEmptyDirectories )
     REGISTER_TEST( DistributionStatsLog )
+    REGISTER_TEST( WorkerLogLinesAreTimestamped )
+    REGISTER_TEST( WorkerLogRotates )
+    REGISTER_TEST( WorkerLogConcurrentWriters )
+    REGISTER_TEST( WorkerLogInAnUnwritableDirectoryIsDisabled )
+    REGISTER_TEST( WorkerLogRecordsABuild )
     REGISTER_TEST( PayloadsAcceptedByWorker )
     REGISTER_TEST( PchChunksReachTheWorker )
     REGISTER_TEST( PchLeftHalfSentIsDropped )
@@ -1739,6 +1751,241 @@ void TestDistributed::DistributionStatsLog() const
     }
 }
 
+// WorkerLog
+//------------------------------------------------------------------------------
+namespace
+{
+    // The directory of a WorkerLog test, empty of what an earlier run left
+    void MakeWorkerLogDir( const char * test, AString & outDir )
+    {
+        outDir.Format( "../tmp/Test/Distributed/WorkerLog/%s/", test );
+        Array<AString> files;
+        FileIO::GetFiles( outDir, AStackString( "*" ), true, &files );
+        for ( const AString & file : files )
+        {
+            FileIO::FileDelete( file.Get() );
+        }
+        VERIFY( FileIO::EnsurePathExists( outDir ) );
+    }
+
+    // Splits the text of a file into its lines. Each ends in a newline, or the file is not a log of whole lines.
+    bool ReadLogLines( const AString & path, Array<AString> & outLines )
+    {
+        FileStream f;
+        if ( f.Open( path.Get(), FileStream::READ_ONLY ) == false )
+        {
+            return false;
+        }
+        Array<char> content;
+        content.SetSize( (size_t)f.GetFileSize() );
+        if ( f.Read( content.Begin(), content.GetSize() ) != content.GetSize() )
+        {
+            return false;
+        }
+        const char * lineStart = content.Begin();
+        for ( const char * c = content.Begin(); c != content.End(); ++c )
+        {
+            if ( *c == '\n' )
+            {
+                outLines.EmplaceBack();
+                outLines.Top().Assign( lineStart, c );
+                lineStart = ( c + 1 );
+            }
+        }
+        return ( lineStart == content.End() );
+    }
+
+    uint64_t GetSize( const AString & path )
+    {
+        FileStream f;
+        return f.Open( path.Get(), FileStream::READ_ONLY ) ? f.GetFileSize() : 0;
+    }
+
+    // "[dddd-dd-dd dd:dd:dd] " at the start of a line
+    bool HasTimestamp( const AString & line )
+    {
+        const char * pattern = "[dddd-dd-dd dd:dd:dd] ";
+        if ( line.GetLength() < AString::StrLen( pattern ) )
+        {
+            return false;
+        }
+        for ( uint32_t i = 0; pattern[ i ]; ++i )
+        {
+            const bool isDigit = ( ( line[ i ] >= '0' ) && ( line[ i ] <= '9' ) );
+            if ( pattern[ i ] == 'd' ? ( isDigit == false ) : ( line[ i ] != pattern[ i ] ) )
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // "t<a> n<b>" -> a and b
+    bool ParseWriterLine( const char * text, uint32_t & outThread, uint32_t & outNumber )
+    {
+        uint32_t * outs[] = { &outThread, &outNumber };
+        const char prefixes[] = { 't', 'n' };
+        for ( uint32_t i = 0; i < 2; ++i )
+        {
+            if ( *text++ != prefixes[ i ] )
+            {
+                return false;
+            }
+            *outs[ i ] = 0;
+            uint32_t numDigits = 0;
+            for ( ; ( *text >= '0' ) && ( *text <= '9' ); ++text, ++numDigits )
+            {
+                *outs[ i ] = ( ( *outs[ i ] * 10 ) + (uint32_t)( *text - '0' ) );
+            }
+            if ( ( numDigits == 0 ) || ( ( i == 0 ) && ( *text++ != ' ' ) ) )
+            {
+                return false;
+            }
+        }
+        return ( *text == 0 );
+    }
+
+    struct WorkerLogWriter
+    {
+        WorkerLog * m_Log = nullptr;
+        uint32_t    m_Index = 0;
+    };
+
+    uint32_t WriteWorkerLogLines( void * param )
+    {
+        const WorkerLogWriter * writer = static_cast<const WorkerLogWriter *>( param );
+        for ( uint32_t n = 0; n < 200; ++n )
+        {
+            writer->m_Log->Write( "t%u n%u", writer->m_Index, n );
+        }
+        return 0;
+    }
+}
+
+// WorkerLogLinesAreTimestamped
+//------------------------------------------------------------------------------
+void TestDistributed::WorkerLogLinesAreTimestamped() const
+{
+    AStackString<> dir;
+    MakeWorkerLogDir( "WorkerLogLinesAreTimestamped", dir );
+
+    WorkerLog log( dir );
+    TEST_ASSERT( log.IsEnabled() );
+    log.Write( "connect %s", "10.0.0.7" );
+
+    Array<AString> lines;
+    TEST_ASSERT( ReadLogLines( log.GetPath(), lines ) );
+    TEST_ASSERT( lines.GetSize() == 1 );
+    TEST_ASSERT( HasTimestamp( lines[ 0 ] ) );
+    TEST_ASSERT( lines[ 0 ].EndsWith( "] connect 10.0.0.7" ) );
+    TEST_ASSERT( lines[ 0 ].GetLength() == AString::StrLen( "[dddd-dd-dd dd:dd:dd] connect 10.0.0.7" ) );
+}
+
+// WorkerLogRotates
+//------------------------------------------------------------------------------
+void TestDistributed::WorkerLogRotates() const
+{
+    AStackString<> dir;
+    MakeWorkerLogDir( "WorkerLogRotates", dir );
+
+    const uint64_t kMaxSize = 250;
+    WorkerLog log( dir, kMaxSize );
+    TEST_ASSERT( log.IsEnabled() );
+    for ( uint32_t i = 0; i < 20; ++i )
+    {
+        log.Write( "event number=%02u padding=0123456789", i ); // About 60 bytes with the timestamp
+    }
+
+    AStackString<> oldPath( log.GetPath() );
+    oldPath += ".old";
+    AStackString<> oldOldPath( oldPath );
+    oldOldPath += ".old";
+    TEST_ASSERT( FileIO::FileExists( oldPath.Get() ) );
+    TEST_ASSERT( FileIO::FileExists( oldOldPath.Get() ) == false );
+    TEST_ASSERT( GetSize( log.GetPath() ) <= kMaxSize );
+    TEST_ASSERT( GetSize( oldPath ) <= kMaxSize );
+
+    Array<AString> lines;
+    TEST_ASSERT( ReadLogLines( log.GetPath(), lines ) );
+    TEST_ASSERT( lines.IsEmpty() == false );
+    TEST_ASSERT( lines.Top().EndsWith( "number=19 padding=0123456789" ) );
+}
+
+// WorkerLogConcurrentWriters
+//------------------------------------------------------------------------------
+void TestDistributed::WorkerLogConcurrentWriters() const
+{
+    AStackString<> dir;
+    MakeWorkerLogDir( "WorkerLogConcurrentWriters", dir );
+
+    WorkerLog log( dir, ( 100 * MEGABYTE ) );
+    TEST_ASSERT( log.IsEnabled() );
+
+    const uint32_t kNumThreads = 4;
+    WorkerLogWriter writers[ kNumThreads ];
+    Thread threads[ kNumThreads ];
+    for ( uint32_t i = 0; i < kNumThreads; ++i )
+    {
+        writers[ i ].m_Log = &log;
+        writers[ i ].m_Index = i;
+        threads[ i ].Start( WriteWorkerLogLines, "WorkerLogWriter", &writers[ i ] );
+    }
+    for ( uint32_t i = 0; i < kNumThreads; ++i )
+    {
+        threads[ i ].Join();
+    }
+
+    Array<AString> lines;
+    TEST_ASSERT( ReadLogLines( log.GetPath(), lines ) );
+    TEST_ASSERT( lines.GetSize() == ( kNumThreads * 200 ) );
+    Array<bool> seen;
+    seen.SetSize( kNumThreads * 200 );
+    for ( bool & s : seen )
+    {
+        s = false;
+    }
+    for ( const AString & line : lines )
+    {
+        TEST_ASSERT( HasTimestamp( line ) );
+        uint32_t t = 0;
+        uint32_t n = 0;
+        TEST_ASSERT( ParseWriterLine( line.Get() + AString::StrLen( "[dddd-dd-dd dd:dd:dd] " ), t, n ) );
+        TEST_ASSERT( ( t < kNumThreads ) && ( n < 200 ) );
+        TEST_ASSERT( seen[ ( t * 200 ) + n ] == false );
+        seen[ ( t * 200 ) + n ] = true;
+    }
+}
+
+// WorkerLogInAnUnwritableDirectoryIsDisabled
+//------------------------------------------------------------------------------
+void TestDistributed::WorkerLogInAnUnwritableDirectoryIsDisabled() const
+{
+    AStackString<> dir;
+    MakeWorkerLogDir( "WorkerLogInAnUnwritableDirectoryIsDisabled", dir );
+
+    // A file where a directory would have to be
+    AStackString<> blocker( dir );
+    blocker += "blocker";
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( blocker.Get(), FileStream::WRITE_ONLY ) );
+        TEST_ASSERT( f.WriteFromString( AStackString( "x" ) ) );
+    }
+    AStackString<> badDir( blocker );
+    badDir += "/sub/";
+
+    WorkerLog log( badDir );
+    TEST_ASSERT( log.IsEnabled() == false );
+    log.Write( "connect %s", "10.0.0.7" ); // Does nothing
+    TEST_ASSERT( FileIO::FileExists( log.GetPath().Get() ) == false );
+    TEST_ASSERT( FileIO::DirectoryExists( badDir ) == false );
+
+    // An empty directory disables it too
+    WorkerLog none( AString::GetEmpty() );
+    TEST_ASSERT( none.IsEnabled() == false );
+    none.Write( "connect" );
+}
+
 // PCH sending
 //------------------------------------------------------------------------------
 namespace
@@ -1998,6 +2245,62 @@ void TestDistributed::PchLeftHalfSentIsDropped() const
     TEST_ASSERT( sender.ConnectToWorker() );
     TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, numChunks ) );
     TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, cachedPath ); } ) );
+}
+
+// WorkerLogRecordsABuild
+//------------------------------------------------------------------------------
+void TestDistributed::WorkerLogRecordsABuild() const
+{
+    FBuildTestOptions options;
+    MakeDistributedPchOptions( options );
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+    ClearWorkerPchStore(); // Else the PCH is found on the worker and not received
+
+    Array<AString> files;
+    FileIO::GetFiles( AStackString( "../tmp/Test/Distributed" ), AStackString( "*.*" ), true, &files );
+    for ( const AString & file : files )
+    {
+        FileIO::FileDelete( file.Get() );
+    }
+
+    AStackString<> logPath;
+    uint64_t sizeBefore = 0;
+    uint32_t numConnects = 0;
+    uint32_t numPchsReceived = 0;
+    uint32_t numJobsReceived = 0;
+    uint32_t numJobsFinished = 0;
+    uint32_t numDisconnects = 0;
+    bool isLogComplete = false;
+    {
+        Server worker( 1 );
+        logPath = worker.GetLogPath();
+        sizeBefore = GetStatsLogSize( logPath );
+        TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( fBuild.Build( "../tmp/Test/Distributed/distpch.lib" ) );
+        TEST_ASSERT( FileIO::FileExists( "../tmp/Test/Distributed/distpch.lib" ) );
+
+        TEST_ASSERT( FileIO::FileExists( logPath.Get() ) );
+        isLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] connect ", numConnects );
+        VERIFY( CountInStatsLogSince( logPath, sizeBefore, "] pch received id=0x", numPchsReceived ) );
+        VERIFY( CountInStatsLogSince( logPath, sizeBefore, "] job received ", numJobsReceived ) );
+        VERIFY( CountInStatsLogSince( logPath, sizeBefore, "] job finished ", numJobsFinished ) );
+    }
+    const bool isDisconnectLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] disconnect ", numDisconnects );
+
+    // A log that was rotated since is not all there
+    if ( isLogComplete )
+    {
+        TEST_ASSERT( numConnects >= 1 );
+        TEST_ASSERT( numPchsReceived >= 1 );
+        TEST_ASSERT( numJobsReceived >= 1 );
+        TEST_ASSERT( numJobsFinished >= 1 );
+    }
+    if ( isDisconnectLogComplete )
+    {
+        TEST_ASSERT( numDisconnects >= 1 );
+    }
 }
 
 // PchInChunksThroughTheBuild
@@ -6594,21 +6897,21 @@ namespace
     return type;
 }
 
-/*static*/ uint64_t TestDistributed::GetStatsLogSize()
+/*static*/ void TestDistributed::GetStatsLogPath( AString & outPath )
 {
-    AStackString<> logPath;
-    VERIFY( FBuild::GetTempDir( logPath ) );
-    logPath += "FBuild-distribution-stats.log";
+    VERIFY( FBuild::GetTempDir( outPath ) );
+    outPath += "FBuild-distribution-stats.log";
+}
+
+/*static*/ uint64_t TestDistributed::GetStatsLogSize( const AString & logPath )
+{
     FileStream f;
     return f.Open( logPath.Get(), FileStream::READ_ONLY ) ? f.GetFileSize() : 0;
 }
 
-/*static*/ bool TestDistributed::CountInStatsLogSince( uint64_t sizeBefore, const char * text, uint32_t & outCount )
+/*static*/ bool TestDistributed::CountInStatsLogSince( const AString & logPath, uint64_t sizeBefore, const char * text, uint32_t & outCount )
 {
     outCount = 0;
-    AStackString<> logPath;
-    VERIFY( FBuild::GetTempDir( logPath ) );
-    logPath += "FBuild-distribution-stats.log";
     FileStream f;
     if ( f.Open( logPath.Get(), FileStream::READ_ONLY ) == false )
     {
@@ -7105,7 +7408,9 @@ void TestDistributed::StoredTransformedPchThatCannotBeInvertedIsDropped() const
 //------------------------------------------------------------------------------
 void TestDistributed::ClientSendsTheTransformedPch() const
 {
-    const uint64_t statsLogSize = GetStatsLogSize();
+    AStackString<> statsLogPath;
+    GetStatsLogPath( statsLogPath );
+    const uint64_t statsLogSize = GetStatsLogSize( statsLogPath );
     uint32_t numLogged = 0;
 
     // The PCH is sent after the transform
@@ -7115,7 +7420,7 @@ void TestDistributed::ClientSendsTheTransformedPch() const
         TEST_ASSERT( worker.GetPchType() == kTransformedBlobType );
         TEST_ASSERT( worker.GetPchCompressedSize() < worker.GetPchUncompressedSize() );
     }
-    const bool isLogComplete = CountInStatsLogSince( statsLogSize, "pch-transform:", numLogged );
+    const bool isLogComplete = CountInStatsLogSince( statsLogPath, statsLogSize, "pch-transform:", numLogged );
     TEST_ASSERT( ( isLogComplete == false ) || ( numLogged == 1 ) ); // The connection says so in its stats
 }
 

@@ -10,6 +10,7 @@
 #include "Core/Env/Types.h"
 #include "Core/Process/Atomic.h"
 #include "Core/Strings/AString.h"
+#include "Core/Time/Timer.h"
 
 // PchReceiver
 //------------------------------------------------------------------------------
@@ -50,6 +51,8 @@ public:
     // Safe to ask from another connection's thread.
     bool IsReceiving( uint64_t pchId ) const { return ( m_ReceivingPchId.Load() == pchId ); }
 
+    float GetSecondsReceiving() const { return m_ReceiveTimer.GetElapsed(); } // Since the first chunk of the PCH being received
+
     // A COMPLETE PCH is where the jobs look for it now
     void EndReceiving() { m_ReceivingPchId.Store( 0 ); }
 
@@ -73,6 +76,7 @@ private:
     uint32_t        m_CompressedSize = 0;
     uint32_t        m_ChunkSize = 0;
     uint32_t        m_NextIndex = 0;
+    Timer           m_ReceiveTimer; // Restarted by the first chunk of a PCH
     Array<char>     m_Compressed;   // As received, so far
     AString         m_TempFile;     // The compressed PCH, until it is moved into place
     Atomic<uint32_t> m_NumChunksReceived{ 0 };

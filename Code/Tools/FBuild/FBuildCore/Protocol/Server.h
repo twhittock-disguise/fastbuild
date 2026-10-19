@@ -7,6 +7,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchReceiver.h"
+#include "Tools/FBuild/FBuildCore/Helpers/WorkerLog.h"
 
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
@@ -42,6 +43,8 @@ public:
 
     bool IsSynchingTool( AString & statusStr ) const;
 
+    const AString & GetLogPath() const { return m_Log.GetPath(); }
+
 private:
     // TCPConnection interface
     virtual void OnConnected( const ConnectionInfo * connection ) override;
@@ -57,6 +60,9 @@ private:
 
     static uint32_t ThreadFuncStatic( void * param );
     void ThreadFunc();
+
+    // Warns on the console, and in the log as "error <text>"
+    void LogWarning( MSVC_SAL_PRINTF const char * fmtString, ... ) FORMAT_STRING( 2, 3 );
 
     void FinalizeCompletedJobs();
     void TouchToolchains();
@@ -113,6 +119,7 @@ private:
     bool IsPchBeingReceived( uint64_t pchId ) const; // Caller holds m_ClientListMutex
     bool IsPchCached( uint64_t pchId ); // Does not refresh LRU recency
 
+    WorkerLog m_Log; // Constructed from FBuild::GetWorkerCacheDir, before anything is logged
     uint32_t m_PrefetchBuffer = 0;
     JobQueueRemote * m_JobQueueRemote;
 
