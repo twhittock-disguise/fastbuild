@@ -457,6 +457,18 @@ namespace DistributedTest
             MutexHolder mh( m_Mutex );
             out = m_Results;
         }
+        // The MSG_REQUEST_MANIFEST and MSG_REQUEST_FILE received, in order
+        struct ToolchainRequest
+        {
+            uint64_t    m_ToolId = 0;
+            uint32_t    m_FileId = 0;
+            bool        m_IsManifest = false;
+        };
+        void GetToolchainRequests( Array<ToolchainRequest> & out ) const
+        {
+            MutexHolder mh( m_Mutex );
+            out = m_ToolchainRequests;
+        }
 
         // A job as a client sends it: the next chunk of the connection's job stream
         bool SendJob( const ConnectionInfo * ci, JobStreamEncoder & encoder, uint64_t toolId, int16_t level, const MemoryStream & job )
@@ -533,13 +545,25 @@ namespace DistributedTest
                 }
                 if ( ( m_CurrentMessage->GetType() == Protocol::MSG_JOB_RESULT_COMPRESSED ) && payload )
                 {
-                    Compressor c;
+                    // Only the data after the header is compressed
                     GatewayWire::ResultHeader header;
-                    if ( Compressor::IsValidData( payload, size ) && c.Decompress( payload ) &&
-                         GatewayWire::ReadResultHeader( c.GetResult(), c.GetResultSize(), header ) )
+                    if ( GatewayWire::ReadResultHeader( payload, size, header ) )
                     {
                         m_Results.Append( header );
                     }
+                }
+                if ( m_CurrentMessage->GetType() == Protocol::MSG_REQUEST_MANIFEST )
+                {
+                    ToolchainRequest & request = m_ToolchainRequests.EmplaceBack();
+                    request.m_ToolId = static_cast<const Protocol::MsgRequestManifest *>( m_CurrentMessage )->GetToolId();
+                    request.m_IsManifest = true;
+                }
+                if ( m_CurrentMessage->GetType() == Protocol::MSG_REQUEST_FILE )
+                {
+                    const Protocol::MsgRequestFile * msg = static_cast<const Protocol::MsgRequestFile *>( m_CurrentMessage );
+                    ToolchainRequest & request = m_ToolchainRequests.EmplaceBack();
+                    request.m_ToolId = msg->GetToolId();
+                    request.m_FileId = msg->GetFileId();
                 }
             }
 
@@ -554,6 +578,7 @@ namespace DistributedTest
         Array<uint64_t> m_ToolchainIds;
         Array<uint64_t> m_PchNeededIds;
         Array<GatewayWire::ResultHeader> m_Results;
+        Array<ToolchainRequest> m_ToolchainRequests;
         Atomic<bool> m_Disconnected{ false };
         Atomic<uint32_t> m_RefusedMajor{ 0 };
         Atomic<uint32_t> m_RefusedMinor{ 0 };

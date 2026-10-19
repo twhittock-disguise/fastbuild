@@ -46,7 +46,10 @@ struct StoredPch
 class DownstreamConnection : public TCPConnectionPool, private WorkerSendQueue::Listener
 {
 public:
-    class Owner   // Called on the connection's threads, with none of its locks held
+    // Called on the connection's threads, with none of its locks held. FindToolchainFile and GetToolchainNumFiles
+    // are also called by SendJob, on its caller's thread with m_SendJobMutex held: they must not wait for a lock
+    // that a caller of SendJob may hold.
+    class Owner
     {
     public:
         virtual void OnDownstreamReady( DownstreamConnection & connection ) = 0;

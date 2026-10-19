@@ -413,12 +413,7 @@ void Server::LogWarning( const char * fmtString, ... )
     }
     Disconnect( connection );
     FDELETE outbox;
-
-    // Before the client leaves the list (QueueResult already fails for it), with no lock held
-    if ( m_Forwarder )
-    {
-        m_Forwarder->OnClientGone( cs->m_Id );
-    }
+    const uint32_t clientId = cs->m_Id;
 
     // Unhook any jobs which are queued or in progress for this client
     // - deletes the queued jobs
@@ -486,13 +481,16 @@ void Server::LogWarning( const char * fmtString, ... )
             delete job;
         }
 
-        // A SendToClient that found this client before it left the list finishes its send first
-        cs->m_SendMutex.Lock();
-        cs->m_SendMutex.Unlock();
         FDELETE cs;
 
         // Redistribute capacity among remaining coordinators
         RecalculateCapacityLocked();
+    }
+
+    // Once the client has left the list, with no lock held
+    if ( m_Forwarder )
+    {
+        m_Forwarder->OnClientGone( clientId );
     }
 
     // Toolchains released above may now be evictable
@@ -636,27 +634,20 @@ bool Server::QueueResult( uint32_t clientId, bool compressed, MemoryStream && pa
 //------------------------------------------------------------------------------
 bool Server::SendToClient( uint32_t clientId, const Protocol::IMessage & msg )
 {
-    // Hand over hand: OnDisconnected takes the send mutex before it frees a client it has taken off the list
-    ClientState * found = nullptr;
+    MutexHolder mh( m_ClientListMutex );
+    for ( ClientState * cs : m_ClientList )
     {
-        MutexHolder mh( m_ClientListMutex );
-        for ( ClientState * cs : m_ClientList )
+        if ( cs->m_Id == clientId )
         {
-            if ( cs->m_Id == clientId )
+            if ( cs->m_Outbox == nullptr )
             {
-                found = cs;
-                found->m_SendMutex.Lock();
-                break;
+                return false; // It is going
             }
+            cs->m_Outbox->PushMessage( msg );
+            return true;
         }
     }
-    if ( found == nullptr )
-    {
-        return false;
-    }
-    const bool sent = msg.Send( found->m_Connection );
-    found->m_SendMutex.Unlock();
-    return sent;
+    return false;
 }
 
 // AskClientForPch
@@ -671,7 +662,7 @@ void Server::AskClientForPch( uint32_t clientId, uint64_t pchId )
             MutexHolder mh2( cs->m_Mutex );
             if ( cs->m_Outbox && MarkPchNeeded( *cs, pchId ) )
             {
-                cs->m_Outbox->PushPchNeeded( pchId );
+                cs->m_Outbox->PushMessage( Protocol::MsgPchNeeded( pchId ) );
             }
             return;
         }
@@ -731,7 +722,7 @@ void Server::ClientOutbox::PushResult( bool compressed, MemoryStream && payload 
     result.m_Payload = FNEW( MemoryStream( Move( payload ) ) );
     result.m_AllocatedCapacity = m_ClientState.m_AllocatedCapacity;
     result.m_Compressed = compressed;
-    result.m_PchNeededId = 0;
+    result.m_IsMessage = false;
     {
         MutexHolder mh( m_Mutex );
         m_Results.Append( result );
@@ -739,15 +730,17 @@ void Server::ClientOutbox::PushResult( bool compressed, MemoryStream && payload 
     m_WakeSemaphore.Signal();
 }
 
-// PushPchNeeded
+// PushMessage
 //------------------------------------------------------------------------------
-void Server::ClientOutbox::PushPchNeeded( uint64_t pchId )
+void Server::ClientOutbox::PushMessage( const Protocol::IMessage & msg )
 {
+    ASSERT( msg.HasPayload() == false );
     QueuedResult request;
-    request.m_Payload = nullptr;
+    request.m_Payload = FNEW( MemoryStream( msg.GetSize() ) );
+    request.m_Payload->WriteBuffer( &msg, msg.GetSize() );
     request.m_AllocatedCapacity = 0;
     request.m_Compressed = false;
-    request.m_PchNeededId = pchId;
+    request.m_IsMessage = true;
     {
         MutexHolder mh( m_Mutex );
         m_Results.Append( request );
@@ -802,10 +795,9 @@ void Server::ClientOutbox::ThreadFunc()
 void Server::ClientOutbox::Send( const QueuedResult & result )
 {
     ClientState & cs = m_ClientState;
-    if ( result.m_Payload == nullptr )
+    if ( result.m_IsMessage )
     {
-        const Protocol::MsgPchNeeded msg( result.m_PchNeededId );
-        SendTo( cs, msg );
+        SendTo( cs, *static_cast<const Protocol::IMessage *>( result.m_Payload->GetData() ) );
         return;
     }
 
@@ -929,13 +921,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
 
     // Send PCH inventory so coordinator knows what's already cached
     Array<uint64_t> pchIds;
-    {
-        MutexHolder mh( m_PchCacheMutex );
-        for ( const PchCacheEntry & e : m_PchCache )
-        {
-            pchIds.Append( e.pchId );
-        }
-    }
+    GetCachedPchIds( pchIds );
     SendIdInventory<Protocol::MsgPchInventory>( *cs, pchIds );
 
     // Send toolchain inventory so coordinator can skip sending toolchains we already have.
@@ -1848,6 +1834,18 @@ bool Server::FindCachedPch( uint64_t pchId, AString & outPath )
     stored->lastWriteTime = Time::GetCurrentFileTime();
     outPath = stored->filePath;
     return true;
+}
+
+// GetCachedPchIds
+//------------------------------------------------------------------------------
+void Server::GetCachedPchIds( Array<uint64_t> & outPchIds ) const
+{
+    MutexHolder mh( m_PchCacheMutex );
+    outPchIds.Clear();
+    for ( const PchCacheEntry & e : m_PchCache )
+    {
+        outPchIds.Append( e.pchId );
+    }
 }
 
 // FindRawPch

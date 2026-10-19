@@ -48,7 +48,9 @@ public:
         virtual void OnClientManifest( uint32_t clientId, uint64_t toolId, const void * payload, size_t payloadSize ) = 0;
         virtual void OnClientFile( uint32_t clientId, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize ) = 0;
         virtual void OnPchStored( uint64_t pchId, uint32_t uncompressedSize, uint32_t compressedSize ) = 0;
-        virtual void OnClientGone( uint32_t clientId ) = 0; // Every client, handshake or not. Nothing is queued for it from here on.
+        // Every client, handshake or not, once it has left the client list: nothing is queued for it from here on,
+        // and a PCH it was sending no longer counts as being received, so another client can be asked for it
+        virtual void OnClientGone( uint32_t clientId ) = 0;
     protected:
         ~Forwarder() = default;
     };
@@ -70,12 +72,13 @@ public:
 
     // A result for the client's outbox (see ClientState::m_Id). False if the client has gone.
     bool QueueResult( uint32_t clientId, bool compressed, MemoryStream && payload );
-    // Sends holding only the client's send mutex, which is taken before the client list is released.
-    // False if the client has gone or the send failed.
+    // A message without a payload, sent by the client's outbox after what is queued before it, so it never
+    // waits for a client that reads slowly. False if the client has gone.
     bool SendToClient( uint32_t clientId, const Protocol::IMessage & msg );
 
     bool FindCachedPch( uint64_t pchId, AString & outPath ); // The compressed PCH. Refreshes LRU recency.
     PchLease AcquirePchLease( uint64_t pchId );
+    void GetCachedPchIds( Array<uint64_t> & outPchIds ) const; // Those in the store now, as the PCH inventory sends them
 
     // Asks the client for a PCH that is not cached, once until it arrives (see RequestPchIfMissing).
     // Sent by the client's outbox, so it never waits for a client that reads slowly.
@@ -155,7 +158,7 @@ private:
 
         // Caller holds m_ClientListMutex. A result counts in cs.m_NumJobsActive until it is sent.
         void PushResult( bool compressed, MemoryStream && payload );
-        void PushPchNeeded( uint64_t pchId ); // Sent after what is queued before it
+        void PushMessage( const Protocol::IMessage & msg ); // Without a payload. Sent after what is queued before it.
         void Wake();
 
         explicit ClientOutbox( const ClientOutbox & other ) = delete;
@@ -164,10 +167,10 @@ private:
     private:
         struct QueuedResult
         {
-            MemoryStream *  m_Payload;              // Null for a PCH request
+            MemoryStream *  m_Payload;              // A result's payload, or the bytes of a message
             uint32_t        m_AllocatedCapacity;    // Of the client when the result was queued
             bool            m_Compressed;
-            uint64_t        m_PchNeededId;          // Of a PCH request
+            bool            m_IsMessage;            // m_Payload is a whole message, sent as it is
         };
 
         static uint32_t ThreadFuncStatic( void * param );

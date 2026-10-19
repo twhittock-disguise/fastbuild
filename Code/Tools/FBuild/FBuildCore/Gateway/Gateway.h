@@ -1,0 +1,217 @@
+// Gateway - One worker to its clients, in front of the workers of a site
+//------------------------------------------------------------------------------
+#pragma once
+
+// Includes
+//------------------------------------------------------------------------------
+#include "Tools/FBuild/FBuildCore/Gateway/DownstreamConnection.h"
+#include "Tools/FBuild/FBuildCore/Gateway/GatewayConfig.h"
+#include "Tools/FBuild/FBuildCore/Gateway/GatewayScheduler.h"
+#include "Tools/FBuild/FBuildCore/Gateway/ToolchainStash.h"
+#include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
+#include "Tools/FBuild/FBuildCore/Protocol/Server.h"
+
+// Core
+#include "Core/Containers/Array.h"
+#include "Core/Process/Atomic.h"
+#include "Core/Process/Mutex.h"
+#include "Core/Process/Semaphore.h"
+#include "Core/Process/Thread.h"
+#include "Core/Strings/AString.h"
+#include "Core/Time/Timer.h"
+
+// Gateway
+//------------------------------------------------------------------------------
+// Its Server takes clients, and hands it their jobs, toolchains and PCHs. It keeps each job until
+// the job's result has come back from a downstream worker, and sends that result to the client
+// that sent the job, with the client's job id restored and the thread index moved to the worker's lane.
+//
+// Locking: m_Mutex guards everything below it. Under it the gateway only pushes to queues, calls
+// the scheduler, reads connection state and takes the Server's PCH cache lock. Sends to clients,
+// disk access (the stash's, the log's) and the Server's client list come after it is released.
+//------------------------------------------------------------------------------
+class Gateway : private Server::Forwarder, private DownstreamConnection::Owner
+{
+    friend class TestGateway;
+public:
+    static constexpr uint32_t kLocalWorkerIndex = 0;   // Used from Task 18
+    explicit Gateway( const GatewayConfig & config );  // Phase A: a pure forwarder
+    virtual ~Gateway();
+
+    explicit Gateway( const Gateway & other ) = delete;
+    Gateway & operator=( const Gateway & other ) = delete;
+
+    bool Listen( uint16_t port );
+    Server & GetServer();
+
+    struct Stats
+    {
+        uint32_t m_Clients = 0;
+        uint32_t m_Workers = 0;        // Configured
+        uint32_t m_ReadyWorkers = 0;
+        uint32_t m_PoolSlots = 0;
+        uint32_t m_Waiting = 0;
+        uint32_t m_Parked = 0;
+        uint32_t m_Running = 0;
+        uint64_t m_HeldJobBytes = 0;
+        uint32_t m_Forwarded = 0;
+        uint32_t m_Retries = 0;
+        uint32_t m_GiveUps = 0;
+        uint32_t m_Timeouts = 0;
+        uint64_t m_PchBytesForwarded = 0;
+        uint32_t m_ToolchainRequests = 0;
+    };
+    void GetStats( Stats & outStats ) const;
+
+private:
+    // Server::Forwarder
+    virtual uint32_t GetPoolSlots() const override;
+    virtual void GetToolchainInventory( uint32_t clientId, Array<uint64_t> & outToolIds ) override;
+    virtual void OnClientJob( uint32_t clientId, const Protocol::MsgJob & msg, void * jobData, size_t jobDataSize ) override;
+    virtual void OnClientManifest( uint32_t clientId, uint64_t toolId, const void * payload, size_t payloadSize ) override;
+    virtual void OnClientFile( uint32_t clientId, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize ) override;
+    virtual void OnPchStored( uint64_t pchId, uint32_t uncompressedSize, uint32_t compressedSize ) override;
+    virtual void OnClientGone( uint32_t clientId ) override;
+
+    // DownstreamConnection::Owner
+    virtual void OnDownstreamReady( DownstreamConnection & connection ) override;
+    virtual void OnDownstreamResult( DownstreamConnection & connection, bool compressed, void * payload, uint32_t payloadSize ) override;
+    virtual void OnDownstreamLost( DownstreamConnection & connection ) override;
+    virtual bool FindPch( uint64_t pchId, StoredPch & outPch, PchLease & outLease ) override;
+    virtual bool FindToolchainFile( uint64_t toolId, uint32_t fileId, AString & outPath, uint32_t & outSize ) override;
+    virtual uint32_t GetToolchainNumFiles( uint64_t toolId ) override;
+
+    // A client's job, held until its result has been passed on
+    struct GatewayJob
+    {
+        GatewayJob() = default;
+        explicit GatewayJob( const GatewayJob & other ) = delete;
+        GatewayJob & operator=( const GatewayJob & other ) = delete;
+
+        uint32_t    m_Id = 0;                   // The scheduler's
+        uint32_t    m_ClientId = 0;
+        uint32_t    m_ClientJobId = 0;
+        uint64_t    m_ToolId = 0;
+        uint64_t    m_PchId = 0;
+        int16_t     m_ResultCompressionLevel = 0;
+        void *      m_Data = nullptr;           // As decoded, with the client's job id
+        size_t      m_DataSize = 0;
+        PchLease    m_PchLease;                 // From its arrival, so the PCH is not evicted while it is held
+        bool        m_Parked = false;           // Waiting for its toolchain or PCH, and not yet in the scheduler
+    };
+
+    // One dispatch of a job. The attempt id is the job id the worker sees.
+    struct Attempt
+    {
+        uint32_t    m_AttemptId = 0;
+        uint32_t    m_JobId = 0;
+        uint32_t    m_WorkerIndex = 0;
+        Timer       m_Started;
+        bool        m_Expired = false;
+    };
+
+    struct Worker
+    {
+        DownstreamConnection *  m_Connection = nullptr;
+        bool                    m_Ready = false;    // In the scheduler and the pool
+    };
+
+    struct Client
+    {
+        uint32_t        m_Id = 0;
+        Array<uint64_t> m_Pins;     // The toolchains it was advertised
+    };
+
+    // A PCH in the Server's store, as far as the gateway knows. Those found at start are measured once.
+    struct KnownPch
+    {
+        uint64_t    m_Id = 0;
+        uint32_t    m_UncompressedSize = 0;
+        uint32_t    m_CompressedSize = 0;
+        bool        m_Measured = false;
+        bool        m_Unusable = false;     // Its measurement failed
+    };
+
+    // A client that is sending a toolchain the stash does not hold whole yet
+    struct Upload
+    {
+        uint64_t    m_ToolId = 0;
+        uint32_t    m_ClientId = 0;
+        bool        m_Requested = false;        // The gateway asked it for the manifest
+        bool        m_FilesRequested = false;
+    };
+
+    // What is done once m_Mutex is released, in this order
+    struct Actions
+    {
+        struct PchAsk { uint32_t m_ClientId; uint64_t m_PchId; };
+        struct ToolchainRequest { uint32_t m_ClientId; uint64_t m_ToolId; uint32_t m_FileId; }; // kManifestFileId: the manifest
+
+        Array<uint64_t>         m_DropIncomplete;
+        Array<uint64_t>         m_ReleaseUses;
+        Array<GatewayJob *>     m_FreeJobs;
+        Array<uint32_t>         m_Disconnects;
+        Array<PchAsk>           m_PchAsks;
+        Array<ToolchainRequest> m_ToolchainRequests;
+        Array<AString>          m_LogLines;
+    };
+    void Run( Actions & actions );
+
+    class WorkerAffinity;
+
+    // The caller holds m_Mutex
+    void Dispatch( Actions & actions );
+    void Schedule( GatewayJob & job );
+    void Park( GatewayJob & job, Actions & actions );
+    void ReleaseParked();       // Schedules those that have what they wait for
+    bool IsReady( const GatewayJob & job );
+    bool IsPchStored( uint64_t pchId );
+    bool LookUpPch( uint64_t pchId, StoredPch & outPch, PchLease & outLease );
+    void RequestToolchain( uint32_t clientId, uint64_t toolId, bool askForManifest, Actions & actions ); // Else its missing files
+    void RequestMissingFiles( Upload & upload, Actions & actions );
+    void OnToolchainPayload( uint32_t clientId, uint64_t toolId, Actions & actions );
+    bool IsUploaded( uint64_t toolId ) const; // Some live client is sending it
+    void RemoveJob( GatewayJob * job, Actions & actions );
+    void UpdatePool();
+    Client & FindOrAddClient( uint32_t clientId );
+    GatewayJob * FindJob( uint32_t jobId ) const;
+    Worker * FindWorker( const DownstreamConnection & connection );
+    KnownPch * FindKnownPch( uint64_t pchId );
+    void GetStatsLocked( Stats & outStats ) const;
+    void FormatStats( AString & outLine ) const;
+
+    static uint32_t HousekeepingThreadFuncStatic( void * param );
+    void HousekeepingThreadFunc();
+    void MeasureStoredPchs(); // Those found at start
+
+    const GatewayConfig     m_Config;
+    ToolchainStash          m_Stash;
+    Server *                m_Server = nullptr; // Destroyed before the stash, and once nothing holds a lease
+    Atomic<uint32_t>        m_PoolSlots{ 0 };
+
+    mutable Mutex           m_Mutex;
+    bool                    m_ShuttingDown = false;
+    GatewayScheduler        m_Scheduler;
+    Array<Worker>           m_Workers;          // Worker index - 1
+    Array<Client>           m_Clients;
+    Array<GatewayJob *>     m_Jobs;             // In the order they arrived
+    Array<Attempt>          m_Attempts;
+    Array<KnownPch>         m_Pchs;
+    Array<Upload>           m_Uploads;
+    uint32_t                m_NextJobId = 1;
+    uint32_t                m_NextAttemptId = 1;
+    uint64_t                m_HeldJobBytes = 0;
+    uint32_t                m_NumParked = 0;
+    uint32_t                m_Forwarded = 0;
+    uint32_t                m_Retries = 0;
+    uint32_t                m_GiveUps = 0;
+    uint32_t                m_Timeouts = 0;
+    uint64_t                m_PchBytesForwarded = 0;
+    uint32_t                m_ToolchainRequests = 0;         // MSG_REQUEST_MANIFEST and MSG_REQUEST_FILE sent
+
+    Thread                  m_HousekeepingThread;
+    Semaphore               m_HousekeepingSemaphore;
+    Atomic<bool>            m_Quit{ false };
+};
+
+//------------------------------------------------------------------------------

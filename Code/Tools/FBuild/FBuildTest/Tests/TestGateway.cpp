@@ -9,6 +9,7 @@
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/Gateway/DownstreamConnection.h"
+#include "Tools/FBuild/FBuildCore/Gateway/Gateway.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayConfig.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayScheduler.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
@@ -409,6 +410,17 @@ private:
     void DownstreamAskingForAnUnknownPchIsClosed() const;
     void DownstreamOfAnotherMajorIsLost() const;
     void UnreachableDownstreamIsLost() const;
+    void GatewayAdvertisesTheSumOfItsWorkers() const;
+    void GatewayForwardsAJobAndItsResult() const;
+    void JobsWaitForTheirToolchainAtTheGateway() const;
+    void JobForAMissingToolchainRequestsIt() const;
+    void AdvertisedToolchainIsPinnedForTheConnection() const;
+    void GatewayAsksTheClientForAMissingPch() const;
+    void PchCrossesTheUplinkOnceForTwoWorkers() const;
+    void ResultsGoBackToTheClientThatSentTheJob() const;
+    void ThreadLanesOfTwoWorkersDoNotCollide() const;
+    void ClientsAreServedInTurn() const;
+    void GatewayLogsForwarding() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -436,6 +448,10 @@ private:
     static void AddActiveJobs( Server & server, uint32_t clientId, uint32_t numJobs );
     static uint32_t GetNumJobsActive( Server & server, uint32_t clientId );
     static size_t CountMessages( const DistributedTest::HandshakeProbe & probe, uint8_t type );
+    // A pure gateway in front of numWorkers workers, which listen from kGatewayTestDownstreamPort on
+    static void MakeGatewayConfig( uint32_t numWorkers, GatewayConfig & outConfig );
+    static Gateway::Stats GetGatewayStats( const Gateway & gateway );
+    static bool WaitForReadyWorkers( const Gateway & gateway, uint32_t numWorkers );
 
     mutable SyntheticToolchain::ScratchWorkerCache m_WorkerCache;
 };
@@ -498,6 +514,17 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( DownstreamAskingForAnUnknownPchIsClosed )
     REGISTER_TEST( DownstreamOfAnotherMajorIsLost )
     REGISTER_TEST( UnreachableDownstreamIsLost )
+    REGISTER_TEST( GatewayAdvertisesTheSumOfItsWorkers )
+    REGISTER_TEST( GatewayForwardsAJobAndItsResult )
+    REGISTER_TEST( JobsWaitForTheirToolchainAtTheGateway )
+    REGISTER_TEST( JobForAMissingToolchainRequestsIt )
+    REGISTER_TEST( AdvertisedToolchainIsPinnedForTheConnection )
+    REGISTER_TEST( GatewayAsksTheClientForAMissingPch )
+    REGISTER_TEST( PchCrossesTheUplinkOnceForTwoWorkers )
+    REGISTER_TEST( ResultsGoBackToTheClientThatSentTheJob )
+    REGISTER_TEST( ThreadLanesOfTwoWorkersDoNotCollide )
+    REGISTER_TEST( ClientsAreServedInTurn )
+    REGISTER_TEST( GatewayLogsForwarding )
 REGISTER_TESTS_END
 
 // PreTest
@@ -3298,6 +3325,570 @@ void TestGateway::UnreachableDownstreamIsLost() const
         DownstreamConnection connection( owner, GetEchoWorkerAddress(), 2 );
     }
     TEST_ASSERT( owner.GetNumLost() == 2 );
+}
+
+// Gateway helpers
+//------------------------------------------------------------------------------
+namespace
+{
+    constexpr uint64_t kGatewayTool = 0x7201;
+
+    // A toolchain's messages, as a client sends them ahead of its jobs
+    bool SendToolchainManifest( DistributedTest::HandshakeProbe & probe, const ConnectionInfo * ci, uint64_t toolId, uint32_t numFiles )
+    {
+        MemoryStream manifest;
+        MakeStashManifest( manifest, toolId, numFiles );
+        return probe.SendMessage( ci, Protocol::MsgManifest( toolId ), manifest.GetData(), manifest.GetSize() );
+    }
+    bool SendToolchainFile( DistributedTest::HandshakeProbe & probe, const ConnectionInfo * ci, uint64_t toolId, uint32_t fileId )
+    {
+        Array<char> bytes;
+        FillStashFile( toolId, fileId, bytes );
+        return probe.SendMessage( ci, Protocol::MsgFile( toolId, fileId ), bytes.Begin(), bytes.GetSize() );
+    }
+    bool SendToolchain( DistributedTest::HandshakeProbe & probe, const ConnectionInfo * ci, uint64_t toolId = kGatewayTool )
+    {
+        return SendToolchainManifest( probe, ci, toolId, 1 ) && SendToolchainFile( probe, ci, toolId, 0 );
+    }
+
+    bool SendGatewayJob( DistributedTest::HandshakeProbe & probe,
+                         const ConnectionInfo * ci,
+                         JobStreamEncoder & encoder,
+                         uint32_t jobId,
+                         const char * marker,
+                         uint64_t pchId = 0,
+                         uint64_t toolId = kGatewayTool )
+    {
+        MemoryStream job;
+        MakeJob( jobId, marker, pchId, job );
+        return probe.SendJob( ci, encoder, toolId, 0, job );
+    }
+
+    size_t GetNumResults( const DistributedTest::HandshakeProbe & probe )
+    {
+        Array<GatewayWire::ResultHeader> results;
+        probe.GetResults( results );
+        return results.GetSize();
+    }
+
+    size_t GetNumToolchainRequests( const DistributedTest::HandshakeProbe & probe )
+    {
+        Array<DistributedTest::HandshakeProbe::ToolchainRequest> requests;
+        probe.GetToolchainRequests( requests );
+        return requests.GetSize();
+    }
+
+    bool ReadWholeFile( const AString & path, AString & outContent )
+    {
+        FileStream f;
+        if ( f.Open( path.Get(), FileStream::READ_ONLY ) == false )
+        {
+            return false;
+        }
+        const uint32_t size = (uint32_t)f.GetFileSize();
+        outContent.SetLength( size );
+        return ( f.Read( outContent.Get(), size ) == size );
+    }
+}
+
+// MakeGatewayConfig
+//------------------------------------------------------------------------------
+/*static*/ void TestGateway::MakeGatewayConfig( uint32_t numWorkers, GatewayConfig & outConfig )
+{
+    GetGatewayCacheDir( outConfig.m_CacheDir );
+    for ( uint32_t i = 0; i < numWorkers; ++i )
+    {
+        GatewayConfig::Worker & worker = outConfig.m_Workers.EmplaceBack();
+        worker.m_Host = "127.0.0.1";
+        worker.m_Port = (uint16_t)( kGatewayTestDownstreamPort + i );
+    }
+}
+
+// GetGatewayStats
+//------------------------------------------------------------------------------
+/*static*/ Gateway::Stats TestGateway::GetGatewayStats( const Gateway & gateway )
+{
+    Gateway::Stats stats;
+    gateway.GetStats( stats );
+    return stats;
+}
+
+// WaitForReadyWorkers
+//------------------------------------------------------------------------------
+/*static*/ bool TestGateway::WaitForReadyWorkers( const Gateway & gateway, uint32_t numWorkers )
+{
+    return WaitUntil( [ &gateway, numWorkers ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == numWorkers ); } );
+}
+
+// GatewayAdvertisesTheSumOfItsWorkers
+//------------------------------------------------------------------------------
+void TestGateway::GatewayAdvertisesTheSumOfItsWorkers() const
+{
+    EchoWorker w1( 8 );
+    EchoWorker w2( 16 );
+    TEST_ASSERT( w1.Listen( kGatewayTestDownstreamPort ) );
+    TEST_ASSERT( w2.Listen( kGatewayTestDownstreamPort + 1 ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 2, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
+
+    const Gateway::Stats stats = GetGatewayStats( gateway );
+    TEST_ASSERT( stats.m_Workers == 2 );
+    TEST_ASSERT( stats.m_PoolSlots == 24 );
+
+    DistributedTest::HandshakeProbe probe;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe ) != 0 );
+    TEST_ASSERT( probe.GetAckCapacity() == 24 );
+    probe.ShutdownAllConnections();
+}
+
+// GatewayForwardsAJobAndItsResult
+//------------------------------------------------------------------------------
+void TestGateway::GatewayForwardsAJobAndItsResult() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+
+    // The client's id comes back, and the thread is on worker 1's lane
+    Array<GatewayWire::ResultHeader> results;
+    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( results[ 0 ].m_JobId == 5 );
+    TEST_ASSERT( results[ 0 ].m_Name == "m5" );
+    TEST_ASSERT( results[ 0 ].m_Ok );
+    TEST_ASSERT( GatewayWire::MakeLane( 1, 1001 ) == 1257 );
+    TEST_ASSERT( results[ 0 ].m_ThreadIndex == 1257 );
+
+    Array<EchoWorker::ReceivedJob> jobs;
+    worker.GetJobs( jobs );
+    TEST_ASSERT( ( jobs.GetSize() == 1 ) && ( jobs[ 0 ].m_Name == "m5" ) && ( jobs[ 0 ].m_ToolId == kGatewayTool ) );
+    Array<uint8_t> types;
+    worker.GetMessageTypes( types );
+    TEST_ASSERT( types.GetSize() == 3 );
+    TEST_ASSERT( ( types[ 0 ] == Protocol::MSG_MANIFEST ) && ( types[ 1 ] == Protocol::MSG_FILE ) && ( types[ 2 ] == Protocol::MSG_JOB ) );
+
+    // Nothing is held once the result has gone back
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+    const Gateway::Stats stats = GetGatewayStats( gateway );
+    TEST_ASSERT( ( stats.m_Forwarded == 1 ) && ( stats.m_Running == 0 ) && ( stats.m_Waiting == 0 ) && ( stats.m_Parked == 0 ) );
+    probe.ShutdownAllConnections();
+}
+
+// JobsWaitForTheirToolchainAtTheGateway
+//------------------------------------------------------------------------------
+void TestGateway::JobsWaitForTheirToolchainAtTheGateway() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+
+    // The job arrives while its toolchain is half sent
+    TEST_ASSERT( SendToolchainManifest( probe, ci, kGatewayTool, 2 ) );
+    TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 0 ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
+    Thread::Sleep( 100 );
+    TEST_ASSERT( worker.GetNumJobs() == 0 );
+
+    TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 1 ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    Array<uint8_t> types;
+    worker.GetMessageTypes( types );
+    TEST_ASSERT( types.GetSize() == 4 );
+    TEST_ASSERT( ( types[ 0 ] == Protocol::MSG_MANIFEST ) && ( types[ 1 ] == Protocol::MSG_FILE ) && ( types[ 2 ] == Protocol::MSG_FILE ) );
+    TEST_ASSERT( types[ 3 ] == Protocol::MSG_JOB );
+
+    // The client was sending it, so it was not asked for it
+    TEST_ASSERT( GetNumToolchainRequests( probe ) == 0 );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_ToolchainRequests == 0 );
+    probe.ShutdownAllConnections();
+}
+
+// JobForAMissingToolchainRequestsIt
+//------------------------------------------------------------------------------
+void TestGateway::JobForAMissingToolchainRequestsIt() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    Array<uint64_t> advertised;
+    probe.GetToolchainIds( advertised );
+    TEST_ASSERT( advertised.IsEmpty() );
+
+    // A job for a toolchain it never sent
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+    Array<DistributedTest::HandshakeProbe::ToolchainRequest> requests;
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 1 ); } ) );
+    probe.GetToolchainRequests( requests );
+    TEST_ASSERT( requests[ 0 ].m_IsManifest && ( requests[ 0 ].m_ToolId == kGatewayTool ) );
+
+    TEST_ASSERT( SendToolchainManifest( probe, ci, kGatewayTool, 1 ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 2 ); } ) );
+    probe.GetToolchainRequests( requests );
+    TEST_ASSERT( ( requests[ 1 ].m_IsManifest == false ) && ( requests[ 1 ].m_ToolId == kGatewayTool ) && ( requests[ 1 ].m_FileId == 0 ) );
+    TEST_ASSERT( worker.GetNumJobs() == 0 );
+
+    TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 0 ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    Array<uint8_t> types;
+    worker.GetMessageTypes( types );
+    TEST_ASSERT( types.GetSize() == 3 );
+    TEST_ASSERT( ( types[ 0 ] == Protocol::MSG_MANIFEST ) && ( types[ 1 ] == Protocol::MSG_FILE ) && ( types[ 2 ] == Protocol::MSG_JOB ) );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_ToolchainRequests == 2 );
+    TEST_ASSERT( GetNumToolchainRequests( probe ) == 2 );
+    probe.ShutdownAllConnections();
+}
+
+// AdvertisedToolchainIsPinnedForTheConnection
+//------------------------------------------------------------------------------
+void TestGateway::AdvertisedToolchainIsPinnedForTheConnection() const
+{
+    // The stash holds the toolchain from an earlier run
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    {
+        AStackString<> stashDir( config.m_CacheDir );
+        stashDir.AppendFormat( "gateway%ctoolchains%c", (char)NATIVE_SLASH, (char)NATIVE_SLASH );
+        ToolchainStash stash( stashDir );
+        AddCompleteToStash( stash, kGatewayTool );
+    }
+
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    DistributedTest::HandshakeProbe a;
+    const ConnectionInfo * ciA = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), a, &ciA ) != 0 );
+    Array<uint64_t> advertised;
+    a.GetToolchainIds( advertised );
+    TEST_ASSERT( ( advertised.GetSize() == 1 ) && ( advertised[ 0 ] == kGatewayTool ) );
+
+    // Another client fills the stash, which evicts what it can
+    {
+        DistributedTest::HandshakeProbe b;
+        const ConnectionInfo * ciB = nullptr;
+        TEST_ASSERT( ConnectProbe( gateway.GetServer(), b, &ciB ) != 0 );
+        const uint64_t firstTool = 0x8001;
+        const uint64_t lastTool = firstTool + ToolchainStash::kMaxToolchains - 1;
+        for ( uint64_t toolId = firstTool; toolId <= lastTool; ++toolId )
+        {
+            TEST_ASSERT( SendToolchain( b, ciB, toolId ) );
+        }
+        TEST_ASSERT( WaitUntil( [ &gateway, lastTool ]() { return gateway.m_Stash.IsComplete( lastTool ); } ) );
+        TEST_ASSERT( gateway.m_Stash.IsComplete( firstTool ) == false );
+        TEST_ASSERT( gateway.m_Stash.IsComplete( kGatewayTool ) );
+        b.ShutdownAllConnections();
+        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 1 ); } ) );
+    }
+    TEST_ASSERT( gateway.m_Stash.IsComplete( kGatewayTool ) );
+
+    // A's job is forwarded with the toolchain, and nothing is asked of A
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( a, ciA, encoder, 5, "m5" ) );
+    TEST_ASSERT( WaitUntil( [ &a ]() { return ( GetNumResults( a ) == 1 ); } ) );
+    TEST_ASSERT( GetNumToolchainRequests( a ) == 0 );
+    Array<uint8_t> types;
+    worker.GetMessageTypes( types );
+    TEST_ASSERT( types.GetSize() == 3 );
+    TEST_ASSERT( ( types[ 0 ] == Protocol::MSG_MANIFEST ) && ( types[ 1 ] == Protocol::MSG_FILE ) && ( types[ 2 ] == Protocol::MSG_JOB ) );
+
+    // Once A has gone, the toolchain can be evicted
+    a.ShutdownAllConnections();
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 0 ); } ) );
+    for ( uint64_t toolId = 0x9001; toolId < ( 0x9001 + ToolchainStash::kMaxToolchains ); ++toolId )
+    {
+        AddCompleteToStash( gateway.m_Stash, toolId );
+    }
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( gateway.m_Stash.IsComplete( kGatewayTool ) == false ); } ) );
+}
+
+// GatewayAsksTheClientForAMissingPch
+//------------------------------------------------------------------------------
+void TestGateway::GatewayAsksTheClientForAMissingPch() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 64 * 1024, 3, pch );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() == 1 ); } ) );
+    TEST_ASSERT( probe.GetPchNeededId( 0 ) == pch.m_Id );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_Parked == 1 );
+    TEST_ASSERT( worker.GetNumJobs() == 0 );
+
+    TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+    Array<GatewayWire::ResultHeader> results;
+    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
+    TEST_ASSERT( worker.GetNumPchCopies() == 1 );
+    TEST_ASSERT( worker.GetPchBytes() == pch.m_CompressedSize );
+    TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
+    probe.ShutdownAllConnections();
+}
+
+// PchCrossesTheUplinkOnceForTwoWorkers
+//------------------------------------------------------------------------------
+void TestGateway::PchCrossesTheUplinkOnceForTwoWorkers() const
+{
+    EchoWorker w1( 1, EchoWorker::ANSWER_NEVER );
+    EchoWorker w2( 1, EchoWorker::ANSWER_NEVER );
+    TEST_ASSERT( w1.Listen( kGatewayTestDownstreamPort ) );
+    TEST_ASSERT( w2.Listen( kGatewayTestDownstreamPort + 1 ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 2, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 2 * MEGABYTE, 4, pch );
+    TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+
+    // One slot each, so the two jobs go to the two workers
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6", pch.m_Id ) );
+    TEST_ASSERT( WaitUntil( [ &w1, &w2 ]() { return ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 1 ); } ) );
+    TEST_ASSERT( ( w1.GetNumPchCopies() == 1 ) && ( w1.GetPchBytes() == pch.m_CompressedSize ) );
+    TEST_ASSERT( ( w2.GetNumPchCopies() == 1 ) && ( w2.GetPchBytes() == pch.m_CompressedSize ) );
+    w1.AnswerHeldJobs();
+    w2.AnswerHeldJobs();
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+
+    // The client sent it once, and was never asked for it
+    TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_PchBytesForwarded == ( 2 * (uint64_t)pch.m_CompressedSize ) );
+    probe.ShutdownAllConnections();
+}
+
+// ResultsGoBackToTheClientThatSentTheJob
+//------------------------------------------------------------------------------
+void TestGateway::ResultsGoBackToTheClientThatSentTheJob() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    DistributedTest::HandshakeProbe a;
+    DistributedTest::HandshakeProbe b;
+    const ConnectionInfo * ciA = nullptr;
+    const ConnectionInfo * ciB = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), a, &ciA ) != 0 );
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), b, &ciB ) != 0 );
+    TEST_ASSERT( SendToolchain( a, ciA ) && SendToolchain( b, ciB ) );
+
+    // The same job id from each
+    JobStreamEncoder encoderA;
+    JobStreamEncoder encoderB;
+    TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 5, "a" ) );
+    TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, 5, "b" ) );
+    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( GetNumResults( a ) == 1 ) && ( GetNumResults( b ) == 1 ); } ) );
+    Thread::Sleep( 100 ); // A result sent to the wrong client would have arrived by now
+
+    Array<GatewayWire::ResultHeader> results;
+    a.GetResults( results );
+    TEST_ASSERT( ( results.GetSize() == 1 ) && ( results[ 0 ].m_JobId == 5 ) && ( results[ 0 ].m_Name == "a" ) );
+    b.GetResults( results );
+    TEST_ASSERT( ( results.GetSize() == 1 ) && ( results[ 0 ].m_JobId == 5 ) && ( results[ 0 ].m_Name == "b" ) );
+    TEST_ASSERT( worker.GetNumJobs() == 2 );
+    a.ShutdownAllConnections();
+    b.ShutdownAllConnections();
+}
+
+// ThreadLanesOfTwoWorkersDoNotCollide
+//------------------------------------------------------------------------------
+void TestGateway::ThreadLanesOfTwoWorkersDoNotCollide() const
+{
+    EchoWorker w1( 1, EchoWorker::ANSWER_NEVER ); // Both answer from thread 1001
+    EchoWorker w2( 1, EchoWorker::ANSWER_NEVER );
+    TEST_ASSERT( w1.Listen( kGatewayTestDownstreamPort ) );
+    TEST_ASSERT( w2.Listen( kGatewayTestDownstreamPort + 1 ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 2, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
+
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
+    TEST_ASSERT( WaitUntil( [ &w1, &w2 ]() { return ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 1 ); } ) );
+    w1.AnswerHeldJobs();
+    w2.AnswerHeldJobs();
+    Array<GatewayWire::ResultHeader> results;
+    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
+
+    // Worker 1's lanes start at 1257, worker 2's at 1513
+    Array<EchoWorker::ReceivedJob> jobsOf1;
+    w1.GetJobs( jobsOf1 );
+    for ( const GatewayWire::ResultHeader & result : results )
+    {
+        const bool fromWorker1 = ( result.m_Name == jobsOf1[ 0 ].m_Name );
+        TEST_ASSERT( result.m_ThreadIndex == ( fromWorker1 ? 1257 : 1513 ) );
+    }
+    TEST_ASSERT( results[ 0 ].m_ThreadIndex != results[ 1 ].m_ThreadIndex );
+    probe.ShutdownAllConnections();
+}
+
+// ClientsAreServedInTurn
+//------------------------------------------------------------------------------
+void TestGateway::ClientsAreServedInTurn() const
+{
+    EchoWorker worker( 1, EchoWorker::ANSWER_NEVER );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+
+    DistributedTest::HandshakeProbe a;
+    DistributedTest::HandshakeProbe b;
+    const ConnectionInfo * ciA = nullptr;
+    const ConnectionInfo * ciB = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), a, &ciA ) != 0 );
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), b, &ciB ) != 0 );
+    TEST_ASSERT( SendToolchain( a, ciA ) && SendToolchain( b, ciB ) );
+
+    // A's first job takes the only slot. Then A has three waiting, and B, which came later, three.
+    JobStreamEncoder encoderA;
+    JobStreamEncoder encoderB;
+    TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 1, "a1" ) );
+    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumJobs() == 1 ); } ) );
+    TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 2, "a2" ) );
+    TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 3, "a3" ) );
+    TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 4, "a4" ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 3 ); } ) );
+    TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, 1, "b1" ) );
+    TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, 2, "b2" ) );
+    TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, 3, "b3" ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 6 ); } ) );
+
+    // Each result frees the slot for the next turn
+    for ( size_t i = 1; i < 7; ++i )
+    {
+        worker.AnswerHeldJobs();
+        TEST_ASSERT( WaitUntil( [ &worker, i ]() { return ( worker.GetNumJobs() == ( i + 1 ) ); } ) );
+    }
+    worker.AnswerHeldJobs();
+
+    const char * const expected[] = { "a1", "a2", "b1", "a3", "b2", "a4", "b3" };
+    Array<EchoWorker::ReceivedJob> jobs;
+    worker.GetJobs( jobs );
+    TEST_ASSERT( jobs.GetSize() == 7 );
+    for ( size_t i = 0; i < 7; ++i )
+    {
+        TEST_ASSERT( jobs[ i ].m_Name == expected[ i ] );
+    }
+    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( GetNumResults( a ) == 4 ) && ( GetNumResults( b ) == 3 ); } ) );
+    a.ShutdownAllConnections();
+    b.ShutdownAllConnections();
+}
+
+// GatewayLogsForwarding
+//------------------------------------------------------------------------------
+void TestGateway::GatewayLogsForwarding() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 64 * 1024, 5, pch );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    AStackString<> logPath;
+    uint32_t clientId = 0;
+    {
+        Gateway gateway( config );
+        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+        logPath = gateway.GetServer().GetLogPath();
+
+        DistributedTest::HandshakeProbe probe;
+        const ConnectionInfo * ci = nullptr;
+        clientId = ConnectProbe( gateway.GetServer(), probe, &ci );
+        TEST_ASSERT( clientId != 0 );
+        TEST_ASSERT( SendToolchain( probe, ci ) );
+        TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+        JobStreamEncoder encoder;
+        TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
+        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+        probe.ShutdownAllConnections();
+    }
+
+    // The gateway's own log, with the stats line it wrote as it shut down
+    TEST_ASSERT( logPath.BeginsWith( config.m_CacheDir ) );
+    AString log;
+    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    AStackString<> expected;
+    expected.Format( "gateway worker-ready worker=127.0.0.1:%u slots=4", (uint32_t)kGatewayTestDownstreamPort );
+    TEST_ASSERT( log.Find( expected.Get() ) );
+    expected.Format( "gateway job-forward client=%u job=5 attempt=", clientId );
+    TEST_ASSERT( log.Find( expected.Get() ) );
+    expected.Format( " worker=127.0.0.1:%u pch=0x%016" PRIx64, (uint32_t)kGatewayTestDownstreamPort, pch.m_Id );
+    TEST_ASSERT( log.Find( expected.Get() ) );
+    expected.Format( "gateway pch-forward pch=0x%016" PRIx64 " worker=127.0.0.1:%u bytes=%u", pch.m_Id, (uint32_t)kGatewayTestDownstreamPort, pch.m_CompressedSize );
+    TEST_ASSERT( log.Find( expected.Get() ) );
+    const char * stats = log.Find( "gateway stats clients=" );
+    TEST_ASSERT( stats );
+    TEST_ASSERT( strstr( stats, " workers=1/1 pool=4 waiting=0 parked=0 running=0 heldMiB=0 forwarded=1 retries=0 giveups=0 timeouts=0 pchMiB=0" ) );
 }
 
 //------------------------------------------------------------------------------
