@@ -8,6 +8,7 @@
 #include "Tools/FBuild/FBuildTest/Tests/SyntheticToolchain.h"
 
 #include "Tools/FBuild/FBuildCore/FBuild.h"
+#include "Tools/FBuild/FBuildCore/Gateway/GatewayScheduler.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
 #include "Tools/FBuild/FBuildCore/Gateway/ToolchainStash.h"
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
@@ -380,6 +381,17 @@ private:
     void ReleaseWithoutUseKeepsLaterPins() const;
     void DroppingAnIncompleteToolchainKeepsItsPins() const;
     void ReUploadDuringAPendingDeleteEndsIntact() const;
+    void SchedulerTakesClientsInTurn() const;
+    void SchedulerPrefersAWorkerHoldingThePch() const;
+    void SchedulerTakesAJobItsWorkerHoldsFirst() const;
+    void SchedulerNeverGivesAWorkerAJobItIsUnableToTake() const;
+    void SchedulerUsesNoMoreSlotsThanAWorkerHas() const;
+    void FailedJobIsRetriedElsewhereAtMostTwice() const;
+    void RetryUsesTheSameWorkerWhenThereIsNoOther() const;
+    void RetriedJobGoesFirst() const;
+    void RemovedWorkerReportsItsRunningJobs() const;
+    void RemovedClientDropsOnlyItsWaitingJobs() const;
+    void WaitingForCountsOnlyJobsAWorkerCanTake() const;
 
     // Waits for something that happens on another thread
     static constexpr float kWaitTimeoutSeconds = 30.0f;
@@ -446,6 +458,17 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( ReleaseWithoutUseKeepsLaterPins )
     REGISTER_TEST( DroppingAnIncompleteToolchainKeepsItsPins )
     REGISTER_TEST( ReUploadDuringAPendingDeleteEndsIntact )
+    REGISTER_TEST( SchedulerTakesClientsInTurn )
+    REGISTER_TEST( SchedulerPrefersAWorkerHoldingThePch )
+    REGISTER_TEST( SchedulerTakesAJobItsWorkerHoldsFirst )
+    REGISTER_TEST( SchedulerNeverGivesAWorkerAJobItIsUnableToTake )
+    REGISTER_TEST( SchedulerUsesNoMoreSlotsThanAWorkerHas )
+    REGISTER_TEST( FailedJobIsRetriedElsewhereAtMostTwice )
+    REGISTER_TEST( RetryUsesTheSameWorkerWhenThereIsNoOther )
+    REGISTER_TEST( RetriedJobGoesFirst )
+    REGISTER_TEST( RemovedWorkerReportsItsRunningJobs )
+    REGISTER_TEST( RemovedClientDropsOnlyItsWaitingJobs )
+    REGISTER_TEST( WaitingForCountsOnlyJobsAWorkerCanTake )
 REGISTER_TESTS_END
 
 // PreTest
@@ -1982,6 +2005,383 @@ void TestGateway::ReUploadDuringAPendingDeleteEndsIntact() const
     uint32_t size = 0;
     TEST_ASSERT( stash.GetManifestFile( 1, path, size ) );
     TEST_ASSERT( StoredFileEquals( path, manifest.GetData(), manifest.GetSize() ) );
+}
+
+// Scheduler helpers
+//------------------------------------------------------------------------------
+namespace
+{
+    // Every worker is able and holds nothing, except as set. The first matching rule wins; 0 matches any id.
+    class FakeAffinity
+    {
+    public:
+        void Set( uint32_t workerId, uint64_t pchId, uint64_t toolId, GatewayScheduler::Affinity affinity )
+        {
+            m_Rules.Append( Rule{ workerId, pchId, toolId, affinity } );
+        }
+
+        GatewayScheduler::Affinity operator()( uint32_t workerId, uint64_t pchId, uint64_t toolId ) const
+        {
+            for ( const Rule & rule : m_Rules )
+            {
+                if ( ( rule.m_WorkerId == workerId ) &&
+                     ( ( rule.m_PchId == 0 ) || ( rule.m_PchId == pchId ) ) &&
+                     ( ( rule.m_ToolId == 0 ) || ( rule.m_ToolId == toolId ) ) )
+                {
+                    return rule.m_Affinity;
+                }
+            }
+            return GatewayScheduler::AFFINITY_NONE;
+        }
+
+    private:
+        struct Rule
+        {
+            uint32_t m_WorkerId;
+            uint64_t m_PchId;
+            uint64_t m_ToolId;
+            GatewayScheduler::Affinity m_Affinity;
+        };
+        Array<Rule> m_Rules;
+    };
+
+    bool Starts( GatewayScheduler & scheduler, const FakeAffinity & affinity, uint32_t jobId, uint32_t workerId )
+    {
+        GatewayScheduler::Assignment assignment;
+        return scheduler.Next( affinity, assignment ) &&
+               ( assignment.m_JobId == jobId ) &&
+               ( assignment.m_WorkerId == workerId );
+    }
+
+    bool StartsNothing( GatewayScheduler & scheduler, const FakeAffinity & affinity )
+    {
+        GatewayScheduler::Assignment assignment;
+        return ( scheduler.Next( affinity, assignment ) == false );
+    }
+
+    // A job that ran on the worker ends
+    void Complete( GatewayScheduler & scheduler, uint32_t jobId, uint32_t workerId )
+    {
+        scheduler.ReleaseSlot( workerId );
+        scheduler.OnCompleted( jobId );
+    }
+
+    constexpr uint64_t kSchedulerTool = 0x7001;
+}
+
+// SchedulerTakesClientsInTurn
+//------------------------------------------------------------------------------
+void TestGateway::SchedulerTakesClientsInTurn() const
+{
+    const FakeAffinity affinity;
+    GatewayScheduler scheduler;
+    scheduler.SetWorkerSlots( 1, 8 );
+    for ( uint32_t jobId = 101; jobId <= 106; ++jobId )
+    {
+        scheduler.AddJob( jobId, 1, 0, kSchedulerTool );
+    }
+    scheduler.AddJob( 201, 2, 0, kSchedulerTool );
+    scheduler.AddJob( 202, 2, 0, kSchedulerTool );
+
+    // A, B, A, B, then A for the rest
+    const uint32_t expected[] = { 101, 201, 102, 202, 103, 104, 105, 106 };
+    for ( const uint32_t jobId : expected )
+    {
+        TEST_ASSERT( Starts( scheduler, affinity, jobId, 1 ) );
+    }
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+    TEST_ASSERT( scheduler.GetNumRunning() == 8 );
+}
+
+// SchedulerPrefersAWorkerHoldingThePch
+//------------------------------------------------------------------------------
+void TestGateway::SchedulerPrefersAWorkerHoldingThePch() const
+{
+    const uint64_t pchHeld = 0x50;
+    const uint64_t pchBeingSent = 0x51;
+    const uint64_t pchNowhere = 0x52;
+    FakeAffinity affinity;
+    affinity.Set( 2, pchHeld, 0, GatewayScheduler::AFFINITY_HOLDS );
+    affinity.Set( 3, pchBeingSent, 0, GatewayScheduler::AFFINITY_RECEIVING );
+
+    GatewayScheduler scheduler;
+    for ( uint32_t workerId = 1; workerId <= 3; ++workerId )
+    {
+        scheduler.SetWorkerSlots( workerId, 4 );
+    }
+    scheduler.AddJob( 1, 1, pchHeld, kSchedulerTool );
+    scheduler.AddJob( 2, 1, pchHeld, kSchedulerTool );
+    scheduler.AddJob( 3, 1, pchBeingSent, kSchedulerTool );
+    scheduler.AddJob( 4, 1, pchNowhere, kSchedulerTool );
+
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 2 ) );
+    TEST_ASSERT( Starts( scheduler, affinity, 2, 2 ) );  // Holding beats more free slots
+    TEST_ASSERT( Starts( scheduler, affinity, 3, 3 ) );  // Receiving beats the lower id
+    TEST_ASSERT( Starts( scheduler, affinity, 4, 1 ) );  // The most free slots, then the lower id
+
+    scheduler.AddJob( 5, 1, pchNowhere, kSchedulerTool );
+    scheduler.SetWorkerSlots( 3, 8 );
+    TEST_ASSERT( Starts( scheduler, affinity, 5, 3 ) );  // More free slots beat the lower id
+}
+
+// SchedulerTakesAJobItsWorkerHoldsFirst
+//------------------------------------------------------------------------------
+void TestGateway::SchedulerTakesAJobItsWorkerHoldsFirst() const
+{
+    // Jobs 1..n, each with its own PCH; the worker holds those of job 2 and job n
+    const uint32_t numJobs = GatewayScheduler::kScanDepth + 2;
+    FakeAffinity affinity;
+    affinity.Set( 1, 0x100 + 2, 0, GatewayScheduler::AFFINITY_HOLDS );
+    affinity.Set( 1, 0x100 + numJobs, 0, GatewayScheduler::AFFINITY_HOLDS );
+
+    GatewayScheduler scheduler;
+    scheduler.SetWorkerSlots( 1, 32 );
+    for ( uint32_t jobId = 1; jobId <= numJobs; ++jobId )
+    {
+        scheduler.AddJob( jobId, 1, 0x100 + jobId, kSchedulerTool );
+    }
+
+    TEST_ASSERT( Starts( scheduler, affinity, 2, 1 ) );
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );          // Job n is beyond kScanDepth
+    TEST_ASSERT( Starts( scheduler, affinity, numJobs, 1 ) );    // Now it is within it
+    TEST_ASSERT( Starts( scheduler, affinity, 3, 1 ) );
+}
+
+// SchedulerNeverGivesAWorkerAJobItIsUnableToTake
+//------------------------------------------------------------------------------
+void TestGateway::SchedulerNeverGivesAWorkerAJobItIsUnableToTake() const
+{
+    const uint64_t otherTool = 0x7002;
+    FakeAffinity affinity;
+    affinity.Set( 1, 0, kSchedulerTool, GatewayScheduler::AFFINITY_UNABLE );
+
+    GatewayScheduler scheduler;
+    scheduler.SetWorkerSlots( 1, 4 );
+    scheduler.SetWorkerSlots( 2, 1 );
+    scheduler.AddJob( 1, 1, 0, kSchedulerTool );
+    scheduler.AddJob( 2, 1, 0, kSchedulerTool );
+    scheduler.AddJob( 3, 1, 0, otherTool );
+
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 2 ) );  // Not worker 1, for all its free slots
+    TEST_ASSERT( Starts( scheduler, affinity, 3, 1 ) );  // Job 2 has no free worker able to take it
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+    TEST_ASSERT( scheduler.GetNumWaiting() == 1 );
+
+    Complete( scheduler, 1, 2 );
+    TEST_ASSERT( Starts( scheduler, affinity, 2, 2 ) );
+}
+
+// SchedulerUsesNoMoreSlotsThanAWorkerHas
+//------------------------------------------------------------------------------
+void TestGateway::SchedulerUsesNoMoreSlotsThanAWorkerHas() const
+{
+    // Worker 2 keeps a slot free throughout, for jobs it is unable to take
+    FakeAffinity affinity;
+    affinity.Set( 2, 0, kSchedulerTool, GatewayScheduler::AFFINITY_UNABLE );
+    GatewayScheduler scheduler;
+    scheduler.SetWorkerSlots( 1, 2 );
+    scheduler.SetWorkerSlots( 2, 1 );
+    TEST_ASSERT( scheduler.GetTotalSlots() == 3 );
+    for ( uint32_t jobId = 1; jobId <= 6; ++jobId )
+    {
+        scheduler.AddJob( jobId, 1, 0, kSchedulerTool );
+    }
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
+    TEST_ASSERT( Starts( scheduler, affinity, 2, 1 ) );
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+
+    // Fewer slots than running: nothing new until it is below
+    scheduler.SetWorkerSlots( 1, 1 );
+    TEST_ASSERT( scheduler.GetTotalSlots() == 2 );
+    Complete( scheduler, 1, 1 );
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+    Complete( scheduler, 2, 1 );
+    TEST_ASSERT( Starts( scheduler, affinity, 3, 1 ) );
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+
+    scheduler.SetWorkerSlots( 1, 3 );
+    TEST_ASSERT( Starts( scheduler, affinity, 4, 1 ) );
+    TEST_ASSERT( Starts( scheduler, affinity, 5, 1 ) );
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+    TEST_ASSERT( scheduler.GetNumRunning() == 3 );
+    TEST_ASSERT( scheduler.GetNumWaiting() == 1 );
+}
+
+// FailedJobIsRetriedElsewhereAtMostTwice
+//------------------------------------------------------------------------------
+void TestGateway::FailedJobIsRetriedElsewhereAtMostTwice() const
+{
+    const FakeAffinity affinity;
+    GatewayScheduler scheduler;
+    for ( uint32_t workerId = 1; workerId <= 3; ++workerId )
+    {
+        scheduler.SetWorkerSlots( workerId, 1 );
+    }
+    scheduler.AddJob( 1, 1, 0, kSchedulerTool );
+
+    // Each attempt avoids the workers that failed it, though the tie-break favours them
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
+    TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_RETRY );
+    scheduler.ReleaseSlot( 1 );
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 2 ) );
+    TEST_ASSERT( scheduler.OnFailed( 1, 2 ) == GatewayScheduler::OUTCOME_RETRY );
+    scheduler.ReleaseSlot( 2 );
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 3 ) );
+    TEST_ASSERT( scheduler.OnFailed( 1, 3 ) == GatewayScheduler::OUTCOME_GIVE_UP );
+    scheduler.ReleaseSlot( 3 );
+
+    TEST_ASSERT( scheduler.GetNumWaiting() == 0 );
+    TEST_ASSERT( scheduler.GetNumRunning() == 0 );
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+}
+
+// RetryUsesTheSameWorkerWhenThereIsNoOther
+//------------------------------------------------------------------------------
+void TestGateway::RetryUsesTheSameWorkerWhenThereIsNoOther() const
+{
+    // Worker 2 is unable to take the job, and worker 3 has no slots
+    FakeAffinity affinity;
+    affinity.Set( 2, 0, kSchedulerTool, GatewayScheduler::AFFINITY_UNABLE );
+    GatewayScheduler scheduler;
+    scheduler.SetWorkerSlots( 1, 1 );
+    scheduler.SetWorkerSlots( 2, 1 );
+    scheduler.SetWorkerSlots( 3, 0 );
+    scheduler.AddJob( 1, 1, 0, kSchedulerTool );
+
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
+    TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_RETRY );
+    scheduler.ReleaseSlot( 1 );
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
+    TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_RETRY );
+    scheduler.ReleaseSlot( 1 );
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
+    TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_GIVE_UP );
+}
+
+// RetriedJobGoesFirst
+//------------------------------------------------------------------------------
+void TestGateway::RetriedJobGoesFirst() const
+{
+    const FakeAffinity affinity;
+    GatewayScheduler scheduler;
+    scheduler.SetWorkerSlots( 1, 1 );
+    scheduler.SetWorkerSlots( 2, 1 );
+    for ( uint32_t jobId = 1; jobId <= 3; ++jobId )
+    {
+        scheduler.AddJob( jobId, 1, 0, kSchedulerTool );
+    }
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
+    TEST_ASSERT( Starts( scheduler, affinity, 2, 2 ) );
+    TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_RETRY );
+    scheduler.ReleaseSlot( 1 );
+    Complete( scheduler, 2, 2 );
+
+    // Job 1 is ahead of job 3 again, and goes to the worker that did not fail it
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 2 ) );
+    TEST_ASSERT( Starts( scheduler, affinity, 3, 1 ) );
+}
+
+// RemovedWorkerReportsItsRunningJobs
+//------------------------------------------------------------------------------
+void TestGateway::RemovedWorkerReportsItsRunningJobs() const
+{
+    const FakeAffinity affinity;
+    GatewayScheduler scheduler;
+    scheduler.SetWorkerSlots( 1, 2 );
+    scheduler.SetWorkerSlots( 2, 1 );
+    for ( uint32_t jobId = 1; jobId <= 4; ++jobId )
+    {
+        scheduler.AddJob( jobId, 1, 0, kSchedulerTool );
+    }
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
+    TEST_ASSERT( Starts( scheduler, affinity, 2, 1 ) );
+    TEST_ASSERT( Starts( scheduler, affinity, 3, 2 ) );
+
+    Array<uint32_t> running;
+    scheduler.RemoveWorker( 1, running );
+    TEST_ASSERT( running.GetSize() == 2 );
+    TEST_ASSERT( running.Find( 1u ) && running.Find( 2u ) );
+    TEST_ASSERT( scheduler.GetTotalSlots() == 1 );
+    TEST_ASSERT( scheduler.GetNumRunning() == 3 );  // Until each one fails
+
+    TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_RETRY );
+    TEST_ASSERT( scheduler.OnFailed( 2, 1 ) == GatewayScheduler::OUTCOME_RETRY );
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+    Complete( scheduler, 3, 2 );
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 2 ) );
+
+    // The worker connects again with none of its old work, and job 2 still avoids it
+    scheduler.SetWorkerSlots( 1, 1 );
+    TEST_ASSERT( Starts( scheduler, affinity, 4, 1 ) );
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+    TEST_ASSERT( scheduler.GetNumWaiting() == 1 );
+}
+
+// RemovedClientDropsOnlyItsWaitingJobs
+//------------------------------------------------------------------------------
+void TestGateway::RemovedClientDropsOnlyItsWaitingJobs() const
+{
+    const FakeAffinity affinity;
+    GatewayScheduler scheduler;
+    scheduler.SetWorkerSlots( 1, 2 );
+    scheduler.AddJob( 1, 1, 0, kSchedulerTool );
+    scheduler.AddJob( 2, 1, 0, kSchedulerTool );
+    scheduler.AddJob( 3, 1, 0, kSchedulerTool );
+    scheduler.AddJob( 4, 2, 0, kSchedulerTool );
+    scheduler.AddJob( 5, 2, 0, kSchedulerTool );
+    scheduler.AddJob( 6, 3, 0, kSchedulerTool );
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
+    TEST_ASSERT( Starts( scheduler, affinity, 4, 1 ) );
+
+    Array<uint32_t> waiting;
+    scheduler.RemoveClient( 1, waiting );
+    TEST_ASSERT( waiting.GetSize() == 2 );
+    TEST_ASSERT( waiting.Find( 2u ) && waiting.Find( 3u ) );
+    TEST_ASSERT( scheduler.GetNumWaiting() == 2 );
+    TEST_ASSERT( scheduler.GetNumRunning() == 2 );
+
+    // The turn stays with the client after the last one served
+    Complete( scheduler, 4, 1 );
+    TEST_ASSERT( Starts( scheduler, affinity, 6, 1 ) );
+    TEST_ASSERT( StartsNothing( scheduler, affinity ) );
+
+    // A running job of a client that has gone is not retried
+    TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_GIVE_UP );
+    scheduler.ReleaseSlot( 1 );
+    TEST_ASSERT( Starts( scheduler, affinity, 5, 1 ) );
+    TEST_ASSERT( scheduler.GetNumWaiting() == 0 );
+    TEST_ASSERT( scheduler.GetNumRunning() == 2 );
+}
+
+// WaitingForCountsOnlyJobsAWorkerCanTake
+//------------------------------------------------------------------------------
+void TestGateway::WaitingForCountsOnlyJobsAWorkerCanTake() const
+{
+    // Worker 1 is able to take jobs for one tool only
+    const uint64_t otherTool = 0x7002;
+    FakeAffinity affinity;
+    affinity.Set( 1, 0, kSchedulerTool, GatewayScheduler::AFFINITY_NONE );
+    affinity.Set( 1, 0, 0, GatewayScheduler::AFFINITY_UNABLE );
+    GatewayScheduler scheduler;
+    scheduler.SetWorkerSlots( 1, 1 );
+    scheduler.SetWorkerSlots( 2, 1 );
+    scheduler.AddJob( 1, 1, 0, kSchedulerTool );
+    scheduler.AddJob( 2, 1, 0, otherTool );
+    scheduler.AddJob( 3, 2, 0, otherTool );
+    scheduler.AddJob( 4, 2, 0, kSchedulerTool );
+    TEST_ASSERT( scheduler.GetNumWaitingFor( 1, affinity ) == 2 );
+    TEST_ASSERT( scheduler.GetNumWaitingFor( 2, affinity ) == 4 );
+
+    // Not a running job
+    TEST_ASSERT( Starts( scheduler, affinity, 1, 1 ) );
+    TEST_ASSERT( scheduler.GetNumWaitingFor( 1, affinity ) == 1 );
+    TEST_ASSERT( scheduler.GetNumWaitingFor( 2, affinity ) == 3 );
+
+    // Nor one the worker failed, while another able worker has not
+    TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_RETRY );
+    scheduler.ReleaseSlot( 1 );
+    TEST_ASSERT( scheduler.GetNumWaitingFor( 1, affinity ) == 1 );
+    TEST_ASSERT( scheduler.GetNumWaitingFor( 2, affinity ) == 4 );
 }
 
 //------------------------------------------------------------------------------
