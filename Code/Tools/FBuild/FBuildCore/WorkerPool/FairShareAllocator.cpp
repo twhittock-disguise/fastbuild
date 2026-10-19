@@ -67,33 +67,31 @@ void FairShareAllocator::Recompute( Array<uint32_t> & outChanged )
 
     // When some want more, the slots left are fewer than they are: one each, in order
     const uint32_t remainder = anyWantMore ? (uint32_t)( m_PoolSlots - used ) : 0;
-    const size_t numClients = m_Clients.GetSize();
     for ( uint32_t i = 0; i < remainder; ++i )
     {
-        size_t best = numClients;
-        for ( size_t c = 0; c < numClients; ++c )
+        Client * best = nullptr;
+        for ( Client & client : m_Clients )
         {
-            const Client & client = m_Clients[ c ];
             if ( ( client.m_Demand > level ) && ( client.m_Share == level ) &&
-                 ( ( best == numClients ) || TakesRemainderBefore( c, best, level ) ) )
+                 ( ( best == nullptr ) || TakesRemainderBefore( client, *best, level ) ) )
             {
-                best = c;
+                best = &client;
             }
         }
-        ASSERT( best < numClients );
-        ++m_Clients[ best ].m_Share;
+        ASSERT( best );
+        ++best->m_Share;
+        best->m_LastRemainderSerial = ++m_RemainderSerial;
     }
 
     for ( Client & client : m_Clients )
     {
-        const uint32_t allowance = GetNewAllowance( client, level, ( remainder > 0 ) );
+        const uint32_t allowance = GetNewAllowance( client, level );
         if ( allowance != client.m_Allowance )
         {
             client.m_Allowance = allowance;
             outChanged.Append( client.m_Id );
         }
     }
-    ++m_Rotation;
 }
 
 // IsScarce
@@ -159,22 +157,24 @@ uint32_t FairShareAllocator::GetWaterLevel() const
 
 // TakesRemainderBefore
 //------------------------------------------------------------------------------
-bool FairShareAllocator::TakesRemainderBefore( size_t a, size_t b, uint32_t level ) const
+/*static*/ bool FairShareAllocator::TakesRemainderBefore( const Client & a, const Client & b, uint32_t level )
 {
-    const uint32_t unmetA = ( m_Clients[ a ].m_Demand - level );
-    const uint32_t unmetB = ( m_Clients[ b ].m_Demand - level );
-    if ( unmetA != unmetB )
+    // Above a level of 0 everyone has slots, so the spare ones stay where they are
+    if ( level > 0 )
     {
-        return ( unmetA > unmetB );
+        const bool aHolds = ( a.m_Allowance > level );
+        const bool bHolds = ( b.m_Allowance > level );
+        if ( aHolds != bHolds )
+        {
+            return aHolds;
+        }
     }
-    const size_t numClients = m_Clients.GetSize();
-    const size_t start = ( m_Rotation % numClients );
-    return ( ( ( a + numClients - start ) % numClients ) < ( ( b + numClients - start ) % numClients ) );
+    return ( a.m_LastRemainderSerial < b.m_LastRemainderSerial );
 }
 
 // GetNewAllowance
 //------------------------------------------------------------------------------
-uint32_t FairShareAllocator::GetNewAllowance( const Client & client, uint32_t level, bool hasRemainder ) const
+uint32_t FairShareAllocator::GetNewAllowance( const Client & client, uint32_t level ) const
 {
     const uint32_t target = client.m_Share;
     const uint32_t old = client.m_Allowance;
@@ -183,10 +183,10 @@ uint32_t FairShareAllocator::GetNewAllowance( const Client & client, uint32_t le
         return target;
     }
     const uint32_t reduction = ( old - target );
-    const bool lostARemainderSlot = hasRemainder && ( client.m_Demand > level ) && ( target == level ) && ( reduction == 1 );
+    const bool passedOnAScarceSlot = ( level == 0 ) && ( reduction == 1 );
     const bool pastThreshold = ( reduction >= kHysteresisSlots ) &&
                                ( ( (uint64_t)reduction * 100 ) >= ( (uint64_t)old * kHysteresisPercent ) );
-    if ( lostARemainderSlot || pastThreshold )
+    if ( passedOnAScarceSlot || pastThreshold )
     {
         return target;
     }
