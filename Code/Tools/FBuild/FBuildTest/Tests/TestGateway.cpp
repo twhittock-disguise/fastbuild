@@ -451,6 +451,7 @@ private:
     void ReducedAllowanceKeepsTheJobsAClientHolds() const;
     void GatewayDemandSharesADownstreamWorker() const;
     void ClientWithoutAllowanceLearnsANewPool() const;
+    void WorkerWithoutCpusAcksNoCapacity() const;
     void WorkerWithoutSlotsKeepsTheJobsItRuns() const;
     void WorkerBackWithSlotsCountsTheJobsItRuns() const;
     void LostWorkerWithoutSlotsHasItsJobsRetried() const;
@@ -648,6 +649,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( ReducedAllowanceKeepsTheJobsAClientHolds )
     REGISTER_TEST( GatewayDemandSharesADownstreamWorker )
     REGISTER_TEST( ClientWithoutAllowanceLearnsANewPool )
+    REGISTER_TEST( WorkerWithoutCpusAcksNoCapacity )
     REGISTER_TEST( WorkerWithoutSlotsKeepsTheJobsItRuns )
     REGISTER_TEST( WorkerBackWithSlotsCountsTheJobsItRuns )
     REGISTER_TEST( LostWorkerWithoutSlotsHasItsJobsRetried )
@@ -7201,6 +7203,31 @@ void TestGateway::ClientWithoutAllowanceLearnsANewPool() const
     TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 0 ); } ) );
     WorkerThreadRemote::SetNumCPUsToUse( 6 );
     TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 6 ); } ) );
+}
+
+// WorkerWithoutCpusAcksNoCapacity
+//------------------------------------------------------------------------------
+void TestGateway::WorkerWithoutCpusAcksNoCapacity() const
+{
+    // A worker given no CPUs has no pool slots, not even a prefetch buffer: the client is acked with no capacity
+    {
+        const DistributedTest::RemoteCpusForTest cpus( 0 );
+        Server s( 1, 3 ); // With a prefetch buffer
+        TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+        DistributedTest::HandshakeProbe probe;
+        TEST_ASSERT( probe.ConnectAndHandshake( Protocol::kTestPort ) != nullptr );
+        TEST_ASSERT( probe.GetAckCapacity() == 0 );
+    }
+
+    // With CPUs it is acked with its share of them
+    {
+        const DistributedTest::RemoteCpusForTest cpus( 2 );
+        Server s( 1, 3 ); // With a prefetch buffer
+        TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
+        DistributedTest::HandshakeProbe probe;
+        TEST_ASSERT( probe.ConnectAndHandshake( Protocol::kTestPort ) != nullptr );
+        TEST_ASSERT( probe.GetAckCapacity() > 0 );
+    }
 }
 
 // WorkerWithoutSlotsKeepsTheJobsItRuns

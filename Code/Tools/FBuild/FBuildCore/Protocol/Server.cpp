@@ -2634,7 +2634,12 @@ void Server::FinalizeCompletedJobs()
 //------------------------------------------------------------------------------
 uint32_t Server::GetPoolSlots() const
 {
-    return m_Forwarder ? m_Forwarder->GetPoolSlots() : ( WorkerThreadRemote::GetNumCPUsToUse() + m_PrefetchBuffer );
+    if ( m_Forwarder )
+    {
+        return m_Forwarder->GetPoolSlots();
+    }
+    const uint32_t cpus = WorkerThreadRemote::GetNumCPUsToUse();
+    return ( cpus > 0 ) ? ( cpus + m_PrefetchBuffer ) : 0; // No CPUs given means no work is taken, so no prefetch either
 }
 
 // ShareSlotsLocked
