@@ -4570,11 +4570,12 @@ void TestGateway::PchEvictedFromTheStoreLeavesTheGateway() const
     TEST_ASSERT( SendPchFromProbe( probe, ci, first ) );
     TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_KnownPchs == 1 ); } ) );
     TEST_ASSERT( SendPchFromProbe( probe, ci, second ) );
-    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway, &first ]() { AStackString<> path; return ( gateway.GetServer().FindCachedPch( first.m_Id, path ) == false ); } ) );
+    // The store reports what it evicted before what it stored
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway, &second ]() { MutexHolder mh( gateway.m_Mutex ); const Gateway::KnownPch * known = gateway.FindKnownPch( second.m_Id ); return ( known && known->m_Measured ); } ) );
 
     // The gateway knows only what the store holds
-    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_KnownPchs == 1 ); } ) );
     MutexHolder mh( gateway.m_Mutex );
+    TEST_ASSERT( gateway.m_Pchs.GetSize() == 1 );
     TEST_ASSERT( gateway.FindKnownPch( first.m_Id ) == nullptr );
     TEST_ASSERT( gateway.IsPchStored( first.m_Id ) == false );
     TEST_ASSERT( gateway.IsPchStored( second.m_Id ) );
