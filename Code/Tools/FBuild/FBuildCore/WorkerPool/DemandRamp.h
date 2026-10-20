@@ -15,6 +15,12 @@
 // kSendMinIntervalSeconds after it; the first, and a change to or from 0, are sent at once.
 // Time is the caller's, in seconds.
 //------------------------------------------------------------------------------
+// Whether a change of delta from base is at least minDelta, and at least percent of base
+inline bool IsChangeAtLeast( uint32_t delta, uint32_t base, uint32_t minDelta, uint32_t percent )
+{
+    return ( delta >= minDelta ) && ( ( (uint64_t)delta * 100 ) >= ( (uint64_t)base * percent ) );
+}
+
 class DemandRamp   // Not thread safe: one thread only (the client thread)
 {
 public:

@@ -18,6 +18,8 @@ class Job;
 class WorkerThreadRemote : public WorkerThread
 {
 public:
+    static constexpr uint16_t kThreadIndexBase = 1000; // A remote thread's index is this plus its number, from 1
+
     explicit WorkerThreadRemote( uint16_t threadIndex );
     virtual ~WorkerThreadRemote() override;
 

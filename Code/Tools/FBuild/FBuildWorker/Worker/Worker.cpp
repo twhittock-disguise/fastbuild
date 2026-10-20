@@ -23,7 +23,6 @@
 #include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
 
 // Core
-#include "Core/Env/CPUInfo.h"
 #include "Core/Env/Env.h"
 #include "Core/Env/ErrorFormat.h"
 #include "Core/Env/Types.h"
@@ -43,7 +42,7 @@
 
 // CONSTRUCTOR
 //------------------------------------------------------------------------------
-Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart, uint32_t numThreadsInJobQueue, uint32_t prefetchBuffer,
+Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart, uint32_t numCpus, uint32_t prefetchBuffer,
                 const AString & gatewayConfigFile, bool noBrokerage )
     : m_ConsoleMode( consoleMode )
     , m_PeriodicRestart( periodicRestart )
@@ -54,7 +53,7 @@ Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart, ui
     m_NetworkStartupHelper = FNEW( NetworkStartupHelper );
     if ( gatewayConfigFile.IsEmpty() )
     {
-        m_ConnectionPool = FNEW( Server( numThreadsInJobQueue, prefetchBuffer ) );
+        m_ConnectionPool = FNEW( Server( numCpus, prefetchBuffer ) );
     }
     else
     {
@@ -62,8 +61,7 @@ Worker::Worker( const AString & args, bool consoleMode, bool periodicRestart, ui
         if ( GatewayConfig::Load( gatewayConfigFile, config, m_GatewayConfigError ) )
         {
             // Its own cores are one more worker, with what -cpus, -mode and -prefetch give a worker
-            const uint32_t localThreads = numThreadsInJobQueue ? numThreadsInJobQueue : CPUInfo::Get().GetNumUsefulCores();
-            m_Gateway = FNEW( Gateway( config, localThreads, prefetchBuffer ) );
+            m_Gateway = FNEW( Gateway( config, numCpus, prefetchBuffer ) );
             m_ConnectionPool = &m_Gateway->GetServer();
         }
     }

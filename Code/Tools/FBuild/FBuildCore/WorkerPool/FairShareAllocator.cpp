@@ -184,8 +184,7 @@ uint32_t FairShareAllocator::GetNewAllowance( const Client & client, uint32_t le
     }
     const uint32_t reduction = ( old - target );
     const bool passedOnAScarceSlot = ( level == 0 ) && ( reduction == 1 );
-    const bool pastThreshold = ( reduction >= kHysteresisSlots ) &&
-                               ( ( (uint64_t)reduction * 100 ) >= ( (uint64_t)old * kHysteresisPercent ) );
+    const bool pastThreshold = IsChangeAtLeast( reduction, old, kHysteresisSlots, kHysteresisPercent );
     if ( passedOnAScarceSlot || pastThreshold )
     {
         return target;

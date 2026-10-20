@@ -241,6 +241,7 @@ private:
         Thread m_Thread;
     };
     uint32_t m_NextClientId = 1; // Under m_ClientListMutex
+    ClientState * FindClientLocked( uint32_t clientId ) const; // Caller holds m_ClientListMutex. Null if it has left the list.
 
     // A connection is sent its ack and inventories by its receive thread, and everything else by its outbox,
     // so every send goes through here holding cs.m_SendMutex alone: no other lock waits for a client to read.

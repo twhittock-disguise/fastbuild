@@ -4,6 +4,9 @@
 
 // Includes
 //------------------------------------------------------------------------------
+#include "Tools/FBuild/FBuildCore/WorkerPool/DemandRamp.h"
+
+// Core
 #include "Core/Containers/Array.h"
 #include "Core/Env/Types.h"
 
@@ -22,7 +25,7 @@
 class FairShareAllocator
 {
 public:
-    static constexpr uint32_t kInitialDemand = 4;         // Assumed for a new client (= DemandRamp::kStartSlots); its share is the ack's allowance
+    static constexpr uint32_t kInitialDemand = DemandRamp::kStartSlots; // Assumed for a new client; its share is the ack's allowance
     static constexpr uint32_t kHysteresisSlots = 2;
     static constexpr uint32_t kHysteresisPercent = 10;    // A reduction applies if >= max( kHysteresisSlots, this % )
 

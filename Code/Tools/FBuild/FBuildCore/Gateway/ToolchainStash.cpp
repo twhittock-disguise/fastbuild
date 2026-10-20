@@ -134,14 +134,14 @@ ToolchainStash::Result ToolchainStash::AddManifest( uint64_t toolId, const void 
     {
         return STASH_INVALID;
     }
-    return Write( toolId, kManifestSlot, numFiles, payload, payloadSize );
+    return Write( toolId, kManifestFileId, numFiles, payload, payloadSize );
 }
 
 // AddFile
 //------------------------------------------------------------------------------
 ToolchainStash::Result ToolchainStash::AddFile( uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize )
 {
-    if ( fileId == kManifestSlot )
+    if ( fileId == kManifestFileId )
     {
         return STASH_INVALID;
     }
@@ -156,7 +156,7 @@ ToolchainStash::Result ToolchainStash::Claim( uint64_t toolId, uint32_t slot, ui
 {
     MutexHolder mh( m_Mutex );
     Entry * entry = Find( toolId );
-    if ( slot == kManifestSlot )
+    if ( slot == kManifestFileId )
     {
         if ( entry == nullptr )
         {
@@ -196,7 +196,7 @@ ToolchainStash::Result ToolchainStash::Claim( uint64_t toolId, uint32_t slot, ui
     }
     entry->m_LastUse = ++m_Clock;
 
-    SlotState & state = ( slot == kManifestSlot ) ? entry->m_ManifestState : entry->m_FileStates[ slot ];
+    SlotState & state = ( slot == kManifestFileId ) ? entry->m_ManifestState : entry->m_FileStates[ slot ];
     if ( state != SLOT_EMPTY )
     {
         return entry->IsComplete() ? STASH_COMPLETE : STASH_INCOMPLETE; // Already held, or being written
@@ -257,11 +257,11 @@ ToolchainStash::Result ToolchainStash::Write( uint64_t toolId, uint32_t slot, ui
         Entry * entry = Find( toolId );
         ASSERT( entry && ( entry->m_NumWrites > 0 ) );
         --entry->m_NumWrites;
-        SlotState & state = ( slot == kManifestSlot ) ? entry->m_ManifestState : entry->m_FileStates[ slot ];
+        SlotState & state = ( slot == kManifestFileId ) ? entry->m_ManifestState : entry->m_FileStates[ slot ];
         if ( written )
         {
             state = SLOT_HELD;
-            if ( slot == kManifestSlot )
+            if ( slot == kManifestFileId )
             {
                 entry->m_ManifestSize = (uint32_t)payloadSize;
             }
@@ -361,7 +361,7 @@ bool ToolchainStash::GetManifestFile( uint64_t toolId, AString & outPath, uint32
         return false;
     }
     entry->m_LastUse = ++m_Clock;
-    GetSlotPath( toolId, kManifestSlot, outPath );
+    GetSlotPath( toolId, kManifestFileId, outPath );
     outSize = entry->m_ManifestSize;
     return true;
 }
@@ -396,16 +396,13 @@ uint32_t ToolchainStash::GetNumFiles( uint64_t toolId ) const
 void ToolchainStash::AddUse( uint64_t toolId )
 {
     MutexHolder mh( m_Mutex );
-    for ( size_t i = 0; i < m_PinIds.GetSize(); ++i )
+    Pin * pin = m_Pins.Find( toolId );
+    if ( pin )
     {
-        if ( m_PinIds[ i ] == toolId )
-        {
-            ++m_PinCounts[ i ];
-            return;
-        }
+        ++pin->m_Count;
+        return;
     }
-    m_PinIds.Append( toolId );
-    m_PinCounts.Append( 1 );
+    m_Pins.Append( Pin{ toolId, 1 } );
     Entry * entry = Find( toolId );
     if ( entry )
     {
@@ -420,18 +417,14 @@ void ToolchainStash::ReleaseUse( uint64_t toolId )
     Array<uint64_t> toDelete;
     {
         MutexHolder mh( m_Mutex );
-        for ( size_t i = 0; i < m_PinIds.GetSize(); ++i )
+        Pin * pin = m_Pins.Find( toolId );
+        if ( pin )
         {
-            if ( m_PinIds[ i ] == toolId )
+            if ( --pin->m_Count == 0 )
             {
-                if ( --m_PinCounts[ i ] == 0 )
-                {
-                    m_PinIds.EraseIndex( i );
-                    m_PinCounts.EraseIndex( i );
-                }
-                Trim( toDelete );
-                break;
+                m_Pins.Erase( pin );
             }
+            Trim( toDelete );
         }
     }
     DeleteToolchains( toDelete );
@@ -491,14 +484,8 @@ ToolchainStash::Entry * ToolchainStash::Find( uint64_t toolId ) const
 //------------------------------------------------------------------------------
 uint32_t ToolchainStash::GetNumPins( uint64_t toolId ) const
 {
-    for ( size_t i = 0; i < m_PinIds.GetSize(); ++i )
-    {
-        if ( m_PinIds[ i ] == toolId )
-        {
-            return m_PinCounts[ i ];
-        }
-    }
-    return 0;
+    const Pin * pin = m_Pins.Find( toolId );
+    return pin ? pin->m_Count : 0;
 }
 
 // Remove
@@ -548,7 +535,7 @@ void ToolchainStash::GetToolchainDirectory( uint64_t toolId, AString & outDirect
 void ToolchainStash::GetSlotPath( uint64_t toolId, uint32_t slot, AString & outPath ) const
 {
     GetToolchainDirectory( toolId, outPath );
-    if ( slot == kManifestSlot )
+    if ( slot == kManifestFileId )
     {
         outPath += kManifestFileName;
     }
@@ -656,7 +643,7 @@ void ToolchainStash::Scan()
         if ( toolchain.m_HasManifest )
         {
             AStackString<> path;
-            GetSlotPath( toolchain.m_ToolId, kManifestSlot, path );
+            GetSlotPath( toolchain.m_ToolId, kManifestFileId, path );
             Array<char> bytes;
             FileStream f;
             if ( f.Open( path.Get() ) )

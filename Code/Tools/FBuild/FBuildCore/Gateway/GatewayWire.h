@@ -4,6 +4,9 @@
 
 // Includes
 //------------------------------------------------------------------------------
+#include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
+
+// Core
 #include "Core/Env/Types.h"
 
 // Forward Declarations
@@ -21,8 +24,7 @@ namespace GatewayWire
     // A serialized job starts with its job id and ends with its PCH id (Job::Serialize)
     static constexpr size_t kMinJobSize = sizeof( uint32_t ) + sizeof( uint64_t );
 
-    // Remote thread indexes start at 1001 (JobQueueRemote), and profiler lanes are named from 1000
-    static constexpr uint16_t kFirstThreadIndex = 1000;
+    static constexpr uint16_t kFirstThreadIndex = WorkerThreadRemote::kThreadIndexBase; // Profiler lanes are named from it
     static constexpr uint32_t kLaneStride = 256; // Lanes per worker; worker 0 is the gateway's own pool
     static constexpr uint32_t kMaxWorkerIndex = ( 0xFFFF - kFirstThreadIndex ) / kLaneStride - 1;
 

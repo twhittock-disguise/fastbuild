@@ -6,6 +6,7 @@
 //------------------------------------------------------------------------------
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayConfig.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayScheduler.h"
+#include "Tools/FBuild/FBuildCore/Gateway/ToolchainStash.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchLease.h"
 #include "Tools/FBuild/FBuildCore/Protocol/WorkerSendQueue.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/DemandRamp.h"
@@ -66,7 +67,6 @@ public:
     protected:
         ~Owner() = default;
     };
-    static constexpr uint32_t kManifestFileId = 0xFFFFFFFF;
     // The most ids of an inventory that are taken: well above what a worker keeps (Server::kMaxCachedPchEntries).
     // The worker is sent again what it has beyond them, if a job needs it.
     static constexpr uint32_t kMaxInventoryEntries = 1024;

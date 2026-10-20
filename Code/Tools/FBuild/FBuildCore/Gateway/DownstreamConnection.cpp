@@ -178,7 +178,7 @@ GatewayScheduler::Affinity DownstreamConnection::GetAffinity( uint64_t pchId, ui
     {
         pch = GatewayScheduler::AFFINITY_RECEIVING;
     }
-    return ( tool < pch ) ? tool : pch;
+    return Math::Min( tool, pch );
 }
 
 // SendJob
@@ -200,7 +200,7 @@ void DownstreamConnection::SendJob( const Protocol::MsgJob & msg, ConstMemoryStr
     if ( queueToolchain )
     {
         const uint32_t numFiles = m_Owner.GetToolchainNumFiles( toolId );
-        bool queued = ( numFiles > 0 ) && QueueToolchainFile( toolId, kManifestFileId );
+        bool queued = ( numFiles > 0 ) && QueueToolchainFile( toolId, ToolchainStash::kManifestFileId );
         for ( uint32_t fileId = 0; queued && ( fileId < numFiles ); ++fileId )
         {
             queued = QueueToolchainFile( toolId, fileId );
@@ -340,7 +340,7 @@ void DownstreamConnection::OnJobCompleted( uint64_t pchId )
             }
             case Protocol::MSG_REQUEST_MANIFEST:
             {
-                ProcessToolchainRequest( static_cast<const Protocol::MsgRequestManifest *>( imsg )->GetToolId(), kManifestFileId );
+                ProcessToolchainRequest( static_cast<const Protocol::MsgRequestManifest *>( imsg )->GetToolId(), ToolchainStash::kManifestFileId );
                 break;
             }
             case Protocol::MSG_REQUEST_FILE:
@@ -509,7 +509,7 @@ bool DownstreamConnection::QueueToolchainFile( uint64_t toolId, uint32_t fileId 
     {
         return false;
     }
-    if ( fileId == kManifestFileId )
+    if ( fileId == ToolchainStash::kManifestFileId )
     {
         m_SendQueue.Push( SendQueueItem( Protocol::MsgManifest( toolId ), path, 0, size, SendKind::Toolchain, size, 0, false ) );
     }

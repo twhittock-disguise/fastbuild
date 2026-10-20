@@ -3443,7 +3443,7 @@ namespace
             toolchain.m_ToolId = toolId;
             for ( uint32_t i = 0; i <= numFiles; ++i )
             {
-                const uint32_t fileId = ( i == numFiles ) ? DownstreamConnection::kManifestFileId : i;
+                const uint32_t fileId = ( i == numFiles ) ? ToolchainStash::kManifestFileId : i;
                 AString & path = toolchain.m_Paths.EmplaceBack();
                 VERIFY( FBuild::GetTempDir( path ) );
                 path.AppendFormat( "downstream_tool_%u_%u.bin", (uint32_t)toolId, fileId );
@@ -5692,7 +5692,7 @@ void TestGateway::JobsWaitingWithNoWorkersAreReturned() const
             Gateway::Actions actions;
             gateway.GiveUpJobsNoWorkerCanTake( actions );
             const Gateway::GatewayJob * waiting = gateway.FindJob( 2 ); // Client job 6
-            countedWithoutWorker = waiting && waiting->m_NoWorker;
+            countedWithoutWorker = waiting && ( waiting->m_NoWorkerSince != 0 );
         }
         TEST_ASSERT( countedWithoutWorker == false );
         TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 2 ); } ) );

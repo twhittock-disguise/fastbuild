@@ -132,8 +132,7 @@ private:
         PchLease    m_PchLease;                 // From its arrival, so the PCH is not evicted while it is held
         uint32_t    m_NumAttempts = 0;          // Dispatched so far
         bool        m_Parked = false;           // Waiting for its toolchain or PCH, and not yet in the scheduler
-        bool        m_NoWorker = false;         // Waiting in the scheduler with no worker able to take it, since m_NoWorkerSince
-        int64_t     m_NoWorkerSince = 0;        // Timer::GetNow
+        int64_t     m_NoWorkerSince = 0;        // Timer::GetNow since it waits in the scheduler with no worker able to take it; 0: not so
     };
 
     // One dispatch of a job. The attempt id is the job id the worker sees.

@@ -37,6 +37,25 @@ namespace
         directory.AppendFormat( "gateway%ctoolchains%c", (char)NATIVE_SLASH, (char)NATIVE_SLASH );
         return AString( directory );
     }
+
+    bool ContainsSorted( const Array<uint32_t> & sorted, uint32_t value )
+    {
+        size_t begin = 0;
+        size_t end = sorted.GetSize();
+        while ( begin < end )
+        {
+            const size_t middle = begin + ( ( end - begin ) / 2 );
+            if ( sorted[ middle ] < value )
+            {
+                begin = middle + 1;
+            }
+            else
+            {
+                end = middle;
+            }
+        }
+        return ( begin < sorted.GetSize() ) && ( sorted[ begin ] == value );
+    }
 }
 
 // WorkerAffinity
@@ -866,7 +885,7 @@ void Gateway::RemoveWorker( Worker & worker, DownstreamConnection & connection, 
 /*virtual*/ bool Gateway::FindToolchainFile( uint64_t toolId, uint32_t fileId, AString & outPath, uint32_t & outSize )
 {
     // The stash's index only: SendJob calls this with the gateway's mutex held
-    return ( fileId == DownstreamConnection::kManifestFileId ) ? m_Stash.GetManifestFile( toolId, outPath, outSize )
+    return ( fileId == ToolchainStash::kManifestFileId ) ? m_Stash.GetManifestFile( toolId, outPath, outSize )
                                                                : m_Stash.GetFile( toolId, fileId, outPath, outSize );
 }
 
@@ -936,7 +955,7 @@ void Gateway::Run( Actions & actions )
     }
     for ( const Actions::ToolchainRequest & request : actions.m_ToolchainRequests )
     {
-        if ( request.m_FileId == DownstreamConnection::kManifestFileId )
+        if ( request.m_FileId == ToolchainStash::kManifestFileId )
         {
             m_Server->SendToClient( request.m_ClientId, Protocol::MsgRequestManifest( request.m_ToolId ) );
         }
@@ -1126,7 +1145,7 @@ void Gateway::RequestToolchain( uint32_t clientId, uint64_t toolId, bool askForM
     m_Uploads.Append( upload );
     if ( askForManifest )
     {
-        actions.m_ToolchainRequests.Append( Actions::ToolchainRequest{ clientId, toolId, DownstreamConnection::kManifestFileId } );
+        actions.m_ToolchainRequests.Append( Actions::ToolchainRequest{ clientId, toolId, ToolchainStash::kManifestFileId } );
         ++m_ToolchainRequests;
         AStackString<> line;
         line.Format( "gateway toolchain-request client=%u tool=0x%016" PRIx64 " files=0", clientId, toolId );
@@ -1417,8 +1436,7 @@ void Gateway::GiveUpJobsNoWorkerCanTake( Actions & actions )
         }
     }
 
-    // Each waiting job's bound starts when none of them can take it, and starts again once one can. m_Jobs is in
-    // the order of the job ids, so it is walked along with the sorted waiting ids.
+    // Each waiting job's bound starts when none of them can take it, and starts again once one can
     Array<uint32_t> waitingJobIds;
     m_Scheduler.GetWaitingJobIds( waitingJobIds );
     waitingJobIds.Sort();
@@ -1426,25 +1444,19 @@ void Gateway::GiveUpJobsNoWorkerCanTake( Actions & actions )
     const int64_t now = Timer::GetNow(); // One time for the tick, so the jobs that lost their workers together go together
     const int64_t bound = (int64_t)( (double)m_Config.m_NoWorkerGiveUpSeconds * (double)Timer::GetFrequency() );
     Array<GatewayJob *> givenUp;
-    size_t w = 0;
     for ( GatewayJob * job : m_Jobs )
     {
-        while ( ( w < waitingJobIds.GetSize() ) && ( waitingJobIds[ w ] < job->m_Id ) )
-        {
-            ++w;
-        }
-        bool noWorker = ( w < waitingJobIds.GetSize() ) && ( waitingJobIds[ w ] == job->m_Id );
+        bool noWorker = ContainsSorted( waitingJobIds, job->m_Id );
         for ( size_t i = 0; noWorker && ( i < ableWorkers.GetSize() ); ++i )
         {
             noWorker = ( affinity( ableWorkers[ i ], job->m_PchId, job->m_ToolId ) == GatewayScheduler::AFFINITY_UNABLE );
         }
         if ( noWorker == false )
         {
-            job->m_NoWorker = false;
+            job->m_NoWorkerSince = 0;
         }
-        else if ( job->m_NoWorker == false )
+        else if ( job->m_NoWorkerSince == 0 )
         {
-            job->m_NoWorker = true;
             job->m_NoWorkerSince = now;
         }
         else if ( ( now - job->m_NoWorkerSince ) >= bound )

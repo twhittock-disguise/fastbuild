@@ -28,8 +28,9 @@ class WorkerSettings;
 class Worker : public Singleton<Worker>
 {
 public:
-    explicit Worker( const AString & args, bool consoleMode, bool periodicRestart, uint32_t numThreadsInJobQueue = 0, uint32_t prefetchBuffer = 0,
-            const AString & gatewayConfigFile = AString::GetEmpty(), bool noBrokerage = false );
+    // numCpus: the threads that build jobs here
+    explicit Worker( const AString & args, bool consoleMode, bool periodicRestart, uint32_t numCpus, uint32_t prefetchBuffer,
+            const AString & gatewayConfigFile, bool noBrokerage );
     ~Worker();
 
     int32_t Work();

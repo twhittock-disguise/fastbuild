@@ -579,24 +579,32 @@ void Server::LogWarning( const char * fmtString, ... )
     return msg.Send( cs.m_Connection, payload );
 }
 
+// FindClientLocked
+//------------------------------------------------------------------------------
+Server::ClientState * Server::FindClientLocked( uint32_t clientId ) const
+{
+    for ( ClientState * cs : m_ClientList )
+    {
+        if ( cs->m_Id == clientId )
+        {
+            return cs;
+        }
+    }
+    return nullptr;
+}
+
 // QueueResult
 //------------------------------------------------------------------------------
 bool Server::QueueResult( uint32_t clientId, bool compressed, MemoryStream && payload, uint8_t flags )
 {
     MutexHolder mh( m_ClientListMutex );
-    for ( ClientState * cs : m_ClientList )
+    ClientState * cs = FindClientLocked( clientId );
+    if ( ( cs == nullptr ) || ( cs->m_Outbox == nullptr ) ) // Gone, or going
     {
-        if ( cs->m_Id == clientId )
-        {
-            if ( cs->m_Outbox == nullptr )
-            {
-                return false; // It is going
-            }
-            cs->m_Outbox->PushResult( compressed, Move( payload ), flags );
-            return true;
-        }
+        return false;
     }
-    return false;
+    cs->m_Outbox->PushResult( compressed, Move( payload ), flags );
+    return true;
 }
 
 // SendToClient
@@ -604,19 +612,13 @@ bool Server::QueueResult( uint32_t clientId, bool compressed, MemoryStream && pa
 bool Server::SendToClient( uint32_t clientId, const Protocol::IMessage & msg )
 {
     MutexHolder mh( m_ClientListMutex );
-    for ( ClientState * cs : m_ClientList )
+    ClientState * cs = FindClientLocked( clientId );
+    if ( ( cs == nullptr ) || ( cs->m_Outbox == nullptr ) ) // Gone, or going
     {
-        if ( cs->m_Id == clientId )
-        {
-            if ( cs->m_Outbox == nullptr )
-            {
-                return false; // It is going
-            }
-            cs->m_Outbox->PushMessage( msg );
-            return true;
-        }
+        return false;
     }
-    return false;
+    cs->m_Outbox->PushMessage( msg );
+    return true;
 }
 
 // AskClientForPch
@@ -624,14 +626,11 @@ bool Server::SendToClient( uint32_t clientId, const Protocol::IMessage & msg )
 void Server::AskClientForPch( uint32_t clientId, uint64_t pchId )
 {
     MutexHolder mh( m_ClientListMutex );
-    for ( ClientState * cs : m_ClientList )
+    ClientState * cs = FindClientLocked( clientId );
+    if ( cs )
     {
-        if ( cs->m_Id == clientId )
-        {
-            MutexHolder mh2( cs->m_Mutex );
-            RequestPchIfMissing( *cs, pchId );
-            return;
-        }
+        MutexHolder mh2( cs->m_Mutex );
+        RequestPchIfMissing( *cs, pchId );
     }
 }
 
@@ -641,13 +640,10 @@ void Server::DisconnectClient( uint32_t clientId )
 {
     // Under the lock, as a connection outlives its client's place in the list
     MutexHolder mh( m_ClientListMutex );
-    for ( const ClientState * cs : m_ClientList )
+    const ClientState * cs = FindClientLocked( clientId );
+    if ( cs )
     {
-        if ( cs->m_Id == clientId )
-        {
-            Disconnect( cs->m_Connection );
-            return;
-        }
+        Disconnect( cs->m_Connection );
     }
 }
 
@@ -656,14 +652,8 @@ void Server::DisconnectClient( uint32_t clientId )
 uint32_t Server::GetMaxAllowance( uint32_t clientId ) const
 {
     MutexHolder mh( m_ClientListMutex );
-    for ( const ClientState * cs : m_ClientList )
-    {
-        if ( cs->m_Id == clientId )
-        {
-            return cs->m_MaxAllocatedCapacity;
-        }
-    }
-    return 0;
+    const ClientState * cs = FindClientLocked( clientId );
+    return cs ? cs->m_MaxAllocatedCapacity : 0;
 }
 
 // ClientOutbox

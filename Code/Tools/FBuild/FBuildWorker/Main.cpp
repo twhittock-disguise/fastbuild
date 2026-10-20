@@ -127,7 +127,7 @@ int Main( const AString & args )
             : ( effectiveCpus + 1 ) / 2; // ceil(cpus/2)
 
         Worker worker( args, options.m_ConsoleMode, options.m_PeriodicRestart,
-                       cpuAllocation, prefetch,
+                       effectiveCpus, prefetch,
                        options.m_GatewayConfigFile, options.m_NoBrokerage );
         if ( options.m_OverrideCPUAllocation )
         {

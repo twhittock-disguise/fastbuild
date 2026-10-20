@@ -115,7 +115,7 @@ void WorkerThreadRemote::GetStatus( AString & hostName, AString & status, bool &
 bool WorkerThreadRemote::IsEnabled() const
 {
     // determine 1-base CPU identifier
-    const uint16_t cpuId = ( m_ThreadIndex - 1000u ); // remote thread index starts at 1001
+    const uint16_t cpuId = (uint16_t)( m_ThreadIndex - kThreadIndexBase );
 
     // enabled?
     return ( cpuId <= s_NumCPUsToUse );

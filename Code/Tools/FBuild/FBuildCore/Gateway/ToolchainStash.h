@@ -19,6 +19,7 @@ class ToolchainStash
 {
 public:
     static constexpr uint32_t kMaxToolchains = 16;   // Unpinned ones beyond this are evicted, least recently used first
+    static constexpr uint32_t kManifestFileId = 0xFFFFFFFF; // The file id that stands for the manifest
 
     // Takes up what an earlier run left: complete toolchains are held, partial ones removed
     explicit ToolchainStash( const AString & directory );
@@ -74,8 +75,6 @@ private:
         bool IsComplete() const { return ( m_ManifestState == SLOT_HELD ) && ( m_NumFilesHeld == m_NumFiles ); }
     };
 
-    static constexpr uint32_t kManifestSlot = 0xFFFFFFFF;
-
     Result Write( uint64_t toolId, uint32_t slot, uint32_t numFiles, const void * payload, size_t payloadSize );
     Result Claim( uint64_t toolId, uint32_t slot, uint32_t numFiles, Array<uint64_t> & outToDelete, bool & outClaimed, bool & outMustWait );
     uint32_t GetNumPins( uint64_t toolId ) const;
@@ -90,8 +89,14 @@ private:
     AString             m_Directory;    // With a trailing slash
     mutable Mutex       m_Mutex;
     Array<Entry>        m_Entries;
-    Array<uint64_t>     m_PinIds;       // Pins are per toolchain id, and outlive the entry
-    Array<uint32_t>     m_PinCounts;
+    struct Pin
+    {
+        uint64_t    m_ToolId;
+        uint32_t    m_Count;
+
+        bool operator==( uint64_t toolId ) const { return ( m_ToolId == toolId ); }
+    };
+    Array<Pin>          m_Pins;         // Per toolchain id, so they outlive the entry
     Array<uint64_t>     m_Deleting;     // Removed toolchains whose directory is not yet deleted
     mutable uint64_t    m_Clock = 0;
 

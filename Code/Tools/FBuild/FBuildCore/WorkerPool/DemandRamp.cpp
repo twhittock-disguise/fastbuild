@@ -65,8 +65,7 @@ bool DemandRamp::ShouldSend( uint32_t demand, float nowSeconds ) const
         return false;
     }
     const uint32_t delta = ( demand > m_SentDemand ) ? ( demand - m_SentDemand ) : ( m_SentDemand - demand );
-    return ( delta >= kSendMinDelta ) &&
-           ( ( (uint64_t)delta * 100 ) >= ( (uint64_t)m_SentDemand * kSendMinDeltaPercent ) );
+    return IsChangeAtLeast( delta, m_SentDemand, kSendMinDelta, kSendMinDeltaPercent );
 }
 
 // OnSent

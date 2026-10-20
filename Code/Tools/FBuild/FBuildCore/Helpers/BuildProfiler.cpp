@@ -11,6 +11,7 @@
 #include "Tools/FBuild/FBuildCore/Graph/Node.h"
 #include "Tools/FBuild/FBuildCore/Helpers/JSON.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
+#include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
 
 // Core
 #include "Core/Env/CPUInfo.h"
@@ -161,9 +162,9 @@ void BuildProfiler::Serialize( const FBuildOptions & options )
     {
         const uint32_t workedPid = static_cast<uint32_t>( m_WorkerInfo.GetIndexOf( &workerInfo ) );
         s_Buffer.AppendFormat( "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%u,\"tid\":0,\"args\":{\"name\":\"Worker: %s\"}},", workedPid, workerInfo.m_WorkerName.Get() );
-        for ( uint32_t i = 1000; i <= workerInfo.m_MaxThreadId; ++i )
+        for ( uint32_t i = WorkerThreadRemote::kThreadIndexBase; i <= workerInfo.m_MaxThreadId; ++i )
         {
-            s_Buffer.AppendFormat( "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%u,\"tid\":%u,\"args\":{\"name\":\"Thread %02u\"}},", workedPid, i, i - 1000 );
+            s_Buffer.AppendFormat( "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%u,\"tid\":%u,\"args\":{\"name\":\"Thread %02u\"}},", workedPid, i, i - WorkerThreadRemote::kThreadIndexBase );
         }
     }
 
