@@ -308,6 +308,11 @@ private:
     // Runs before each PCH found at start is measured, so a test can hold the measurement until quit is set
     typedef void ( *MeasureTestHook )( uint64_t pchId, const Atomic<bool> & quit );
     inline static MeasureTestHook s_MeasureTestHook = nullptr;
+
+    // Runs before each local job is handed to the Server. True: the hook has taken the job (and its data, to
+    // FREE), which runs for the gateway until the test hands it to Server::RunLocalJob.
+    typedef bool ( *LocalJobTestHook )( uint64_t toolId, int16_t resultCompressionLevel, void * data, size_t dataSize );
+    inline static LocalJobTestHook s_LocalJobTestHook = nullptr;
 };
 
 //------------------------------------------------------------------------------

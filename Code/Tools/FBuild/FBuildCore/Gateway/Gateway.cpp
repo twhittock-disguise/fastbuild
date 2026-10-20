@@ -930,6 +930,12 @@ void Gateway::Run( Actions & actions )
     }
     for ( Actions::LocalJob & localJob : actions.m_LocalJobs )
     {
+        if ( s_LocalJobTestHook && s_LocalJobTestHook( localJob.m_ToolId, localJob.m_ResultCompressionLevel, localJob.m_Data, localJob.m_DataSize ) )
+        {
+            localJob.m_Data = nullptr;
+            continue;
+        }
+
         // Takes the Server's toolchain, local job, PCH cache and job queue locks; Forwarder::OnLocalJobEnded follows
         m_Server->RunLocalJob( Protocol::MsgJob( localJob.m_ToolId, localJob.m_ResultCompressionLevel ), localJob.m_Data, localJob.m_DataSize );
         FREE( localJob.m_Data );
