@@ -152,7 +152,7 @@ private:
     void MismatchedProtocolVersionIsRefused() const;
     void FramesOfAnotherMajorAreRefused() const;
     void HandshakeLayoutIsFrozen() const;
-    void AckCarriesACapacityAbove255() const;
+    void CapacityAbove255ReachesTheClient() const;
     void ClientReadsACapacityAbove255() const;
     void SharesMoveWithDemandBetweenTwoClients() const;
     void ScarceSlotsRotateOnTheirOwn() const;
@@ -412,10 +412,8 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( MismatchedProtocolVersionIsRefused )
     REGISTER_TEST( FramesOfAnotherMajorAreRefused )
     REGISTER_TEST( HandshakeLayoutIsFrozen )
-    REGISTER_TEST( AckCarriesACapacityAbove255 )
-#if defined( __WINDOWS__ )
+    REGISTER_TEST( CapacityAbove255ReachesTheClient )
     REGISTER_TEST( ClientReadsACapacityAbove255 )
-#endif
     REGISTER_TEST( SharesMoveWithDemandBetweenTwoClients )
     REGISTER_TEST( ScarceSlotsRotateOnTheirOwn )
     REGISTER_TEST( ClientRampsUpItsDemand )
@@ -3583,10 +3581,11 @@ void TestDistributed::HandshakeLayoutIsFrozen() const
     TEST_ASSERT( oldAck->GetWorkerCapacity() == 4 );
 }
 
-// AckCarriesACapacityAbove255
+// CapacityAbove255ReachesTheClient
 //------------------------------------------------------------------------------
-void TestDistributed::AckCarriesACapacityAbove255() const
+void TestDistributed::CapacityAbove255ReachesTheClient() const
 {
+    const DistributedTest::RemoteCpusForTest cpus( 340 );
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
@@ -3595,15 +3594,13 @@ void TestDistributed::AckCarriesACapacityAbove255() const
     TEST_ASSERT( ci );
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
 
-    // The ack is the share of the demand a new client is assumed to have; a demand reported gets the rest.
-    // A test worker uses every thread it is told to.
+    // The ack is the share of the demand a new client is assumed to have; a demand reported gets the rest
     TEST_ASSERT( probe.GetAckCapacity() == FairShareAllocator::kInitialDemand );
-    TEST_ASSERT( WorkerThreadRemote::GetNumCPUsToUse() > 500 );
     TEST_ASSERT( probe.SendDemand( ci, 500 ) );
-    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetLastAllowance() == 500 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetLastAllowance() == 340 ); } ) );
     Array<DistributedTest::HandshakeProbe::CapacityUpdate> updates;
     probe.GetCapacityUpdates( updates );
-    TEST_ASSERT( updates.Top().m_PoolSlots == WorkerThreadRemote::GetNumCPUsToUse() );
+    TEST_ASSERT( updates.Top().m_PoolSlots == 340 );
 }
 
 // SharesMoveWithDemandBetweenTwoClients
@@ -3635,22 +3632,45 @@ void TestDistributed::ScarceSlotsRotateOnTheirOwn() const
     TEST_ASSERT( b.SendDemand( ciB, 10 ) );
     TEST_ASSERT( DistributedTest::WaitUntil( [ &b ]() { return ( b.GetLastAllowance() != 0xFFFFFFFF ); } ) );
 
-    // With nothing more sent, the slot keeps moving between them
-    Array<DistributedTest::HandshakeProbe::CapacityUpdate> updates;
-    a.GetCapacityUpdates( updates );
-    const size_t numUpdatesA = updates.GetSize();
-    b.GetCapacityUpdates( updates );
-    const size_t numUpdatesB = updates.GetSize();
-    auto rotated = [ &a, &b, numUpdatesA, numUpdatesB ]()
+    // With nothing more sent, the slot moves between them, and is never held by both
+    bool servedA = false;
+    bool servedB = false;
+    bool together = false;
+    auto rotated = [ & ]()
     {
-        Array<DistributedTest::HandshakeProbe::CapacityUpdate> newUpdates;
-        a.GetCapacityUpdates( newUpdates );
-        const size_t newA = newUpdates.GetSize();
-        b.GetCapacityUpdates( newUpdates );
-        const size_t newB = newUpdates.GetSize();
-        return ( newA >= ( numUpdatesA + 2 ) ) && ( newB >= ( numUpdatesB + 2 ) );
+        uint32_t allowanceA = 0;
+        uint32_t allowanceB = 0;
+        {
+            MutexHolder mh( s.m_ClientListMutex );
+            if ( s.m_ClientList.GetSize() == 2 )
+            {
+                allowanceA = s.m_ClientList[ 0 ]->m_AllocatedCapacity;
+                allowanceB = s.m_ClientList[ 1 ]->m_AllocatedCapacity;
+            }
+        }
+        servedA |= ( allowanceA == 1 );
+        servedB |= ( allowanceB == 1 );
+        together |= ( ( allowanceA + allowanceB ) > 1 );
+        return servedA && servedB;
     };
     TEST_ASSERT( DistributedTest::WaitUntil( rotated, 5.0f * Server::kRotateSeconds ) );
+    TEST_ASSERT( together == false );
+
+    // and each client is told
+    auto toldOfTheSlot = []( const DistributedTest::HandshakeProbe & probe )
+    {
+        Array<DistributedTest::HandshakeProbe::CapacityUpdate> updates;
+        probe.GetCapacityUpdates( updates );
+        for ( const DistributedTest::HandshakeProbe::CapacityUpdate & update : updates )
+        {
+            if ( update.m_Allowance == 1 )
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return toldOfTheSlot( a ) && toldOfTheSlot( b ); } ) );
 }
 
 // ClientRampsUpItsDemand
@@ -3772,23 +3792,23 @@ void TestDistributed::ClientHonoursAReducedAllowance() const
 //------------------------------------------------------------------------------
 void TestDistributed::ClientReadsACapacityAbove255() const
 {
-    RecordingWorker worker( 300 );
+    // 257 slots: read as 8 bits they would be 1, and the client would send one job at a time
+    RecordingWorker worker( 257 );
     FBuildTestOptions options;
     DistributedTest::MakeDistributedPchOptions( options );
-    options.m_DistVerbose = true;
     options.m_ForceCleanBuild = true;
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
-    auto reached = [ &worker ]() { return worker.GetNumManifests() >= 1; };
+    // The worker answers none of them
+    auto reached = [ &worker ]() { return ( worker.GetNumJobs() >= 8 ); };
     DistributedTest::BuildAborter aborter( reached, DistributedTest::kWaitTimeoutSeconds );
-    const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
+    const bool built = fBuild.Build( "ManyJobs" );
     worker.ShutdownAllConnections();
 
     TEST_ASSERT( built == false ); // Aborted
     TEST_ASSERT( aborter.HasReached() );
-    TEST_ASSERT( GetRecordedOutput().Find( "capacity=300" ) );
 }
 
 // VersionIsShownWithTheProtocol
