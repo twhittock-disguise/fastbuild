@@ -50,6 +50,7 @@ public:
         virtual void OnClientManifest( uint32_t clientId, uint64_t toolId, const void * payload, size_t payloadSize ) = 0;
         virtual void OnClientFile( uint32_t clientId, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize ) = 0;
         virtual void OnPchStored( uint64_t pchId, uint32_t uncompressedSize, uint32_t compressedSize ) = 0;
+        virtual void OnPchsEvicted( const Array<uint64_t> & pchIds ) = 0; // Gone from the store: evicted, dropped or found damaged
         // Every client, handshake or not, once it has left the client list: nothing is queued for it from here on,
         // and a PCH it was sending no longer counts as being received, so another client can be asked for it
         virtual void OnClientGone( uint32_t clientId ) = 0;
@@ -96,6 +97,7 @@ public:
     bool SendToClient( uint32_t clientId, const Protocol::IMessage & msg );
 
     bool FindCachedPch( uint64_t pchId, AString & outPath ); // The compressed PCH. Refreshes LRU recency.
+    bool IsPchCached( uint64_t pchId ); // Does not refresh LRU recency
     PchLease AcquirePchLease( uint64_t pchId );
     void GetCachedPchIds( Array<uint64_t> & outPchIds ) const; // Those in the store now, as the PCH inventory sends them
     void DropStoredPch( uint64_t pchId ); // A stored PCH that is not what its id says: removed, so it can be asked for again
@@ -253,7 +255,6 @@ private:
     void RequestPchIfMissing( ClientState & cs, uint64_t pchId );
     bool MarkPchNeeded( ClientState & cs, uint64_t pchId ); // True if the client is to be asked. Same locks.
     bool IsPchBeingReceived( uint64_t pchId ) const; // Caller holds m_ClientListMutex
-    bool IsPchCached( uint64_t pchId ); // Does not refresh LRU recency
 
     Forwarder * const m_Forwarder = nullptr; // Gateway mode
     AString m_CacheDir; // The root of the PCH store and the log, with a trailing slash. Empty if there is none.

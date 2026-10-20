@@ -262,6 +262,7 @@ namespace
             MutexHolder mh( m_Mutex );
             m_StoredPchs.Append( StoredPch{ pchId, uncompressedSize, compressedSize } );
         }
+        virtual void OnPchsEvicted( const Array<uint64_t> & /*pchIds*/ ) override {}
         virtual void OnClientGone( uint32_t clientId ) override
         {
             // No Server lock is held here, so the server can be called back
@@ -457,6 +458,7 @@ private:
     void GatewayLogsForwarding() const;
     void DroppedPchIsUnpackedAgainOnceStoredAgain() const;
     void PchStoreOfAGatewayCacheDirLeavesTheWorkerCacheAlone() const;
+    void PchEvictedFromTheStoreLeavesTheGateway() const;
     void StoredPchThatFailsMeasurementIsDropped() const;
     void StoredPchOfAnotherIdIsDropped() const;
     void HousekeepingRunsWhileStoredPchsAreMeasured() const;
@@ -649,6 +651,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( GatewayLogsForwarding )
     REGISTER_TEST( DroppedPchIsUnpackedAgainOnceStoredAgain )
     REGISTER_TEST( PchStoreOfAGatewayCacheDirLeavesTheWorkerCacheAlone )
+    REGISTER_TEST( PchEvictedFromTheStoreLeavesTheGateway )
     REGISTER_TEST( StoredPchThatFailsMeasurementIsDropped )
     REGISTER_TEST( StoredPchOfAnotherIdIsDropped )
     REGISTER_TEST( HousekeepingRunsWhileStoredPchsAreMeasured )
@@ -4651,6 +4654,48 @@ void TestGateway::PchStoreOfAGatewayCacheDirLeavesTheWorkerCacheAlone() const
     Env::SetEnvVariable( "FASTBUILD_TEMP_PATH", original );
     TEST_ASSERT( hadWorkerCache == false );
     TEST_ASSERT( madeWorkerCache == false );
+}
+
+// PchEvictedFromTheStoreLeavesTheGateway
+//------------------------------------------------------------------------------
+void TestGateway::PchEvictedFromTheStoreLeavesTheGateway() const
+{
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    Gateway gateway( config );
+
+    // The store keeps one PCH, so each that arrives evicts the one before
+    gateway.GetServer().m_PchCacheLimitsFunc = []( const AString &, uint64_t, Server::PchCacheLimits & outLimits )
+    {
+        outLimits.m_Bytes = 1;
+        outLimits.m_MinEntries = 1;
+        outLimits.m_RawBytes = 0;
+        return true;
+    };
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+
+    DistributedTest::CompressedPch first;
+    DistributedTest::CompressedPch second;
+    DistributedTest::MakeCompressedPch( 64 * 1024, 11, first );
+    DistributedTest::MakeCompressedPch( 64 * 1024, 12, second );
+    TEST_ASSERT( SendPchFromProbe( probe, ci, first ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_KnownPchs == 1 ); } ) );
+    TEST_ASSERT( SendPchFromProbe( probe, ci, second ) );
+    TEST_ASSERT( WaitUntil( [ &gateway, &first ]() { AStackString<> path; return ( gateway.GetServer().FindCachedPch( first.m_Id, path ) == false ); } ) );
+
+    // The gateway knows only what the store holds
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_KnownPchs == 1 ); } ) );
+    MutexHolder mh( gateway.m_Mutex );
+    TEST_ASSERT( gateway.FindKnownPch( first.m_Id ) == nullptr );
+    TEST_ASSERT( gateway.IsPchStored( first.m_Id ) == false );
+    TEST_ASSERT( gateway.IsPchStored( second.m_Id ) );
+    probe.ShutdownAllConnections();
 }
 
 // StoredPchThatFailsMeasurementIsDropped

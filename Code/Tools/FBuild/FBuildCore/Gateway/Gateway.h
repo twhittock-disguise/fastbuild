@@ -85,6 +85,7 @@ public:
         uint32_t m_Timeouts = 0;
         uint64_t m_PchBytesForwarded = 0;
         uint32_t m_ToolchainRequests = 0;
+        uint32_t m_KnownPchs = 0;       // Of the Server's store, as far as the gateway knows
     };
     void GetStats( Stats & outStats ) const;
 
@@ -96,6 +97,7 @@ private:
     virtual void OnClientManifest( uint32_t clientId, uint64_t toolId, const void * payload, size_t payloadSize ) override;
     virtual void OnClientFile( uint32_t clientId, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize ) override;
     virtual void OnPchStored( uint64_t pchId, uint32_t uncompressedSize, uint32_t compressedSize ) override;
+    virtual void OnPchsEvicted( const Array<uint64_t> & pchIds ) override;
     virtual void OnClientGone( uint32_t clientId ) override;
     virtual void OnLocalJobEnded( uint32_t jobId, bool hasResult, bool compressed, MemoryStream & payload ) override;
 

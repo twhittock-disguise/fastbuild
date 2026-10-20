@@ -1733,6 +1733,10 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgPchF
 
     if ( m_Forwarder )
     {
+        if ( evictedIds.IsEmpty() == false )
+        {
+            m_Forwarder->OnPchsEvicted( evictedIds );
+        }
         m_Forwarder->OnPchStored( pchId, msg->GetUncompressedSize(), msg->GetCompressedSize() );
     }
 
@@ -2188,6 +2192,12 @@ void Server::DropStoredPch( uint64_t pchId )
     }
     RemovePchFiles( dropped ); // The disk is written with no lock held
     m_Log.Write( "pch dropped id=0x%016" PRIx64, pchId );
+    if ( m_Forwarder )
+    {
+        Array<uint64_t> droppedIds;
+        droppedIds.Append( pchId );
+        m_Forwarder->OnPchsEvicted( droppedIds );
+    }
 }
 
 // GetCachedPchIds
@@ -2480,6 +2490,12 @@ void Server::UnpackPch( uint64_t pchId )
     {
         // Clients are asked for it again when a job needs it
         LogWarning( "PCH 0x%016" PRIx64 " is damaged: dropping it\n", pchId );
+        if ( m_Forwarder )
+        {
+            Array<uint64_t> droppedIds;
+            droppedIds.Append( pchId );
+            m_Forwarder->OnPchsEvicted( droppedIds );
+        }
     }
     else
     {

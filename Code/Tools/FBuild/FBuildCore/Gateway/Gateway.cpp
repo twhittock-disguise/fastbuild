@@ -407,6 +407,21 @@ void Gateway::GetStats( Stats & outStats ) const
     Run( actions );
 }
 
+// OnPchsEvicted
+//------------------------------------------------------------------------------
+/*virtual*/ void Gateway::OnPchsEvicted( const Array<uint64_t> & pchIds )
+{
+    MutexHolder mh( m_Mutex );
+    for ( const uint64_t pchId : pchIds )
+    {
+        KnownPch * known = FindKnownPch( pchId );
+        if ( known && ( m_Server->IsPchCached( pchId ) == false ) ) // Unless it was stored again meanwhile
+        {
+            m_Pchs.Erase( known );
+        }
+    }
+}
+
 // OnClientGone
 //------------------------------------------------------------------------------
 /*virtual*/ void Gateway::OnClientGone( uint32_t clientId )
@@ -1058,7 +1073,7 @@ bool Gateway::IsPchStored( uint64_t pchId )
     {
         return true;
     }
-    m_Pchs.Erase( known ); // Evicted, which the store does not report
+    m_Pchs.Erase( known ); // Gone from the store, which reports it with no lock held, so it may not have yet
     return false;
 }
 
@@ -1549,6 +1564,7 @@ void Gateway::GetStatsLocked( Stats & outStats ) const
     outStats.m_Timeouts = m_Timeouts;
     outStats.m_PchBytesForwarded = m_PchBytesForwarded;
     outStats.m_ToolchainRequests = m_ToolchainRequests;
+    outStats.m_KnownPchs = (uint32_t)m_Pchs.GetSize();
 }
 
 // FormatStats
