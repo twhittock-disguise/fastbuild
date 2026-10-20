@@ -9,6 +9,7 @@
 #include "Tools/FBuild/FBuildCore/FBuildVersion.h"
 
 // Core
+#include "Core/Containers/Array.h"
 #include "Core/Env/Env.h"
 #include "Core/FileIO/ConstMemoryStream.h"
 #include "Core/FileIO/MemoryStream.h"
@@ -17,6 +18,7 @@
 
 // system
 #include <memory.h> // for memset
+#include <string.h> // for memcpy
 #include <stddef.h> // for offsetof
 #if defined( __APPLE__ ) || defined( __LINUX__ )
     #include <unistd.h> // for ::gethostname
@@ -390,6 +392,141 @@ void Protocol::FormatVersion( AString & outText, uint32_t major, uint32_t minor 
 void Protocol::GetVersionString( AString & outText )
 {
     FormatVersion( outText, kVersionMajor, kVersionMinor );
+}
+
+// WriteJobResult
+//------------------------------------------------------------------------------
+void Protocol::WriteJobResult( MemoryStream & out,
+                               uint32_t jobId,
+                               const AString & name,
+                               bool ok,
+                               bool systemError,
+                               const Array<AString> & messages,
+                               uint32_t buildTime,
+                               uint16_t threadIndex,
+                               const void * data,
+                               uint32_t dataSize )
+{
+    out.Write( jobId );
+    out.Write( name );
+    out.Write( ok );
+    out.Write( systemError );
+    out.Write( messages );
+    out.Write( buildTime );
+    out.Write( threadIndex );
+    out.Write( dataSize );
+    if ( dataSize > 0 )
+    {
+        out.WriteBuffer( data, dataSize );
+    }
+}
+
+namespace
+{
+    // Reads from a buffer that came from the network, so every read is bounds checked
+    class WireReader
+    {
+    public:
+        WireReader( const void * data, size_t size )
+            : m_Data( static_cast<const char *>( data ) )
+            , m_Size( size )
+        {
+        }
+
+        size_t Tell() const { return m_Pos; }
+        size_t GetRemaining() const { return ( m_Size - m_Pos ); }
+
+        template <class T>
+        bool Read( T & out )
+        {
+            if ( GetRemaining() < sizeof( T ) )
+            {
+                return false;
+            }
+            memcpy( &out, m_Data + m_Pos, sizeof( T ) );
+            m_Pos += sizeof( T );
+            return true;
+        }
+
+        // Skipped if out is null
+        bool ReadString( AString * out )
+        {
+            uint32_t length;
+            if ( ( Read( length ) == false ) || ( GetRemaining() < length ) )
+            {
+                return false;
+            }
+            if ( out )
+            {
+                out->Assign( m_Data + m_Pos, m_Data + m_Pos + length );
+            }
+            m_Pos += length;
+            return true;
+        }
+
+        bool Skip( size_t bytes )
+        {
+            if ( GetRemaining() < bytes )
+            {
+                return false;
+            }
+            m_Pos += bytes;
+            return true;
+        }
+
+    private:
+        const char * m_Data;
+        size_t m_Size;
+        size_t m_Pos = 0;
+    };
+}
+
+// ReadJobResult
+//------------------------------------------------------------------------------
+bool Protocol::ReadJobResult( const void * payload,
+                              size_t payloadSize,
+                              JobResultHeader & outHeader,
+                              Array<AString> * outMessages,
+                              AString * outName )
+{
+    WireReader reader( payload, payloadSize );
+
+    uint32_t numMessages;
+    if ( ( reader.Read( outHeader.m_JobId ) == false ) ||
+         ( reader.ReadString( outName ) == false ) ||
+         ( reader.Read( outHeader.m_Ok ) == false ) ||
+         ( reader.Read( outHeader.m_SystemError ) == false ) ||
+         ( reader.Read( numMessages ) == false ) )
+    {
+        return false;
+    }
+    if ( outMessages )
+    {
+        outMessages->Clear();
+    }
+    for ( uint32_t i = 0; i < numMessages; ++i )
+    {
+        AString * message = outMessages ? &outMessages->EmplaceBack() : nullptr;
+        if ( reader.ReadString( message ) == false )
+        {
+            return false;
+        }
+    }
+
+    if ( reader.Read( outHeader.m_BuildTime ) == false )
+    {
+        return false;
+    }
+    outHeader.m_ThreadIndexOffset = static_cast<uint32_t>( reader.Tell() );
+    if ( ( reader.Read( outHeader.m_ThreadIndex ) == false ) ||
+         ( reader.Read( outHeader.m_DataSize ) == false ) )
+    {
+        return false;
+    }
+
+    // The data that follows is as long as it says
+    outHeader.m_DataOffset = static_cast<uint32_t>( reader.Tell() );
+    return reader.Skip( outHeader.m_DataSize );
 }
 
 //------------------------------------------------------------------------------

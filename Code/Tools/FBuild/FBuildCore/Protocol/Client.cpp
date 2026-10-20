@@ -113,8 +113,8 @@ private:
     virtual void OnDisconnected( const ConnectionInfo * connection ) override;
     virtual void OnReceive( const ConnectionInfo * connection, void * data, uint32_t size, bool & keepMemory ) override;
 
-    void Process( const Protocol::MsgJobResult *, const void * payload, size_t payloadSize );
-    void Process( const Protocol::MsgJobResultCompressed * msg, const void * payload, size_t payloadSize );
+    void Process( const ConnectionInfo * connection, const Protocol::MsgJobResult *, const void * payload, size_t payloadSize );
+    void Process( const ConnectionInfo * connection, const Protocol::MsgJobResultCompressed * msg, const void * payload, size_t payloadSize );
     void Process( const ConnectionInfo * connection, const Protocol::MsgRequestManifest * msg );
     void Process( const ConnectionInfo * connection, const Protocol::MsgRequestFile * msg );
     void Process( const ConnectionInfo * connection, const Protocol::MsgConnectionAck * msg, uint32_t size );
@@ -124,7 +124,7 @@ private:
     void Process( const Protocol::MsgPchNeeded * msg );
     void Process( const Protocol::MsgCapacity * msg );
 
-    void ProcessJobResultCommon( bool isCompressed, uint8_t flags, const void * payload, size_t payloadSize );
+    void ProcessJobResultCommon( const ConnectionInfo * connection, bool isCompressed, uint8_t flags, const void * payload, size_t payloadSize );
     void Refuse( const ConnectionInfo * connection, uint32_t workerMajor, uint32_t workerMinor );
     void OnInventoriesComplete();
 
@@ -576,13 +576,13 @@ void Client::CommunicateJobAvailability()
         case Protocol::MSG_JOB_RESULT:
         {
             const Protocol::MsgJobResult * msg = static_cast<const Protocol::MsgJobResult *>( imsg );
-            Process( msg, payload, payloadSize );
+            Process( connection, msg, payload, payloadSize );
             break;
         }
         case Protocol::MSG_JOB_RESULT_COMPRESSED:
         {
             const Protocol::MsgJobResultCompressed * msg = static_cast<const Protocol::MsgJobResultCompressed *>( imsg );
-            Process( msg, payload, payloadSize );
+            Process( connection, msg, payload, payloadSize );
             break;
         }
         case Protocol::MSG_REQUEST_MANIFEST:
@@ -651,24 +651,26 @@ void Client::CommunicateJobAvailability()
 
 // Process( MsgJobResult )
 //------------------------------------------------------------------------------
-void ClientToWorkerConnection::Process( const Protocol::MsgJobResult * msg,
+void ClientToWorkerConnection::Process( const ConnectionInfo * connection,
+                                        const Protocol::MsgJobResult * msg,
                                         const void * payload,
                                         size_t payloadSize )
 {
     PROFILE_SECTION( "MsgJobResult" );
     const bool compressed = false;
-    ProcessJobResultCommon( compressed, msg->GetFlags(), payload, payloadSize );
+    ProcessJobResultCommon( connection, compressed, msg->GetFlags(), payload, payloadSize );
 }
 
 // Process( MsgJobResultCompressed )
 //------------------------------------------------------------------------------
-void ClientToWorkerConnection::Process( const Protocol::MsgJobResultCompressed * msg,
+void ClientToWorkerConnection::Process( const ConnectionInfo * connection,
+                                        const Protocol::MsgJobResultCompressed * msg,
                                         const void * payload,
                                         size_t payloadSize )
 {
     PROFILE_SECTION( "MsgJobResultCompressed" );
     const bool compressed = true;
-    ProcessJobResultCommon( compressed, msg->GetFlags(), payload, payloadSize );
+    ProcessJobResultCommon( connection, compressed, msg->GetFlags(), payload, payloadSize );
 }
 
 // Process( MsgConnectionAck )
@@ -1187,7 +1189,8 @@ void ClientToWorkerConnection::SendPendingPchs()
 
 // ProcessJobResultCommon
 //------------------------------------------------------------------------------
-void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
+void ClientToWorkerConnection::ProcessJobResultCommon( const ConnectionInfo * connection,
+                                                       bool isCompressed,
                                                        uint8_t flags,
                                                        const void * payload,
                                                        size_t payloadSize )
@@ -1197,40 +1200,29 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
     // amount of time. (For example OnReturnRemoteJob when cancelling the local job in a race)
     const int64_t receivedResultEndTime = Timer::GetNow();
 
+    // A result that cannot be read ends the connection, which returns its jobs to the queue
+    Protocol::JobResultHeader header;
+    Array<AString> messages;
+    if ( Protocol::ReadJobResult( payload, payloadSize, header, &messages ) == false )
+    {
+        DIST_INFO( "Protocol Error: %s sent a result that cannot be read (%zu bytes)\n", m_Worker->m_Address.Get(), payloadSize );
+        Disconnect( connection );
+        return;
+    }
+    const uint32_t jobId = header.m_JobId;
+    bool result = header.m_Ok;
+    const bool systemError = header.m_SystemError;
+    const uint32_t buildTime = header.m_BuildTime;
+    const uint16_t remoteThreadId = header.m_ThreadIndex;
+    const uint32_t dataSize = header.m_DataSize;
+    const void * data = static_cast<const char *>( payload ) + header.m_DataOffset;
+
     // Decrement in-flight count immediately
     m_JobsInFlight.Decrement();
 
     m_ResultsReceived.Increment();
     MarkProgress();
     m_ResultBytesReceived.Add( payloadSize );
-
-    ConstMemoryStream ms( payload, payloadSize );
-
-    uint32_t jobId = 0;
-    ms.Read( jobId );
-
-    AStackString name;
-    ms.Read( name );
-
-    bool result = false;
-    ms.Read( result );
-
-    bool systemError = false;
-    ms.Read( systemError );
-
-    Array<AString> messages;
-    ms.Read( messages );
-
-    uint32_t buildTime;
-    ms.Read( buildTime );
-
-    uint16_t remoteThreadId = 0;
-    ms.Read( remoteThreadId );
-
-    // get result data (built data or errors if failed)
-    uint32_t dataSize = 0;
-    ms.Read( dataSize );
-    const void * data = (const char *)ms.GetData() + ms.Tell();
 
     {
         MutexHolder mh( m_Mutex );

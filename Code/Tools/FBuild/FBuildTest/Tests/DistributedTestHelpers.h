@@ -39,6 +39,16 @@
 //------------------------------------------------------------------------------
 namespace DistributedTest
 {
+    // A result as a test client reads it, with the job's name
+    struct ReceivedResult : public Protocol::JobResultHeader
+    {
+        AString m_Name;
+    };
+    inline bool ReadReceivedResult( const void * payload, size_t payloadSize, ReceivedResult & out )
+    {
+        return Protocol::ReadJobResult( payload, payloadSize, out, nullptr, &out.m_Name );
+    }
+
     // Sends the chunks of a PCH to a worker, as a coordinator does
     class PchSender : public TCPConnectionPool
     {
@@ -484,7 +494,7 @@ namespace DistributedTest
             }
         }
         // The results received, in order
-        void GetResults( Array<GatewayWire::ResultHeader> & out ) const
+        void GetResults( Array<ReceivedResult> & out ) const
         {
             MutexHolder mh( m_Mutex );
             out = m_Results;
@@ -613,8 +623,8 @@ namespace DistributedTest
                 }
                 if ( ( m_CurrentMessage->GetType() == Protocol::MSG_JOB_RESULT ) && payload )
                 {
-                    GatewayWire::ResultHeader header;
-                    if ( GatewayWire::ReadResultHeader( payload, size, header ) )
+                    ReceivedResult header;
+                    if ( ReadReceivedResult( payload, size, header ) )
                     {
                         m_Results.Append( header );
                         m_ResultFlags.Append( static_cast<const Protocol::MsgJobResult *>( m_CurrentMessage )->GetFlags() );
@@ -623,8 +633,8 @@ namespace DistributedTest
                 if ( ( m_CurrentMessage->GetType() == Protocol::MSG_JOB_RESULT_COMPRESSED ) && payload )
                 {
                     // Only the data after the header is compressed
-                    GatewayWire::ResultHeader header;
-                    if ( GatewayWire::ReadResultHeader( payload, size, header ) )
+                    ReceivedResult header;
+                    if ( ReadReceivedResult( payload, size, header ) )
                     {
                         m_Results.Append( header );
                         m_ResultFlags.Append( static_cast<const Protocol::MsgJobResultCompressed *>( m_CurrentMessage )->GetFlags() );
@@ -656,7 +666,7 @@ namespace DistributedTest
         Array<uint64_t> m_ToolchainIds;
         Array<uint64_t> m_PchInventoryIds;
         Array<uint64_t> m_PchNeededIds;
-        Array<GatewayWire::ResultHeader> m_Results;
+        Array<ReceivedResult> m_Results;
         Array<uint8_t> m_ResultFlags;
         Array<ToolchainRequest> m_ToolchainRequests;
         Array<CapacityUpdate> m_CapacityUpdates;

@@ -241,7 +241,7 @@ private:
         uint8_t     m_Flags = 0;
         bool        m_PassOn = false;
     };
-    void RouteResult( uint32_t workerIndex, const GatewayWire::ResultHeader & header, void * payload, uint32_t payloadSize, ResultRoute & outRoute, Actions & actions );
+    void RouteResult( uint32_t workerIndex, const Protocol::JobResultHeader & header, void * payload, uint32_t payloadSize, ResultRoute & outRoute, Actions & actions );
     void OnLocalAttemptFailed( uint32_t attemptId, Actions & actions ); // It ended without a result
     void ParkJobsWaitingForPch( uint64_t pchId, Actions & actions ); // It has gone from the store: the jobs wait for it again
     void ExpireHungAttempts( Actions & actions );

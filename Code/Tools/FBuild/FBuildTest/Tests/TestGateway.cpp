@@ -1180,8 +1180,8 @@ void TestGateway::ResultHeaderIsReadAndPatched() const
     MemoryStream ms;
     MakeResult( ms, 42, 1003, data, sizeof( data ) );
 
-    GatewayWire::ResultHeader header;
-    TEST_ASSERT( GatewayWire::ReadResultHeader( ms.GetData(), ms.GetSize(), header ) );
+    DistributedTest::ReceivedResult header;
+    TEST_ASSERT( DistributedTest::ReadReceivedResult( ms.GetData(), ms.GetSize(), header ) );
     TEST_ASSERT( header.m_JobId == 42 );
     TEST_ASSERT( header.m_Name == "obj/file.obj" );
     TEST_ASSERT( header.m_Ok );
@@ -1194,8 +1194,8 @@ void TestGateway::ResultHeaderIsReadAndPatched() const
     memcpy( patched.Begin(), ms.GetData(), ms.GetSize() );
     GatewayWire::PatchResult( patched.Begin(), patched.GetSize(), header, 7, 1260 );
 
-    GatewayWire::ResultHeader after;
-    TEST_ASSERT( GatewayWire::ReadResultHeader( patched.Begin(), patched.GetSize(), after ) );
+    DistributedTest::ReceivedResult after;
+    TEST_ASSERT( DistributedTest::ReadReceivedResult( patched.Begin(), patched.GetSize(), after ) );
     TEST_ASSERT( after.m_JobId == 7 );
     TEST_ASSERT( after.m_ThreadIndex == 1260 );
     TEST_ASSERT( after.m_Name == header.m_Name );
@@ -1223,19 +1223,19 @@ void TestGateway::ResultCutShortIsRejected() const
     MakeResult( ms, 42, 1003, data, sizeof( data ) );
 
     // Every cut that loses part of the header or of the data is refused
-    GatewayWire::ResultHeader header;
+    DistributedTest::ReceivedResult header;
     for ( size_t size = 0; size < ms.GetSize(); ++size )
     {
-        TEST_ASSERT( GatewayWire::ReadResultHeader( ms.GetData(), size, header ) == false );
+        TEST_ASSERT( DistributedTest::ReadReceivedResult( ms.GetData(), size, header ) == false );
     }
-    TEST_ASSERT( GatewayWire::ReadResultHeader( ms.GetData(), ms.GetSize(), header ) );
+    TEST_ASSERT( DistributedTest::ReadReceivedResult( ms.GetData(), ms.GetSize(), header ) );
 
     // A name that claims more than the message holds
     MemoryStream hostile;
     hostile.Write( (uint32_t)1 );
     hostile.Write( (uint32_t)0xFFFFFFF0 );
     hostile.WriteBuffer( "abc", 3 );
-    TEST_ASSERT( GatewayWire::ReadResultHeader( hostile.GetData(), hostile.GetSize(), header ) == false );
+    TEST_ASSERT( DistributedTest::ReadReceivedResult( hostile.GetData(), hostile.GetSize(), header ) == false );
 }
 
 // LanesUseRealThreadIndexes
@@ -1272,8 +1272,8 @@ void TestGateway::LostResultIsASystemError() const
     MemoryStream ms;
     GatewayWire::WriteLostResult( ms, 99, "lost on worker" );
 
-    GatewayWire::ResultHeader header;
-    TEST_ASSERT( GatewayWire::ReadResultHeader( ms.GetData(), ms.GetSize(), header ) );
+    DistributedTest::ReceivedResult header;
+    TEST_ASSERT( DistributedTest::ReadReceivedResult( ms.GetData(), ms.GetSize(), header ) );
     TEST_ASSERT( header.m_JobId == 99 );
     TEST_ASSERT( header.m_Ok == false );
     TEST_ASSERT( header.m_SystemError );
@@ -1564,7 +1564,7 @@ void TestGateway::GatewayResultReachesOnlyALiveClient() const
     MemoryStream result;
     MakeResult( result, 7, 1001, "obj", 3 );
     TEST_ASSERT( s.QueueResult( id, false, Move( result ) ) );
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( results[ 0 ].m_JobId == 7 );
     TEST_ASSERT( WaitUntil( [ &s, id ]() { return ( GetNumJobsActive( s, id ) == 0 ); } ) );
@@ -3468,7 +3468,7 @@ namespace
         GatewayScheduler::Affinity GetAffinityWhenReady() const { MutexHolder mh( m_Mutex ); return m_AffinityWhenReady; }
         uint32_t GetCapacityWhenReady() const { MutexHolder mh( m_Mutex ); return m_CapacityWhenReady; }
         void GetCapacityUpdates( Array<uint32_t> & out ) const { MutexHolder mh( m_Mutex ); out = m_CapacityUpdates; } // Allowance, pool, in pairs
-        void GetResults( Array<GatewayWire::ResultHeader> & out ) const { MutexHolder mh( m_Mutex ); out = m_Results; }
+        void GetResults( Array<DistributedTest::ReceivedResult> & out ) const { MutexHolder mh( m_Mutex ); out = m_Results; }
         size_t GetNumResults() const { MutexHolder mh( m_Mutex ); return m_Results.GetSize(); }
         bool WasAnyResultCompressed() const { MutexHolder mh( m_Mutex ); return m_AnyCompressed; }
 
@@ -3499,8 +3499,8 @@ namespace
         }
         virtual void OnDownstreamResult( DownstreamConnection &, bool compressed, void * payload, uint32_t payloadSize ) override
         {
-            GatewayWire::ResultHeader header;
-            const bool read = GatewayWire::ReadResultHeader( payload, payloadSize, header );
+            DistributedTest::ReceivedResult header;
+            const bool read = DistributedTest::ReadReceivedResult( payload, payloadSize, header );
             FREE( payload );
             MutexHolder mh( m_Mutex );
             m_AnyCompressed |= compressed;
@@ -3557,7 +3557,7 @@ namespace
         GatewayScheduler::Affinity m_AffinityWhenReady = GatewayScheduler::AFFINITY_UNABLE;
         uint32_t m_CapacityWhenReady = 0;
         Array<uint32_t> m_CapacityUpdates; // Allowance, pool, in pairs
-        Array<GatewayWire::ResultHeader> m_Results;
+        Array<DistributedTest::ReceivedResult> m_Results;
         bool m_AnyCompressed = false;
         Atomic<uint32_t> m_NumReady{ 0 };
         Atomic<uint32_t> m_NumLost{ 0 };
@@ -3766,7 +3766,7 @@ void TestGateway::DownstreamResultIsHandedOver() const
     SendDownstreamJob( connection, owner, 10, "m10", nullptr );
     TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 2 ); } ) );
 
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     owner.GetResults( results );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 9 ) && ( results[ 0 ].m_Name == "m9" ) );
     TEST_ASSERT( results[ 0 ].m_Ok && ( results[ 0 ].m_SystemError == false ) );
@@ -4073,7 +4073,7 @@ namespace
 
     size_t GetNumResults( const DistributedTest::HandshakeProbe & probe )
     {
-        Array<GatewayWire::ResultHeader> results;
+        Array<DistributedTest::ReceivedResult> results;
         probe.GetResults( results );
         return results.GetSize();
     }
@@ -4172,7 +4172,7 @@ void TestGateway::GatewayForwardsAJobAndItsResult() const
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
 
     // The client's id comes back, and the thread is on worker 1's lane
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( results[ 0 ].m_JobId == 5 );
     TEST_ASSERT( results[ 0 ].m_Name == "m5" );
@@ -4371,7 +4371,7 @@ void TestGateway::GatewayAsksTheClientForAMissingPch() const
     TEST_ASSERT( worker.GetNumJobs() == 0 );
 
     TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( worker.GetNumPchCopies() == 1 );
@@ -4447,7 +4447,7 @@ void TestGateway::ResultsGoBackToTheClientThatSentTheJob() const
     TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( GetNumResults( a ) == 1 ) && ( GetNumResults( b ) == 1 ); } ) );
     Thread::Sleep( 100 ); // A result sent to the wrong client would have arrived by now
 
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     a.GetResults( results );
     TEST_ASSERT( ( results.GetSize() == 1 ) && ( results[ 0 ].m_JobId == 5 ) && ( results[ 0 ].m_Name == "a" ) );
     b.GetResults( results );
@@ -4481,13 +4481,13 @@ void TestGateway::ThreadLanesOfTwoWorkersDoNotCollide() const
     TEST_ASSERT( WaitUntil( [ &w1, &w2 ]() { return ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 1 ); } ) );
     w1.AnswerHeldJobs();
     w2.AnswerHeldJobs();
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
 
     // Worker 1's lanes start at 1257, worker 2's at 1513
     Array<EchoWorker::ReceivedJob> jobsOf1;
     w1.GetJobs( jobsOf1 );
-    for ( const GatewayWire::ResultHeader & result : results )
+    for ( const DistributedTest::ReceivedResult & result : results )
     {
         const bool fromWorker1 = ( result.m_Name == jobsOf1[ 0 ].m_Name );
         TEST_ASSERT( result.m_ThreadIndex == ( fromWorker1 ? 1257 : 1513 ) );
@@ -4688,7 +4688,7 @@ namespace
     TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() == 1 ); } ) );
     TEST_ASSERT( probe.GetPchNeededId( 0 ) == pch.m_Id );
     TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( worker.GetPchBytes() == pch.m_CompressedSize );
@@ -4895,7 +4895,7 @@ void TestGateway::HousekeepingRunsWhileStoredPchsAreMeasured() const
 
         // Once measured, it is sent from the store
         s_MeasurementsReleased.Store( true );
-        Array<GatewayWire::ResultHeader> results;
+        Array<DistributedTest::ReceivedResult> results;
         TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
         TEST_ASSERT( ( results[ 1 ].m_JobId == 6 ) && results[ 1 ].m_Ok );
         TEST_ASSERT( worker.GetPchBytes() == pch.m_CompressedSize );
@@ -4967,7 +4967,7 @@ void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
 
         // The first job is released once that measurement ends, while the one after it is held
         s_AllowedMeasurements.Store( 2 );
-        Array<GatewayWire::ResultHeader> results;
+        Array<DistributedTest::ReceivedResult> results;
         TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.IsEmpty() == false ); } ) );
         TEST_ASSERT( ( results.GetSize() == 1 ) && ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
         TEST_ASSERT( s_MeasureOrder[ 1 ] == lastPchId );
@@ -5096,7 +5096,7 @@ void TestGateway::JobOfALostWorkerIsRetriedElsewhere() const
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
 
     // Worker 1 takes it first (the lower id) and goes; worker 2 builds it
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok && ( results[ 0 ].m_SystemError == false ) );
     TEST_ASSERT( results[ 0 ].m_ThreadIndex == GatewayWire::MakeLane( 2, 1001 ) );
@@ -5131,7 +5131,7 @@ void TestGateway::SystemErrorIsRetriedAndNotPassedOn() const
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
 
     // Only the result of the retry reaches the client
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     Thread::Sleep( 100 );
     probe.GetResults( results );
@@ -5174,7 +5174,7 @@ void TestGateway::JobIsTriedOnAtMostThreeWorkers() const
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
 
     // One result, the last worker's failure, flagged as given up by the gateway
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     Thread::Sleep( 200 );
     probe.GetResults( results );
@@ -5220,7 +5220,7 @@ void TestGateway::CompileFailureIsPassedOnUnretried() const
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
 
     // The code is at fault, not the worker: the failure goes up as it is
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && ( results[ 0 ].m_Ok == false ) && ( results[ 0 ].m_SystemError == false ) );
     Array<uint8_t> flags;
@@ -5258,7 +5258,7 @@ void TestGateway::HungJobIsRetriedAfterTheWatchdog() const
     TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
     TEST_ASSERT( timer.GetElapsed() >= config.m_JobTimeoutSeconds );
     TEST_ASSERT( ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 1 ) );
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     probe.GetResults( results );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
     Gateway::Stats stats = GetGatewayStats( gateway );
@@ -5310,7 +5310,7 @@ void TestGateway::WorkerAskingForAnUnknownPchDoesNotReachTheClient() const
 
     // The gateway ends that connection, and builds the job elsewhere
     TEST_ASSERT( w1.AskForPch( 0xDEAD0003 ) );
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( w2.GetNumJobs() == 1 );
@@ -5636,7 +5636,7 @@ namespace
     // The client's job ids of the results received, each flagged as given up by the gateway
     bool AreAllGivenUp( const DistributedTest::HandshakeProbe & probe, Array<uint32_t> & outJobIds )
     {
-        Array<GatewayWire::ResultHeader> results;
+        Array<DistributedTest::ReceivedResult> results;
         Array<uint8_t> flags;
         probe.GetResults( results );
         probe.GetResultFlags( flags );
@@ -5749,7 +5749,7 @@ void TestGateway::ToolchainIsKeptForAClientSendingItWhenAnotherLeaves() const
     }
 
     // What B sent is kept, and B's job is built
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &b, &results ]() { b.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 6 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( b.IsDisconnected() == false );
@@ -5791,7 +5791,7 @@ void TestGateway::ToolchainDroppedUnderItsSenderIsAskedForAgain() const
     TEST_ASSERT( ( requests[ 1 ].m_IsManifest == false ) && ( requests[ 1 ].m_FileId == 0 ) );
     TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 0 ) );
 
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 6 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( probe.IsDisconnected() == false );
@@ -5909,9 +5909,9 @@ void TestGateway::JobsQueuedBehindABusyWorkerAreKept() const
         TEST_ASSERT( WaitUntil( [ &probe, i ]() { return ( GetNumResults( probe ) == i ); } ) );
         TEST_ASSERT( WaitUntil( [ &worker, i ]() { return ( worker.GetNumJobs() == ( ( i < 3 ) ? ( i + 1 ) : 3 ) ); } ) );
     }
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     probe.GetResults( results );
-    for ( const GatewayWire::ResultHeader & result : results )
+    for ( const DistributedTest::ReceivedResult & result : results )
     {
         TEST_ASSERT( result.m_Ok );
     }
@@ -7912,7 +7912,7 @@ void TestGateway::RetryOfALocalJobWaitsForADroppedPch() const
 
     TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
     TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
-    Array<GatewayWire::ResultHeader> results;
+    Array<DistributedTest::ReceivedResult> results;
     probe.GetResults( results );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( ( echo.GetNumJobs() == 1 ) && ( echo.GetNumPchCopies() == 1 ) && ( echo.GetNumPchAsks() == 0 ) );

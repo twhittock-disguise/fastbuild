@@ -550,13 +550,13 @@ void Gateway::OnStashed( uint32_t clientId, uint64_t toolId, ToolchainStash::Res
     // The job id is the attempt's (Dispatch)
     uint32_t payloadSize = 0;
     void * data = nullptr;
-    GatewayWire::ResultHeader header;
+    Protocol::JobResultHeader header;
     bool readable = false;
     if ( hasResult )
     {
         payloadSize = (uint32_t)payload.GetSize();
         data = payload.Release();
-        readable = data && GatewayWire::ReadResultHeader( data, payloadSize, header ) && ( header.m_JobId == jobId );
+        readable = data && Protocol::ReadJobResult( data, payloadSize, header ) && ( header.m_JobId == jobId );
     }
 
     Actions actions;
@@ -686,8 +686,8 @@ void Gateway::ParkJobsWaitingForPch( uint64_t pchId, Actions & actions )
 //------------------------------------------------------------------------------
 /*virtual*/ void Gateway::OnDownstreamResult( DownstreamConnection & connection, bool compressed, void * payload, uint32_t payloadSize )
 {
-    GatewayWire::ResultHeader header;
-    if ( GatewayWire::ReadResultHeader( payload, payloadSize, header ) == false )
+    Protocol::JobResultHeader header;
+    if ( Protocol::ReadJobResult( payload, payloadSize, header ) == false )
     {
         FREE( payload );
         connection.Close( "protocol" );
@@ -721,7 +721,7 @@ void Gateway::ParkJobsWaitingForPch( uint64_t pchId, Actions & actions )
 
 // RouteResult
 //------------------------------------------------------------------------------
-void Gateway::RouteResult( uint32_t workerIndex, const GatewayWire::ResultHeader & header, void * payload, uint32_t payloadSize, ResultRoute & outRoute, Actions & actions )
+void Gateway::RouteResult( uint32_t workerIndex, const Protocol::JobResultHeader & header, void * payload, uint32_t payloadSize, ResultRoute & outRoute, Actions & actions )
 {
     Attempt * attempt = nullptr;
     for ( Attempt & a : m_Attempts )

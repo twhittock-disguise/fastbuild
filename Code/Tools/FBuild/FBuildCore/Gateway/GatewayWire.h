@@ -5,11 +5,11 @@
 // Includes
 //------------------------------------------------------------------------------
 #include "Core/Env/Types.h"
-#include "Core/Strings/AString.h"
 
 // Forward Declarations
 //------------------------------------------------------------------------------
 class MemoryStream;
+namespace Protocol { struct JobResultHeader; }
 
 // GatewayWire
 //------------------------------------------------------------------------------
@@ -29,18 +29,8 @@ namespace GatewayWire
     [[nodiscard]] bool PeekJob( const void * job, size_t jobSize, uint32_t & outJobId, uint64_t & outPchId );
     void SetJobId( void * job, size_t jobSize, uint32_t jobId );
 
-    // The fields of a result (Server::FinalizeCompletedJobs) before its data
-    struct ResultHeader
-    {
-        uint32_t m_JobId = 0;
-        AString m_Name;
-        bool m_Ok = false;
-        bool m_SystemError = false;
-        uint16_t m_ThreadIndex = 0;
-        uint32_t m_ThreadIndexOffset = 0; // Where the thread index is in the payload
-    };
-    [[nodiscard]] bool ReadResultHeader( const void * payload, size_t payloadSize, ResultHeader & outHeader );
-    void PatchResult( void * payload, size_t payloadSize, const ResultHeader & header, uint32_t jobId, uint16_t threadIndex );
+    // The job id and the thread index of a result read with Protocol::ReadJobResult
+    void PatchResult( void * payload, size_t payloadSize, const Protocol::JobResultHeader & header, uint32_t jobId, uint16_t threadIndex );
 
     // kFirstThreadIndex + workerIndex * kLaneStride + Clamp( threadIndex - kFirstThreadIndex, 1, kLaneStride - 1 )
     uint16_t MakeLane( uint32_t workerIndex, uint16_t threadIndex );

@@ -254,17 +254,16 @@ namespace
     void WriteJobResult( const Job & job, bool ok, MemoryStream & ms )
     {
         const Node * node = job.GetNode();
-        ms.Write( job.GetJobId() );
-        ms.Write( node->GetName() );
-        ms.Write( ok );
-        ms.Write( job.GetSystemErrorCount() > 0 );
-        ms.Write( job.GetMessages() );
-        ms.Write( node->GetLastBuildTime() );
-        ms.Write( job.GetRemoteThreadIndex() ); // The thread used to build the job to assist with visualization
-
-        // write the data - build result for success, or output+errors for failure
-        ms.Write( (uint32_t)job.GetDataSize() );
-        ms.WriteBuffer( job.GetData(), job.GetDataSize() );
+        Protocol::WriteJobResult( ms,
+                                  job.GetJobId(),
+                                  node->GetName(),
+                                  ok,
+                                  job.GetSystemErrorCount() > 0,
+                                  job.GetMessages(),
+                                  node->GetLastBuildTime(),
+                                  job.GetRemoteThreadIndex(), // The thread used to build the job to assist with visualization
+                                  job.GetData(), // Build result for success, or output+errors for failure
+                                  (uint32_t)job.GetDataSize() );
     }
 }
 

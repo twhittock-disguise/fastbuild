@@ -9,6 +9,7 @@
 
 // Forward Declarations
 //------------------------------------------------------------------------------
+template <class T> class Array;
 class ConnectionInfo;
 class AString;
 class ConstMemoryStream;
@@ -237,6 +238,38 @@ namespace Protocol
         uint8_t m_Flags;
     };
     static_assert( sizeof( MsgJobResultCompressed ) == sizeof( IMessage ) + 1, "MsgJobResultCompressed message has incorrect size" );
+
+    // The payload of a MSG_JOB_RESULT(_COMPRESSED): job id, name, ok, system error, messages, build time (ms),
+    // thread index, then the data with its size (only the data is compressed)
+    void WriteJobResult( MemoryStream & out,
+                         uint32_t jobId,
+                         const AString & name,
+                         bool ok,
+                         bool systemError,
+                         const Array<AString> & messages,
+                         uint32_t buildTime,
+                         uint16_t threadIndex,
+                         const void * data,
+                         uint32_t dataSize );
+
+    // The fields of a result, read from a payload that came from the network
+    struct JobResultHeader
+    {
+        uint32_t m_JobId = 0;
+        bool m_Ok = false;
+        bool m_SystemError = false;
+        uint32_t m_BuildTime = 0;
+        uint16_t m_ThreadIndex = 0;
+        uint32_t m_ThreadIndexOffset = 0; // Where the thread index is in the payload
+        uint32_t m_DataOffset = 0;
+        uint32_t m_DataSize = 0;
+    };
+    // False unless the whole payload, data included, is there. The messages and the name are read only if asked for.
+    [[nodiscard]] bool ReadJobResult( const void * payload,
+                                      size_t payloadSize,
+                                      JobResultHeader & outHeader,
+                                      Array<AString> * outMessages = nullptr,
+                                      AString * outName = nullptr );
 
     // MsgRequestManifest
     //------------------------------------------------------------------------------
