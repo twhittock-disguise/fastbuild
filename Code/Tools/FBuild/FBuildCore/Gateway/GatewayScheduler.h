@@ -35,11 +35,9 @@ public:
     void SetWorkerSlots( uint32_t workerId, uint32_t slots );  // Adds it if new, its running jobs using slots. Fewer slots than running: no new work until below.
     void RemoveWorker( uint32_t workerId, Array<uint32_t> & outRunningJobIds ); // The jobs stay running until OnFailed or OnCompleted
     void ReleaseSlot( uint32_t workerId );
-    uint32_t GetTotalSlots() const;
 
     void AddJob( uint32_t jobId, uint32_t clientId, uint64_t pchId, uint64_t toolId );
     void RemoveClient( uint32_t clientId, Array<uint32_t> & outWaitingJobIds ); // Its running jobs are given up when they fail
-    void RemoveWaitingJobs( Array<uint32_t> & outJobIds ); // Every client's; the running jobs stay
     bool RemoveWaitingJob( uint32_t jobId ); // False if it is not waiting
     void GetWaitingJobIds( Array<uint32_t> & outJobIds ) const; // Every client's
 
@@ -57,6 +55,8 @@ public:
     uint32_t GetNumRunning() const;
 
 private:
+    friend class TestGateway;
+
     struct Worker
     {
         uint32_t m_Id = 0;

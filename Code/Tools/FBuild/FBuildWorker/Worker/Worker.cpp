@@ -204,9 +204,7 @@ uint32_t Worker::WorkThread()
 
     // start listening
     StatusMessage( "Listening on port %u\n", Protocol::kPort );
-    const bool listening = m_Gateway ? m_Gateway->Listen( Protocol::kPort )
-                                     : m_ConnectionPool->Listen( Protocol::kPort );
-    if ( listening == false )
+    if ( m_ConnectionPool->Listen( Protocol::kPort ) == false )
     {
         ErrorMessage( "Failed to listen on port %u.  Check port is not in use.", Protocol::kPort );
         return (uint32_t)-1;

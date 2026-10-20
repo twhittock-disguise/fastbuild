@@ -159,7 +159,6 @@ private:
     // Push-based job tracking. The capacity is the allowance: of the ack, then of the last MSG_CAPACITY.
     // Jobs in flight above it stay where they are; no more are sent until they are fewer.
     Atomic<uint32_t> m_WorkerCapacity{ 0 };
-    Atomic<uint32_t> m_WorkerPoolSlots{ 0 }; // The worker's whole pool, from the last MSG_CAPACITY
     Atomic<uint32_t> m_JobsInFlight{ 0 };
     DemandRamp m_DemandRamp; // Client thread only. Its time is m_ConnectionTimer's.
     Atomic<bool> m_AwaitingInventory{ true }; // Jobs wait for the inventories the worker advertises, so they are not sent what it already has
@@ -856,7 +855,6 @@ void ClientToWorkerConnection::Process( const Protocol::MsgCapacity * msg )
 
     // An allowance of 0 is a wait, not a refusal: the demand is still reported
     m_WorkerCapacity.Store( msg->GetAllowance() );
-    m_WorkerPoolSlots.Store( msg->GetPoolSlots() );
     DIST_INFO( " - Worker %s allowance=%u pool=%u\n", m_Worker->m_Address.Get(), msg->GetAllowance(), msg->GetPoolSlots() );
 }
 

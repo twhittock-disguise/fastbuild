@@ -59,18 +59,6 @@ void GatewayScheduler::ReleaseSlot( uint32_t workerId )
     }
 }
 
-// GetTotalSlots
-//------------------------------------------------------------------------------
-uint32_t GatewayScheduler::GetTotalSlots() const
-{
-    uint32_t total = 0;
-    for ( const Worker & worker : m_Workers )
-    {
-        total += worker.m_Slots;
-    }
-    return total;
-}
-
 // AddJob
 //------------------------------------------------------------------------------
 void GatewayScheduler::AddJob( uint32_t jobId, uint32_t clientId, uint64_t pchId, uint64_t toolId )
@@ -120,21 +108,6 @@ void GatewayScheduler::RemoveClient( uint32_t clientId, Array<uint32_t> & outWai
     if ( m_NextClient >= m_Clients.GetSize() )
     {
         m_NextClient = 0;
-    }
-}
-
-// RemoveWaitingJobs
-//------------------------------------------------------------------------------
-void GatewayScheduler::RemoveWaitingJobs( Array<uint32_t> & outJobIds )
-{
-    outJobIds.Clear();
-    for ( Client & client : m_Clients )
-    {
-        for ( const Job & job : client.m_Waiting )
-        {
-            outJobIds.Append( job.m_Id );
-        }
-        client.m_Waiting.Clear();
     }
 }
 

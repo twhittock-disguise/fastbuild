@@ -575,6 +575,7 @@ private:
     static Gateway::Stats GetGatewayStats( const Gateway & gateway );
     static bool WaitForReadyWorkers( const Gateway & gateway, uint32_t numWorkers );
     static uint32_t GetSchedulerSlots( const Gateway & gateway ); // Of every worker in the gateway's scheduler
+    static uint32_t GetTotalSlots( const GatewayScheduler & scheduler ); // Of every worker in the scheduler
     static uint32_t WatchTheShares( void * param ); // A ShareWatch
     // A stored PCH that does not hold what its id says is dropped at start, and asked of the client
     static void CheckStoredPchIsDropped( const void * storedData, size_t storedSize, const DistributedTest::CompressedPch & pch );
@@ -2820,7 +2821,7 @@ void TestGateway::SchedulerUsesNoMoreSlotsThanAWorkerHas() const
     GatewayScheduler scheduler;
     scheduler.SetWorkerSlots( 1, 2 );
     scheduler.SetWorkerSlots( 2, 1 );
-    TEST_ASSERT( scheduler.GetTotalSlots() == 3 );
+    TEST_ASSERT( GetTotalSlots( scheduler ) == 3 );
     for ( uint32_t jobId = 1; jobId <= 6; ++jobId )
     {
         scheduler.AddJob( jobId, 1, 0, kSchedulerTool );
@@ -2831,7 +2832,7 @@ void TestGateway::SchedulerUsesNoMoreSlotsThanAWorkerHas() const
 
     // Fewer slots than running: nothing new until it is below
     scheduler.SetWorkerSlots( 1, 1 );
-    TEST_ASSERT( scheduler.GetTotalSlots() == 2 );
+    TEST_ASSERT( GetTotalSlots( scheduler ) == 2 );
     Complete( scheduler, 1, 1 );
     TEST_ASSERT( StartsNothing( scheduler, affinity ) );
     Complete( scheduler, 2, 1 );
@@ -2962,7 +2963,7 @@ void TestGateway::RemovedWorkerReportsItsRunningJobs() const
     scheduler.RemoveWorker( 1, running );
     TEST_ASSERT( running.GetSize() == 2 );
     TEST_ASSERT( running.Find( 1u ) && running.Find( 2u ) );
-    TEST_ASSERT( scheduler.GetTotalSlots() == 1 );
+    TEST_ASSERT( GetTotalSlots( scheduler ) == 1 );
     TEST_ASSERT( scheduler.GetNumRunning() == 3 );  // Until each one fails
 
     TEST_ASSERT( scheduler.OnFailed( 1, 1 ) == GatewayScheduler::OUTCOME_RETRY );
@@ -3491,11 +3492,11 @@ namespace
             m_CapacityWhenReady = connection.GetAllowance();
             m_NumReady.Increment();
         }
-        virtual void OnDownstreamCapacity( DownstreamConnection &, uint32_t allowance, uint32_t poolSlots ) override
+        virtual void OnDownstreamCapacity( DownstreamConnection & connection ) override
         {
             MutexHolder mh( m_Mutex );
-            m_CapacityUpdates.Append( allowance );
-            m_CapacityUpdates.Append( poolSlots );
+            m_CapacityUpdates.Append( connection.GetAllowance() );
+            m_CapacityUpdates.Append( connection.GetPoolSlots() );
         }
         virtual void OnDownstreamResult( DownstreamConnection &, bool compressed, void * payload, uint32_t payloadSize ) override
         {
@@ -4138,7 +4139,7 @@ void TestGateway::GatewayAdvertisesTheSumOfItsWorkers() const
     GatewayConfig config;
     MakeGatewayConfig( 2, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     const Gateway::Stats stats = GetGatewayStats( gateway );
@@ -4161,7 +4162,7 @@ void TestGateway::GatewayForwardsAJobAndItsResult() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -4204,7 +4205,7 @@ void TestGateway::JobsWaitForTheirToolchainAtTheGateway() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -4243,7 +4244,7 @@ void TestGateway::JobForAMissingToolchainRequestsIt() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -4295,7 +4296,7 @@ void TestGateway::AdvertisedToolchainIsPinnedForTheConnection() const
     EchoWorker worker( 4 );
     TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe a;
@@ -4353,7 +4354,7 @@ void TestGateway::GatewayAsksTheClientForAMissingPch() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -4391,7 +4392,7 @@ void TestGateway::PchCrossesTheUplinkOnceForTwoWorkers() const
     GatewayConfig config;
     MakeGatewayConfig( 2, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -4428,7 +4429,7 @@ void TestGateway::ResultsGoBackToTheClientThatSentTheJob() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe a;
@@ -4468,7 +4469,7 @@ void TestGateway::ThreadLanesOfTwoWorkersDoNotCollide() const
     GatewayConfig config;
     MakeGatewayConfig( 2, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -4505,7 +4506,7 @@ void TestGateway::ClientsAreServedInTurn() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     // The worker's pool has a slot for each client, and it gives the gateway one of them
@@ -4569,7 +4570,7 @@ void TestGateway::GatewayLogsForwarding() const
     uint32_t clientId = 0;
     {
         Gateway gateway( config );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
         logPath = gateway.GetServer().GetLogPath();
 
@@ -4668,7 +4669,7 @@ namespace
     EchoWorker worker( 4 );
     TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     // It goes from the store once it has been measured, so it is not advertised
@@ -4794,7 +4795,7 @@ void TestGateway::PchEvictedFromTheStoreLeavesTheGateway() const
         outLimits.m_RawBytes = 0;
         return true;
     };
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
     DistributedTest::HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
@@ -4862,7 +4863,7 @@ void TestGateway::HousekeepingRunsWhileStoredPchsAreMeasured() const
     AStackString<> logPath;
     {
         Gateway gateway( config );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         logPath = gateway.GetServer().GetLogPath();
         TEST_ASSERT( WaitUntil( []() { return ( s_HeldMeasurements.Load() == 1 ); } ) );
 
@@ -4933,7 +4934,7 @@ void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
     uint64_t otherPchId = 0;
     {
         Gateway gateway( config );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
         logPath = gateway.GetServer().GetLogPath();
         TEST_ASSERT( WaitUntil( []() { return ( s_HeldMeasurements.Load() == 1 ); } ) );
@@ -5043,7 +5044,7 @@ void TestGateway::GiveUpDoesNotDenyListTheGateway() const
     AStackString<> logPath;
     {
         Gateway gateway( config );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
         logPath = gateway.GetServer().GetLogPath();
 
@@ -5085,7 +5086,7 @@ void TestGateway::JobOfALostWorkerIsRetriedElsewhere() const
     GatewayConfig config;
     MakeFailureConfig( 2, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -5120,7 +5121,7 @@ void TestGateway::SystemErrorIsRetriedAndNotPassedOn() const
     GatewayConfig config;
     MakeFailureConfig( 2, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -5163,7 +5164,7 @@ void TestGateway::JobIsTriedOnAtMostThreeWorkers() const
     GatewayConfig config;
     MakeFailureConfig( 4, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 4 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -5209,7 +5210,7 @@ void TestGateway::CompileFailureIsPassedOnUnretried() const
     GatewayConfig config;
     MakeFailureConfig( 2, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -5243,7 +5244,7 @@ void TestGateway::HungJobIsRetriedAfterTheWatchdog() const
     GatewayConfig config;
     MakeFailureConfig( 2, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -5297,7 +5298,7 @@ void TestGateway::WorkerAskingForAnUnknownPchDoesNotReachTheClient() const
     MakeFailureConfig( 2, config );
     config.m_JobTimeoutSeconds = 600.0f; // The retry is the lost worker's, not the watchdog's
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -5328,7 +5329,7 @@ void TestGateway::LostWorkerIsConnectedAgain() const
     GatewayConfig config;
     MakeFailureConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
     TEST_ASSERT( worker.GetNumConnections() == 1 );
 
@@ -5364,7 +5365,7 @@ void TestGateway::DroppedClientJobsFinishAndAreDiscarded() const
     MakeFailureConfig( 1, config );
     config.m_JobTimeoutSeconds = 600.0f;
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     {
@@ -5400,7 +5401,7 @@ void TestGateway::RunningJobsOfADroppedClientAreFreedWithTheirWorker() const
     MakeFailureConfig( 2, config );
     config.m_JobTimeoutSeconds = 600.0f;
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     {
@@ -5434,7 +5435,7 @@ void TestGateway::WaitingJobsOfADroppedClientAreFreed() const
     MakeFailureConfig( 1, config );
     config.m_JobTimeoutSeconds = 600.0f;
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     uint64_t heldWhileRunning = 0;
@@ -5476,7 +5477,7 @@ void TestGateway::ClientHoldingTooManyJobsIsDisconnected() const
     MakeFailureConfig( 1, config );
     config.m_JobTimeoutSeconds = 600.0f;
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -5520,7 +5521,7 @@ void TestGateway::StalledWorkerDoesNotStallTheGateway() const
     MakeFailureConfig( 2, config );
     config.m_JobTimeoutSeconds = 600.0f;
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
     w1.StallReading( true );
 
@@ -5558,7 +5559,7 @@ void TestGateway::ToolchainOfADroppedClientIsAskedOfAnother() const
     GatewayConfig config;
     MakeFailureConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe a;
@@ -5602,7 +5603,7 @@ void TestGateway::GatewayWithNoWorkersRefusesClients() const
     GatewayConfig config;
     MakeFailureConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     Thread::Sleep( 500 ); // Some attempts to connect to it
 
     DistributedTest::HandshakeProbe probe;
@@ -5666,7 +5667,7 @@ void TestGateway::JobsWaitingWithNoWorkersAreReturned() const
     AStackString<> logPath;
     {
         Gateway gateway( config );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
         logPath = gateway.GetServer().GetLogPath();
 
@@ -5724,7 +5725,7 @@ void TestGateway::ToolchainIsKeptForAClientSendingItWhenAnotherLeaves() const
     EchoWorker worker( 4 );
     TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
     DistributedTest::HandshakeProbe a;
     DistributedTest::HandshakeProbe b;
@@ -5766,7 +5767,7 @@ void TestGateway::ToolchainDroppedUnderItsSenderIsAskedForAgain() const
     EchoWorker worker( 4 );
     TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
     DistributedTest::HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
@@ -5807,7 +5808,7 @@ void TestGateway::ToolchainTheStashCannotWriteReturnsItsJobs() const
     EchoWorker worker( 4 );
     TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
     DistributedTest::HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
@@ -5853,7 +5854,7 @@ void TestGateway::JobWaitingForAHungWorkerIsReturned() const
     MakeFailureConfig( 1, config );
     config.m_NoWorkerGiveUpSeconds = 1.0f;
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -5886,7 +5887,7 @@ void TestGateway::JobsQueuedBehindABusyWorkerAreKept() const
     config.m_JobTimeoutSeconds = 600.0f;
     config.m_NoWorkerGiveUpSeconds = 0.5f;
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -5930,7 +5931,7 @@ void TestGateway::NoWorkerBoundStartsAgainWhenAWorkerReturns() const
     config.m_ReconnectSeconds = 0.5f;
     config.m_NoWorkerGiveUpSeconds = 1.5f;
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -5972,7 +5973,7 @@ void TestGateway::GatewayLogsFailures() const
     uint32_t clientId = 0;
     {
         Gateway gateway( config );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
         logPath = gateway.GetServer().GetLogPath();
 
@@ -6127,7 +6128,7 @@ namespace
                         r->m_Gateway.Get()->GetStats( stats );
                         Thread::Sleep( 1 );
                     } while ( ( stats.m_PoolSlots == 0 ) && ( timer.GetElapsed() < 30.0f ) );
-                    r->m_Restarted.Store( r->m_Gateway.Get()->Listen( Protocol::kTestPort ) );
+                    r->m_Restarted.Store( r->m_Gateway.Get()->GetServer().Listen( Protocol::kTestPort ) );
                     break;
                 }
                 Thread::Sleep( 1 );
@@ -6159,7 +6160,7 @@ void TestGateway::BuildThroughAPureForwardingGateway() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     const char * target( "../tmp/Test/Distributed/dist.lib" );
@@ -6199,7 +6200,7 @@ void TestGateway::PchBuildThroughTheGatewaySendsEachPchOnce() const
         EchoWorker echo( 1, EchoWorker::ANSWER_SYSTEM_ERROR );
         TEST_ASSERT( echo.Listen( kGatewayTestDownstreamPort + 1 ) );
         Gateway gateway( config );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
         TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 2 );
         logPath = gateway.GetServer().GetLogPath();
@@ -6268,7 +6269,7 @@ void TestGateway::GatewayRestartMidBuildCompletesTheBuild() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     UniquePtr<Gateway> gateway( FNEW( Gateway( config ) ) );
-    TEST_ASSERT( gateway.Get()->Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.Get()->GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( *gateway.Get(), 1 ) );
     TEST_ASSERT( GetGatewayStats( *gateway.Get() ).m_PoolSlots == 1 );
 
@@ -6353,7 +6354,7 @@ void TestGateway::GatewayIsNoSlowerThanDirect() const
         GatewayConfig config;
         MakeGatewayConfig( 1, config );
         Gateway gateway( config );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
         const Timer timer;
         TEST_ASSERT( fBuild.Build( target ) );
@@ -7022,12 +7023,24 @@ void TestGateway::RampReportsOnlyRealChanges() const
     TEST_ASSERT( ramp.ShouldSend( 1, 3.02f ) );
 }
 
+// GetTotalSlots
+//------------------------------------------------------------------------------
+/*static*/ uint32_t TestGateway::GetTotalSlots( const GatewayScheduler & scheduler )
+{
+    uint32_t total = 0;
+    for ( const GatewayScheduler::Worker & worker : scheduler.m_Workers )
+    {
+        total += worker.m_Slots;
+    }
+    return total;
+}
+
 // GetSchedulerSlots
 //------------------------------------------------------------------------------
 /*static*/ uint32_t TestGateway::GetSchedulerSlots( const Gateway & gateway )
 {
     MutexHolder mh( gateway.m_Mutex );
-    return gateway.m_Scheduler.GetTotalSlots();
+    return GetTotalSlots( gateway.m_Scheduler );
 }
 
 // DownstreamReportsDemandAndTakesItsAllowance
@@ -7122,7 +7135,7 @@ void TestGateway::GatewayPoolIsTheSumOfItsWorkerPools() const
     GatewayConfig config;
     MakeGatewayConfig( 2, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     // Their pools, not the shares they give the gateway, which are its slots on them
@@ -7148,7 +7161,7 @@ void TestGateway::WorkerWithoutSlotsLeavesTheScheduler() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     // A worker that offers nothing leaves the pool
@@ -7173,7 +7186,7 @@ void TestGateway::SharesMoveWithDemandThroughTheGateway() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
     Server & server = gateway.GetServer();
 
@@ -7215,7 +7228,7 @@ void TestGateway::ReducedAllowanceKeepsTheJobsAClientHolds() const
     MakeFailureConfig( 1, config );
     config.m_JobTimeoutSeconds = 600.0f;
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     // A has had the whole pool, and then half of it
@@ -7320,9 +7333,9 @@ void TestGateway::GatewayDemandSharesADownstreamWorker() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
-    TEST_ASSERT( WaitUntil( [ &worker ]() { MutexHolder mh( worker.m_ClientListMutex ); return ( worker.m_ClientList.GetSize() == 2 ) && ( worker.m_ClientList[ 1 ]->m_Demand == 0 ); } ) );
+    TEST_ASSERT( WaitUntil( [ &worker ]() { MutexHolder mh( worker.m_ClientListMutex ); return ( worker.m_ClientList.GetSize() == 2 ) && worker.m_ClientList[ 1 ]->m_HandshakeDone.Load() && ( worker.m_ClientList[ 1 ]->m_AllocatedCapacity == 0 ); } ) );
     TEST_ASSERT( WaitUntil( [ &other ]() { return ( other.GetLastAllowance() == 8 ); } ) );
 
     // While the gateway has jobs, the worker shares itself evenly between the two
@@ -7383,7 +7396,7 @@ void TestGateway::WorkerWithoutSlotsKeepsTheJobsItRuns() const
     GatewayConfig config;
     MakeGatewayConfig( 2, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -7422,7 +7435,7 @@ void TestGateway::WorkerBackWithSlotsCountsTheJobsItRuns() const
     GatewayConfig config;
     MakeGatewayConfig( 1, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     // Two running, one waiting
@@ -7464,7 +7477,7 @@ void TestGateway::LostWorkerWithoutSlotsHasItsJobsRetried() const
     GatewayConfig config;
     MakeGatewayConfig( 2, config );
     Gateway gateway( config );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 2 ) );
 
     DistributedTest::HandshakeProbe probe;
@@ -7673,7 +7686,7 @@ void TestGateway::JobsTheLocalPoolCannotTakeAreReturned() const
     GatewayConfig config;
     config.m_NoWorkerGiveUpSeconds = 1.0f;
     Gateway gateway( config, 1, 0 );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 1 );
 
     DistributedTest::HandshakeProbe probe;
@@ -7703,7 +7716,7 @@ void TestGateway::LocalToolchainWorkDoesNotHoldBackTheGateway() const
     const DistributedTest::RemoteCpusForTest oneCpu( 1 );
     GatewayConfig config;
     Gateway gateway( config, 1, 0 );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     DistributedTest::HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
@@ -7764,7 +7777,7 @@ void TestGateway::JobTheLocalPoolCannotTakeIsReturnedWhileOthersWaitForIt() cons
     GatewayConfig config;
     config.m_NoWorkerGiveUpSeconds = 2.0f;
     Gateway gateway( config, 8, 0 );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( fBuild.Build( "../tmp/Test/Distributed/dist.lib" ) );
     Array<uint64_t> toolIds;
     gateway.m_Stash.GetComplete( toolIds );
@@ -7859,7 +7872,7 @@ void TestGateway::RetryOfALocalJobWaitsForADroppedPch() const
     config.m_CacheDir.Clear();
     config.m_ReconnectSeconds = 0.2f;
     Gateway gateway( config, 1, 0 );
-    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 1 );
 
     DistributedTest::HandshakeProbe probe;
@@ -7941,7 +7954,7 @@ void TestGateway::LocalPoolIsOneMoreWorker() const
         TEST_ASSERT( fBuild.Initialize() );
         DeleteDistributedTestOutputs();
         Gateway gateway( config, 2, 0 );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
         TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == ( 2 + 1 ) );
         logPath = gateway.GetServer().GetLogPath();
@@ -7972,7 +7985,7 @@ void TestGateway::LocalPoolIsOneMoreWorker() const
         TEST_ASSERT( fBuild.Initialize() );
         DeleteDistributedTestOutputs();
         Gateway gateway( config, 2, 0 );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
         TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 1 );
 
@@ -8009,7 +8022,7 @@ void TestGateway::BuildOnTheGatewayAlone() const
     AStackString<> logPath;
     {
         Gateway gateway( config, 4, 0 );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 4 );
         logPath = gateway.GetServer().GetLogPath();
 
@@ -8055,7 +8068,7 @@ void TestGateway::JobsFailingDownstreamAreBuiltOnTheGateway() const
         EchoWorker echo( 1, EchoWorker::ANSWER_SYSTEM_ERROR );
         TEST_ASSERT( echo.Listen( kGatewayTestDownstreamPort ) );
         Gateway gateway( config, 4, 0 );
-        TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+        TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
         DistributedTest::DenyListPoller poller( fBuild );
@@ -8104,7 +8117,7 @@ void TestGateway::GatewayRestartMidBuildWithALocalPool() const
 
     GatewayConfig config; // No worker
     UniquePtr<Gateway> gateway( FNEW( Gateway( config, 1, 0 ) ) );
-    TEST_ASSERT( gateway.Get()->Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( gateway.Get()->GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( GetGatewayStats( *gateway.Get() ).m_PoolSlots == 1 );
 
     bool built = false;

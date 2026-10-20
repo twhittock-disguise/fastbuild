@@ -68,7 +68,6 @@ private:
         Array<uint32_t>     m_FileSizes;
         uint32_t            m_NumFilesHeld = 0;
         uint32_t            m_NumWrites = 0;        // In progress, outside the lock
-        uint32_t            m_NumUses = 0;
         uint64_t            m_LastUse = 0;
         bool                m_DropWhenIdle = false;
 

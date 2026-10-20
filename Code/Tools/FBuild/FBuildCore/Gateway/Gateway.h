@@ -64,7 +64,6 @@ public:
     explicit Gateway( const Gateway & other ) = delete;
     Gateway & operator=( const Gateway & other ) = delete;
 
-    bool Listen( uint16_t port );
     Server & GetServer();
 
     struct Stats
@@ -110,7 +109,7 @@ private:
     virtual void OnDownstreamReady( DownstreamConnection & connection ) override;
     virtual void OnDownstreamResult( DownstreamConnection & connection, bool compressed, void * payload, uint32_t payloadSize ) override;
     virtual void OnDownstreamLost( DownstreamConnection & connection ) override;
-    virtual void OnDownstreamCapacity( DownstreamConnection & connection, uint32_t allowance, uint32_t poolSlots ) override;
+    virtual void OnDownstreamCapacity( DownstreamConnection & connection ) override;
     virtual bool FindPch( uint64_t pchId, StoredPch & outPch, PchLease & outLease ) override;
     virtual bool FindToolchainFile( uint64_t toolId, uint32_t fileId, AString & outPath, uint32_t & outSize ) override;
     virtual uint32_t GetToolchainNumFiles( uint64_t toolId ) override;

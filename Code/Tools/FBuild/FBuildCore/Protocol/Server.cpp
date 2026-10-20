@@ -953,8 +953,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgDema
     uint32_t allowance = 0;
     {
         MutexHolder mh( m_ClientListMutex );
-        cs->m_Demand = msg->GetDemand();
-        m_Allocator.SetDemand( cs->m_Id, cs->m_Demand );
+        m_Allocator.SetDemand( cs->m_Id, msg->GetDemand() );
         ShareSlotsLocked( poolSlots );
         MarkCapacityChanged( *cs ); // Whether or not its allowance changed, so that it learns the pool
         allowance = cs->m_AllocatedCapacity;

@@ -182,7 +182,6 @@ private:
         Atomic<uint32_t> m_NumJobsActive;
         uint32_t m_AllocatedCapacity = 0; // The allowance. Under m_ClientListMutex.
         uint32_t m_MaxAllocatedCapacity = 0; // The largest allowance so far. Under m_ClientListMutex.
-        uint32_t m_Demand = FairShareAllocator::kInitialDemand; // The last reported. Under m_ClientListMutex.
         Atomic<bool> m_CapacityChanged{ false }; // The outbox is to send the allowance
         Atomic<bool> m_HandshakeDone{ false };   // The ack and the inventories have been sent: allowances may follow
 

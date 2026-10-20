@@ -214,13 +214,6 @@ Gateway::~Gateway()
     m_Server = nullptr;
 }
 
-// Listen
-//------------------------------------------------------------------------------
-bool Gateway::Listen( uint16_t port )
-{
-    return m_Server->Listen( port );
-}
-
 // GetServer
 //------------------------------------------------------------------------------
 Server & Gateway::GetServer()
@@ -657,7 +650,7 @@ void Gateway::ParkJobsWaitingForPch( uint64_t pchId, Actions & actions )
 
 // OnDownstreamCapacity
 //------------------------------------------------------------------------------
-/*virtual*/ void Gateway::OnDownstreamCapacity( DownstreamConnection & connection, uint32_t /*allowance*/, uint32_t /*poolSlots*/ )
+/*virtual*/ void Gateway::OnDownstreamCapacity( DownstreamConnection & connection )
 {
     Actions actions;
     {

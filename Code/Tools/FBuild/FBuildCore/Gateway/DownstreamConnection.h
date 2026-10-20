@@ -50,8 +50,7 @@ class DownstreamConnection : public TCPConnectionPool, private WorkerSendQueue::
 {
 public:
     // Called on the connection's threads, with none of its locks held. FindToolchainFile and GetToolchainNumFiles
-    // are also called by SendJob, on its caller's thread with m_SendJobMutex held: they must not wait for a lock
-    // that a caller of SendJob may hold.
+    // are also called by SendJob, on its caller's thread: they must not wait for a lock that its caller holds.
     class Owner
     {
     public:
@@ -61,8 +60,9 @@ public:
         virtual bool FindPch( uint64_t pchId, StoredPch & outPch, PchLease & outLease ) = 0;
         virtual bool FindToolchainFile( uint64_t toolId, uint32_t fileId, AString & outPath, uint32_t & outSize ) = 0;
         virtual uint32_t GetToolchainNumFiles( uint64_t toolId ) = 0;    // The Gateway answers from ToolchainStash::GetNumFiles
-        // A MSG_CAPACITY once the connection is ready. One that comes before is in what the connection reports when ready.
-        virtual void OnDownstreamCapacity( DownstreamConnection & /*connection*/, uint32_t /*allowance*/, uint32_t /*poolSlots*/ ) {}
+        // A MSG_CAPACITY once the connection is ready, read with GetAllowance and GetPoolSlots. One that comes
+        // before is in what the connection reports when ready.
+        virtual void OnDownstreamCapacity( DownstreamConnection & connection ) = 0;
     protected:
         ~Owner() = default;
     };
@@ -98,6 +98,7 @@ public:
     // chunk has been handed to the socket, because a worker asks for a PCH that a job needs and that it
     // neither holds nor is receiving. pchLease is kept while the PCH's chunks are queued. The toolchain's
     // files are asked of the owner (GetToolchainNumFiles, FindToolchainFile) on the caller's thread.
+    // One call at a time (the Gateway holds its mutex), so a job never goes ahead of its toolchain.
     void SendJob( const Protocol::MsgJob & msg, ConstMemoryStream && job, const StoredPch * pch, PchLease && pchLease );
 
     // A job that used the PCH completed on the worker: the PCH was there, so the times it was sent again
@@ -141,8 +142,6 @@ private:
     bool m_AckReceived = false;
     bool m_PchInventoryReceived = false;
     bool m_ToolchainInventoryReceived = false;
-
-    Mutex m_SendJobMutex; // One SendJob at a time, so a job never goes ahead of its toolchain
 
     struct JobWaitingForPch
     {

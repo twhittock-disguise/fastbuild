@@ -187,8 +187,6 @@ void DownstreamConnection::SendJob( const Protocol::MsgJob & msg, ConstMemoryStr
 {
     PchLease lease( Move( pchLease ) ); // Released on return unless the PCH's chunks are queued
 
-    MutexHolder sendJobLock( m_SendJobMutex );
-
     const uint64_t toolId = msg.GetToolId();
     bool queueToolchain = false;
     {
@@ -371,7 +369,7 @@ void DownstreamConnection::OnJobCompleted( uint64_t pchId )
                 m_PoolSlots.Store( msg->GetPoolSlots() );
                 if ( m_Ready.Load() ) // Before that, the owner reads them when told the connection is ready
                 {
-                    m_Owner.OnDownstreamCapacity( *this, allowance, msg->GetPoolSlots() );
+                    m_Owner.OnDownstreamCapacity( *this );
                 }
                 break;
             }
