@@ -1024,23 +1024,14 @@ void TestGateway::SendQueueStopsOnAFileItCannotRead() const
 
 // MakeResult
 //------------------------------------------------------------------------------
-// The layout Server::FinalizeCompletedJobs writes
 namespace
 {
     void MakeResult( MemoryStream & ms, uint32_t jobId, uint16_t threadIndex, const char * data, uint32_t dataSize )
     {
-        ms.Write( jobId );
-        ms.Write( AStackString( "obj/file.obj" ) );
-        ms.Write( true );
-        ms.Write( false );
         Array<AString> messages;
         messages.EmplaceBack( "first message" );
         messages.EmplaceBack( "second" );
-        ms.Write( messages );
-        ms.Write( (uint32_t)1234 );
-        ms.Write( threadIndex );
-        ms.Write( dataSize );
-        ms.WriteBuffer( data, dataSize );
+        Protocol::WriteJobResult( ms, jobId, AStackString( "obj/file.obj" ), true, false, messages, 1234, threadIndex, data, dataSize );
     }
 }
 
@@ -1048,25 +1039,34 @@ namespace
 //------------------------------------------------------------------------------
 void TestGateway::PeekJobReadsTheIdsOfASerializedJob() const
 {
-    // The layout Job::Serialize writes: id, name, working dir, node properties, data, pch id
-    MemoryStream ms;
-    ms.Write( (uint32_t)0xA1B2C3D4 );
-    ms.Write( AStackString( "obj/file.obj" ) );
-    ms.Write( AStackString( "C:\\work" ) );
-    ms.Write( (uint32_t)777 ); // Node properties
-    ms.Write( (uint32_t)5 );
-    ms.WriteBuffer( "hello", 5 );
-    ms.Write( (uint64_t)0x1122334455667788ull );
-
+    // A job as a client sends it, and what a worker reads of it
+    DistributedTest::CapturedJob captured;
+#if defined( __WINDOWS__ )
+    TEST_ASSERT( DistributedTest::CapturePchJob( captured, DistributedTest::kWaitTimeoutSeconds ) ); // PCH distribution is for MSVC
+#else
+    TEST_ASSERT( DistributedTest::CaptureJob( "../tmp/Test/Distributed/dist.lib", captured, DistributedTest::kWaitTimeoutSeconds ) );
+#endif
+    Array<char> & data = captured.m_Data;
     uint32_t jobId = 0;
     uint64_t pchId = 0;
-    TEST_ASSERT( GatewayWire::PeekJob( ms.GetData(), ms.GetSize(), jobId, pchId ) );
-    TEST_ASSERT( jobId == 0xA1B2C3D4 );
-    TEST_ASSERT( pchId == 0x1122334455667788ull );
+    {
+        ConstMemoryStream ms( data.Begin(), data.GetSize() );
+        const Job job( ms );
+        TEST_ASSERT( GatewayWire::PeekJob( data.Begin(), data.GetSize(), jobId, pchId ) );
+        TEST_ASSERT( ( jobId == job.GetJobId() ) && ( pchId == job.GetPchId() ) );
+    }
+
+    // The id the gateway gives it is the one the worker reads
+    GatewayWire::SetJobId( data.Begin(), data.GetSize(), jobId + 1000 );
+    {
+        ConstMemoryStream ms( data.Begin(), data.GetSize() );
+        const Job job( ms );
+        TEST_ASSERT( ( job.GetJobId() == ( jobId + 1000 ) ) && ( job.GetPchId() == pchId ) );
+    }
 
     // Too short to hold both
-    TEST_ASSERT( GatewayWire::PeekJob( ms.GetData(), GatewayWire::kMinJobSize - 1, jobId, pchId ) == false );
-    TEST_ASSERT( GatewayWire::PeekJob( ms.GetData(), GatewayWire::kMinJobSize, jobId, pchId ) );
+    TEST_ASSERT( GatewayWire::PeekJob( data.Begin(), GatewayWire::kMinJobSize - 1, jobId, pchId ) == false );
+    TEST_ASSERT( GatewayWire::PeekJob( data.Begin(), GatewayWire::kMinJobSize, jobId, pchId ) );
 }
 
 // SetJobIdChangesOnlyTheFirstFourBytes
@@ -3023,10 +3023,8 @@ namespace
         uint32_t GetNumPchCopies() const { MutexHolder mh( m_Mutex ); return m_NumPchCopies; } // Last chunks received
         void SetAnswer( Answer answer ) { MutexHolder mh( m_Mutex ); m_Answer = answer; }
 
-        // As a real Server does (Server::Process( MsgJob )): a job whose PCH is neither held nor being received
-        // makes the worker ask for it, once until a copy arrives
-        void AskForMissingPchs() { MutexHolder mh( m_Mutex ); m_AsksForMissingPchs = true; }
-        uint32_t GetNumPchAsks() const { MutexHolder mh( m_Mutex ); return m_NumPchAsks; }
+        // Jobs for a PCH that was neither advertised nor whole here when they arrived
+        uint32_t GetNumJobsAheadOfTheirPch() const { MutexHolder mh( m_Mutex ); return m_NumJobsAheadOfTheirPch; }
 
         // Those held on a connection that has ended were dropped with it
         void AnswerHeldJobs( Answer answer = ANSWER_OK )
@@ -3072,7 +3070,6 @@ namespace
                 MutexHolder mh( m_Mutex );
                 m_Connection = connection;
             }
-            m_Decoder.Replace( FNEW( JobStreamDecoder ) ); // A new connection starts a new job stream
             FakeWorker::Handshake( connection );
         }
 
@@ -3119,18 +3116,9 @@ namespace
                 MutexHolder mh( m_Mutex );
                 m_PchBytes += payloadSize;
                 m_NumPchCopies += isLast ? 1 : 0;
-                if ( isLast )
+                if ( isLast && ( m_HeldPchs.Find( msg.GetPchId() ) == nullptr ) )
                 {
-                    m_ReceivingPchs.FindAndErase( msg.GetPchId() );
-                    m_AskedPchs.FindAndErase( msg.GetPchId() );
-                    if ( m_HeldPchs.Find( msg.GetPchId() ) == nullptr )
-                    {
-                        m_HeldPchs.Append( msg.GetPchId() );
-                    }
-                }
-                else if ( m_ReceivingPchs.Find( msg.GetPchId() ) == nullptr )
-                {
-                    m_ReceivingPchs.Append( msg.GetPchId() );
+                    m_HeldPchs.Append( msg.GetPchId() );
                 }
             }
             else if ( ( message.GetType() == Protocol::MSG_JOB ) && payload )
@@ -3143,7 +3131,7 @@ namespace
         {
             void * job = nullptr;
             size_t jobSize = 0;
-            if ( m_Decoder.Get()->Decode( payload, payloadSize, job, jobSize ) == false )
+            if ( DecodeJob( connection, payload, payloadSize, job, jobSize ) == false )
             {
                 return;
             }
@@ -3160,18 +3148,13 @@ namespace
             }
 
             Answer answer;
-            bool askForPch = false;
             {
                 MutexHolder mh( m_Mutex );
                 m_Jobs.Append( received );
                 answer = m_Answer;
-                const uint64_t pchId = received.m_PchId;
-                if ( m_AsksForMissingPchs && ( pchId != 0 ) && ( m_HeldPchs.Find( pchId ) == nullptr ) &&
-                     ( m_ReceivingPchs.Find( pchId ) == nullptr ) && ( m_AskedPchs.Find( pchId ) == nullptr ) )
+                if ( ( received.m_PchId != 0 ) && ( m_HeldPchs.Find( received.m_PchId ) == nullptr ) )
                 {
-                    m_AskedPchs.Append( pchId );
-                    ++m_NumPchAsks;
-                    askForPch = true;
+                    ++m_NumJobsAheadOfTheirPch;
                 }
                 if ( answer == ANSWER_NEVER )
                 {
@@ -3180,10 +3163,6 @@ namespace
                     held.m_JobId = received.m_JobId;
                     held.m_Name = received.m_Name;
                 }
-            }
-            if ( askForPch )
-            {
-                Protocol::MsgPchNeeded( received.m_PchId ).Send( connection );
             }
             if ( answer == ANSWER_DISCONNECT )
             {
@@ -3203,16 +3182,8 @@ namespace
             {
                 messages.EmplaceBack( "echo worker failure" );
             }
-            MemoryStream ms;
-            ms.Write( jobId );
-            ms.Write( name );
-            ms.Write( ok );
-            ms.Write( answer == ANSWER_SYSTEM_ERROR );
-            ms.Write( messages );
-            ms.Write( (uint32_t)1 ); // Build time
-            ms.Write( m_ThreadIndex );
-            ms.Write( (uint32_t)name.GetLength() ); // The data: the name again
-            ms.WriteBuffer( name.Get(), name.GetLength() );
+            MemoryStream ms; // The data: the name again
+            Protocol::WriteJobResult( ms, jobId, name, ok, ( answer == ANSWER_SYSTEM_ERROR ), messages, 1, m_ThreadIndex, name.Get(), name.GetLength() );
             const Protocol::MsgJobResult result( 0 );
             result.Send( connection, ms );
         }
@@ -3227,11 +3198,7 @@ namespace
         uint64_t m_PchBytes = 0;
         uint32_t m_NumPchCopies = 0;
         Array<uint64_t> m_HeldPchs;         // Advertised, or a copy arrived
-        Array<uint64_t> m_ReceivingPchs;    // Some chunks arrived
-        Array<uint64_t> m_AskedPchs;        // Asked for, and no copy arrived since
-        bool m_AsksForMissingPchs = false;
-        uint32_t m_NumPchAsks = 0;
-        UniquePtr<JobStreamDecoder> m_Decoder;  // Receive thread
+        uint32_t m_NumJobsAheadOfTheirPch = 0;
         Atomic<bool> m_StallReading{ false };
         Semaphore m_StallSemaphore;
     };
@@ -3522,7 +3489,6 @@ void TestGateway::DownstreamSendsAJobOnlyBehindItsPch() const
     Array<uint64_t> tools;
     tools.Append( kDownstreamTool );
     EchoWorker worker( 4, EchoWorker::ANSWER_OK, Array<uint64_t>(), tools );
-    worker.AskForMissingPchs();
     TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
     RecordingOwner owner;
     const StoredPch small = WriteDownstreamPch( 0xB501, 5000 );
@@ -3541,7 +3507,7 @@ void TestGateway::DownstreamSendsAJobOnlyBehindItsPch() const
     TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 4 ); } ) );
     Thread::Sleep( 100 ); // A copy sent again would have arrived by now
 
-    TEST_ASSERT( worker.GetNumPchAsks() == 0 );
+    TEST_ASSERT( worker.GetNumJobsAheadOfTheirPch() == 0 );
     TEST_ASSERT( worker.GetNumPchCopies() == 2 );
     TEST_ASSERT( owner.GetNumPchLookups() == 0 );
     TEST_ASSERT( owner.GetNumLeases() == 0 );
@@ -7523,7 +7489,6 @@ void TestGateway::RetryOfALocalJobWaitsForADroppedPch() const
 
     // A worker that comes meanwhile is not sent the job without its PCH
     EchoWorker echo( 4 );
-    echo.AskForMissingPchs();
     TEST_ASSERT( echo.Listen( kGatewayTestDownstreamPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
     Thread::Sleep( 200 );
@@ -7534,7 +7499,7 @@ void TestGateway::RetryOfALocalJobWaitsForADroppedPch() const
     Array<DistributedTest::ReceivedResult> results;
     probe.GetResults( results );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
-    TEST_ASSERT( ( echo.GetNumJobs() == 1 ) && ( echo.GetNumPchCopies() == 1 ) && ( echo.GetNumPchAsks() == 0 ) );
+    TEST_ASSERT( ( echo.GetNumJobs() == 1 ) && ( echo.GetNumPchCopies() == 1 ) && ( echo.GetNumJobsAheadOfTheirPch() == 0 ) );
 }
 
 // LocalPoolIsOneMoreWorker

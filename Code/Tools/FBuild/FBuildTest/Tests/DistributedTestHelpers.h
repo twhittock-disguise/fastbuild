@@ -338,6 +338,10 @@ namespace DistributedTest
         {
             m_Stopping.Store( true );
             ShutdownAllConnections();
+            for ( const ConnectionState & state : m_Connections )
+            {
+                FDELETE state.m_Decoder;
+            }
         }
         explicit FakeWorker( const FakeWorker & other ) = delete;
         FakeWorker & operator=( const FakeWorker & other ) = delete;
@@ -412,6 +416,21 @@ namespace DistributedTest
             msg.Send( connection, payload );
         }
 
+        // The next job of the connection's job stream, from the payload of a MSG_JOB (FREE it). Called by the
+        // connection's receive thread, as a worker decodes it.
+        bool DecodeJob( const ConnectionInfo * connection, const void * payload, uint32_t payloadSize, void *& outJob, size_t & outJobSize )
+        {
+            JobStreamDecoder * decoder = nullptr;
+            {
+                MutexHolder mh( m_ConnectionsMutex );
+                for ( const ConnectionState & state : m_Connections )
+                {
+                    decoder = ( state.m_Connection == connection ) ? state.m_Decoder : decoder;
+                }
+            }
+            return decoder && decoder->Decode( payload, payloadSize, outJob, outJobSize );
+        }
+
         // Every message after the handshake. The payload is null for a message that has none.
         virtual void OnMessage( const ConnectionInfo * connection,
                                 const Protocol::IMessage & message,
@@ -466,6 +485,18 @@ namespace DistributedTest
             else if ( message->GetType() == Protocol::MSG_CONNECTION )
             {
                 {
+                    // A new connection starts a new job stream
+                    MutexHolder mh( m_ConnectionsMutex );
+                    for ( ConnectionState & state : m_Connections )
+                    {
+                        if ( state.m_Connection == connection )
+                        {
+                            FDELETE state.m_Decoder;
+                            state.m_Decoder = FNEW( JobStreamDecoder );
+                        }
+                    }
+                }
+                {
                     MutexHolder mh( m_ConnectionTimesMutex );
                     m_ConnectionTimes.Append( m_Timer.GetElapsed() );
                 }
@@ -493,6 +524,7 @@ namespace DistributedTest
         {
             const ConnectionInfo *      m_Connection = nullptr;
             const Protocol::IMessage *  m_Message = nullptr; // Its header, until its payload arrives
+            JobStreamDecoder *          m_Decoder = nullptr; // Its job stream, from its handshake on
         };
         mutable Mutex m_ConnectionsMutex;
         Array<ConnectionState> m_Connections;
@@ -1014,7 +1046,7 @@ namespace DistributedTest
         const CapturedJob & GetJob() const { return m_Job; } // Once there is one
 
     private:
-        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage & message, void * payload, uint32_t payloadSize ) override
+        virtual void OnMessage( const ConnectionInfo * connection, const Protocol::IMessage & message, void * payload, uint32_t payloadSize ) override
         {
             if ( ( message.GetType() != Protocol::MSG_JOB ) || m_HasJob.Load() )
             {
@@ -1022,7 +1054,7 @@ namespace DistributedTest
             }
             void * job = nullptr;
             size_t jobSize = 0;
-            if ( m_Decoder.Decode( payload, payloadSize, job, jobSize ) == false )
+            if ( DecodeJob( connection, payload, payloadSize, job, jobSize ) == false )
             {
                 return;
             }
@@ -1036,13 +1068,12 @@ namespace DistributedTest
             m_HasJob.Store( true );
         }
 
-        JobStreamDecoder m_Decoder;
         CapturedJob m_Job;
         Atomic<bool> m_HasJob{ false };
     };
 
-    // Runs a build that sends a job for a PCH to a worker, and keeps the job. False if none was sent in time.
-    inline bool CapturePchJob( CapturedJob & outJob, float timeoutSeconds )
+    // Runs a build of the target that sends a job to a worker, and keeps the job. False if none was sent in time.
+    inline bool CaptureJob( const char * target, CapturedJob & outJob, float timeoutSeconds )
     {
         FBuildTestOptions options;
         options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
@@ -1061,7 +1092,7 @@ namespace DistributedTest
         auto reached = [ &worker ]() { return worker.HasJob(); };
         {
             BuildAborter aborter( reached, timeoutSeconds );
-            fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
+            fBuild.Build( target );
         }
         worker.ShutdownAllConnections();
         if ( worker.HasJob() == false )
@@ -1071,7 +1102,13 @@ namespace DistributedTest
         outJob.m_ToolId = worker.GetJob().m_ToolId;
         outJob.m_PchId = worker.GetJob().m_PchId;
         outJob.m_Data = worker.GetJob().m_Data;
-        return ( outJob.m_ToolId != 0 ) && ( outJob.m_PchId != 0 );
+        return ( outJob.m_ToolId != 0 );
+    }
+
+    // A job for a PCH
+    inline bool CapturePchJob( CapturedJob & outJob, float timeoutSeconds )
+    {
+        return CaptureJob( "../tmp/Test/Distributed/distpch.lib", outJob, timeoutSeconds ) && ( outJob.m_PchId != 0 );
     }
 
     struct LocalBuildResult

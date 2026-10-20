@@ -2757,11 +2757,11 @@ namespace
             {
                 void * job = nullptr;
                 size_t jobSize = 0;
-                if ( m_Decoder.Decode( payload, payloadSize, job, jobSize ) )
+                if ( DecodeJob( connection, payload, payloadSize, job, jobSize ) )
                 {
-                    uint32_t jobId = 0; // The first thing a job holds
                     ConstMemoryStream js( job, jobSize );
-                    js.Read( jobId );
+                    const Job parsed( js );
+                    const uint32_t jobId = parsed.GetJobId();
                     FREE( job );
                     SendCorruptResult( connection, jobId );
                 }
@@ -2770,24 +2770,16 @@ namespace
 
         void SendCorruptResult( const ConnectionInfo * connection, uint32_t jobId )
         {
-            MemoryStream ms;
-            ms.Write( jobId );
-            ms.Write( AStackString( "corrupt" ) );
-            ms.Write( true );  // Built ok, so the data should be object files
-            ms.Write( false ); // Not a system error
-            ms.Write( Array<AString>() );
-            ms.Write( (uint32_t)0 ); // Build time
-            ms.Write( (uint16_t)0 ); // Thread
+            // Built ok, so the data should be object files
             char garbage[ 64 ];
             memset( garbage, 0xFF, sizeof( garbage ) );
-            ms.Write( (uint32_t)sizeof( garbage ) );
-            ms.WriteBuffer( garbage, sizeof( garbage ) );
+            MemoryStream ms;
+            Protocol::WriteJobResult( ms, jobId, AStackString( "corrupt" ), true, false, Array<AString>(), 0, 0, garbage, sizeof( garbage ) );
             const Protocol::MsgJobResultCompressed msg( 0 );
             msg.Send( connection, ms );
             m_NumResultsSent.Increment();
         }
 
-        JobStreamDecoder m_Decoder;
         Atomic<uint32_t> m_NumResultsSent{ 0 };
     };
 
@@ -2828,13 +2820,13 @@ namespace
             }
             void * job = nullptr;
             size_t jobSize = 0;
-            if ( m_Decoder.Decode( payload, payloadSize, job, jobSize ) == false )
+            if ( DecodeJob( connection, payload, payloadSize, job, jobSize ) == false )
             {
                 return;
             }
-            uint32_t jobId = 0; // The first thing a job holds
             ConstMemoryStream js( job, jobSize );
-            js.Read( jobId );
+            const Job parsed( js );
+            const uint32_t jobId = parsed.GetJobId();
             FREE( job );
             {
                 MutexHolder mh( m_Mutex );
@@ -2842,24 +2834,16 @@ namespace
             }
             m_NumJobs.Increment();
 
-            // Laid out as Server::FinalizeCompletedJobs writes it
-            MemoryStream ms;
-            ms.Write( jobId );
-            ms.Write( AStackString( "given up" ) );
-            ms.Write( false ); // Not built
-            ms.Write( true );  // A system error
+            // Not built, a system error
             Array<AString> messages;
             messages.EmplaceBack( "no result after 3 attempts" );
-            ms.Write( messages );
-            ms.Write( (uint32_t)0 ); // Build time
-            ms.Write( (uint16_t)0 ); // Thread
-            ms.Write( (uint32_t)0 ); // No data
+            MemoryStream ms;
+            Protocol::WriteJobResult( ms, jobId, AStackString( "given up" ), false, true, messages, 0, 0, nullptr, 0 );
             const Protocol::MsgJobResultCompressed msg( m_Flags );
             msg.Send( connection, ms );
         }
 
         const uint8_t m_Flags;
-        JobStreamDecoder m_Decoder;
         mutable Mutex m_Mutex;
         Array<uint32_t> m_JobIds; // In the order they arrived
         Atomic<uint32_t> m_NumJobs{ 0 };
@@ -4635,7 +4619,7 @@ namespace
             {
                 void * job = nullptr;
                 size_t jobSize = 0;
-                if ( m_Decoder.Decode( payload, payloadSize, job, jobSize ) )
+                if ( DecodeJob( connection, payload, payloadSize, job, jobSize ) )
                 {
                     ConstMemoryStream ms( job, jobSize );
                     const Job parsed( ms );
@@ -4709,25 +4693,16 @@ namespace
         void SendResult( const ConnectionInfo * connection, uint32_t jobId )
         {
             // A result that is not valid compressed data: the job fails, but it is finished, which is what is looked at
-            MemoryStream ms;
-            ms.Write( jobId );
-            ms.Write( AStackString( "lost" ) );
-            ms.Write( true );  // Built ok, so the data should be object files
-            ms.Write( false ); // Not a system error
-            ms.Write( Array<AString>() );
-            ms.Write( (uint32_t)0 ); // Build time
-            ms.Write( (uint16_t)0 ); // Thread
             char garbage[ 64 ];
             memset( garbage, 0xFF, sizeof( garbage ) );
-            ms.Write( (uint32_t)sizeof( garbage ) );
-            ms.WriteBuffer( garbage, sizeof( garbage ) );
+            MemoryStream ms;
+            Protocol::WriteJobResult( ms, jobId, AStackString( "lost" ), true, false, Array<AString>(), 0, 0, garbage, sizeof( garbage ) );
             const Protocol::MsgJobResultCompressed msg( 0 );
             msg.Send( connection, ms );
             m_NumResultsSent.Increment();
         }
 
         const Mode m_Mode;
-        JobStreamDecoder m_Decoder;
         Array<HeldJob> m_Held;
         Array<uint64_t> m_Lost;     // PCHs a copy was received of and dropped
         Array<uint64_t> m_Kept;
