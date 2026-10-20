@@ -15,6 +15,7 @@
 #include "Core/Env/Assert.h"
 #include "Core/Env/Types.h"
 #include "Core/FileIO/ConstMemoryStream.h"
+#include "Core/Math/Conversions.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Profile/Profile.h"
 #include "Core/Strings/AStackString.h"
@@ -365,11 +366,12 @@ void DownstreamConnection::OnJobCompleted( uint64_t pchId )
             case Protocol::MSG_CAPACITY:
             {
                 const Protocol::MsgCapacity * msg = static_cast<const Protocol::MsgCapacity *>( imsg );
-                m_Allowance.Store( msg->GetAllowance() );
+                const uint32_t allowance = Math::Min( msg->GetAllowance(), msg->GetPoolSlots() ); // No more than there is
+                m_Allowance.Store( allowance );
                 m_PoolSlots.Store( msg->GetPoolSlots() );
                 if ( m_Ready.Load() ) // Before that, the owner reads them when told the connection is ready
                 {
-                    m_Owner.OnDownstreamCapacity( *this, msg->GetAllowance(), msg->GetPoolSlots() );
+                    m_Owner.OnDownstreamCapacity( *this, allowance, msg->GetPoolSlots() );
                 }
                 break;
             }
@@ -414,21 +416,34 @@ bool DownstreamConnection::ProcessInventory( const void * payload, size_t payloa
     received = true;
 
     const uint64_t * ids = static_cast<const uint64_t *>( payload );
+    const uint32_t numTaken = Math::Min( numEntries, kMaxInventoryEntries );
+    if ( isPch )
     {
         MutexHolder mh( m_Mutex );
-        if ( isPch )
+        m_PchState.OnInventory( ids, numTaken );
+    }
+    else
+    {
+        // Sorted with no lock held, then merged with those known
+        Array<uint64_t> reported;
+        reported.Append( ids, ids + numTaken );
+        reported.Sort();
+        MutexHolder mh( m_Mutex );
+        Array<uint64_t> known( m_Toolchains );
+        known.Sort();
+        size_t k = 0;
+        for ( size_t i = 0; i < reported.GetSize(); ++i )
         {
-            m_PchState.OnInventory( ids, numEntries );
-        }
-        else
-        {
-            for ( uint32_t i = 0; i < numEntries; ++i )
+            const uint64_t toolId = reported[ i ];
+            while ( ( k < known.GetSize() ) && ( known[ k ] < toolId ) )
             {
-                if ( m_Toolchains.Find( ids[ i ] ) == nullptr )
-                {
-                    m_Toolchains.Append( ids[ i ] );
-                }
+                ++k;
             }
+            if ( ( ( i > 0 ) && ( reported[ i - 1 ] == toolId ) ) || ( ( k < known.GetSize() ) && ( known[ k ] == toolId ) ) )
+            {
+                continue;
+            }
+            m_Toolchains.Append( toolId );
         }
     }
 

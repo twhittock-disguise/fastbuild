@@ -14,12 +14,29 @@
 class PchSendState
 {
 public:
-    // The worker reports the PCHs it has cached
+    // The worker reports the PCHs it has cached. Each is looked for among those known in sorted copies, so a long
+    // inventory costs no search per id.
     void OnInventory( const uint64_t * pchIds, size_t numPchIds )
     {
-        for ( size_t i = 0; i < numPchIds; ++i )
+        Array<uint64_t> reported;
+        reported.Append( pchIds, pchIds + numPchIds );
+        reported.Sort();
+        Array<uint64_t> held( m_OnWorker );
+        held.Sort();
+        size_t h = 0;
+        for ( size_t i = 0; i < reported.GetSize(); ++i )
         {
-            OnDelivered( pchIds[ i ] );
+            const uint64_t pchId = reported[ i ];
+            while ( ( h < held.GetSize() ) && ( held[ h ] < pchId ) )
+            {
+                ++h;
+            }
+            if ( ( ( i > 0 ) && ( reported[ i - 1 ] == pchId ) ) || ( ( h < held.GetSize() ) && ( held[ h ] == pchId ) ) )
+            {
+                continue;
+            }
+            m_Sending.FindAndErase( pchId );
+            m_OnWorker.Append( pchId );
         }
     }
 

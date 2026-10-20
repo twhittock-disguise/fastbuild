@@ -445,6 +445,8 @@ private:
     void DownstreamAskingForAnUnknownPchIsClosed() const;
     void DownstreamIgnoresARequestForAnUnknownToolchain() const;
     void DownstreamThatCannotReadWhatItSendsIsClosed() const;
+    void DownstreamTakesABoundedInventory() const;
+    void DownstreamAllowanceIsWithinThePool() const;
     void DownstreamOfAnotherMajorIsLost() const;
     void UnreachableDownstreamIsLost() const;
     void GatewayAdvertisesTheSumOfItsWorkers() const;
@@ -643,6 +645,8 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( DownstreamAskingForAnUnknownPchIsClosed )
     REGISTER_TEST( DownstreamIgnoresARequestForAnUnknownToolchain )
     REGISTER_TEST( DownstreamThatCannotReadWhatItSendsIsClosed )
+    REGISTER_TEST( DownstreamTakesABoundedInventory )
+    REGISTER_TEST( DownstreamAllowanceIsWithinThePool )
     REGISTER_TEST( DownstreamOfAnotherMajorIsLost )
     REGISTER_TEST( UnreachableDownstreamIsLost )
     REGISTER_TEST( GatewayAdvertisesTheSumOfItsWorkers )
@@ -3936,6 +3940,56 @@ void TestGateway::DownstreamThatCannotReadWhatItSendsIsClosed() const
     TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
     const char * reason = connection.GetCloseReason();
     TEST_ASSERT( reason && ( strcmp( reason, "send" ) == 0 ) );
+}
+
+// DownstreamTakesABoundedInventory
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamTakesABoundedInventory() const
+{
+    // More ids than are taken, some of them twice
+    const uint32_t numIds = DownstreamConnection::kMaxInventoryEntries + 100;
+    Array<uint64_t> pchs;
+    Array<uint64_t> tools;
+    for ( uint32_t i = 0; i < numIds; ++i )
+    {
+        pchs.Append( 0xC000 + i );
+        tools.Append( 0xD000 + i );
+    }
+    pchs[ 1 ] = pchs[ 0 ];
+    tools[ 1 ] = tools[ 0 ];
+    EchoWorker worker( 4, EchoWorker::ANSWER_OK, pchs, tools );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+    // The first ones are held, those beyond the bound are not known
+    const uint64_t lastTaken = ( DownstreamConnection::kMaxInventoryEntries - 1 );
+    TEST_ASSERT( connection.GetAffinity( 0xC000, 0xD000 ) == GatewayScheduler::AFFINITY_HOLDS );
+    TEST_ASSERT( connection.GetAffinity( 0xC000 + lastTaken, 0xD000 + lastTaken ) == GatewayScheduler::AFFINITY_HOLDS );
+    TEST_ASSERT( connection.GetAffinity( 0xC000 + numIds - 1, 0 ) == GatewayScheduler::AFFINITY_NONE );
+    TEST_ASSERT( connection.GetAffinity( 0, 0xD000 + numIds - 1 ) == GatewayScheduler::AFFINITY_NONE );
+    TEST_ASSERT( connection.HasEnded() == false );
+}
+
+// DownstreamAllowanceIsWithinThePool
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamAllowanceIsWithinThePool() const
+{
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+    // A worker that gives more than its pool gives its pool
+    worker.SendCapacity( 10, 6 );
+    Array<uint32_t> updates;
+    TEST_ASSERT( WaitUntil( [ &owner, &updates ]() { owner.GetCapacityUpdates( updates ); return ( updates.GetSize() == 2 ); } ) );
+    TEST_ASSERT( ( updates[ 0 ] == 6 ) && ( updates[ 1 ] == 6 ) );
+    TEST_ASSERT( ( connection.GetAllowance() == 6 ) && ( connection.GetPoolSlots() == 6 ) );
 }
 
 // DownstreamOfAnotherMajorIsLost
