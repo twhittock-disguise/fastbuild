@@ -61,27 +61,6 @@
 
 // TestDistributed
 //------------------------------------------------------------------------------
-using DistributedTest::FakeWorker;
-using DistributedTest::HandshakeProbe;
-using DistributedTest::PchSender;
-using DistributedTest::CompressedPch;
-using DistributedTest::BuildAborter;
-using DistributedTest::DenyListPoller;
-using DistributedTest::LocalBuildResult;
-using DistributedTest::BuildPchLocal;
-using DistributedTest::MakeTestContent;
-using DistributedTest::CompressPch;
-using DistributedTest::MakeCompressedPch;
-using DistributedTest::SendPch;
-using DistributedTest::GetStatsLogPath;
-using DistributedTest::GetStatsLogSize;
-using DistributedTest::CountInStatsLogSince;
-using DistributedTest::MakeDistributedPchOptions;
-using DistributedTest::ClearWorkerPchStore;
-using DistributedTest::ReadStats;
-using DistributedTest::RemoteCpusForTest;
-using DistributedTest::CapturedJob;
-
 namespace
 {
     class RecordingWorker;
@@ -243,9 +222,6 @@ private:
                      bool shouldFail = false,
                      bool allowRace = false ) const;
 
-    // Handshakes with the Server on the test port, and waits for the ack and the inventories
-    static const ConnectionInfo * ConnectProbe( HandshakeProbe & probe );
-
     // Reduces the allowance of a Server's one client once it has kFullAllowance jobs, and records the most it
     // has before, and once it has come down to kReducedAllowance (settled)
     struct AllowanceReduction
@@ -261,23 +237,6 @@ private:
         Atomic<uint64_t>    m_LogSizeWhenSettled{ 0 };   // Of the Server's log
     };
     static uint32_t ReduceTheAllowanceWhenFull( void * param );
-
-    // Waits for something that happens on another thread
-    static constexpr float kWaitTimeoutSeconds = 30.0f;
-    template <class CONDITION>
-    static bool WaitUntil( const CONDITION & condition, float timeoutSeconds = kWaitTimeoutSeconds )
-    {
-        const Timer timer;
-        while ( condition() == false )
-        {
-            if ( timer.GetElapsed() > timeoutSeconds )
-            {
-                return false;
-            }
-            Thread::Sleep( 1 );
-        }
-        return true;
-    }
 
     // PchDataCache helpers
     struct CompressionRequest
@@ -323,7 +282,7 @@ private:
     // A worker that makes room for another PCH when its second job arrives
     static void EvictForTheSecondJob( Server & server, void * user );
 
-    void CapturePchJob( CapturedJob & outJob ) const;
+    void CapturePchJob( DistributedTest::CapturedJob & outJob ) const;
 
     // The compressed PCH store, and the working copies of its PCHs
     struct StoredPch
@@ -867,7 +826,7 @@ void TestDistributed::PchStartupScanAppliesTheBudget() const
 
 /*static*/ bool TestDistributed::WriteTestFile( const char * path, uint32_t size, Array<char> & outContent, uint32_t seed )
 {
-    MakeTestContent( size, seed, outContent );
+    DistributedTest::MakeTestContent( size, seed, outContent );
 
     if ( FileIO::EnsurePathExistsForFile( AStackString<>( path ) ) == false )
     {
@@ -883,7 +842,7 @@ void TestDistributed::PchStartupScanAppliesTheBudget() const
                                                                               uint64_t & outSize )
 {
     PchDataCache::CompressedState state = PchDataCache::COMPRESSING;
-    WaitUntil( [ & ]()
+    DistributedTest::WaitUntil( [ & ]()
     {
         state = cache.GetCompressed( entry, outFilePath, outSize );
         return ( state != PchDataCache::COMPRESSING );
@@ -980,7 +939,7 @@ void TestDistributed::PchCompressRetry() const
         const AStackString<> path( "../tmp/Test/Distributed/PchCompressRetry/appears.pch" );
         const uint32_t fileSize = ( 1 * MEGABYTE );
         FileIO::FileDelete( path.Get() );
-        MakeTestContent( fileSize, 0, content );
+        DistributedTest::MakeTestContent( fileSize, 0, content );
 
         PchDataCache::Entry entry;
         entry.pchId = PchId::Calc( content.Begin(), fileSize );
@@ -992,7 +951,7 @@ void TestDistributed::PchCompressRetry() const
         uint64_t size = 0;
         TEST_ASSERT( cache.GetCompressed( entry, filePath, size ) == PchDataCache::COMPRESSING );
 
-        TEST_ASSERT( WaitUntil( [ & ]() { return ( cache.GetFailedAttempts( entry.pchId ) != 0 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return ( cache.GetFailedAttempts( entry.pchId ) != 0 ); } ) );
         TEST_ASSERT( cache.GetFailedAttempts( entry.pchId ) == 1 );
         TEST_ASSERT( WriteTestFile( path.Get(), fileSize, content ) );
 
@@ -1102,7 +1061,7 @@ void TestDistributed::PchTakeReadyPchs() const
     pending.Append( kWorkerHasIt );
     onWorker.Append( kWorkerHasIt ); // Reported in the worker's inventory
     bool allOk = true;
-    TEST_ASSERT( WaitUntil( [ & ]()
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]()
     {
         if ( cache.TakeReadyPchs( pending, onWorker, ready ) == false )
         {
@@ -2073,13 +2032,13 @@ void TestDistributed::PayloadsAcceptedByWorker() const
 
     Server worker( 1 );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
     const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)dataSize, Protocol::kPchChunkSize );
     TEST_ASSERT( sender.SendChunks( entry.pchId, fileSize, data.Begin(), (uint32_t)dataSize, Protocol::kPchChunkSize, 0, numChunks ) );
 
     AStackString<> cachedPath;
-    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( entry.pchId, cachedPath ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return worker.FindCachedPch( entry.pchId, cachedPath ); } ) );
 
     // The worker keeps it as it was sent, compressed
     {
@@ -2120,7 +2079,7 @@ void TestDistributed::PayloadsAcceptedByWorker() const
         TEST_ASSERT( randomChunks >= 4 );
         TEST_ASSERT( sender.SendChunks( randomEntry.pchId, randomEntry.uncompressedSize, randomData.Begin(), (uint32_t)randomDataSize, Protocol::kPchChunkSize, 0, randomChunks ) );
         AStackString<> randomCached;
-        TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( randomEntry.pchId, randomCached ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return worker.FindCachedPch( randomEntry.pchId, randomCached ); } ) );
         FileStream f;
         TEST_ASSERT( f.Open( randomCached.Get(), FileStream::READ_ONLY ) );
         TEST_ASSERT( f.GetFileSize() == randomDataSize );
@@ -2158,12 +2117,12 @@ void TestDistributed::PchChunksReachTheWorker() const
 
     Server worker( 1 );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
     TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, numChunks ) );
 
     AStackString<> cachedPath;
-    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, cachedPath ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, cachedPath ); } ) );
     FileStream f;
     TEST_ASSERT( f.Open( cachedPath.Get(), FileStream::READ_ONLY ) );
     TEST_ASSERT( f.GetFileSize() == compressedSize );
@@ -2200,20 +2159,20 @@ void TestDistributed::PchLeftHalfSentIsDropped() const
 
     // The connection ends with half of the PCH sent
     {
-        PchSender sender;
+        DistributedTest::PchSender sender;
         TEST_ASSERT( sender.ConnectToWorker() );
-        TEST_ASSERT( WaitUntil( [ & ]() { return numClients() == 1; } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return numClients() == 1; } ) );
         TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, 2 ) );
 
         // Both chunks have been taken in by the worker
-        TEST_ASSERT( WaitUntil( [ & ]()
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]()
         {
             MutexHolder mh( worker.m_ClientListMutex );
             return ( worker.m_ClientList.GetSize() == 1 ) && ( worker.m_ClientList[ 0 ]->m_PchReceiver.GetNumChunksReceived() >= 2 );
         } ) );
 
         sender.DisconnectFromWorker();
-        TEST_ASSERT( WaitUntil( [ & ]() { return numClients() == 0; } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return numClients() == 0; } ) );
     }
 
     // Nothing is on disk, and the worker does not have the PCH
@@ -2224,10 +2183,10 @@ void TestDistributed::PchLeftHalfSentIsDropped() const
     TEST_ASSERT( worker.FindCachedPch( pchId, cachedPath ) == false );
 
     // It is sent again from the start
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
     TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, numChunks ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, cachedPath ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, cachedPath ); } ) );
 }
 
 // WorkerLogRecordsABuild
@@ -2235,11 +2194,11 @@ void TestDistributed::PchLeftHalfSentIsDropped() const
 void TestDistributed::WorkerLogRecordsABuild() const
 {
     FBuildTestOptions options;
-    MakeDistributedPchOptions( options );
+    DistributedTest::MakeDistributedPchOptions( options );
     options.m_ForceCleanBuild = true;
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
-    ClearWorkerPchStore(); // Else the PCH is found on the worker and not received
+    DistributedTest::ClearWorkerPchStore(); // Else the PCH is found on the worker and not received
 
     Array<AString> files;
     FileIO::GetFiles( AStackString( "../tmp/Test/Distributed" ), AStackString( "*.*" ), true, &files );
@@ -2259,18 +2218,18 @@ void TestDistributed::WorkerLogRecordsABuild() const
     {
         Server worker( 1 );
         logPath = worker.GetLogPath();
-        sizeBefore = GetStatsLogSize( logPath );
+        sizeBefore = DistributedTest::GetStatsLogSize( logPath );
         TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
         TEST_ASSERT( fBuild.Build( "../tmp/Test/Distributed/distpch.lib" ) );
         TEST_ASSERT( FileIO::FileExists( "../tmp/Test/Distributed/distpch.lib" ) );
 
         TEST_ASSERT( FileIO::FileExists( logPath.Get() ) );
-        isLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] connect ", numConnects );
-        isLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] pch received id=0x", numPchsReceived ) && isLogComplete;
-        isLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] job received ", numJobsReceived ) && isLogComplete;
-        isLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] job finished ", numJobsFinished ) && isLogComplete;
+        isLogComplete = DistributedTest::CountInStatsLogSince( logPath, sizeBefore, "] connect ", numConnects );
+        isLogComplete = DistributedTest::CountInStatsLogSince( logPath, sizeBefore, "] pch received id=0x", numPchsReceived ) && isLogComplete;
+        isLogComplete = DistributedTest::CountInStatsLogSince( logPath, sizeBefore, "] job received ", numJobsReceived ) && isLogComplete;
+        isLogComplete = DistributedTest::CountInStatsLogSince( logPath, sizeBefore, "] job finished ", numJobsFinished ) && isLogComplete;
     }
-    const bool isDisconnectLogComplete = CountInStatsLogSince( logPath, sizeBefore, "] disconnect ", numDisconnects );
+    const bool isDisconnectLogComplete = DistributedTest::CountInStatsLogSince( logPath, sizeBefore, "] disconnect ", numDisconnects );
 
     // A log that was rotated since is not all there: nothing is asserted of it
     if ( isLogComplete && isDisconnectLogComplete )
@@ -2289,7 +2248,7 @@ void TestDistributed::PchInChunksThroughTheBuild() const
 {
     // The PCH of the library is sent in pieces far smaller than usual
     FBuildTestOptions options;
-    MakeDistributedPchOptions( options ); // No local race: the PCH is made in a time that a local build of the objects can beat
+    DistributedTest::MakeDistributedPchOptions( options ); // No local race: the PCH is made in a time that a local build of the objects can beat
     options.m_DistributionPchChunkSize = Protocol::kMinPchChunkSize;
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
@@ -2317,7 +2276,7 @@ void TestDistributed::PchInChunksThroughTheBuild() const
     uint32_t numMessages = 0;
     uint64_t rawBytes = 0;
     uint64_t sentBytes = 0;
-    ReadStats( logPath, "  pch: ", numConnections, rawBytes, sentBytes, &numMessages );
+    DistributedTest::ReadStats( logPath, "  pch: ", numConnections, rawBytes, sentBytes, &numMessages );
     TEST_ASSERT( numConnections == 1 );
     TEST_ASSERT( numMessages >= 3 );
 
@@ -2691,7 +2650,7 @@ void TestDistributed::JobStreamAcrossReconnect() const
     uint32_t numConnections;
     uint64_t rawBytes;
     uint64_t sentBytes;
-    ReadStats( logPath, "  jobs: ", numConnections, rawBytes, sentBytes );
+    DistributedTest::ReadStats( logPath, "  jobs: ", numConnections, rawBytes, sentBytes );
     TEST_ASSERT( numConnections >= 2 );
     TEST_ASSERT( rawBytes > 0 );
 
@@ -2767,7 +2726,7 @@ void TestDistributed::ResultsAreCompressed() const
     uint32_t numConnections;
     uint64_t rawBytes;
     uint64_t receivedBytes;
-    ReadStats( logPath, "  results: ", numConnections, rawBytes, receivedBytes );
+    DistributedTest::ReadStats( logPath, "  results: ", numConnections, rawBytes, receivedBytes );
     TEST_ASSERT( numConnections >= 1 );
     TEST_ASSERT( rawBytes >= 32768 );
     TEST_ASSERT( receivedBytes > 0 );
@@ -2779,10 +2738,10 @@ void TestDistributed::ResultsAreCompressed() const
 namespace
 {
     // A worker that answers every job with a result that is not valid compressed data
-    class CorruptResultWorker : public FakeWorker
+    class CorruptResultWorker : public DistributedTest::FakeWorker
     {
     public:
-        CorruptResultWorker() : FakeWorker( 4 ) {}
+        CorruptResultWorker() : DistributedTest::FakeWorker( 4 ) {}
         explicit CorruptResultWorker( const CorruptResultWorker & other ) = delete;
         CorruptResultWorker & operator=( const CorruptResultWorker & other ) = delete;
 
@@ -2833,10 +2792,10 @@ namespace
     };
 
     // A worker with one slot that answers every job with a system error, sent with the given result flags
-    class GiveUpWorker : public FakeWorker
+    class GiveUpWorker : public DistributedTest::FakeWorker
     {
     public:
-        explicit GiveUpWorker( uint8_t flags ) : FakeWorker( 1 ), m_Flags( flags ) {}
+        explicit GiveUpWorker( uint8_t flags ) : DistributedTest::FakeWorker( 1 ), m_Flags( flags ) {}
         explicit GiveUpWorker( const GiveUpWorker & other ) = delete;
         GiveUpWorker & operator=( const GiveUpWorker & other ) = delete;
 
@@ -2925,9 +2884,9 @@ void TestDistributed::ClientRequeuesAGatewayReturnedResultWithoutDenyListing() c
 
     bool built = true;
     {
-        DenyListPoller poller( fBuild );
+        DistributedTest::DenyListPoller poller( fBuild );
         auto never = []() { return false; };
-        BuildAborter aborter( never, kWaitTimeoutSeconds );
+        DistributedTest::BuildAborter aborter( never, DistributedTest::kWaitTimeoutSeconds );
         built = fBuild.Build( "../tmp/Test/Distributed/dist.lib" );
         worker.ShutdownAllConnections();
         TEST_ASSERT( aborter.HasTimedOut() == false );
@@ -2959,7 +2918,7 @@ void TestDistributed::ClientStillDenyListsAPlainSystemError() const
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
     // Once the only worker is deny-listed, nothing takes the requeued job, so the build is stopped
-    DenyListPoller poller( fBuild );
+    DistributedTest::DenyListPoller poller( fBuild );
     Atomic<bool> denyListed( false );
     Timer sinceDenyListed;
     auto settled = [ &poller, &denyListed, &sinceDenyListed ]()
@@ -2976,7 +2935,7 @@ void TestDistributed::ClientStillDenyListsAPlainSystemError() const
         return ( sinceDenyListed.GetElapsed() >= 1.0f );
     };
     {
-        BuildAborter aborter( settled, kWaitTimeoutSeconds );
+        DistributedTest::BuildAborter aborter( settled, DistributedTest::kWaitTimeoutSeconds );
         const bool built = fBuild.Build( "../tmp/Test/Distributed/dist.lib" );
         worker.ShutdownAllConnections();
         TEST_ASSERT( aborter.HasReached() );
@@ -3003,7 +2962,7 @@ void TestDistributed::DenyListedWorkerIsAskedForNothing() const
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
     // Jobs still wait once the worker is deny-listed, and its demand goes to 0, so it keeps no share of its slots
-    DenyListPoller poller( fBuild );
+    DistributedTest::DenyListPoller poller( fBuild );
     auto askedForNothing = [ &poller, &worker ]()
     {
         Array<uint32_t> demands;
@@ -3012,7 +2971,7 @@ void TestDistributed::DenyListedWorkerIsAskedForNothing() const
     };
     bool reached = false;
     {
-        BuildAborter aborter( askedForNothing, kWaitTimeoutSeconds );
+        DistributedTest::BuildAborter aborter( askedForNothing, DistributedTest::kWaitTimeoutSeconds );
         const bool built = fBuild.Build( "../tmp/Test/Distributed/dist.lib" );
         worker.ShutdownAllConnections();
         reached = aborter.HasReached();
@@ -3108,12 +3067,12 @@ void TestDistributed::CorruptResultIsRejected() const
     cs->m_SendMutex.Lock();
 
     // The job arrives and is built, but its result has to wait to be sent
-    const bool jobArrived = WaitUntil( [ cs ]() { return ( cs->m_NumJobsActive.Load() > 0 ); } );
-    hold->m_ReachedSend.Store( jobArrived && WaitUntil( [ cs ]() { return ( cs->m_NumJobsActive.Load() == 0 ); } ) );
+    const bool jobArrived = DistributedTest::WaitUntil( [ cs ]() { return ( cs->m_NumJobsActive.Load() > 0 ); } );
+    hold->m_ReachedSend.Store( jobArrived && DistributedTest::WaitUntil( [ cs ]() { return ( cs->m_NumJobsActive.Load() == 0 ); } ) );
     if ( hold->m_ReachedSend.Load() )
     {
         // What guards the connection's jobs is another lock: jobs can still be received meanwhile
-        hold->m_StateMutexFree.Store( WaitUntil( [ cs ]()
+        hold->m_StateMutexFree.Store( DistributedTest::WaitUntil( [ cs ]()
         {
             if ( cs->m_Mutex.TryLock() )
             {
@@ -3178,13 +3137,13 @@ namespace
 {
     // A worker that completes the handshake, records what it is sent and never answers. With
     // kNoCapacity no job (and no PCH) is ever sent to it.
-    class RecordingWorker : public FakeWorker
+    class RecordingWorker : public DistributedTest::FakeWorker
     {
     public:
         static constexpr uint32_t kNoCapacity = 0;
 
         explicit RecordingWorker( uint32_t capacity, const Array<uint64_t> & toolchainInventory = Array<uint64_t>() )
-            : FakeWorker( capacity, toolchainInventory )
+            : DistributedTest::FakeWorker( capacity, toolchainInventory )
         {
         }
         explicit RecordingWorker( const RecordingWorker & other ) = delete;
@@ -3255,7 +3214,7 @@ namespace
 void TestDistributed::BuildPchLibraryUntilStopped( RecordingWorker & worker, int when ) const
 {
     FBuildTestOptions options;
-    MakeDistributedPchOptions( options );
+    DistributedTest::MakeDistributedPchOptions( options );
     options.m_ForceCleanBuild = true;
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
@@ -3267,7 +3226,7 @@ void TestDistributed::BuildPchLibraryUntilStopped( RecordingWorker & worker, int
         return ( when == BuildStop::TOOLCHAIN_ARRIVES ) ? ( ( worker.GetNumManifests() >= 1 ) && ( worker.GetNumFiles() >= 1 ) )
                                                         : ( worker.GetNumPchFiles() >= 1 );
     };
-    BuildAborter aborter( reached, kWaitTimeoutSeconds );
+    DistributedTest::BuildAborter aborter( reached, DistributedTest::kWaitTimeoutSeconds );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
     worker.ShutdownAllConnections();
 
@@ -3297,7 +3256,7 @@ void TestDistributed::BuildUntilPchSettles( uint32_t capacity, uint32_t & outNum
     constexpr float kSettleSeconds = 5.0f; // Far longer than a client that sends the PCH takes
     constexpr float kBuildTimeoutSeconds = 60.0f;
     FBuildTestOptions options;
-    MakeDistributedPchOptions( options );
+    DistributedTest::MakeDistributedPchOptions( options );
     options.m_ForceCleanBuild = true;
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
@@ -3325,7 +3284,7 @@ void TestDistributed::BuildUntilPchSettles( uint32_t capacity, uint32_t & outNum
     bool built = true;
     bool reached = false;
     {
-        BuildAborter aborter( settled, kBuildTimeoutSeconds );
+        DistributedTest::BuildAborter aborter( settled, kBuildTimeoutSeconds );
         built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
         worker.ShutdownAllConnections();
         reached = aborter.HasReached();
@@ -3389,7 +3348,7 @@ void TestDistributed::ToolchainIsNotSentWhenNothingIsDistributed() const
 {
     // The library is compiled here, so workers have no use for the toolchain
     RecordingWorker worker( RecordingWorker::kNoCapacity );
-    TEST_ASSERT( BuildPchLocal( worker ).m_Built );
+    TEST_ASSERT( DistributedTest::BuildPchLocal( worker ).m_Built );
     TEST_ASSERT( worker.GetNumConnections() >= 1 );
     TEST_ASSERT( worker.GetNumManifests() == 0 );
     TEST_ASSERT( worker.GetNumFiles() == 0 );
@@ -3399,99 +3358,6 @@ void TestDistributed::ToolchainIsNotSentWhenNothingIsDistributed() const
 //------------------------------------------------------------------------------
 namespace
 {
-    // The layout of the handshake messages that every major keeps, as numbers: what peers of another
-    // major find by (see Protocol.h). A change to the protocol that moves one of them has to change these too.
-    constexpr uint32_t kGoldenConnectionSize = 76;
-    constexpr uint32_t kGolden23ConnectionSize = 76;       // The handshake of major 23, which this version reads
-    constexpr uint32_t kGoldenAckSize = 12;
-    constexpr uint32_t kGoldenPrefixSize = 8;               // Header and version fields
-    constexpr uint32_t kGoldenConnectionMajorOffset = 4;    // uint32_t
-    constexpr uint32_t kGoldenHostNameOffset = 12;          // char[ 64 ]
-    constexpr uint32_t kGoldenAckMajorOffset = 6;           // uint8_t, also in MsgRefused
-
-    // The handshake of a client of this version, as bytes a test can change
-    struct HandshakeBytes
-    {
-        HandshakeBytes()
-        {
-            const Protocol::MsgConnection msg;
-            static_assert( sizeof( bytes ) == sizeof( msg ), "Size of the handshake" );
-            memcpy( bytes, &msg, sizeof( msg ) );
-        }
-        void SetMajor( uint32_t major ) { memcpy( bytes + kGoldenConnectionMajorOffset, &major, sizeof( major ) ); }
-        void SetHostName( const char * name ) // Zero terminated if it is shorter than the 64 bytes there are
-        {
-            memset( bytes + kGoldenHostNameOffset, 0, 64 );
-            memcpy( bytes + kGoldenHostNameOffset, name, Math::Min<size_t>( strlen( name ), 64 ) );
-        }
-        void FillHostName( char c ) { memset( bytes + kGoldenHostNameOffset, c, 64 ); }
-        uint8_t bytes[ kGoldenConnectionSize ];
-    };
-
-    // A worker that answers the handshake in a way that is not valid for this version
-    class OddHandshakeWorker : public FakeWorker
-    {
-    public:
-        enum Reply
-        {
-            REFUSE_AS_NEWER_MAJOR,  // MSG_REFUSED from a worker of the next major
-            ACK_OF_OLDER_MAJOR,     // An ack of the previous major
-            ACK_TOO_SHORT,          // An ack of this major that stops after the version fields
-            ACK_WITH_PAYLOAD,       // An ack whose header says a payload follows, which an ack never has
-        };
-        explicit OddHandshakeWorker( Reply reply ) : FakeWorker( 4 ), m_Reply( reply ) {}
-        explicit OddHandshakeWorker( const OddHandshakeWorker & other ) = delete;
-        OddHandshakeWorker & operator=( const OddHandshakeWorker & other ) = delete;
-
-    private:
-        virtual void Handshake( const ConnectionInfo * connection ) override
-        {
-            uint8_t bytes[ sizeof( Protocol::MsgConnectionAck ) ];
-            size_t size = sizeof( bytes );
-            switch ( m_Reply )
-            {
-                case REFUSE_AS_NEWER_MAJOR:
-                {
-                    const Protocol::MsgRefused refused;
-                    size = sizeof( refused );
-                    memcpy( bytes, &refused, size );
-                    bytes[ kGoldenAckMajorOffset ] = (uint8_t)( Protocol::kVersionMajor + 1 );
-                    break;
-                }
-                case ACK_OF_OLDER_MAJOR:
-                {
-                    const Protocol::MsgConnectionAck ack( 4 );
-                    memcpy( bytes, &ack, size );
-                    bytes[ kGoldenAckMajorOffset ] = (uint8_t)( Protocol::kVersionMajor - 1 );
-                    break;
-                }
-                case ACK_TOO_SHORT:
-                {
-                    const Protocol::MsgConnectionAck ack( 4 );
-                    memcpy( bytes, &ack, size );
-                    size = ( kGoldenPrefixSize + 2 ); // The version fields and a little more
-                    break;
-                }
-                case ACK_WITH_PAYLOAD:
-                {
-                    const Protocol::MsgConnectionAck ack( 4 );
-                    memcpy( bytes, &ack, size );
-
-                    // The header alone, announcing a payload. The ack in full follows as that payload.
-                    uint8_t header[ kGoldenPrefixSize ];
-                    memcpy( header, bytes, sizeof( header ) );
-                    header[ 2 ] = 1;
-                    Send( connection, header, sizeof( header ) );
-                    break;
-                }
-            }
-            Send( connection, bytes, (uint32_t)size );
-        }
-        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage &, void *, uint32_t ) override {}
-
-        const Reply m_Reply;
-    };
-
     uint32_t CountOccurrences( const AString & text, const char * what )
     {
         uint32_t count = 0;
@@ -3512,13 +3378,8 @@ void TestDistributed::ToolchainInventoryFollowsAck() const
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
-    HandshakeProbe probe;
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-    TEST_ASSERT( ci );
-    const Protocol::MsgConnection msg;
-    TEST_ASSERT( probe.Send( ci, &msg, sizeof( msg ) ) );
-
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
+    DistributedTest::HandshakeProbe probe;
+    TEST_ASSERT( probe.ConnectAndHandshake( Protocol::kTestPort ) );
 
     // The coordinator holds back its jobs until the last of these arrives
     TEST_ASSERT( probe.GetNumMessages() == 3 );
@@ -3554,12 +3415,8 @@ void TestDistributed::ToolchainInventoryIsBounded() const
     }
     auto isKept = [ kNumToolchains ]( uint32_t index ) { return ( index >= ( kNumToolchains - Server::kMaxCachedToolchains ) ); };
 
-    HandshakeProbe probe;
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-    TEST_ASSERT( ci );
-    const Protocol::MsgConnection msg;
-    TEST_ASSERT( probe.Send( ci, &msg, sizeof( msg ) ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
+    DistributedTest::HandshakeProbe probe;
+    TEST_ASSERT( probe.ConnectAndHandshake( Protocol::kTestPort ) );
 
     // Only the most recently used are offered, so a connection can not hold on to more than a worker keeps
     Array<uint64_t> advertised;
@@ -3584,7 +3441,7 @@ void TestDistributed::ToolchainInventoryIsBounded() const
         MutexHolder mh( s.m_ToolManifestsMutex );
         return s.m_Tools.GetSize();
     };
-    TEST_ASSERT( WaitUntil( [ & ]() { return ( numToolchains() == Server::kMaxCachedToolchains ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return ( numToolchains() == Server::kMaxCachedToolchains ); } ) );
     {
         MutexHolder mh( s.m_ToolManifestsMutex );
         for ( uint32_t i = 0; i < kNumToolchains; ++i )
@@ -3628,20 +3485,20 @@ void TestDistributed::MismatchedProtocolVersionIsRefused() const
 {
     Server s( 1 );
     const AStackString<> logPath( s.GetLogPath() );
-    const uint64_t logSizeBefore = GetStatsLogSize( logPath );
+    const uint64_t logSizeBefore = DistributedTest::GetStatsLogSize( logPath );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
-    HandshakeProbe probe;
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.ConnectTo( Protocol::kTestPort );
     TEST_ASSERT( ci );
 
     // Handshake from a client with the previous protocol version
-    HandshakeBytes handshake;
+    DistributedTest::HandshakeBytes handshake;
     handshake.SetMajor( Protocol::kVersionMajor - 1 );
     TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
 
     // The worker says which version it is, and drops the connection without acknowledging it
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
     TEST_ASSERT( probe.GetNumMessages() == 1 );
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_REFUSED );
     TEST_ASSERT( probe.GetRefusedMajor() == Protocol::kVersionMajor );
@@ -3649,7 +3506,7 @@ void TestDistributed::MismatchedProtocolVersionIsRefused() const
 
     // and the worker's log says so (nothing is asserted of a log that was rotated since)
     uint32_t numRefusals = 0;
-    if ( CountInStatsLogSince( logPath, logSizeBefore, "] refused ", numRefusals ) )
+    if ( DistributedTest::CountInStatsLogSince( logPath, logSizeBefore, "] refused ", numRefusals ) )
     {
         TEST_ASSERT( numRefusals == 1 );
     }
@@ -3667,20 +3524,20 @@ void TestDistributed::FramesOfAnotherMajorAreRefused() const
     // A frame of another major is only read as far as it goes: past its version fields, to the host
     // name, and no further
     const uint32_t frameSizes[] = {
-        kGoldenConnectionSize,
-        kGoldenHostNameOffset,  // Stops before the host name
-        kGoldenPrefixSize,      // Only the header and the version
+        DistributedTest::kGoldenConnectionSize,
+        DistributedTest::kGoldenHostNameOffset,  // Stops before the host name
+        DistributedTest::kGoldenPrefixSize,      // Only the header and the version
     };
     for ( const uint32_t frameSize : frameSizes )
     {
-        HandshakeBytes handshake;
+        DistributedTest::HandshakeBytes handshake;
         handshake.SetMajor( 23 );
 
-        HandshakeProbe probe;
-        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+        DistributedTest::HandshakeProbe probe;
+        const ConnectionInfo * ci = probe.ConnectTo( Protocol::kTestPort );
         TEST_ASSERT( ci );
         TEST_ASSERT( probe.Send( ci, handshake.bytes, frameSize ) );
-        TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
         TEST_ASSERT( probe.GetNumMessages() == 1 );
         TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_REFUSED );
         probe.ShutdownAllConnections();
@@ -3696,21 +3553,21 @@ void TestDistributed::HandshakeLayoutIsFrozen() const
     const Protocol::MsgConnection connection;
     uint8_t connectionBytes[ sizeof( connection ) ];
     memcpy( connectionBytes, &connection, sizeof( connection ) );
-    TEST_ASSERT( sizeof( connection ) == kGoldenConnectionSize );
-    TEST_ASSERT( sizeof( Protocol::MsgConnectionAck ) == kGoldenAckSize );
-    const uint8_t connectionHeader[] = { 1 /*MSG_CONNECTION*/, kGoldenConnectionSize, 0 /*no payload*/, 0 };
+    TEST_ASSERT( sizeof( connection ) == DistributedTest::kGoldenConnectionSize );
+    TEST_ASSERT( sizeof( Protocol::MsgConnectionAck ) == DistributedTest::kGoldenAckSize );
+    const uint8_t connectionHeader[] = { 1 /*MSG_CONNECTION*/, DistributedTest::kGoldenConnectionSize, 0 /*no payload*/, 0 };
     TEST_ASSERT( memcmp( connectionBytes, connectionHeader, sizeof( connectionHeader ) ) == 0 );
-    TEST_ASSERT( connectionBytes[ kGoldenConnectionMajorOffset ] == Protocol::kVersionMajor );
-    TEST_ASSERT( connectionBytes[ kGoldenConnectionMajorOffset + 1 ] == 0 ); // The rest of the uint32_t
+    TEST_ASSERT( connectionBytes[ DistributedTest::kGoldenConnectionMajorOffset ] == Protocol::kVersionMajor );
+    TEST_ASSERT( connectionBytes[ DistributedTest::kGoldenConnectionMajorOffset + 1 ] == 0 ); // The rest of the uint32_t
 
     const Protocol::MsgConnectionAck ack( 4 );
     uint8_t ackBytes[ sizeof( ack ) ];
     memcpy( ackBytes, &ack, sizeof( ack ) );
-    const uint8_t ackHeader[] = { 7 /*MSG_CONNECTION_ACK*/, kGoldenAckSize, 0, 0 };
+    const uint8_t ackHeader[] = { 7 /*MSG_CONNECTION_ACK*/, DistributedTest::kGoldenAckSize, 0, 0 };
     TEST_ASSERT( memcmp( ackBytes, ackHeader, sizeof( ackHeader ) ) == 0 );
-    TEST_ASSERT( ackBytes[ kGoldenAckMajorOffset ] == Protocol::kVersionMajor );
-    TEST_ASSERT( ackBytes[ kGoldenAckMajorOffset + 1 ] == Protocol::kVersionMinor );
-    TEST_ASSERT( ackBytes[ kGoldenPrefixSize ] == 4 ); // The capacity follows the version fields
+    TEST_ASSERT( ackBytes[ DistributedTest::kGoldenAckMajorOffset ] == Protocol::kVersionMajor );
+    TEST_ASSERT( ackBytes[ DistributedTest::kGoldenAckMajorOffset + 1 ] == Protocol::kVersionMinor );
+    TEST_ASSERT( ackBytes[ DistributedTest::kGoldenPrefixSize ] == 4 ); // The capacity follows the version fields
     TEST_ASSERT( ack.GetWorkerCapacity() == 4 );
 
     // The capacity is 32 bits, little endian
@@ -3718,20 +3575,20 @@ void TestDistributed::HandshakeLayoutIsFrozen() const
     uint8_t wideAckBytes[ sizeof( wideAck ) ];
     memcpy( wideAckBytes, &wideAck, sizeof( wideAck ) );
     const uint8_t wideCapacity[] = { 0x54, 0x01, 0, 0 };
-    TEST_ASSERT( memcmp( wideAckBytes + kGoldenPrefixSize, wideCapacity, sizeof( wideCapacity ) ) == 0 );
+    TEST_ASSERT( memcmp( wideAckBytes + DistributedTest::kGoldenPrefixSize, wideCapacity, sizeof( wideCapacity ) ) == 0 );
     TEST_ASSERT( wideAck.GetWorkerCapacity() == 340 );
 
     const Protocol::MsgRefused refused;
     uint8_t refusedBytes[ sizeof( refused ) ];
     memcpy( refusedBytes, &refused, sizeof( refused ) );
-    const uint8_t refusedHeader[] = { 13 /*MSG_REFUSED*/, kGoldenPrefixSize, 0, 0 };
+    const uint8_t refusedHeader[] = { 13 /*MSG_REFUSED*/, DistributedTest::kGoldenPrefixSize, 0, 0 };
     TEST_ASSERT( memcmp( refusedBytes, refusedHeader, sizeof( refusedHeader ) ) == 0 );
-    TEST_ASSERT( refusedBytes[ kGoldenAckMajorOffset ] == Protocol::kVersionMajor );
-    TEST_ASSERT( refusedBytes[ kGoldenAckMajorOffset + 1 ] == Protocol::kVersionMinor );
+    TEST_ASSERT( refusedBytes[ DistributedTest::kGoldenAckMajorOffset ] == Protocol::kVersionMajor );
+    TEST_ASSERT( refusedBytes[ DistributedTest::kGoldenAckMajorOffset + 1 ] == Protocol::kVersionMinor );
 
     // and the handshake a 23.x peer sends is found by them
-    alignas( 8 ) uint8_t connection23[ kGolden23ConnectionSize ] = { 1, kGolden23ConnectionSize, 0, 0, 23, 0, 0, 0, 1 /*platform*/, 6 /*minor*/ };
-    memcpy( connection23 + kGoldenHostNameOffset, "old-client", 11 );
+    alignas( 8 ) uint8_t connection23[ DistributedTest::kGolden23ConnectionSize ] = { 1, DistributedTest::kGolden23ConnectionSize, 0, 0, 23, 0, 0, 0, 1 /*platform*/, 6 /*minor*/ };
+    memcpy( connection23 + DistributedTest::kGoldenHostNameOffset, "old-client", 11 );
     TEST_ASSERT( Protocol::IsValidHeader( connection23, sizeof( connection23 ) ) );
     const Protocol::MsgConnection * old = reinterpret_cast<const Protocol::MsgConnection *>( connection23 );
     TEST_ASSERT( old->GetProtocolVersion() == 23 );
@@ -3754,8 +3611,8 @@ void TestDistributed::AckCarriesACapacityAbove255() const
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
-    HandshakeProbe probe;
-    const ConnectionInfo * ci = ConnectProbe( probe );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.ConnectAndHandshake( Protocol::kTestPort );
     TEST_ASSERT( ci );
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
 
@@ -3764,57 +3621,39 @@ void TestDistributed::AckCarriesACapacityAbove255() const
     TEST_ASSERT( probe.GetAckCapacity() == FairShareAllocator::kInitialDemand );
     TEST_ASSERT( WorkerThreadRemote::GetNumCPUsToUse() > 500 );
     TEST_ASSERT( probe.SendDemand( ci, 500 ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetLastAllowance() == 500 ); } ) );
-    Array<HandshakeProbe::CapacityUpdate> updates;
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetLastAllowance() == 500 ); } ) );
+    Array<DistributedTest::HandshakeProbe::CapacityUpdate> updates;
     probe.GetCapacityUpdates( updates );
     TEST_ASSERT( updates.Top().m_PoolSlots == WorkerThreadRemote::GetNumCPUsToUse() );
     probe.ShutdownAllConnections();
-}
-
-// ConnectProbe
-//------------------------------------------------------------------------------
-/*static*/ const ConnectionInfo * TestDistributed::ConnectProbe( HandshakeProbe & probe )
-{
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-    if ( ci == nullptr )
-    {
-        return nullptr;
-    }
-    const Protocol::MsgConnection msg;
-    if ( ( probe.Send( ci, &msg, sizeof( msg ) ) == false ) ||
-         ( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) == false ) )
-    {
-        return nullptr;
-    }
-    return ci;
 }
 
 // SharesMoveWithDemandBetweenTwoClients
 //------------------------------------------------------------------------------
 void TestDistributed::SharesMoveWithDemandBetweenTwoClients() const
 {
-    const RemoteCpusForTest cpus( 20 );
+    const DistributedTest::RemoteCpusForTest cpus( 20 );
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
-    HandshakeProbe a;
-    const ConnectionInfo * ciA = ConnectProbe( a );
+    DistributedTest::HandshakeProbe a;
+    const ConnectionInfo * ciA = a.ConnectAndHandshake( Protocol::kTestPort );
     TEST_ASSERT( ciA );
     TEST_ASSERT( a.SendDemand( ciA, 100 ) );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 20 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 20 ); } ) );
 
     // Only the final shares are known: A may pass through what is left once B's first share is taken
-    HandshakeProbe b;
-    const ConnectionInfo * ciB = ConnectProbe( b );
+    DistributedTest::HandshakeProbe b;
+    const ConnectionInfo * ciB = b.ConnectAndHandshake( Protocol::kTestPort );
     TEST_ASSERT( ciB );
     TEST_ASSERT( b.SendDemand( ciB, 100 ) );
-    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 10 ) && ( b.GetLastAllowance() == 10 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 10 ) && ( b.GetLastAllowance() == 10 ); } ) );
 
     TEST_ASSERT( b.SendDemand( ciB, 0 ) );
-    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 20 ) && ( b.GetLastAllowance() == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 20 ) && ( b.GetLastAllowance() == 0 ); } ) );
 
     b.ShutdownAllConnections();
-    TEST_ASSERT( WaitUntil( [ &s ]() { MutexHolder mh( s.m_ClientListMutex ); return ( s.m_ClientList.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &s ]() { MutexHolder mh( s.m_ClientListMutex ); return ( s.m_ClientList.GetSize() == 1 ); } ) );
     Thread::Sleep( 200 ); // An update would have come by now
     TEST_ASSERT( a.GetLastAllowance() == 20 );
     a.ShutdownAllConnections();
@@ -3825,36 +3664,36 @@ void TestDistributed::SharesMoveWithDemandBetweenTwoClients() const
 void TestDistributed::ScarceSlotsRotateOnTheirOwn() const
 {
     // One slot for two clients that want it
-    const RemoteCpusForTest cpus( 1 );
+    const DistributedTest::RemoteCpusForTest cpus( 1 );
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
-    HandshakeProbe a;
-    HandshakeProbe b;
-    const ConnectionInfo * ciA = ConnectProbe( a );
+    DistributedTest::HandshakeProbe a;
+    DistributedTest::HandshakeProbe b;
+    const ConnectionInfo * ciA = a.ConnectAndHandshake( Protocol::kTestPort );
     TEST_ASSERT( ciA );
     TEST_ASSERT( a.SendDemand( ciA, 10 ) );
-    const ConnectionInfo * ciB = ConnectProbe( b );
+    const ConnectionInfo * ciB = b.ConnectAndHandshake( Protocol::kTestPort );
     TEST_ASSERT( ciB );
     TEST_ASSERT( b.SendDemand( ciB, 10 ) );
-    TEST_ASSERT( WaitUntil( [ &b ]() { return ( b.GetLastAllowance() != 0xFFFFFFFF ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &b ]() { return ( b.GetLastAllowance() != 0xFFFFFFFF ); } ) );
 
     // With nothing more sent, the slot keeps moving between them
-    Array<HandshakeProbe::CapacityUpdate> updates;
+    Array<DistributedTest::HandshakeProbe::CapacityUpdate> updates;
     a.GetCapacityUpdates( updates );
     const size_t numUpdatesA = updates.GetSize();
     b.GetCapacityUpdates( updates );
     const size_t numUpdatesB = updates.GetSize();
     auto rotated = [ &a, &b, numUpdatesA, numUpdatesB ]()
     {
-        Array<HandshakeProbe::CapacityUpdate> newUpdates;
+        Array<DistributedTest::HandshakeProbe::CapacityUpdate> newUpdates;
         a.GetCapacityUpdates( newUpdates );
         const size_t newA = newUpdates.GetSize();
         b.GetCapacityUpdates( newUpdates );
         const size_t newB = newUpdates.GetSize();
         return ( newA >= ( numUpdatesA + 2 ) ) && ( newB >= ( numUpdatesB + 2 ) );
     };
-    TEST_ASSERT( WaitUntil( rotated, 5.0f * Server::kRotateSeconds ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( rotated, 5.0f * Server::kRotateSeconds ) );
 
     a.ShutdownAllConnections();
     b.ShutdownAllConnections();
@@ -3867,7 +3706,7 @@ void TestDistributed::ClientRampsUpItsDemand() const
     // The worker allows what a new client is given, and never answers, so the jobs wait
     RecordingWorker worker( FairShareAllocator::kInitialDemand );
     FBuildTestOptions options;
-    MakeDistributedPchOptions( options );
+    DistributedTest::MakeDistributedPchOptions( options );
     options.m_ForceCleanBuild = true;
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
@@ -3888,7 +3727,7 @@ void TestDistributed::ClientRampsUpItsDemand() const
         }
         return false;
     };
-    BuildAborter aborter( reached, kWaitTimeoutSeconds );
+    DistributedTest::BuildAborter aborter( reached, DistributedTest::kWaitTimeoutSeconds );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/JobStream/JobStream.lib" );
     worker.ShutdownAllConnections();
 
@@ -3931,7 +3770,7 @@ void TestDistributed::ClientRampsUpItsDemand() const
         {
             if ( reduction->m_Settled.Load() == false )
             {
-                reduction->m_LogSizeWhenSettled.Store( GetStatsLogSize( reduction->m_Server->GetLogPath() ) );
+                reduction->m_LogSizeWhenSettled.Store( DistributedTest::GetStatsLogSize( reduction->m_Server->GetLogPath() ) );
                 reduction->m_Settled.Store( true );
             }
             reduction->m_MaxActiveSettled.Store( Math::Max( reduction->m_MaxActiveSettled.Load(), active ) );
@@ -3944,9 +3783,9 @@ void TestDistributed::ClientRampsUpItsDemand() const
 void TestDistributed::ClientHonoursAReducedAllowance() const
 {
     // Without prefetch, the allowance is every slot of the worker
-    const RemoteCpusForTest cpus( AllowanceReduction::kFullAllowance );
+    const DistributedTest::RemoteCpusForTest cpus( AllowanceReduction::kFullAllowance );
     FBuildTestOptions options;
-    MakeDistributedPchOptions( options );
+    DistributedTest::MakeDistributedPchOptions( options );
     options.m_ForceCleanBuild = true;
     FBuildForTest fBuild( options );
     TEST_ASSERT( fBuild.Initialize() );
@@ -3971,7 +3810,7 @@ void TestDistributed::ClientHonoursAReducedAllowance() const
 
     // Jobs were still to be sent when it settled, so the client held them back rather than running out of them
     uint32_t numJobsReceivedSettled = 0;
-    TEST_ASSERT( CountInStatsLogSince( s.GetLogPath(), reduction.m_LogSizeWhenSettled.Load(), "] job received ", numJobsReceivedSettled ) );
+    TEST_ASSERT( DistributedTest::CountInStatsLogSince( s.GetLogPath(), reduction.m_LogSizeWhenSettled.Load(), "] job received ", numJobsReceivedSettled ) );
     TEST_ASSERT( numJobsReceivedSettled > 0 );
 }
 
@@ -3981,7 +3820,7 @@ void TestDistributed::ClientReadsACapacityAbove255() const
 {
     RecordingWorker worker( 300 );
     FBuildTestOptions options;
-    MakeDistributedPchOptions( options );
+    DistributedTest::MakeDistributedPchOptions( options );
     options.m_DistVerbose = true;
     options.m_ForceCleanBuild = true;
     FBuildForTest fBuild( options );
@@ -3989,7 +3828,7 @@ void TestDistributed::ClientReadsACapacityAbove255() const
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
     auto reached = [ &worker ]() { return worker.GetNumManifests() >= 1; };
-    BuildAborter aborter( reached, kWaitTimeoutSeconds );
+    DistributedTest::BuildAborter aborter( reached, DistributedTest::kWaitTimeoutSeconds );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
     worker.ShutdownAllConnections();
 
@@ -4028,19 +3867,19 @@ void TestDistributed::ShortMessagesAreRejected() const
         Protocol::PayloadRule   m_Payload;
     };
     const Expected expected[] = {
-        { Protocol::MSG_CONNECTION,             kGoldenPrefixSize,                          Protocol::PAYLOAD_NEVER },
+        { Protocol::MSG_CONNECTION,             DistributedTest::kGoldenPrefixSize,                          Protocol::PAYLOAD_NEVER },
         { Protocol::MSG_JOB,                    sizeof( Protocol::MsgJob ),                 Protocol::PAYLOAD_ALWAYS },
         { Protocol::MSG_JOB_RESULT,             sizeof( Protocol::MsgJobResult ),           Protocol::PAYLOAD_ALWAYS },
         { Protocol::MSG_JOB_RESULT_COMPRESSED,  sizeof( Protocol::MsgJobResultCompressed ), Protocol::PAYLOAD_ALWAYS },
         { Protocol::MSG_MANIFEST,               sizeof( Protocol::MsgManifest ),            Protocol::PAYLOAD_ALWAYS },
         { Protocol::MSG_FILE,                   sizeof( Protocol::MsgFile ),                Protocol::PAYLOAD_ALWAYS },
-        { Protocol::MSG_CONNECTION_ACK,         kGoldenPrefixSize,                          Protocol::PAYLOAD_NEVER },
+        { Protocol::MSG_CONNECTION_ACK,         DistributedTest::kGoldenPrefixSize,                          Protocol::PAYLOAD_NEVER },
         { Protocol::MSG_PCH_FILE,               sizeof( Protocol::MsgPchFile ),             Protocol::PAYLOAD_ALWAYS },
         { Protocol::MSG_PCH_INVENTORY,          sizeof( Protocol::MsgPchInventory ),        Protocol::PAYLOAD_OPTIONAL },
         { Protocol::MSG_REQUEST_MANIFEST,       sizeof( Protocol::MsgRequestManifest ),     Protocol::PAYLOAD_NEVER },
         { Protocol::MSG_REQUEST_FILE,           sizeof( Protocol::MsgRequestFile ),         Protocol::PAYLOAD_NEVER },
         { Protocol::MSG_TOOLCHAIN_INVENTORY,    sizeof( Protocol::MsgToolchainInventory ),  Protocol::PAYLOAD_OPTIONAL },
-        { Protocol::MSG_REFUSED,                kGoldenPrefixSize,                          Protocol::PAYLOAD_NEVER },
+        { Protocol::MSG_REFUSED,                DistributedTest::kGoldenPrefixSize,                          Protocol::PAYLOAD_NEVER },
         { Protocol::MSG_PCH_NEEDED,             sizeof( Protocol::MsgPchNeeded ),           Protocol::PAYLOAD_NEVER },
         { Protocol::MSG_DEMAND,                 sizeof( Protocol::MsgDemand ),              Protocol::PAYLOAD_NEVER },
         { Protocol::MSG_CAPACITY,               sizeof( Protocol::MsgCapacity ),            Protocol::PAYLOAD_NEVER },
@@ -4077,22 +3916,22 @@ void TestDistributed::ShortMessagesAreRejected() const
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     // The worker closes the connection to a client that sends one, without answering
-    HandshakeBytes handshake;
+    DistributedTest::HandshakeBytes handshake;
     const Protocol::MsgJob job( 1, 0 );
     struct Frame { const void * data; uint32_t size; };
     const Frame frames[] = {
         { handshake.bytes, 3 },                                         // Not even a header
-        { handshake.bytes, kGoldenPrefixSize - 1 },                     // A handshake that stops before the version
+        { handshake.bytes, DistributedTest::kGoldenPrefixSize - 1 },                     // A handshake that stops before the version
         { &job, (uint32_t)sizeof( job ) - 1 },                          // A job without its last byte
-        { handshake.bytes, kGoldenConnectionSize - 1 },                 // A handshake of this version that is too short for it
+        { handshake.bytes, DistributedTest::kGoldenConnectionSize - 1 },                 // A handshake of this version that is too short for it
     };
     for ( const Frame & frame : frames )
     {
-        HandshakeProbe probe;
-        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+        DistributedTest::HandshakeProbe probe;
+        const ConnectionInfo * ci = probe.ConnectTo( Protocol::kTestPort );
         TEST_ASSERT( ci );
         TEST_ASSERT( probe.Send( ci, frame.data, frame.size ) );
-        TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
         TEST_ASSERT( probe.GetNumMessages() == 0 );
         probe.ShutdownAllConnections();
     }
@@ -4107,7 +3946,7 @@ void TestDistributed::HeadersWithTheWrongPayloadAreRejected() const
 
     // A header that announces a payload its type does not have makes the next frame a payload, and the
     // handshake handler would then read the header as the whole message. Only the header is that long.
-    HandshakeBytes handshake;
+    DistributedTest::HandshakeBytes handshake;
     uint8_t connectionHeader[ sizeof( handshake.bytes ) ]; // A whole handshake, so that only the flag is wrong
     memcpy( connectionHeader, handshake.bytes, sizeof( connectionHeader ) );
     connectionHeader[ 2 ] = 1;
@@ -4125,15 +3964,15 @@ void TestDistributed::HeadersWithTheWrongPayloadAreRejected() const
     };
     for ( const Case & c : cases )
     {
-        HandshakeProbe probe;
-        const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+        DistributedTest::HandshakeProbe probe;
+        const ConnectionInfo * ci = probe.ConnectTo( Protocol::kTestPort );
         TEST_ASSERT( ci );
         TEST_ASSERT( probe.Send( ci, c.m_Header, c.m_HeaderSize ) );
         if ( c.m_Payload )
         {
             probe.Send( ci, c.m_Payload, c.m_PayloadSize ); // The worker may have closed the connection already
         }
-        TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
         TEST_ASSERT( probe.GetNumMessages() == 0 ); // No ack
         probe.ShutdownAllConnections();
     }
@@ -4147,17 +3986,17 @@ void TestDistributed::LongerMessagesAreAccepted() const
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     // A later minor version may add to a message, and only the part that is known is read
-    HandshakeBytes handshake;
+    DistributedTest::HandshakeBytes handshake;
     uint8_t longer[ sizeof( handshake.bytes ) + 8 ];
     memset( longer, 0xAB, sizeof( longer ) );
     memcpy( longer, handshake.bytes, sizeof( handshake.bytes ) );
     longer[ 1 ] = (uint8_t)sizeof( longer ); // Its own size
 
-    HandshakeProbe probe;
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.ConnectTo( Protocol::kTestPort );
     TEST_ASSERT( ci );
     TEST_ASSERT( probe.Send( ci, longer, sizeof( longer ) ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
     TEST_ASSERT( probe.IsDisconnected() == false );
     probe.ShutdownAllConnections();
@@ -4171,14 +4010,14 @@ void TestDistributed::HostNameStaysBounded() const
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     // A client does not have to terminate its host name
-    HandshakeBytes handshake;
+    DistributedTest::HandshakeBytes handshake;
     handshake.FillHostName( 'A' );
 
-    HandshakeProbe probe;
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = probe.ConnectTo( Protocol::kTestPort );
     TEST_ASSERT( ci );
     TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 1 ); } ) );
 
     uint32_t hostNameLength = 0;
     {
@@ -4203,13 +4042,13 @@ void TestDistributed::HostNameIsBoundedByTheFrame() const
     DWORD oldProtection = 0;
     TEST_ASSERT( ::VirtualProtect( pages + pageSize, pageSize, PAGE_NOACCESS, &oldProtection ) );
 
-    HandshakeBytes handshake;
+    DistributedTest::HandshakeBytes handshake;
     handshake.SetHostName( "build-pc" );
     struct Case { uint32_t m_FrameSize; const char * m_Expected; };
     const Case cases[] = {
-        { 0, "" }, { 8, "" }, { kGoldenHostNameOffset, "" },    // Stops before the host name
-        { kGoldenHostNameOffset + 4, "buil" },                  // or in the middle of it
-        { kGoldenConnectionSize, "build-pc" },
+        { 0, "" }, { 8, "" }, { DistributedTest::kGoldenHostNameOffset, "" },    // Stops before the host name
+        { DistributedTest::kGoldenHostNameOffset + 4, "buil" },                  // or in the middle of it
+        { DistributedTest::kGoldenConnectionSize, "build-pc" },
     };
     for ( const Case & c : cases )
     {
@@ -4222,10 +4061,10 @@ void TestDistributed::HostNameIsBoundedByTheFrame() const
 
     // and a name that is not terminated stops where the message does
     handshake.FillHostName( 'A' );
-    char * frame = ( pages + pageSize - kGoldenConnectionSize );
-    memcpy( frame, handshake.bytes, kGoldenConnectionSize );
+    char * frame = ( pages + pageSize - DistributedTest::kGoldenConnectionSize );
+    memcpy( frame, handshake.bytes, DistributedTest::kGoldenConnectionSize );
     AStackString<> name;
-    reinterpret_cast<const Protocol::MsgConnection *>( frame )->GetHostName( kGoldenConnectionSize, name );
+    reinterpret_cast<const Protocol::MsgConnection *>( frame )->GetHostName( DistributedTest::kGoldenConnectionSize, name );
     TEST_ASSERT( name.GetLength() == 64 );
 
     ::VirtualFree( pages, 0, MEM_RELEASE );
@@ -4239,12 +4078,8 @@ void TestDistributed::ServerSendsBothInventoriesAfterTheAck() const
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
-    HandshakeProbe probe;
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-    TEST_ASSERT( ci );
-    HandshakeBytes handshake;
-    TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
+    DistributedTest::HandshakeProbe probe;
+    TEST_ASSERT( probe.ConnectAndHandshake( Protocol::kTestPort ) );
     Thread::Sleep( 200 ); // Anything more would have come by now
     TEST_ASSERT( probe.GetNumMessages() == 3 );
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
@@ -4270,7 +4105,7 @@ namespace
     }
 
     // The attempts a client makes to a worker are at least a reconnect delay apart
-    bool AreSpacedByTheReconnectDelay( const FakeWorker & worker )
+    bool AreSpacedByTheReconnectDelay( const DistributedTest::FakeWorker & worker )
     {
         Array<float> times;
         worker.GetConnectionTimes( times );
@@ -4287,8 +4122,8 @@ namespace
 
 void TestDistributed::ClientRefusesAWorkerThatRefusesIt() const
 {
-    OddHandshakeWorker worker( OddHandshakeWorker::REFUSE_AS_NEWER_MAJOR );
-    const LocalBuildResult result = BuildPchLocal( worker, kShortReconnectDelay );
+    DistributedTest::OddHandshakeWorker worker( DistributedTest::OddHandshakeWorker::REFUSE_AS_NEWER_MAJOR );
+    const DistributedTest::LocalBuildResult result = DistributedTest::BuildPchLocal( worker, kShortReconnectDelay );
     TEST_ASSERT( result.m_Built );
     TEST_ASSERT( result.m_Seconds >= kMinBuildSeconds );
 
@@ -4302,8 +4137,8 @@ void TestDistributed::ClientRefusesAWorkerThatRefusesIt() const
 
 void TestDistributed::ClientRefusesAnAckOfAnotherMajor() const
 {
-    OddHandshakeWorker worker( OddHandshakeWorker::ACK_OF_OLDER_MAJOR );
-    const LocalBuildResult result = BuildPchLocal( worker, kShortReconnectDelay );
+    DistributedTest::OddHandshakeWorker worker( DistributedTest::OddHandshakeWorker::ACK_OF_OLDER_MAJOR );
+    const DistributedTest::LocalBuildResult result = DistributedTest::BuildPchLocal( worker, kShortReconnectDelay );
     TEST_ASSERT( result.m_Built );
     TEST_ASSERT( result.m_Seconds >= kMinBuildSeconds );
 
@@ -4316,8 +4151,8 @@ void TestDistributed::ClientRefusesAnAckOfAnotherMajor() const
 
 void TestDistributed::ClientRejectsAShortAck() const
 {
-    OddHandshakeWorker worker( OddHandshakeWorker::ACK_TOO_SHORT );
-    const LocalBuildResult result = BuildPchLocal( worker, kShortReconnectDelay );
+    DistributedTest::OddHandshakeWorker worker( DistributedTest::OddHandshakeWorker::ACK_TOO_SHORT );
+    const DistributedTest::LocalBuildResult result = DistributedTest::BuildPchLocal( worker, kShortReconnectDelay );
     TEST_ASSERT( result.m_Built );
     TEST_ASSERT( result.m_Seconds >= kMinBuildSeconds );
 
@@ -4334,8 +4169,8 @@ void TestDistributed::ClientRejectsAShortAck() const
 void TestDistributed::ClientRejectsAnAckWithAPayload() const
 {
     // The header of an ack that announces a payload is not an ack: it is dropped like a broken worker
-    OddHandshakeWorker worker( OddHandshakeWorker::ACK_WITH_PAYLOAD );
-    const LocalBuildResult result = BuildPchLocal( worker, kShortReconnectDelay );
+    DistributedTest::OddHandshakeWorker worker( DistributedTest::OddHandshakeWorker::ACK_WITH_PAYLOAD );
+    const DistributedTest::LocalBuildResult result = DistributedTest::BuildPchLocal( worker, kShortReconnectDelay );
     TEST_ASSERT( result.m_Built );
     TEST_ASSERT( result.m_Seconds >= kMinBuildSeconds );
 
@@ -4356,10 +4191,10 @@ namespace
 
     // A worker that acks at once and sends the inventories after a delay, from a thread of its own so
     // that it reads the client's messages meanwhile. It counts the jobs that arrive before them.
-    class LateInventoryWorker : public FakeWorker
+    class LateInventoryWorker : public DistributedTest::FakeWorker
     {
     public:
-        LateInventoryWorker() : FakeWorker( 4 ) {}
+        LateInventoryWorker() : DistributedTest::FakeWorker( 4 ) {}
         ~LateInventoryWorker() override
         {
             if ( m_Started.Load() )
@@ -4433,7 +4268,7 @@ void TestDistributed::ClientWaitsForTheInventoriesBeforeSendingJobs() const
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
     auto jobSent = [ &worker ]() { return ( worker.GetNumJobs() >= 1 ); };
-    BuildAborter aborter( jobSent, kWaitTimeoutSeconds );
+    DistributedTest::BuildAborter aborter( jobSent, DistributedTest::kWaitTimeoutSeconds );
     fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
     worker.ShutdownAllConnections();
 
@@ -4447,10 +4282,10 @@ void TestDistributed::ClientWaitsForTheInventoriesBeforeSendingJobs() const
 namespace
 {
     // A worker that acks and sends no inventories, and counts the jobs it is sent
-    class InventorylessWorker : public FakeWorker
+    class InventorylessWorker : public DistributedTest::FakeWorker
     {
     public:
-        InventorylessWorker() : FakeWorker( 4 ) {}
+        InventorylessWorker() : DistributedTest::FakeWorker( 4 ) {}
         explicit InventorylessWorker( const InventorylessWorker & other ) = delete;
         InventorylessWorker & operator=( const InventorylessWorker & other ) = delete;
 
@@ -4490,7 +4325,7 @@ void TestDistributed::ClientSendsNoJobToAWorkerWithoutInventories() const
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
     auto jobSent = [ &worker ]() { return ( worker.GetNumJobs() >= 1 ); };
-    BuildAborter aborter( jobSent, kNoInventoryWindowSeconds );
+    DistributedTest::BuildAborter aborter( jobSent, kNoInventoryWindowSeconds );
     fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
     worker.ShutdownAllConnections();
 
@@ -4515,7 +4350,7 @@ void TestDistributed::ClientBuildsLocallyWhenAWorkerSendsNoInventories() const
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
 
     auto never = []() { return false; };
-    BuildAborter aborter( never, kWaitTimeoutSeconds );
+    DistributedTest::BuildAborter aborter( never, DistributedTest::kWaitTimeoutSeconds );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
     worker.ShutdownAllConnections();
 
@@ -4569,11 +4404,11 @@ namespace
 {
     // The job as it would be sent if it used another PCH. A job that was read cannot be written again
     // (it has no node to write), so its id is replaced where Job::Serialize puts it, at the end.
-    CapturedJob WithPch( const CapturedJob & job, uint64_t pchId )
+    DistributedTest::CapturedJob WithPch( const DistributedTest::CapturedJob & job, uint64_t pchId )
     {
         TEST_ASSERT( job.m_PchId != 0 );
         TEST_ASSERT( job.m_Data.GetSize() > sizeof( uint64_t ) );
-        CapturedJob result = job;
+        DistributedTest::CapturedJob result = job;
         char * idBytes = ( result.m_Data.Begin() + result.m_Data.GetSize() - sizeof( uint64_t ) );
         uint64_t oldPchId = 0;
         memcpy( &oldPchId, idBytes, sizeof( oldPchId ) );
@@ -4588,7 +4423,7 @@ namespace
     }
 
     // Sends a job to a worker as the client that made it would
-    bool SendCapturedJob( const ConnectionInfo * connection, JobStreamEncoder & encoder, const CapturedJob & job )
+    bool SendCapturedJob( const ConnectionInfo * connection, JobStreamEncoder & encoder, const DistributedTest::CapturedJob & job )
     {
         if ( encoder.Encode( job.m_Data.Begin(), job.m_Data.GetSize() ) == false )
         {
@@ -4598,43 +4433,12 @@ namespace
         const ConstMemoryStream payload( encoder.GetResult(), encoder.GetResultSize() );
         return msg.Send( connection, payload );
     }
-
-    // Sends the handshake of a client and waits for the ack and the inventories
-    // that answer it. Sent after other messages it also says they have been dealt with, as a connection
-    // is served in order: whatever they made the worker send came before the ack.
-    bool Handshake( HandshakeProbe & probe, const ConnectionInfo * connection, float timeoutSeconds )
-    {
-        const size_t numBefore = probe.GetNumMessages();
-        const HandshakeBytes handshake;
-        if ( probe.Send( connection, handshake.bytes, sizeof( handshake.bytes ) ) == false )
-        {
-            return false;
-        }
-        const Timer timer;
-        const size_t numExpected = 3u; // The ack and the two inventories
-        while ( probe.GetNumMessages() < ( numBefore + numExpected ) )
-        {
-            if ( timer.GetElapsed() > timeoutSeconds )
-            {
-                return false;
-            }
-            Thread::Sleep( 1 );
-        }
-        return true;
-    }
-
-    // Connects to a worker and completes the handshake.
-    bool ConnectAndHandshake( HandshakeProbe & probe, const ConnectionInfo * & outConnection, float timeoutSeconds )
-    {
-        outConnection = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-        return ( outConnection != nullptr ) && Handshake( probe, outConnection, timeoutSeconds );
-    }
 }
 
 // Runs a build that sends a job for a PCH to a worker, and keeps the job
-void TestDistributed::CapturePchJob( CapturedJob & outJob ) const
+void TestDistributed::CapturePchJob( DistributedTest::CapturedJob & outJob ) const
 {
-    TEST_ASSERT( DistributedTest::CapturePchJob( outJob, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( DistributedTest::CapturePchJob( outJob, DistributedTest::kWaitTimeoutSeconds ) );
 }
 
 // The jobs waiting on all the connections of a worker
@@ -4668,7 +4472,7 @@ void TestDistributed::CapturePchJob( CapturedJob & outJob ) const
 //------------------------------------------------------------------------------
 void TestDistributed::MSVCFailureOfARemoteJobIsASystemError() const
 {
-    CapturedJob captured;
+    DistributedTest::CapturedJob captured;
     CapturePchJob( captured );
 
     // As a worker handles the result of a compile that failed
@@ -4687,33 +4491,34 @@ void TestDistributed::MSVCFailureOfARemoteJobIsASystemError() const
 //------------------------------------------------------------------------------
 void TestDistributed::WorkerAsksForAMissingPch() const
 {
-    CapturedJob job;
+    DistributedTest::CapturedJob job;
     CapturePchJob( job );
 
     Server s( 1 );
     const AStackString<> logPath( s.GetLogPath() );
-    const uint64_t logSizeBefore = GetStatsLogSize( logPath );
+    const uint64_t logSizeBefore = DistributedTest::GetStatsLogSize( logPath );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-    HandshakeProbe probe;
+    DistributedTest::HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( probe, ci, kWaitTimeoutSeconds ) );
+    ci = probe.ConnectAndHandshake( Protocol::kTestPort );
+    TEST_ASSERT( ci );
 
     // A job for a PCH the worker does not have: it asks for it, naming it
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() >= 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() >= 1 ); } ) );
     TEST_ASSERT( probe.GetPchNeededId( 0 ) == job.m_PchId );
 
     // More jobs for it do not make it ask again, as it is not here yet
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( Handshake( probe, ci, kWaitTimeoutSeconds ) ); // Answered after the jobs
+    TEST_ASSERT( probe.Handshake( ci ) ); // Answered after the jobs
     TEST_ASSERT( CountWaitingJobs( s ) == 3 );
     TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
 
     // The worker's log has the one request (nothing is asserted of a log that was rotated since)
     uint32_t numLogged = 0;
-    if ( CountInStatsLogSince( logPath, logSizeBefore, "] pch needed ", numLogged ) )
+    if ( DistributedTest::CountInStatsLogSince( logPath, logSizeBefore, "] pch needed ", numLogged ) )
     {
         TEST_ASSERT( numLogged == 1 );
     }
@@ -4724,22 +4529,23 @@ void TestDistributed::WorkerAsksForAMissingPch() const
 //------------------------------------------------------------------------------
 void TestDistributed::WorkerDoesNotAskForAPchBeingReceived() const
 {
-    CapturedJob job;
+    DistributedTest::CapturedJob job;
     CapturePchJob( job );
 
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     // One connection is in the middle of sending the PCH: the first of three chunks has arrived
-    HandshakeProbe receiving;
+    DistributedTest::HandshakeProbe receiving;
     const ConnectionInfo * receivingConnection = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( receiving, receivingConnection, kWaitTimeoutSeconds ) );
+    receivingConnection = receiving.ConnectAndHandshake( Protocol::kTestPort );
+    TEST_ASSERT( receivingConnection );
     Array<char> chunk;
     chunk.SetSize( Protocol::kMinPchChunkSize );
     memset( chunk.Begin(), 0, chunk.GetSize() );
     const Protocol::MsgPchFile firstChunk( job.m_PchId, 65536, ( 2 * Protocol::kMinPchChunkSize ) + 100, Protocol::kMinPchChunkSize, 0 );
     TEST_ASSERT( firstChunk.Send( receivingConnection, ConstMemoryStream( chunk.Begin(), chunk.GetSize() ) ) );
-    TEST_ASSERT( WaitUntil( [ & ]()
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]()
     {
         MutexHolder mh( s.m_ClientListMutex );
         for ( const Server::ClientState * cs : s.m_ClientList )
@@ -4753,19 +4559,20 @@ void TestDistributed::WorkerDoesNotAskForAPchBeingReceived() const
     } ) );
 
     // A job for the PCH arrives on another connection: it is on its way, so it is not asked for
-    HandshakeProbe waiting;
+    DistributedTest::HandshakeProbe waiting;
     const ConnectionInfo * waitingConnection = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( waiting, waitingConnection, kWaitTimeoutSeconds ) );
+    waitingConnection = waiting.ConnectAndHandshake( Protocol::kTestPort );
+    TEST_ASSERT( waitingConnection );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( waitingConnection, encoder, job ) );
-    TEST_ASSERT( Handshake( waiting, waitingConnection, kWaitTimeoutSeconds ) ); // Answered after the job
+    TEST_ASSERT( waiting.Handshake( waitingConnection ) ); // Answered after the job
     TEST_ASSERT( CountWaitingJobs( s ) == 1 );
     TEST_ASSERT( waiting.GetNumPchNeeded() == 0 );
     TEST_ASSERT( receiving.GetNumPchNeeded() == 0 );
 
     // The connection sending it goes away, so it will not arrive: the job's client is asked, once
     receiving.ShutdownAllConnections();
-    TEST_ASSERT( WaitUntil( [ &waiting ]() { return ( waiting.GetNumPchNeeded() >= 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &waiting ]() { return ( waiting.GetNumPchNeeded() >= 1 ); } ) );
     Thread::Sleep( 100 ); // The disconnect is dealt with on another thread than the connection's, so nothing sent on it says it is done
     TEST_ASSERT( waiting.GetNumPchNeeded() == 1 );
     TEST_ASSERT( waiting.GetPchNeededId( 0 ) == job.m_PchId );
@@ -4777,46 +4584,47 @@ void TestDistributed::WorkerDoesNotAskForAPchBeingReceived() const
 void TestDistributed::WorkerAsksAgainWhenAPchItHadIsNeededAgain() const
 {
     // A job for a PCH of our own
-    CapturedJob captured;
+    DistributedTest::CapturedJob captured;
     CapturePchJob( captured );
-    CompressedPch pchs[ 2 ];
+    DistributedTest::CompressedPch pchs[ 2 ];
     for ( uint32_t i = 0; i < 2; ++i )
     {
         MakeRandomBytes( 100000, ( 31 + i ), pchs[ i ].m_Content );
-        CompressPch( pchs[ i ] );
+        DistributedTest::CompressPch( pchs[ i ] );
     }
-    const CapturedJob job = WithPch( captured, pchs[ 0 ].m_Id );
+    const DistributedTest::CapturedJob job = WithPch( captured, pchs[ 0 ].m_Id );
 
     Server s( 1 );
     SetPchCacheLimits( s, 1, 0 ); // Room for the PCH that has just arrived only
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-    HandshakeProbe client;
+    DistributedTest::HandshakeProbe client;
     const ConnectionInfo * ci = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( client, ci, kWaitTimeoutSeconds ) );
+    ci = client.ConnectAndHandshake( Protocol::kTestPort );
+    TEST_ASSERT( ci );
 
     // The PCH is asked for
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( WaitUntil( [ &client ]() { return ( client.GetNumPchNeeded() >= 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &client ]() { return ( client.GetNumPchNeeded() >= 1 ); } ) );
     TEST_ASSERT( client.GetPchNeededId( 0 ) == pchs[ 0 ].m_Id );
 
     // and sent, over another connection. The job waits for its toolchain, which never comes.
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
-    TEST_ASSERT( SendPch( sender, pchs[ 0 ] ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pchs[ 0 ] ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
 
     // The job is gone (as one that has been built is). Another PCH arrives and pushes the first out, once
     // it is not being unpacked: a PCH that is is not pushed out.
-    TEST_ASSERT( WaitUntil( [ & ]() { return IsPchUnpacked( s, pchs[ 0 ].m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return IsPchUnpacked( s, pchs[ 0 ].m_Id ); } ) );
     DropWaitingJobs( s );
-    TEST_ASSERT( SendPch( sender, pchs[ 1 ] ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ) && ( s.IsPchCached( pchs[ 0 ].m_Id ) == false ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pchs[ 1 ] ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ) && ( s.IsPchCached( pchs[ 0 ].m_Id ) == false ); } ) );
 
     // A job for the first one again: the worker asks again, as the PCH has arrived since it asked
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( WaitUntil( [ &client ]() { return ( client.GetNumPchNeeded() >= 2 ); } ) );
-    TEST_ASSERT( Handshake( client, ci, kWaitTimeoutSeconds ) ); // Answered after the job
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &client ]() { return ( client.GetNumPchNeeded() >= 2 ); } ) );
+    TEST_ASSERT( client.Handshake( ci ) ); // Answered after the job
     TEST_ASSERT( client.GetNumPchNeeded() == 2 );
     TEST_ASSERT( client.GetPchNeededId( 1 ) == pchs[ 0 ].m_Id );
     client.ShutdownAllConnections();
@@ -4827,7 +4635,7 @@ void TestDistributed::WorkerAsksAgainWhenAPchItHadIsNeededAgain() const
 namespace
 {
     // A worker that is sent PCHs and holds the jobs for them, as a worker does, but that loses them
-    class PchLosingWorker : public FakeWorker
+    class PchLosingWorker : public DistributedTest::FakeWorker
     {
     public:
         enum Mode
@@ -4836,7 +4644,7 @@ namespace
             LOSE_EVERY_COPY,        // Never keeps one
         };
 
-        explicit PchLosingWorker( Mode mode ) : FakeWorker( 4 ), m_Mode( mode ) {}
+        explicit PchLosingWorker( Mode mode ) : DistributedTest::FakeWorker( 4 ), m_Mode( mode ) {}
         explicit PchLosingWorker( const PchLosingWorker & other ) = delete;
         PchLosingWorker & operator=( const PchLosingWorker & other ) = delete;
 
@@ -4968,12 +4776,12 @@ namespace
     };
 
     // A worker that asks for a PCH nobody has when it is sent its first job, and does nothing else
-    class UnknownPchAskingWorker : public FakeWorker
+    class UnknownPchAskingWorker : public DistributedTest::FakeWorker
     {
     public:
         static constexpr uint64_t kUnknownPchId = 0xDEAD0001;
 
-        UnknownPchAskingWorker() : FakeWorker( 4 ) {}
+        UnknownPchAskingWorker() : DistributedTest::FakeWorker( 4 ) {}
         explicit UnknownPchAskingWorker( const UnknownPchAskingWorker & other ) = delete;
         UnknownPchAskingWorker & operator=( const UnknownPchAskingWorker & other ) = delete;
 
@@ -5014,7 +4822,7 @@ void TestDistributed::ClientSendsAPchAgainWhenAsked() const
 
     // What it answers with is not object files, so the build itself fails: what counts is that it ends
     auto never = []() { return false; };
-    BuildAborter aborter( never, 20.0f );
+    DistributedTest::BuildAborter aborter( never, 20.0f );
     fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
     worker.ShutdownAllConnections();
 
@@ -5043,9 +4851,9 @@ void TestDistributed::ClientGivesUpOnAWorkerThatKeepsLosingAPch() const
 
     // The client sends the PCH again a number of times, then closes the connection and does not use the worker
     // again, so that the jobs held for it are built here
-    DenyListPoller poller( fBuild );
+    DistributedTest::DenyListPoller poller( fBuild );
     auto never = []() { return false; };
-    BuildAborter aborter( never, 60.0f );
+    DistributedTest::BuildAborter aborter( never, 60.0f );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
     worker.ShutdownAllConnections();
 
@@ -5075,9 +4883,9 @@ void TestDistributed::ClientGivesUpOnAWorkerThatAsksForAnUnknownPch() const
 
     // The job it holds could never start: the connection is closed and the worker not used again, so that
     // the jobs go back to the queue and are built here
-    DenyListPoller poller( fBuild );
+    DistributedTest::DenyListPoller poller( fBuild );
     auto never = []() { return false; };
-    BuildAborter aborter( never, 60.0f );
+    DistributedTest::BuildAborter aborter( never, 60.0f );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
     worker.ShutdownAllConnections();
 
@@ -5177,11 +4985,11 @@ namespace
     const uint32_t compressedSize = (uint32_t)compressed.GetResultSize();
 
     // It is sent from a connection of its own, which is only made now, as it would take a share of the capacity of the worker
-    PchSender sender;
+    DistributedTest::PchSender sender;
     if ( sender.ConnectToWorker() &&
          sender.SendChunks( otherPchId, (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) ) )
     {
-        eviction->m_HasOnlyTheOtherPch = WaitUntil( [ & ]()
+        eviction->m_HasOnlyTheOtherPch = DistributedTest::WaitUntil( [ & ]()
         {
             MutexHolder mh( server.m_PchCacheMutex );
             return ( server.m_PchCache.GetSize() == 1 ) && ( server.m_PchCache[ 0 ].pchId == otherPchId );
@@ -5192,14 +5000,7 @@ namespace
 void TestDistributed::EvictedPchIsSentAgain() const
 {
     // The worker has room for one job at a time, so that the second is sent after the first is done
-    struct CapacityOfOne
-    {
-        CapacityOfOne() : m_Original( WorkerThreadRemote::GetNumCPUsToUse() ) { WorkerThreadRemote::SetNumCPUsToUse( 1 ); }
-        ~CapacityOfOne() { WorkerThreadRemote::SetNumCPUsToUse( m_Original ); }
-        explicit CapacityOfOne( const CapacityOfOne & other ) = delete;
-        CapacityOfOne & operator=( const CapacityOfOne & other ) = delete;
-        const uint32_t m_Original;
-    } capacityOfOne;
+    const DistributedTest::RemoteCpusForTest capacityOfOne( 1 );
 
     FBuildTestOptions options;
     options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
@@ -5218,7 +5019,7 @@ void TestDistributed::EvictedPchIsSentAgain() const
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     auto never = []() { return false; };
-    BuildAborter aborter( never, 60.0f ); // A job that waits for a PCH that is not sent again does not end
+    DistributedTest::BuildAborter aborter( never, 60.0f ); // A job that waits for a PCH that is not sent again does not end
     const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
 
     // The PCH of the first job was gone before the second arrived, the worker asked for it, and the client
@@ -5238,7 +5039,7 @@ void TestDistributed::PchInsertEvictsToTheBudget() const
     SetPchCacheLimits( s, 1, 0 ); // Room for nothing beyond the PCH that has just arrived
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
     uint64_t pchIds[ 2 ] = {};
     for ( uint32_t i = 0; i < 2; ++i )
@@ -5250,13 +5051,13 @@ void TestDistributed::PchInsertEvictsToTheBudget() const
         pchIds[ i ] = PchId::Calc( content.Begin(), content.GetSize() );
         const uint32_t compressedSize = (uint32_t)compressed.GetResultSize();
         TEST_ASSERT( sender.SendChunks( pchIds[ i ], (uint32_t)content.GetSize(), compressed.GetResult(), compressedSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( compressedSize, Protocol::kPchChunkSize ) ) );
-        TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ i ] ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchIds[ i ] ); } ) );
     }
 
     // The first is gone, with its file, and the one that has just arrived is kept
     AStackString<> firstDir;
     GetWorkerPchDir( pchIds[ 0 ], firstDir );
-    TEST_ASSERT( WaitUntil( [ & ]() { return ( s.IsPchCached( pchIds[ 0 ] ) == false ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return ( s.IsPchCached( pchIds[ 0 ] ) == false ); } ) );
     TEST_ASSERT( FileIO::DirectoryExists( firstDir ) == false );
     TEST_ASSERT( s.IsPchCached( pchIds[ 1 ] ) );
     AStackString<> secondPath;
@@ -5270,12 +5071,12 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
 {
     // PCHs that compress well: what the cache counts is what is on disk, which is the compressed PCH
     const uint32_t kSize = 100000;
-    CompressedPch pchs[ 2 ];
+    DistributedTest::CompressedPch pchs[ 2 ];
     for ( uint32_t i = 0; i < 2; ++i )
     {
         pchs[ i ].m_Content.SetSize( kSize );
         memset( pchs[ i ].m_Content.Begin(), (int)( 'a' + i ), kSize );
-        CompressPch( pchs[ i ] );
+        DistributedTest::CompressPch( pchs[ i ] );
         TEST_ASSERT( pchs[ i ].m_CompressedSize < ( kSize / 10 ) );
     }
 
@@ -5287,12 +5088,12 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
     Server s( 1 );
     SetPchCacheLimits( s, ( kStoredSize * 3 ) / 2, 0 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
 
     // The first is cached as what is on disk, which is what the cache is counted by
-    TEST_ASSERT( SendPch( sender, pchs[ 0 ] ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pchs[ 0 ] ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
     AStackString<> path;
     TEST_ASSERT( s.FindCachedPch( pchs[ 0 ].m_Id, path ) );
     FileStream file;
@@ -5308,9 +5109,9 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
 
     // A second makes twice that, which is over: the first, which is the older, goes
     SetPchRecency( s, pchs[ 0 ].m_Id, 1 );
-    TEST_ASSERT( SendPch( sender, pchs[ 1 ] ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ); } ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return ( s.IsPchCached( pchs[ 0 ].m_Id ) == false ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pchs[ 1 ] ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return ( s.IsPchCached( pchs[ 0 ].m_Id ) == false ); } ) );
     TEST_ASSERT( s_LastCacheBytes.Load() == ( 2 * kStoredSize ) );
     TEST_ASSERT( s.IsPchCached( pchs[ 1 ].m_Id ) );
 
@@ -5363,7 +5164,7 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
 
 /*static*/ void TestDistributed::AddStoredPch( Server & server, uint32_t size, uint32_t seed, StoredPch & outPch )
 {
-    MakeTestContent( size, seed, outPch.m_Content );
+    DistributedTest::MakeTestContent( size, seed, outPch.m_Content );
     Compressor compressed;
     compressed.CompressZstd( outPch.m_Content.Begin(), outPch.m_Content.GetSize(), Compressor::kZstdTransferLevel );
     outPch.m_Id = PchId::Calc( outPch.m_Content.Begin(), outPch.m_Content.GetSize() );
@@ -5451,8 +5252,7 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
     {
         Thread::Sleep( 1 );
     }
-    const Timer timer;
-    for ( ;; )
+    request->m_Resolved = DistributedTest::WaitUntil( [ request ]()
     {
         bool all = true;
         for ( Job * job : request->m_Jobs )
@@ -5462,17 +5262,8 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
                 all = false;
             }
         }
-        if ( all )
-        {
-            request->m_Resolved = true;
-            break;
-        }
-        if ( timer.GetElapsed() > kWaitTimeoutSeconds )
-        {
-            break;
-        }
-        Thread::Sleep( 1 );
-    }
+        return all;
+    } );
     return 0;
 }
 
@@ -5480,17 +5271,17 @@ void TestDistributed::PchInsertCountsTheSizeOnDisk() const
 //------------------------------------------------------------------------------
 void TestDistributed::PchIsStoredCompressed() const
 {
-    CompressedPch pch;
-    MakeCompressedPch( ( 3 * MEGABYTE ) + 5, 1, pch );
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( ( 3 * MEGABYTE ) + 5, 1, pch );
     TEST_ASSERT( pch.m_CompressedSize < ( pch.m_Content.GetSize() / 4 ) );
 
     Server worker( 1 );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
-    TEST_ASSERT( SendPch( sender, pch ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pch ) );
     AStackString<> storedFile;
-    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pch.m_Id, storedFile ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return worker.FindCachedPch( pch.m_Id, storedFile ); } ) );
 
     // What is kept is what was sent, in a file that says how it is stored
     TEST_ASSERT( storedFile.EndsWith( PchBlob::kStoredFileName ) );
@@ -5530,7 +5321,7 @@ void TestDistributed::PchIsUnpackedWhenAJobNeedsIt() const
     Job * job = MakePchJob( s, pch.m_Id );
     TEST_ASSERT( s.TryResolvePch( *job ) == false );
     TEST_ASSERT( job->GetPchCachePath().IsEmpty() );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
 
     // It is where the compile finds it, and is the PCH
     TEST_ASSERT( job->GetPchCachePath() == pch.m_RawFile );
@@ -5560,10 +5351,10 @@ void TestDistributed::PchIsUnpackedWhenAJobNeedsIt() const
 //------------------------------------------------------------------------------
 void TestDistributed::PchThatCannotBeUnpackedIsDropped() const
 {
-    CompressedPch pch;
-    MakeCompressedPch( ( 2 * MEGABYTE ) + 3, 3, pch );
-    CompressedPch other;
-    MakeCompressedPch( ( 2 * MEGABYTE ) + 3, 4, other );
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( ( 2 * MEGABYTE ) + 3, 3, pch );
+    DistributedTest::CompressedPch other;
+    DistributedTest::MakeCompressedPch( ( 2 * MEGABYTE ) + 3, 4, other );
     Compressor lz4;
     lz4.Compress( pch.m_Content.Begin(), pch.m_Content.GetSize(), 1 );
 
@@ -5612,8 +5403,8 @@ void TestDistributed::PchThatCannotBeUnpackedIsDropped() const
         // The job waits, as it does for a PCH that is not there, and is not given a copy
         Job * job = MakePchJob( s, pch.m_Id );
         TEST_ASSERT( s.TryResolvePch( *job ) == false );
-        TEST_ASSERT( WaitUntil( [ & ]() { return ( s.IsPchCached( pch.m_Id ) == false ); } ) );
-        TEST_ASSERT( WaitUntil( [ & ]() { return ( s.m_PchUnpackQueue.IsEmpty() && ( IsPchBeingUnpacked( s, pch.m_Id ) == false ) ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return ( s.IsPchCached( pch.m_Id ) == false ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return ( s.m_PchUnpackQueue.IsEmpty() && ( IsPchBeingUnpacked( s, pch.m_Id ) == false ) ); } ) );
         TEST_ASSERT( s.TryResolvePch( *job ) == false );
         TEST_ASSERT( job->GetPchCachePath().IsEmpty() );
         TEST_ASSERT( s.m_NumPchsUnpacked.Load() == 0 );
@@ -5644,7 +5435,7 @@ void TestDistributed::PchThatCannotBeWrittenIsKept() const
     AddStoredPch( s, 100000, 14, idle );
     {
         Job * job = MakePchJob( s, idle.m_Id );
-        TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
         FDELETE job;
     }
     TEST_ASSERT( FileIO::FileExists( idle.m_RawFile.Get() ) );
@@ -5656,7 +5447,7 @@ void TestDistributed::PchThatCannotBeWrittenIsKept() const
     TEST_ASSERT( FileIO::EnsurePathExists( pch.m_RawFile ) );
     Job * job = MakePchJob( s, pch.m_Id );
     TEST_ASSERT( s.TryResolvePch( *job ) == false );
-    TEST_ASSERT( WaitUntil( [ & ]() { return ( s.m_PchUnpackQueue.IsEmpty() && ( IsPchBeingUnpacked( s, pch.m_Id ) == false ) ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return ( s.m_PchUnpackQueue.IsEmpty() && ( IsPchBeingUnpacked( s, pch.m_Id ) == false ) ); } ) );
 
     // It was tried again once the copies nothing uses were gone
     TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 3 );
@@ -5679,7 +5470,7 @@ void TestDistributed::PchThatCannotBeWrittenIsKept() const
     // With room, the next job is given its copy
     TEST_ASSERT( FileIO::DirectoryDelete( pch.m_RawFile ) );
     Job * next = MakePchJob( s, pch.m_Id );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *next ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.TryResolvePch( *next ); } ) );
     TEST_ASSERT( FileIO::FileExists( pch.m_RawFile.Get() ) );
     FDELETE next;
 }
@@ -5688,11 +5479,11 @@ void TestDistributed::PchThatCannotBeWrittenIsKept() const
 //------------------------------------------------------------------------------
 void TestDistributed::PchThatCannotBeWrittenReturnsItsJobs() const
 {
-    CapturedJob captured;
+    DistributedTest::CapturedJob captured;
     CapturePchJob( captured );
-    CompressedPch pch;
-    MakeCompressedPch( 200000, 8, pch );
-    const CapturedJob job = WithPch( captured, pch.m_Id );
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 200000, 8, pch );
+    const DistributedTest::CapturedJob job = WithPch( captured, pch.m_Id );
 
     // The worker has the PCH, but cannot write a working copy of it: a directory is where it goes
     Server s( 1 );
@@ -5705,19 +5496,20 @@ void TestDistributed::PchThatCannotBeWrittenReturnsItsJobs() const
 
     // A job for it cannot be built here, so the client has it back: a PCH the client sends again would
     // be as good as the one the worker has, and no better
-    HandshakeProbe probe;
+    DistributedTest::HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( probe, ci, kWaitTimeoutSeconds ) );
+    ci = probe.ConnectAndHandshake( Protocol::kTestPort );
+    TEST_ASSERT( ci );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
     TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
     TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 2 ); // Once more, with the unused copies gone
     TEST_ASSERT( s.IsPchCached( pch.m_Id ) );
     TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) );
 
     // Its jobs went with it, and their hold on the PCH
-    TEST_ASSERT( WaitUntil( [ & ]() { return ( CountWaitingJobs( s ) == 0 ) && ( TotalLeases( s ) == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return ( CountWaitingJobs( s ) == 0 ) && ( TotalLeases( s ) == 0 ); } ) );
     TEST_ASSERT( HasRawEntry( s, pch.m_Id ) == false );
     TEST_ASSERT( FileIO::DirectoryDelete( rawFile ) );
 }
@@ -5726,11 +5518,11 @@ void TestDistributed::PchThatCannotBeWrittenReturnsItsJobs() const
 //------------------------------------------------------------------------------
 void TestDistributed::CorruptPchIsAskedForAgain() const
 {
-    CapturedJob captured;
+    DistributedTest::CapturedJob captured;
     CapturePchJob( captured );
-    CompressedPch pch;
-    MakeCompressedPch( 200000, 5, pch );
-    const CapturedJob job = WithPch( captured, pch.m_Id );
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 200000, 5, pch );
+    const DistributedTest::CapturedJob job = WithPch( captured, pch.m_Id );
 
     // The worker has a file that is not the PCH, as it indexed it
     Server s( 1 );
@@ -5746,12 +5538,13 @@ void TestDistributed::CorruptPchIsAskedForAgain() const
     AddStoredBlob( s, pch.m_Id, damaged.Begin(), damaged.GetSize(), true, storedFile );
 
     // A job for it finds out, and the client is asked for the PCH
-    HandshakeProbe probe;
+    DistributedTest::HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
-    TEST_ASSERT( ConnectAndHandshake( probe, ci, kWaitTimeoutSeconds ) );
+    ci = probe.ConnectAndHandshake( Protocol::kTestPort );
+    TEST_ASSERT( ci );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendCapturedJob( ci, encoder, job ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() >= 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() >= 1 ); } ) );
     TEST_ASSERT( probe.GetPchNeededId( 0 ) == pch.m_Id );
     TEST_ASSERT( s.IsPchCached( pch.m_Id ) == false );
     TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) == false );
@@ -5760,16 +5553,16 @@ void TestDistributed::CorruptPchIsAskedForAgain() const
     TEST_ASSERT( IsPchUnpacked( s, pch.m_Id ) == false );
 
     // Sent again, it is unpacked for the job that is waiting
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
-    TEST_ASSERT( SendPch( sender, pch ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return ( NumWaitingJobsWithAPch( s ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pch ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return ( NumWaitingJobsWithAPch( s ) == 1 ); } ) );
     TEST_ASSERT( IsPchUnpacked( s, pch.m_Id ) );
     TEST_ASSERT( CountWaitingJobs( s ) == 1 ); // For its toolchain, which never comes
     TEST_ASSERT( s.IsPchCached( pch.m_Id ) );
 
     // and the client is not asked again: whatever the worker sent before it answers this was sent by then
-    TEST_ASSERT( Handshake( probe, ci, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( probe.Handshake( ci ) );
     TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
     probe.ShutdownAllConnections();
 }
@@ -5858,7 +5651,7 @@ void TestDistributed::UnpackedCopyLivesWithItsJobs() const
     SetPchCacheLimits( s, ( 1ull << 30 ), 0, 0 ); // Nothing is kept for later: a copy is only there while jobs use it
     StoredPch pch;
     AddStoredPch( s, ( 2 * MEGABYTE ), 7, pch );
-    auto resolve = [ & ]( Job & job ) { TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( job ); } ) ); };
+    auto resolve = [ & ]( Job & job ) { TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.TryResolvePch( job ); } ) ); };
 
     Job * a = MakePchJob( s, pch.m_Id );
     Job * b = MakePchJob( s, pch.m_Id );
@@ -5980,7 +5773,7 @@ void TestDistributed::UnusedCopiesGoWhenIdle() const
     StoredPch pch;
     AddStoredPch( s, ( 1 * MEGABYTE ), 8, pch );
     Job * job = MakePchJob( s, pch.m_Id );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
     FDELETE job;
 
     // Kept a while for the next job
@@ -5999,33 +5792,33 @@ void TestDistributed::UnusedCopiesGoWhenIdle() const
 //------------------------------------------------------------------------------
 void TestDistributed::LeasedPchIsNotEvicted() const
 {
-    CompressedPch pchs[ 3 ];
+    DistributedTest::CompressedPch pchs[ 3 ];
     for ( uint32_t i = 0; i < 3; ++i )
     {
-        MakeCompressedPch( 100000, ( 51 + i ), pchs[ i ] );
+        DistributedTest::MakeCompressedPch( 100000, ( 51 + i ), pchs[ i ] );
     }
 
     Server s( 1 );
     SetPchCacheLimits( s, 1, 0 ); // Room for the PCH that has just arrived only
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
 
     // A job needs the first, which is the least recently used. A second arrives, and there is room for one:
     // the first is the only one that could go, and stays, as a job needs it.
-    TEST_ASSERT( SendPch( sender, pchs[ 0 ] ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pchs[ 0 ] ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
     SetPchRecency( s, pchs[ 0 ].m_Id, 1 );
     Job * job = MakePchJob( s, pchs[ 0 ].m_Id );
-    TEST_ASSERT( SendPch( sender, pchs[ 1 ] ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pchs[ 1 ] ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ); } ) );
     TEST_ASSERT( s.IsPchCached( pchs[ 0 ].m_Id ) );
     SetPchRecency( s, pchs[ 1 ].m_Id, 2 );
 
     // The job is gone. A third arrives, and the other two go, the first being the oldest.
     FDELETE job;
-    TEST_ASSERT( SendPch( sender, pchs[ 2 ] ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 2 ].m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pchs[ 2 ] ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 2 ].m_Id ); } ) );
     TEST_ASSERT( s.IsPchCached( pchs[ 0 ].m_Id ) == false );
     TEST_ASSERT( s.IsPchCached( pchs[ 1 ].m_Id ) == false );
 }
@@ -6034,10 +5827,10 @@ void TestDistributed::LeasedPchIsNotEvicted() const
 //------------------------------------------------------------------------------
 void TestDistributed::PchsAreEvictedByRecency() const
 {
-    CompressedPch pchs[ 3 ];
+    DistributedTest::CompressedPch pchs[ 3 ];
     for ( uint32_t i = 0; i < 3; ++i )
     {
-        MakeCompressedPch( 100000, ( 61 + i ), pchs[ i ] );
+        DistributedTest::MakeCompressedPch( 100000, ( 61 + i ), pchs[ i ] );
     }
     // Room for the first and either of the others, counted as they are stored, but not all three
     const uint64_t budget = Math::Max( pchs[ 0 ].m_CompressedSize + pchs[ 1 ].m_CompressedSize,
@@ -6046,21 +5839,21 @@ void TestDistributed::PchsAreEvictedByRecency() const
     Server s( 1 );
     SetPchCacheLimits( s, budget, 0 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
-    TEST_ASSERT( SendPch( sender, pchs[ 0 ] ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pchs[ 0 ] ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 0 ].m_Id ); } ) );
     SetPchRecency( s, pchs[ 0 ].m_Id, 1 );
-    TEST_ASSERT( SendPch( sender, pchs[ 1 ] ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pchs[ 1 ] ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 1 ].m_Id ); } ) );
     TEST_ASSERT( s.IsPchCached( pchs[ 0 ].m_Id ) ); // Both fit
     SetPchRecency( s, pchs[ 1 ].m_Id, 2 );
 
     // The first is used again, so the second is the one that is not
     AStackString<> path;
     TEST_ASSERT( s.FindCachedPch( pchs[ 0 ].m_Id, path ) );
-    TEST_ASSERT( SendPch( sender, pchs[ 2 ] ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 2 ].m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( sender, pchs[ 2 ] ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( pchs[ 2 ].m_Id ); } ) );
     TEST_ASSERT( s.IsPchCached( pchs[ 0 ].m_Id ) );
     TEST_ASSERT( s.IsPchCached( pchs[ 1 ].m_Id ) == false );
 }
@@ -6074,7 +5867,7 @@ void TestDistributed::UnusedCopyGoesWhenTheFreeSpaceIsUnknown() const
     StoredPch pch;
     AddStoredPch( s, ( 1 * MEGABYTE ), 16, pch );
     Job * job = MakePchJob( s, pch.m_Id );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
 
     // It stays for as long as the job needs it
     s.TrimRawPchs( Time::GetCurrentFileTime() );
@@ -6148,7 +5941,7 @@ void TestDistributed::PchStartupScanKeepsTheCompressedStore() const
     makeDir( 0xB006, lz4Dir );
     makeFile( emptyDir, PchBlob::kStoredFileName, nullptr, 0, emptyStored );
     Array<char> content;
-    MakeTestContent( 5000, 1, content );
+    DistributedTest::MakeTestContent( 5000, 1, content );
     Compressor lz4;
     lz4.Compress( content.Begin(), content.GetSize(), 1 );
     makeFile( lz4Dir, PchBlob::kStoredFileName, lz4.GetResult(), lz4.GetResultSize(), lz4Stored );
@@ -6230,8 +6023,8 @@ void TestDistributed::PchStartupScanKeepsTheCompressedStore() const
 //------------------------------------------------------------------------------
 void TestDistributed::PchOfAnotherCompressionIsNotStoredAgain() const
 {
-    CompressedPch pch;
-    MakeCompressedPch( ( 2 * MEGABYTE ) + 7, 17, pch );
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( ( 2 * MEGABYTE ) + 7, 17, pch );
 
     // The same PCH, compressed harder: not the same file, as another coordinator may send it
     Compressor harder;
@@ -6240,26 +6033,26 @@ void TestDistributed::PchOfAnotherCompressionIsNotStoredAgain() const
     TEST_ASSERT( harderSize != pch.m_CompressedSize );
 
     // A PCH sent after it on the same connection, which only arrives if the connection is still there
-    CompressedPch after;
-    MakeCompressedPch( 100000, 18, after );
+    DistributedTest::CompressedPch after;
+    DistributedTest::MakeCompressedPch( 100000, 18, after );
 
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-    PchSender first;
+    DistributedTest::PchSender first;
     TEST_ASSERT( first.ConnectToWorker() );
-    TEST_ASSERT( SendPch( first, pch ) );
+    TEST_ASSERT( DistributedTest::SendPch( first, pch ) );
     AStackString<> storedFile;
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.FindCachedPch( pch.m_Id, storedFile ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.FindCachedPch( pch.m_Id, storedFile ); } ) );
 
     // A job is using it
     Job * job = MakePchJob( s, pch.m_Id );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
 
-    PchSender second;
+    DistributedTest::PchSender second;
     TEST_ASSERT( second.ConnectToWorker() );
     TEST_ASSERT( second.SendChunks( pch.m_Id, (uint32_t)pch.m_Content.GetSize(), harder.GetResult(), harderSize, Protocol::kPchChunkSize, 0, Protocol::MsgPchFile::GetNumChunks( harderSize, Protocol::kPchChunkSize ) ) );
-    TEST_ASSERT( SendPch( second, after ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.IsPchCached( after.m_Id ); } ) );
+    TEST_ASSERT( DistributedTest::SendPch( second, after ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.IsPchCached( after.m_Id ); } ) );
 
     // It is the PCH it was: not replaced, and not counted as the size of the other
     Array<char> onDisk;
@@ -6330,7 +6123,7 @@ void TestDistributed::PchStoreIsUsedThroughTheBuild() const
     uint64_t pchId = 0;
     {
         FBuildTestOptions options;
-        MakeDistributedPchOptions( options );
+        DistributedTest::MakeDistributedPchOptions( options );
         FBuildForTest fBuild( options );
         TEST_ASSERT( fBuild.Initialize() );
         cleanOutput();
@@ -6375,7 +6168,7 @@ void TestDistributed::PchStoreIsUsedThroughTheBuild() const
     // A worker that starts later finds the store, and is not sent the PCH again. Only the objects are built again.
     {
         FBuildTestOptions options;
-        MakeDistributedPchOptions( options );
+        DistributedTest::MakeDistributedPchOptions( options );
         FBuildForTest fBuild( options );
         TEST_ASSERT( fBuild.Initialize( dbFile.Get() ) );
         for ( uint32_t i = 0; i < 3; ++i )
@@ -6437,12 +6230,12 @@ void TestDistributed::PchLeasesAreReleasedByEveryEnd() const
         TEST_ASSERT( fBuild.Build( target ) );
     }
     TEST_ASSERT( worker.m_NumPchUnpackAttempts.Load() >= 1 ); // The jobs did hold a PCH
-    TEST_ASSERT( WaitUntil( [ & ]() { return noLeasesLeft( worker ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return noLeasesLeft( worker ); } ) );
 
     // A build whose connection is dropped under a job, which the coordinator builds again on a new one
     {
         FBuildTestOptions options;
-        MakeDistributedPchOptions( options );
+        DistributedTest::MakeDistributedPchOptions( options );
         options.m_ForceCleanBuild = true;
         FBuildForTest fBuild( options );
         TEST_ASSERT( fBuild.Initialize() );
@@ -6458,23 +6251,23 @@ void TestDistributed::PchLeasesAreReleasedByEveryEnd() const
         TEST_ASSERT( drop.m_Dropped.Load() );
         TEST_ASSERT( built );
     }
-    TEST_ASSERT( WaitUntil( [ & ]() { return noLeasesLeft( worker ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return noLeasesLeft( worker ); } ) );
 
     // A build that is stopped while a job is on the worker
     {
         FBuildTestOptions options;
-        MakeDistributedPchOptions( options );
+        DistributedTest::MakeDistributedPchOptions( options );
         options.m_ForceCleanBuild = true;
         FBuildForTest fBuild( options );
         TEST_ASSERT( fBuild.Initialize() );
         cleanOutput();
 
         auto reached = [ &worker ]() { return WorkerIsBuildingAJob( worker ); };
-        BuildAborter aborter( reached, kWaitTimeoutSeconds );
+        DistributedTest::BuildAborter aborter( reached, DistributedTest::kWaitTimeoutSeconds );
         fBuild.Build( target );
         TEST_ASSERT( aborter.HasReached() );
     }
-    TEST_ASSERT( WaitUntil( [ & ]() { return noLeasesLeft( worker ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return noLeasesLeft( worker ); } ) );
 }
 
 // RegressionTest_RemoteCrashOnErrorFormatting
@@ -6716,7 +6509,7 @@ void TestDistributed::ShutdownMemoryLeak() const
     const float timeout = 5.0f;
 #endif
     auto hasDistributedJobs = []() { return ( Job::GetTotalLocalDataMemoryUsage() != 0 ); };
-    BuildAborter aborter( hasDistributedJobs, timeout );
+    DistributedTest::BuildAborter aborter( hasDistributedJobs, timeout );
 
     // Start build and check it was aborted
     TEST_ASSERT( fBuild.Build( "ShutdownMemoryLeak" ) == false );
@@ -6952,7 +6745,7 @@ namespace
                                                                         bool & outTransformed )
 {
     PchDataCache::CompressedState state = PchDataCache::COMPRESSING;
-    WaitUntil( [ & ]()
+    DistributedTest::WaitUntil( [ & ]()
     {
         state = cache.GetCompressed( entry, outFilePath, outSize, &outTransformed );
         return ( state != PchDataCache::COMPRESSING );
@@ -7219,16 +7012,16 @@ void TestDistributed::WorkerStoresATransformedPch() const
     TEST_ASSERT( MakePchBlob( content, kNoTransform, plainBlob ) );
     TEST_ASSERT( blob.GetSize() < plainBlob.GetSize() );
     const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
-    ClearWorkerPchStore();
+    DistributedTest::ClearWorkerPchStore();
 
     Server worker( 1 );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
     const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)blob.GetSize(), Protocol::kPchChunkSize );
     TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), blob.Begin(), (uint32_t)blob.GetSize(), Protocol::kPchChunkSize, 0, numChunks ) );
     AStackString<> storedFile;
-    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, storedFile ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, storedFile ); } ) );
 
     // What is kept is what was sent: the store is as small as the wire was
     Array<char> onDisk;
@@ -7244,7 +7037,7 @@ void TestDistributed::WorkerStoresATransformedPch() const
 
     // A job is given the PCH, with the transform undone
     Job * job = MakePchJob( worker, pchId );
-    TEST_ASSERT( WaitUntil( [ & ]() { return worker.TryResolvePch( *job ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return worker.TryResolvePch( *job ); } ) );
     Array<char> raw;
     TEST_ASSERT( ReadFile( job->GetPchCachePath(), raw ) );
     TEST_ASSERT( raw.GetSize() == content.GetSize() );
@@ -7267,16 +7060,16 @@ void TestDistributed::WorkerAcceptsAPlainPchFromAnOldClient() const
     TEST_ASSERT( transformed == false );
     TEST_ASSERT( GetBlobType( blob ) == Compressor::eZstd );
     const uint64_t pchId = PchId::Calc( content.Begin(), content.GetSize() );
-    ClearWorkerPchStore();
+    DistributedTest::ClearWorkerPchStore();
 
     Server worker( 1 );
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
-    PchSender sender;
+    DistributedTest::PchSender sender;
     TEST_ASSERT( sender.ConnectToWorker() );
     const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)blob.GetSize(), Protocol::kPchChunkSize );
     TEST_ASSERT( sender.SendChunks( pchId, (uint32_t)content.GetSize(), blob.Begin(), (uint32_t)blob.GetSize(), Protocol::kPchChunkSize, 0, numChunks ) );
     AStackString<> storedFile;
-    TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, storedFile ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, storedFile ); } ) );
 
     Array<char> onDisk;
     TEST_ASSERT( ReadFile( storedFile, onDisk ) );
@@ -7285,7 +7078,7 @@ void TestDistributed::WorkerAcceptsAPlainPchFromAnOldClient() const
     TEST_ASSERT( DecodesToFile( storedFile, content ) );
 
     Job * job = MakePchJob( worker, pchId );
-    TEST_ASSERT( WaitUntil( [ & ]() { return worker.TryResolvePch( *job ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return worker.TryResolvePch( *job ); } ) );
     Array<char> raw;
     TEST_ASSERT( ReadFile( job->GetPchCachePath(), raw ) );
     TEST_ASSERT( raw.GetSize() == content.GetSize() );
@@ -7319,7 +7112,7 @@ void TestDistributed::WorkerRejectsATransformedPchThatIsNotValid() const
             default:                break;
         }
         memcpy( blob.Begin(), &type, sizeof( type ) );
-        ClearWorkerPchStore();
+        DistributedTest::ClearWorkerPchStore();
 
         Server worker( 1 );
         TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
@@ -7328,22 +7121,22 @@ void TestDistributed::WorkerRejectsATransformedPchThatIsNotValid() const
             MutexHolder mh( worker.m_ClientListMutex );
             return worker.m_ClientList.GetSize();
         };
-        PchSender sender;
+        DistributedTest::PchSender sender;
         TEST_ASSERT( sender.ConnectToWorker() );
-        TEST_ASSERT( WaitUntil( [ & ]() { return numClients() == 1; } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return numClients() == 1; } ) );
         const uint32_t numChunks = Protocol::MsgPchFile::GetNumChunks( (uint32_t)blob.GetSize(), Protocol::kPchChunkSize );
         TEST_ASSERT( sender.SendChunks( pchId, size, blob.Begin(), (uint32_t)blob.GetSize(), Protocol::kPchChunkSize, 0, numChunks ) );
 
         AStackString<> storedFile;
         if ( fault == NONE )
         {
-            TEST_ASSERT( WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, storedFile ); } ) );
+            TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return worker.FindCachedPch( pchId, storedFile ); } ) );
             TEST_ASSERT( numClients() == 1 );
             continue;
         }
 
         // A PCH that is not valid is rejected as one that is corrupt: the connection is dropped, and nothing is kept
-        TEST_ASSERT( WaitUntil( [ & ]() { return numClients() == 0; } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return numClients() == 0; } ) );
         TEST_ASSERT( worker.FindCachedPch( pchId, storedFile ) == false );
         AStackString<> dir;
         GetWorkerPchDir( pchId, dir );
@@ -7387,7 +7180,7 @@ void TestDistributed::StoredTransformedPchThatCannotBeInvertedIsDropped() const
             type += ( 1u << 8 );
         }
         memcpy( blob.Begin(), &type, sizeof( type ) );
-        ClearWorkerPchStore(); // What an earlier case left would be found by the worker
+        DistributedTest::ClearWorkerPchStore(); // What an earlier case left would be found by the worker
 
         Server s( 1 );
         AStackString<> storedFile;
@@ -7399,7 +7192,7 @@ void TestDistributed::StoredTransformedPchThatCannotBeInvertedIsDropped() const
         Job * job = MakePchJob( s, pchId );
         if ( which == GOOD )
         {
-            TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
+            TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.TryResolvePch( *job ); } ) );
             Array<char> raw;
             TEST_ASSERT( ReadFile( rawFile, raw ) );
             TEST_ASSERT( raw.GetSize() == content.GetSize() );
@@ -7409,8 +7202,8 @@ void TestDistributed::StoredTransformedPchThatCannotBeInvertedIsDropped() const
         {
             // As a PCH that is damaged: the job waits, the PCH is not unpacked again, and is not kept, so it can be sent again
             TEST_ASSERT( s.TryResolvePch( *job ) == false );
-            TEST_ASSERTM( WaitUntil( [ & ]() { return ( s.IsPchCached( pchId ) == false ); } ), "case %u", which );
-            TEST_ASSERT( WaitUntil( [ & ]() { return ( s.m_PchUnpackQueue.IsEmpty() && ( IsPchBeingUnpacked( s, pchId ) == false ) ); } ) );
+            TEST_ASSERTM( DistributedTest::WaitUntil( [ & ]() { return ( s.IsPchCached( pchId ) == false ); } ), "case %u", which );
+            TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return ( s.m_PchUnpackQueue.IsEmpty() && ( IsPchBeingUnpacked( s, pchId ) == false ) ); } ) );
             TEST_ASSERT( job->GetPchCachePath().IsEmpty() );
             TEST_ASSERT( s.m_NumPchsUnpacked.Load() == 0 );
             TEST_ASSERT( s.m_NumPchUnpackAttempts.Load() == 1 );
@@ -7429,8 +7222,8 @@ void TestDistributed::StoredTransformedPchThatCannotBeInvertedIsDropped() const
 void TestDistributed::ClientSendsTheTransformedPch() const
 {
     AStackString<> statsLogPath;
-    GetStatsLogPath( statsLogPath );
-    const uint64_t statsLogSize = GetStatsLogSize( statsLogPath );
+    DistributedTest::GetStatsLogPath( statsLogPath );
+    const uint64_t statsLogSize = DistributedTest::GetStatsLogSize( statsLogPath );
     uint32_t numLogged = 0;
 
     // The PCH is sent after the transform
@@ -7440,7 +7233,7 @@ void TestDistributed::ClientSendsTheTransformedPch() const
         TEST_ASSERT( worker.GetPchType() == kTransformedBlobType );
         TEST_ASSERT( ( (uint64_t)worker.GetPchCompressedSize() * 100 ) < ( (uint64_t)worker.GetPchUncompressedSize() * 90 ) );
     }
-    const bool isLogComplete = CountInStatsLogSince( statsLogPath, statsLogSize, "pch-transform:", numLogged );
+    const bool isLogComplete = DistributedTest::CountInStatsLogSince( statsLogPath, statsLogSize, "pch-transform:", numLogged );
     TEST_ASSERT( ( isLogComplete == false ) || ( numLogged == 1 ) ); // The connection says so in its stats
 }
 
@@ -7503,7 +7296,7 @@ void TestDistributed::PchTransformedThroughTheBuild() const
         outStoredFile = worker.m_PchCache[ worker.m_PchCache.GetSize() - 1 ].filePath;
         outPchId = worker.m_PchCache[ worker.m_PchCache.GetSize() - 1 ].pchId;
     };
-    ClearWorkerPchStore();
+    DistributedTest::ClearWorkerPchStore();
 
     // A client and a worker of this version: the PCH goes over, and is kept, after the transform
     Array<char> first[ 3 ];
@@ -7512,7 +7305,7 @@ void TestDistributed::PchTransformedThroughTheBuild() const
     uint64_t pchId = 0;
     {
         FBuildTestOptions options;
-        MakeDistributedPchOptions( options );
+        DistributedTest::MakeDistributedPchOptions( options );
         FBuildForTest fBuild( options );
         TEST_ASSERT( fBuild.Initialize() );
         cleanOutput();
@@ -7551,7 +7344,7 @@ void TestDistributed::PchTransformedThroughTheBuild() const
     // A worker that starts later finds it in the store, and is not sent the PCH again. The objects are the same.
     {
         FBuildTestOptions options;
-        MakeDistributedPchOptions( options );
+        DistributedTest::MakeDistributedPchOptions( options );
         FBuildForTest fBuild( options );
         TEST_ASSERT( fBuild.Initialize( dbFile.Get() ) );
         deleteObjects();
@@ -7586,12 +7379,12 @@ void TestDistributed::PchTransformFallsBackThroughTheBuild() const
         {
             FileIO::FileDelete( file.Get() );
         }
-        ClearWorkerPchStore();
+        DistributedTest::ClearWorkerPchStore();
 
         // The transform makes what does not give the PCH back, or fails, so what is sent is the PCH as it is: the build is not at fault
         TransformFaultGuard faulty( fault );
         FBuildTestOptions options;
-        MakeDistributedPchOptions( options );
+        DistributedTest::MakeDistributedPchOptions( options );
         FBuildForTest fBuild( options );
         TEST_ASSERT( fBuild.Initialize() );
 
@@ -7666,10 +7459,10 @@ namespace
 
     // A worker that ends the connection once it has the chunk before the last of a PCH, as the client is about
     // to send the last. It takes no job.
-    class PchDroppingWorker : public FakeWorker
+    class PchDroppingWorker : public DistributedTest::FakeWorker
     {
     public:
-        PchDroppingWorker() : FakeWorker( 1 ) {}
+        PchDroppingWorker() : DistributedTest::FakeWorker( 1 ) {}
         explicit PchDroppingWorker( const PchDroppingWorker & other ) = delete;
         PchDroppingWorker & operator=( const PchDroppingWorker & other ) = delete;
 
@@ -7701,10 +7494,10 @@ namespace
     };
 
     // A worker that has the capacity for a job and never does it
-    class SilentWorker : public FakeWorker
+    class SilentWorker : public DistributedTest::FakeWorker
     {
     public:
-        SilentWorker() : FakeWorker( 1 ) {}
+        SilentWorker() : DistributedTest::FakeWorker( 1 ) {}
         explicit SilentWorker( const SilentWorker & other ) = delete;
         SilentWorker & operator=( const SilentWorker & other ) = delete;
 
@@ -7717,7 +7510,7 @@ namespace
     class ConnectionEndHook
     {
     public:
-        ConnectionEndHook( Client::HookPoint point, FakeWorker & worker ) : m_Point( point ), m_Worker( worker )
+        ConnectionEndHook( Client::HookPoint point, DistributedTest::FakeWorker & worker ) : m_Point( point ), m_Worker( worker )
         {
             s_Active = this;
             Client::SetTestHook( &Hook );
@@ -7755,7 +7548,7 @@ namespace
 
         inline static ConnectionEndHook * s_Active = nullptr;
         const Client::HookPoint m_Point;
-        FakeWorker & m_Worker;
+        DistributedTest::FakeWorker & m_Worker;
         Atomic<uint32_t> m_NumReached{ 0 };
         Atomic<bool> m_Fired{ false };
         Atomic<bool> m_SeenEnd{ false };
@@ -7771,7 +7564,7 @@ void TestDistributed::ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend() const
     // connects again, and again. The connection has to be ended however far the send thread has come.
     const HangGuard guard( "ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend", kHangSeconds );
     FBuildTestOptions options;
-    MakeDistributedPchOptions( options );
+    DistributedTest::MakeDistributedPchOptions( options );
     options.m_ForceCleanBuild = true;
     options.m_DistributionPchChunkSize = Protocol::kMinPchChunkSize;
     options.m_DistributionReconnectDelay = 0.05f;
@@ -7782,7 +7575,7 @@ void TestDistributed::ClientIsNotStuckWhenTheWorkerDropsDuringAPchSend() const
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
     const uint32_t kNumDrops = 40;
     auto dropped = [ &worker, kNumDrops ]() { return ( worker.GetNumDrops() >= kNumDrops ); };
-    BuildAborter aborter( dropped, kWaitTimeoutSeconds );
+    DistributedTest::BuildAborter aborter( dropped, DistributedTest::kWaitTimeoutSeconds );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
     worker.ShutdownAllConnections();
     TEST_ASSERT( built == false ); // Aborted
@@ -7798,7 +7591,7 @@ void TestDistributed::ClientIsNotStuckWhenTheConnectionEndsBeforeAPchIsDelivered
     // until the connection has ended. Ending it waits for the send thread, and it must not do so holding that lock.
     const HangGuard guard( "ClientIsNotStuckWhenTheConnectionEndsBeforeAPchIsDelivered", kHangSeconds );
     FBuildTestOptions options;
-    MakeDistributedPchOptions( options );
+    DistributedTest::MakeDistributedPchOptions( options );
     options.m_ForceCleanBuild = true;
     options.m_DistributionReconnectDelay = 0.05f;
     FBuildForTest fBuild( options );
@@ -7808,7 +7601,7 @@ void TestDistributed::ClientIsNotStuckWhenTheConnectionEndsBeforeAPchIsDelivered
     TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
     const ConnectionEndHook hook( Client::BEFORE_PCH_DELIVERED, worker );
     auto connectedAgain = [ &worker, &hook ]() { return ( hook.HasFired() && ( worker.GetNumConnections() >= 2 ) ); };
-    BuildAborter aborter( connectedAgain, kWaitTimeoutSeconds );
+    DistributedTest::BuildAborter aborter( connectedAgain, DistributedTest::kWaitTimeoutSeconds );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/distpch.lib" );
     worker.ShutdownAllConnections();
     TEST_ASSERT( built == false ); // Aborted
@@ -7825,7 +7618,7 @@ void TestDistributed::JobPushedAsTheConnectionEndsIsReturned() const
     // jobs that are not taken by anything are what other workers and the build here are given.
     const HangGuard guard( "JobPushedAsTheConnectionEndsIsReturned", kHangSeconds );
     FBuildTestOptions options;
-    MakeDistributedPchOptions( options );
+    DistributedTest::MakeDistributedPchOptions( options );
     options.m_ForceCleanBuild = true;
     options.m_DistributionReconnectDelay = 60.0f; // Not within the test
     FBuildForTest fBuild( options );
@@ -7839,7 +7632,7 @@ void TestDistributed::JobPushedAsTheConnectionEndsIsReturned() const
         // The job the thread held was one fewer when the point was reached than the jobs there were
         return ( hook.HasFired() && ( JobQueue::Get().GetNumDistributableJobsAvailable() >= ( (size_t)hook.GetNumJobsAvailable() + 1 ) ) );
     };
-    BuildAborter aborter( returned, 10.0f );
+    DistributedTest::BuildAborter aborter( returned, 10.0f );
     const bool built = fBuild.Build( "../tmp/Test/Distributed/ResultCompression/ResultCompression.lib" );
     worker.ShutdownAllConnections();
     TEST_ASSERT( built == false ); // Aborted

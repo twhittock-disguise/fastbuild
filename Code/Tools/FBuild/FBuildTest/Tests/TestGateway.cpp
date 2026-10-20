@@ -54,69 +54,6 @@ namespace
 {
     constexpr uint16_t kGatewayTestDownstreamPort = Protocol::kTestPort + 1;
 
-    // Listens as a worker would and records the messages that arrive, in order
-    class MessageRecorder : public TCPConnectionPool
-    {
-    public:
-        MessageRecorder() = default;
-        virtual ~MessageRecorder() override { ShutdownAllConnections(); }
-        explicit MessageRecorder( const MessageRecorder & other ) = delete;
-        MessageRecorder & operator=( const MessageRecorder & other ) = delete;
-
-        size_t GetNumMessages() const
-        {
-            MutexHolder mh( m_Mutex );
-            return m_Types.GetSize();
-        }
-        uint8_t GetType( size_t index ) const
-        {
-            MutexHolder mh( m_Mutex );
-            return m_Types[ index ];
-        }
-        void GetPayload( size_t index, Array<char> & outPayload ) const
-        {
-            MutexHolder mh( m_Mutex );
-            outPayload = m_Payloads[ index ];
-        }
-
-    private:
-        virtual void OnReceive( const ConnectionInfo *, void * data, uint32_t size, bool & keepMemory ) override
-        {
-            keepMemory = true; // freed below
-            void * payload = nullptr;
-            if ( m_CurrentMessage == nullptr )
-            {
-                m_CurrentMessage = static_cast<const Protocol::IMessage *>( data );
-                if ( m_CurrentMessage->HasPayload() )
-                {
-                    return;
-                }
-            }
-            else
-            {
-                payload = data;
-            }
-
-            {
-                MutexHolder mh( m_Mutex );
-                m_Types.Append( (uint8_t)m_CurrentMessage->GetType() );
-                Array<char> & recorded = m_Payloads.EmplaceBack();
-                if ( payload )
-                {
-                    recorded.Append( static_cast<const char *>( payload ), static_cast<const char *>( payload ) + size );
-                }
-            }
-            FREE( (void *)m_CurrentMessage );
-            FREE( payload );
-            m_CurrentMessage = nullptr;
-        }
-
-        mutable Mutex m_Mutex;
-        Array<uint8_t> m_Types;
-        Array<Array<char>> m_Payloads; // Empty for a message without one
-        const Protocol::IMessage * m_CurrentMessage = nullptr;
-    };
-
     // Records when the queue reports a PCH delivered, and what had been sent by then
     class DeliveryRecorder : public WorkerSendQueue::Listener
     {
@@ -213,7 +150,6 @@ namespace
             uint32_t    m_CompressedSize;
         };
 
-        uint32_t GetNumPoolSlotQueries() const { return m_NumPoolSlotQueries.Load(); }
         void GetInventoryClients( Array<uint32_t> & out ) const { MutexHolder mh( m_Mutex ); out = m_InventoryClients; }
         void GetJobs( Array<Received> & out ) const { MutexHolder mh( m_Mutex ); out = m_Jobs; }
         void GetManifests( Array<Received> & out ) const { MutexHolder mh( m_Mutex ); out = m_Manifests; }
@@ -225,11 +161,7 @@ namespace
         size_t GetNumStoredPchs() const { MutexHolder mh( m_Mutex ); return m_StoredPchs.GetSize(); }
         size_t GetNumGoneClients() const { MutexHolder mh( m_Mutex ); return m_GoneClients.GetSize(); }
 
-        virtual uint32_t GetPoolSlots() const override
-        {
-            m_NumPoolSlotQueries.Increment();
-            return m_PoolSlots;
-        }
+        virtual uint32_t GetPoolSlots() const override { return m_PoolSlots; }
         virtual void GetToolchainInventory( uint32_t clientId, Array<uint64_t> & outToolIds ) override
         {
             MutexHolder mh( m_Mutex );
@@ -306,7 +238,6 @@ namespace
 
         const uint32_t m_PoolSlots;
         const Array<uint64_t> m_ToolIds;
-        mutable Atomic<uint32_t> m_NumPoolSlotQueries{ 0 };
         mutable Mutex m_Mutex;
         Array<uint32_t> m_InventoryClients;
         Array<Received> m_Jobs;
@@ -351,13 +282,6 @@ namespace
         Array<DistributedTest::HandshakeProbe::CapacityUpdate> updates;
         probe.GetCapacityUpdates( updates );
         return ( updates.IsEmpty() == false ) && ( updates.Top().m_Allowance == allowance ) && ( updates.Top().m_PoolSlots == poolSlots );
-    }
-
-    size_t CountFilesUnder( const AString & directory )
-    {
-        Array<AString> files;
-        FileIO::GetFiles( directory, AStackString<>( "*" ), true, &files );
-        return files.GetSize();
     }
 
     bool AnyPathContains( const AString & directory, const char * text )
@@ -541,23 +465,6 @@ private:
     void JobsFailingDownstreamAreBuiltOnTheGateway() const;
     void GatewayRestartMidBuildWithALocalPool() const;
 #endif
-
-    // Waits for something that happens on another thread
-    static constexpr float kWaitTimeoutSeconds = 30.0f;
-    template <class CONDITION>
-    static bool WaitUntil( const CONDITION & condition, float timeoutSeconds = kWaitTimeoutSeconds )
-    {
-        const Timer timer;
-        while ( condition() == false )
-        {
-            if ( timer.GetElapsed() > timeoutSeconds )
-            {
-                return false;
-            }
-            Thread::Sleep( 1 );
-        }
-        return true;
-    }
 
     // Connects the probe and completes its handshake. The id of its client on the server, or 0.
     static uint32_t ConnectProbe( Server & server, DistributedTest::HandshakeProbe & probe, const ConnectionInfo ** outConnection = nullptr );
@@ -768,7 +675,7 @@ REGISTER_TESTS_END
 //------------------------------------------------------------------------------
 /*static*/ uint32_t TestGateway::ConnectProbe( Server & server, DistributedTest::HandshakeProbe & probe, const ConnectionInfo ** outConnection )
 {
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    const ConnectionInfo * ci = probe.ConnectAndHandshake( Protocol::kTestPort );
     if ( ci == nullptr )
     {
         return 0;
@@ -776,12 +683,6 @@ REGISTER_TESTS_END
     if ( outConnection )
     {
         *outConnection = ci;
-    }
-    const Protocol::MsgConnection msg;
-    if ( ( probe.Send( ci, &msg, sizeof( msg ) ) == false ) ||
-         ( WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) == false ) )
-    {
-        return 0;
     }
 
     // The newest client has the highest id
@@ -894,12 +795,12 @@ void TestGateway::SlowClientDoesNotHoldBackAnother() const
     TEST_ASSERT( s.QueueResult( idB, false, Move( small ) ) );
 
     // B's result arrives while A's outbox still holds results it cannot send
-    TEST_ASSERT( WaitUntil( [ &b ]() { return ( CountMessages( b, Protocol::MSG_JOB_RESULT ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &b ]() { return ( CountMessages( b, Protocol::MSG_JOB_RESULT ) == 1 ); } ) );
     TEST_ASSERT( CountMessages( a, Protocol::MSG_JOB_RESULT ) == 0 );
     TEST_ASSERT( GetNumJobsActive( s, idA ) > 0 );
 
     a.StallReading( false );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( CountMessages( a, Protocol::MSG_JOB_RESULT ) == kNumLargeResults ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( CountMessages( a, Protocol::MSG_JOB_RESULT ) == kNumLargeResults ); } ) );
 
     a.ShutdownAllConnections();
     b.ShutdownAllConnections();
@@ -921,9 +822,9 @@ void TestGateway::SlowClientDoesNotHoldBackCapacityUpdates() const
     const uint32_t idA = ConnectProbe( s, a, &ciA );
     TEST_ASSERT( idA != 0 );
     TEST_ASSERT( a.SendDemand( ciA, 8 ) );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 8 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 8 ); } ) );
     TEST_ASSERT( ConnectProbe( s, b, &ciB ) != 0 );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 4 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 4 ); } ) );
     a.StallReading( true );
 
     // More than the socket buffers hold, so the sends to A back up
@@ -942,12 +843,12 @@ void TestGateway::SlowClientDoesNotHoldBackCapacityUpdates() const
 
     // B wants nothing, so A's allowance changes too: B's update arrives while A's waits behind its results
     TEST_ASSERT( b.SendDemand( ciB, 0 ) );
-    TEST_ASSERT( WaitUntil( [ &b ]() { return ( b.GetLastAllowance() == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &b ]() { return ( b.GetLastAllowance() == 0 ); } ) );
     TEST_ASSERT( CountMessages( a, Protocol::MSG_JOB_RESULT ) == 0 );
     TEST_ASSERT( CountMessages( a, Protocol::MSG_CAPACITY ) == numCapacityMessagesA );
 
     a.StallReading( false );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( CountMessages( a, Protocol::MSG_JOB_RESULT ) == kNumLargeResults ) && ( a.GetLastAllowance() == 8 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( CountMessages( a, Protocol::MSG_JOB_RESULT ) == kNumLargeResults ) && ( a.GetLastAllowance() == 8 ); } ) );
 
     a.ShutdownAllConnections();
     b.ShutdownAllConnections();
@@ -957,7 +858,7 @@ void TestGateway::SlowClientDoesNotHoldBackCapacityUpdates() const
 //------------------------------------------------------------------------------
 void TestGateway::SendQueueSendsQueuedMessagesBeforePchChunks() const
 {
-    MessageRecorder recorder;
+    DistributedTest::HandshakeProbe recorder;
     TEST_ASSERT( recorder.Listen( kGatewayTestDownstreamPort ) );
     DeliveryRecorder listener;
     WorkerSendQueue queue( listener, AStackString( "127.0.0.1" ) );
@@ -976,20 +877,21 @@ void TestGateway::SendQueueSendsQueuedMessagesBeforePchChunks() const
 
     QueueRunner runner( queue );
     TEST_ASSERT( runner.Start() );
-    TEST_ASSERT( WaitUntil( [ &recorder ]() { return ( recorder.GetNumMessages() == 3 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &recorder ]() { return ( recorder.GetNumMessages() == 3 ); } ) );
     runner.Stop();
 
-    TEST_ASSERT( recorder.GetType( 0 ) == Protocol::MSG_CONNECTION );
-    TEST_ASSERT( recorder.GetType( 1 ) == Protocol::MSG_JOB );
-    TEST_ASSERT( recorder.GetType( 2 ) == Protocol::MSG_PCH_FILE );
+    TEST_ASSERT( recorder.GetMessageType( 0 ) == Protocol::MSG_CONNECTION );
+    TEST_ASSERT( recorder.GetMessageType( 1 ) == Protocol::MSG_JOB );
+    TEST_ASSERT( recorder.GetMessageType( 2 ) == Protocol::MSG_PCH_FILE );
 }
 
 // SendQueueReadsFileSlicesAtSendTime
 //------------------------------------------------------------------------------
 void TestGateway::SendQueueReadsFileSlicesAtSendTime() const
 {
-    MessageRecorder recorder;
+    DistributedTest::HandshakeProbe recorder;
     TEST_ASSERT( recorder.Listen( kGatewayTestDownstreamPort ) );
+    recorder.KeepPayloads();
     DeliveryRecorder listener;
     WorkerSendQueue queue( listener, AStackString( "127.0.0.1" ) );
     listener.m_Queue = &queue;
@@ -1000,20 +902,16 @@ void TestGateway::SendQueueReadsFileSlicesAtSendTime() const
     queue.Push( SendQueueItem( Protocol::MsgPchFile( 0x77, 100, 5, 5, 0 ), path, 3, 5, SendKind::Pch, 100, 0x77, true ) );
 
     // Written after the push
+    Array<char> bytes;
+    for ( size_t i = 0; i < 16; ++i )
     {
-        char bytes[ 16 ];
-        for ( size_t i = 0; i < sizeof( bytes ); ++i )
-        {
-            bytes[ i ] = (char)i;
-        }
-        FileStream f;
-        TEST_ASSERT( f.Open( path.Get(), FileStream::WRITE_ONLY ) );
-        TEST_ASSERT( f.Write( bytes, sizeof( bytes ) ) == sizeof( bytes ) );
+        bytes.Append( (char)i );
     }
+    TEST_ASSERT( WriteFile( path, bytes ) );
 
     QueueRunner runner( queue );
     TEST_ASSERT( runner.Start() );
-    TEST_ASSERT( WaitUntil( [ &recorder ]() { return ( recorder.GetNumMessages() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &recorder ]() { return ( recorder.GetNumMessages() == 1 ); } ) );
     runner.Stop();
 
     Array<char> payload;
@@ -1036,8 +934,9 @@ void TestGateway::SendQueueReadsFileSlicesAtSendTime() const
 //------------------------------------------------------------------------------
 void TestGateway::SendQueueStreamCompressesJobs() const
 {
-    MessageRecorder recorder;
+    DistributedTest::HandshakeProbe recorder;
     TEST_ASSERT( recorder.Listen( kGatewayTestDownstreamPort ) );
+    recorder.KeepPayloads();
     DeliveryRecorder listener;
     WorkerSendQueue queue( listener, AStackString( "127.0.0.1" ) );
 
@@ -1052,7 +951,7 @@ void TestGateway::SendQueueStreamCompressesJobs() const
 
     QueueRunner runner( queue );
     TEST_ASSERT( runner.Start() );
-    TEST_ASSERT( WaitUntil( [ &recorder ]() { return ( recorder.GetNumMessages() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &recorder ]() { return ( recorder.GetNumMessages() == 2 ); } ) );
     runner.Stop();
     TEST_ASSERT( queue.GetNumUnsentJobs() == 0 );
 
@@ -1060,7 +959,7 @@ void TestGateway::SendQueueStreamCompressesJobs() const
     JobStreamDecoder decoder;
     for ( size_t i = 0; i < 2; ++i )
     {
-        TEST_ASSERT( recorder.GetType( i ) == Protocol::MSG_JOB );
+        TEST_ASSERT( recorder.GetMessageType( i ) == Protocol::MSG_JOB );
         Array<char> payload;
         recorder.GetPayload( i, payload );
         TEST_ASSERT( payload.GetSize() < jobs[ i ].GetSize() );
@@ -1081,7 +980,7 @@ void TestGateway::SendQueueStreamCompressesJobs() const
 //------------------------------------------------------------------------------
 void TestGateway::SendQueueStopsOnAFileItCannotRead() const
 {
-    MessageRecorder recorder;
+    DistributedTest::HandshakeProbe recorder;
     TEST_ASSERT( recorder.Listen( kGatewayTestDownstreamPort ) );
     DeliveryRecorder listener;
     WorkerSendQueue queue( listener, AStackString( "127.0.0.1" ) );
@@ -1096,7 +995,7 @@ void TestGateway::SendQueueStopsOnAFileItCannotRead() const
     // It stops by itself, without sending what follows
     QueueRunner runner( queue );
     TEST_ASSERT( runner.Start() );
-    TEST_ASSERT( WaitUntil( [ &runner ]() { return runner.HasReturned(); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &runner ]() { return runner.HasReturned(); } ) );
     TEST_ASSERT( queue.IsQuitting() );
     runner.Stop();
     TEST_ASSERT( recorder.GetNumMessages() == 0 );
@@ -1319,7 +1218,7 @@ void TestGateway::GatewayAdvertisesTheForwarderPool() const
 
     // The forwarder's pool is what is shared
     TEST_ASSERT( a.SendDemand( ciA, 340 ) );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return LastCapacityIs( a, 340, 340 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return LastCapacityIs( a, 340, 340 ); } ) );
 
     DistributedTest::HandshakeProbe b;
     const uint32_t idB = ConnectProbe( s, b );
@@ -1346,13 +1245,11 @@ void TestGateway::GatewayWithoutCapacityClosesTheHandshake() const
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     DistributedTest::HandshakeProbe probe;
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-    TEST_ASSERT( ci );
-    const Protocol::MsgConnection msg;
-    TEST_ASSERT( probe.Send( ci, &msg, sizeof( msg ) ) );
+    const ConnectionInfo * ci = probe.ConnectTo( Protocol::kTestPort );
+    TEST_ASSERT( ci && probe.SendHandshake( ci ) );
 
     // Closed without an ack, so the client builds elsewhere
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
     TEST_ASSERT( probe.GetNumMessages() == 0 );
     Array<uint32_t> inventoryClients;
     forwarder.GetInventoryClients( inventoryClients );
@@ -1377,18 +1274,13 @@ void TestGateway::GatewayRefusesAClientOfAnotherMajor() const
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
 
     DistributedTest::HandshakeProbe probe;
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
+    const ConnectionInfo * ci = probe.ConnectTo( Protocol::kTestPort );
     TEST_ASSERT( ci );
+    DistributedTest::HandshakeBytes handshake;
+    handshake.SetMajor( Protocol::kVersionMajor + 1 );
+    TEST_ASSERT( probe.Send( ci, handshake.bytes, sizeof( handshake.bytes ) ) );
 
-    // The major follows the message header
-    const Protocol::MsgConnection msg;
-    char handshake[ sizeof( msg ) ];
-    memcpy( handshake, &msg, sizeof( msg ) );
-    const uint32_t otherMajor = ( Protocol::kVersionMajor + 1 );
-    memcpy( handshake + sizeof( Protocol::IMessage ), &otherMajor, sizeof( otherMajor ) );
-    TEST_ASSERT( probe.Send( ci, handshake, sizeof( handshake ) ) );
-
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
     TEST_ASSERT( probe.GetNumMessages() == 1 );
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_REFUSED );
     TEST_ASSERT( probe.GetRefusedMajor() == Protocol::kVersionMajor );
@@ -1422,7 +1314,7 @@ void TestGateway::GatewayHandsDecodedJobsToTheForwarder() const
     JobStreamEncoder encoder;
     TEST_ASSERT( probe.SendJob( ci, encoder, 0xAB, 3, first ) );
     TEST_ASSERT( probe.SendJob( ci, encoder, 0xAB, -1, second ) );
-    TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumJobs() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumJobs() == 2 ); } ) );
 
     Array<StubForwarder::Received> jobs;
     forwarder.GetJobs( jobs );
@@ -1474,7 +1366,7 @@ void TestGateway::GatewayHandsToolchainMessagesToTheForwarder() const
     SyntheticToolchain::WriteManifest( manifest, toolId, root, fileName, content );
     TEST_ASSERT( probe.SendMessage( ci, Protocol::MsgManifest( toolId ), manifest.GetData(), manifest.GetSize() ) );
     TEST_ASSERT( probe.SendMessage( ci, Protocol::MsgFile( toolId, 0 ), content, strlen( content ) ) );
-    TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumToolchainMessages() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumToolchainMessages() == 2 ); } ) );
 
     Array<StubForwarder::Received> manifests;
     forwarder.GetManifests( manifests );
@@ -1519,7 +1411,7 @@ void TestGateway::GatewayReportsAStoredPch() const
     DistributedTest::CompressedPch pch;
     DistributedTest::MakeCompressedPch( 2 * MEGABYTE, 1, pch );
     TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
-    TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumStoredPchs() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumStoredPchs() == 1 ); } ) );
 
     Array<StubForwarder::StoredPch> stored;
     forwarder.GetStoredPchs( stored );
@@ -1535,7 +1427,7 @@ void TestGateway::GatewayReportsAStoredPch() const
     TEST_ASSERT( s.GetLogPath().BeginsWith( cacheDir ) );
     AStackString<> workerCache;
     TEST_ASSERT( FBuild::GetWorkerCacheDir( workerCache ) );
-    TEST_ASSERT( CountFilesUnder( workerCache ) == 0 );
+    TEST_ASSERT( CountFilesIn( workerCache ) == 0 );
 
     probe.ShutdownAllConnections();
 }
@@ -1560,19 +1452,19 @@ void TestGateway::GatewayResultReachesOnlyALiveClient() const
     MakeJob( 7, "job", 0, job );
     JobStreamEncoder encoder;
     TEST_ASSERT( probe.SendJob( ci, encoder, 0xAB, 0, job ) );
-    TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumJobs() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumJobs() == 1 ); } ) );
 
     MemoryStream result;
     MakeResult( result, 7, 1001, "obj", 3 );
     TEST_ASSERT( s.QueueResult( id, false, Move( result ) ) );
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( results[ 0 ].m_JobId == 7 );
-    TEST_ASSERT( WaitUntil( [ &s, id ]() { return ( GetNumJobsActive( s, id ) == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &s, id ]() { return ( GetNumJobsActive( s, id ) == 0 ); } ) );
 
     // Once the forwarder hears the client has gone, nothing more is queued for it
     s.DisconnectClient( id );
-    TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumGoneClients() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumGoneClients() == 1 ); } ) );
     Array<uint32_t> gone;
     forwarder.GetGoneClients( gone );
     TEST_ASSERT( gone[ 0 ] == id );
@@ -1582,7 +1474,7 @@ void TestGateway::GatewayResultReachesOnlyALiveClient() const
     MemoryStream late;
     MakeResult( late, 7, 1001, "obj", 3 );
     TEST_ASSERT( s.QueueResult( id, false, Move( late ) ) == false );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
 }
 
 // PureGatewayNeverTouchesTheJobQueue
@@ -1614,13 +1506,13 @@ void TestGateway::PureGatewayNeverTouchesTheJobQueue() const
         JobStreamEncoder encoder;
         TEST_ASSERT( probe.SendJob( ci, encoder, 0x11, 0, job ) );
 
-        TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumJobs() == 1 ) &&
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumJobs() == 1 ) &&
                                                           ( forwarder.GetNumToolchainMessages() == 2 ) &&
                                                           ( forwarder.GetNumStoredPchs() == 1 ); } ) );
         TEST_ASSERT( JobQueueRemote::IsValid() == false );
 
         probe.ShutdownAllConnections();
-        TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumGoneClients() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumGoneClients() == 1 ); } ) );
     }
     TEST_ASSERT( JobQueueRemote::IsValid() == false );
     TEST_ASSERT( forwarder.GetNumGoneClients() == 1 );
@@ -1680,7 +1572,7 @@ void TestGateway::AskingASlowClientForAPchDoesNotHoldBackAnother() const
         payload.WriteBuffer( large.Begin(), large.GetSize() );
         TEST_ASSERT( s.QueueResult( idA, false, Move( payload ) ) );
     }
-    TEST_ASSERT( WaitUntil( [ &s, idA ]() { return ( GetNumJobsActive( s, idA ) < kNumLargeResults ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &s, idA ]() { return ( GetNumJobsActive( s, idA ) < kNumLargeResults ); } ) );
     Thread::Sleep( 100 ); // It has taken A's send mutex
 
     PchAsker asker;
@@ -1691,8 +1583,8 @@ void TestGateway::AskingASlowClientForAPchDoesNotHoldBackAnother() const
     asker.m_OtherPchId = 0x5678;
     Thread thread;
     thread.Start( PchAsker::ThreadFunc, "PchAsker", &asker );
-    const bool returned = WaitUntil( [ &asker ]() { return asker.m_Done.Load(); } );
-    const bool otherAsked = WaitUntil( [ &b ]() { return ( b.GetNumPchNeeded() == 1 ); } );
+    const bool returned = DistributedTest::WaitUntil( [ &asker ]() { return asker.m_Done.Load(); } );
+    const bool otherAsked = DistributedTest::WaitUntil( [ &b ]() { return ( b.GetNumPchNeeded() == 1 ); } );
     a.StallReading( false );
     thread.Join();
     TEST_ASSERT( returned );
@@ -1700,7 +1592,7 @@ void TestGateway::AskingASlowClientForAPchDoesNotHoldBackAnother() const
     TEST_ASSERT( b.GetPchNeededId( 0 ) == 0x5678 );
 
     // A is asked once, after the results queued before
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetNumPchNeeded() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( a.GetNumPchNeeded() == 1 ); } ) );
     TEST_ASSERT( CountMessages( a, Protocol::MSG_JOB_RESULT ) == kNumLargeResults );
     Thread::Sleep( 100 );
     TEST_ASSERT( a.GetNumPchNeeded() == 1 );
@@ -1717,7 +1609,7 @@ void TestGateway::WorkerAskingASlowClientDoesNotHoldBackAnother() const
 {
     // A real job for a PCH, sent for a toolchain made up here
     DistributedTest::CapturedJob captured;
-    TEST_ASSERT( DistributedTest::CapturePchJob( captured, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( DistributedTest::CapturePchJob( captured, DistributedTest::kWaitTimeoutSeconds ) );
     MemoryStream job;
     job.WriteBuffer( captured.m_Data.Begin(), captured.m_Data.GetSize() );
     const uint64_t toolId = 0x5107;
@@ -1744,7 +1636,7 @@ void TestGateway::WorkerAskingASlowClientDoesNotHoldBackAnother() const
     MemoryStream manifest;
     SyntheticToolchain::WriteManifest( manifest, toolId, root, fileName, "synthetic" );
     TEST_ASSERT( c.SendMessage( ciC, Protocol::MsgManifest( toolId ), manifest.GetData(), manifest.GetSize() ) );
-    TEST_ASSERT( WaitUntil( [ & ]()
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]()
     {
         MutexHolder mh( s.m_ToolManifestsMutex );
         ToolManifest * const * found = s.m_Tools.FindDeref( toolId );
@@ -1764,7 +1656,7 @@ void TestGateway::WorkerAskingASlowClientDoesNotHoldBackAnother() const
         payload.WriteBuffer( large.Begin(), large.GetSize() );
         TEST_ASSERT( s.QueueResult( idA, false, Move( payload ) ) );
     }
-    TEST_ASSERT( WaitUntil( [ & ]()
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]()
     {
         MutexHolder mh( s.m_ClientListMutex );
         for ( Server::ClientState * cs : s.m_ClientList )
@@ -1809,7 +1701,7 @@ void TestGateway::WorkerAskingASlowClientDoesNotHoldBackAnother() const
     const AStackString<> logPath( s.GetLogPath() );
     JobStreamEncoder encoder;
     TEST_ASSERT( a.SendJob( ciA, encoder, toolId, 0, job ) );
-    TEST_ASSERT( WaitUntil( [ & ]()
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]()
     {
         uint32_t numAsked = 0;
         return DistributedTest::CountInStatsLogSince( logPath, 0, "pch needed id=", numAsked ) && ( numAsked == 1 );
@@ -1817,10 +1709,10 @@ void TestGateway::WorkerAskingASlowClientDoesNotHoldBackAnother() const
     Queuer first{ &s, idB, 3 };
     Thread firstThread;
     firstThread.Start( queueOnceClientsAre, "Queuer", &first );
-    const bool resultFlowed = WaitUntil( [ &b ]() { return ( CountMessages( b, Protocol::MSG_JOB_RESULT ) == 1 ); } );
+    const bool resultFlowed = DistributedTest::WaitUntil( [ &b ]() { return ( CountMessages( b, Protocol::MSG_JOB_RESULT ) == 1 ); } );
     const bool capacityFlowed = resultFlowed &&
                                 b.SendDemand( ciB, 0 ) &&
-                                WaitUntil( [ &b ]() { return ( b.GetLastAllowance() == 0 ); } );
+                                DistributedTest::WaitUntil( [ &b ]() { return ( b.GetLastAllowance() == 0 ); } );
 
     // C leaves before sending the files, so A, whose job waits for them, is asked for them: B is still served
     bool flowedAfterLeaving = false;
@@ -1830,7 +1722,7 @@ void TestGateway::WorkerAskingASlowClientDoesNotHoldBackAnother() const
     {
         c.ShutdownAllConnections();
         secondThread.Start( queueOnceClientsAre, "Queuer", &second );
-        flowedAfterLeaving = WaitUntil( [ &b ]() { return ( CountMessages( b, Protocol::MSG_JOB_RESULT ) == 2 ); } );
+        flowedAfterLeaving = DistributedTest::WaitUntil( [ &b ]() { return ( CountMessages( b, Protocol::MSG_JOB_RESULT ) == 2 ); } );
     }
 
     a.StallReading( false );
@@ -1844,7 +1736,7 @@ void TestGateway::WorkerAskingASlowClientDoesNotHoldBackAnother() const
     TEST_ASSERT( flowedAfterLeaving );
 
     // A has it all, after the results queued before
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetNumPchNeeded() == 1 ) && ( CountMessages( a, Protocol::MSG_REQUEST_FILE ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( a.GetNumPchNeeded() == 1 ) && ( CountMessages( a, Protocol::MSG_REQUEST_FILE ) == 1 ); } ) );
     TEST_ASSERT( CountMessages( a, Protocol::MSG_JOB_RESULT ) == kNumLargeResults );
     TEST_ASSERT( a.GetPchNeededId( 0 ) == captured.m_PchId );
 
@@ -1904,14 +1796,8 @@ namespace
 
     bool StoredFileEquals( const AString & path, const void * expected, size_t expectedSize )
     {
-        FileStream f;
-        if ( f.Open( path.Get() ) == false )
-        {
-            return false;
-        }
         Array<char> bytes;
-        bytes.SetSize( (size_t)f.GetFileSize() );
-        return ( f.ReadBuffer( bytes.Begin(), bytes.GetSize() ) == bytes.GetSize() ) &&
+        return FBuildTest::ReadFile( path, bytes ) &&
                ( bytes.GetSize() == expectedSize ) &&
                ( memcmp( bytes.Begin(), expected, expectedSize ) == 0 );
     }
@@ -1990,7 +1876,7 @@ void TestGateway::StashKeepsWhatTheClientSent() const
     TEST_ASSERT( stash.GetManifestFile( toolId + 1, path, size ) == false );
 
     // Only the payloads: no temporary file is left
-    TEST_ASSERT( CountFilesUnder( dir ) == 3 );
+    TEST_ASSERT( CountFilesIn( dir ) == 3 );
 }
 
 // StashSurvivesARestart
@@ -2048,21 +1934,17 @@ void TestGateway::PartialStashIsDroppedAtStart() const
     GetStashToolchainDir( dir, 0xC0, leftover );
     leftover += NATIVE_SLASH;
     leftover += "file.0.bin.tmp";
-    {
-        FileStream f;
-        TEST_ASSERT( f.Open( leftover.Get(), FileStream::WRITE_ONLY ) );
-        TEST_ASSERT( f.Write( "x", 1 ) == 1 );
-    }
+    Array<char> content;
+    content.Append( 'x' );
+    TEST_ASSERT( WriteFile( leftover, content ) );
     AStackString<> garbage;
     GetStashToolchainDir( dir, 0xD0, garbage );
-    TEST_ASSERT( FileIO::EnsurePathExists( garbage ) );
     garbage += NATIVE_SLASH;
     garbage += "manifest.bin";
-    {
-        FileStream f;
-        TEST_ASSERT( f.Open( garbage.Get(), FileStream::WRITE_ONLY ) );
-        TEST_ASSERT( f.Write( "garbage", 7 ) == 7 );
-    }
+    const char garbageBytes[] = "garbage";
+    content.Clear();
+    content.Append( garbageBytes, garbageBytes + 7 );
+    TEST_ASSERT( WriteFile( garbage, content ) );
 
     ToolchainStash restarted( dir );
     Array<uint64_t> complete;
@@ -2077,7 +1959,7 @@ void TestGateway::PartialStashIsDroppedAtStart() const
         TEST_ASSERT( FileIO::DirectoryExists( droppedDir ) == false );
     }
     TEST_ASSERT( FileIO::FileExists( leftover.Get() ) == false );
-    TEST_ASSERT( CountFilesUnder( dir ) == 2 );
+    TEST_ASSERT( CountFilesIn( dir ) == 2 );
 }
 
 // StashRejectsWhatDoesNotMatch
@@ -2111,7 +1993,7 @@ void TestGateway::StashRejectsWhatDoesNotMatch() const
     TEST_ASSERT( stash.GetNumFiles( 0x11 ) == 0 );
     stash.DropIncomplete( 0x11 ); // Nothing to drop
     stash.ReleaseUse( 0x11 );
-    TEST_ASSERT( CountFilesUnder( dir ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 0 );
 
     // A file the manifest does not list
     TEST_ASSERT( stash.AddManifest( 0x11, manifest.GetData(), manifest.GetSize() ) == ToolchainStash::STASH_INCOMPLETE );
@@ -2128,7 +2010,7 @@ void TestGateway::StashRejectsWhatDoesNotMatch() const
     Array<uint32_t> missing;
     stash.GetMissingFiles( 0x11, missing );
     TEST_ASSERT( missing.GetSize() == 2 );
-    TEST_ASSERT( CountFilesUnder( dir ) == 1 );
+    TEST_ASSERT( CountFilesIn( dir ) == 1 );
 }
 
 // StashRejectsAManifestAWorkerWouldRefuse
@@ -2188,7 +2070,7 @@ void TestGateway::StashRejectsAManifestAWorkerWouldRefuse() const
     TEST_ASSERT( stash.AddManifest( toolId, cut.GetData(), cut.GetSize() - 8 ) == ToolchainStash::STASH_INVALID );
 
     // Nothing of them is kept, and a sound one is
-    TEST_ASSERT( CountFilesUnder( dir ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 0 );
     TEST_ASSERT( stash.AddManifest( toolId, cut.GetData(), cut.GetSize() ) == ToolchainStash::STASH_INCOMPLETE );
 }
 
@@ -2246,7 +2128,7 @@ void TestGateway::StashRejectsAManifestOfLengthsItCannotHold() const
         ++toolId;
     }
 
-    TEST_ASSERT( CountFilesUnder( dir ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 0 );
 }
 
 // DuplicateUploadsAreIgnored
@@ -2294,7 +2176,7 @@ void TestGateway::DuplicateUploadsAreIgnored() const
     TEST_ASSERT( StoredFileEquals( manifestPath, manifest.GetData(), manifest.GetSize() ) );
     TEST_ASSERT( StashHoldsFile( stash, toolId, 0, file0 ) );
     TEST_ASSERT( StashHoldsFile( stash, toolId, 1, file1 ) );
-    TEST_ASSERT( CountFilesUnder( dir ) == 3 );
+    TEST_ASSERT( CountFilesIn( dir ) == 3 );
 }
 
 // StashEvictsTheLeastRecentlyUsedToolchainNotInUse
@@ -2332,7 +2214,7 @@ void TestGateway::StashEvictsTheLeastRecentlyUsedToolchainNotInUse() const
     AStackString<> evictedDir;
     GetStashToolchainDir( dir, 3, evictedDir );
     TEST_ASSERT( FileIO::DirectoryExists( evictedDir ) == false );
-    TEST_ASSERT( CountFilesUnder( dir ) == ( 2 * ToolchainStash::kMaxToolchains ) );
+    TEST_ASSERT( CountFilesIn( dir ) == ( 2 * ToolchainStash::kMaxToolchains ) );
 
     // One being received is never what goes, but it takes a place
     TEST_ASSERT( AddStashManifest( stash, 200, 2 ) == ToolchainStash::STASH_INCOMPLETE );
@@ -2400,12 +2282,12 @@ void TestGateway::FileWithTheManifestSlotIdIsRejected() const
     Array<uint64_t> complete;
     stash.GetComplete( complete );
     TEST_ASSERT( complete.IsEmpty() );
-    TEST_ASSERT( CountFilesUnder( dir ) == 0 );
+    TEST_ASSERT( CountFilesIn( dir ) == 0 );
 
     // And for one that exists
     TEST_ASSERT( AddStashManifest( stash, 0x32, 1 ) == ToolchainStash::STASH_INCOMPLETE );
     TEST_ASSERT( stash.AddFile( 0x32, 0xFFFFFFFF, "bytes", 5 ) == ToolchainStash::STASH_INVALID );
-    TEST_ASSERT( CountFilesUnder( dir ) == 1 );
+    TEST_ASSERT( CountFilesIn( dir ) == 1 );
 }
 
 // AdvertisedPinSurvivesUntilTheToolchainArrives
@@ -2581,7 +2463,7 @@ void TestGateway::ReUploadDuringAPendingDeleteEndsIntact() const
     uploader.m_Stash = &stash;
     Thread evictor;
     evictor.Start( StashUploader::EvictorFunc, "StashEvictor", &uploader );
-    TEST_ASSERT( WaitUntil( [ &stall ]() { return stall.m_Entered.Load(); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &stall ]() { return stall.m_Entered.Load(); } ) );
     TEST_ASSERT( stash.IsComplete( 1 ) == false );
 
     // A client sends it again meanwhile
@@ -2590,7 +2472,7 @@ void TestGateway::ReUploadDuringAPendingDeleteEndsIntact() const
     Thread::Sleep( 100 );
     stall.m_Release.Store( true );
     evictor.Join();
-    const bool done = WaitUntil( [ &uploader ]() { return uploader.m_Done.Load(); } );
+    const bool done = DistributedTest::WaitUntil( [ &uploader ]() { return uploader.m_Done.Load(); } );
     reuploader.Join();
     TEST_ASSERT( done );
 
@@ -2634,7 +2516,7 @@ void TestGateway::ManifestWaitsForAPendingDeleteForABoundedTime() const
     uploader.m_Stash = &stash;
     Thread evictor;
     evictor.Start( StashUploader::EvictorFunc, "StashEvictor", &uploader );
-    TEST_ASSERT( WaitUntil( [ &stall ]() { return stall.m_Entered.Load(); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &stall ]() { return stall.m_Entered.Load(); } ) );
 
     // Its manifest, sent again meanwhile, waits for the delete as long as the bound, in time
     const Timer timer;
@@ -3103,11 +2985,9 @@ void TestGateway::GatewayConfigReadsHostsAndPorts() const
     AStackString<> path;
     VERIFY( FBuild::GetTempDir( path ) );
     path += "gateway_workers.txt";
-    {
-        FileStream f;
-        TEST_ASSERT( f.Open( path.Get(), FileStream::WRITE_ONLY ) );
-        TEST_ASSERT( f.Write( text, strlen( text ) ) == strlen( text ) );
-    }
+    Array<char> content;
+    content.Append( text, text + strlen( text ) );
+    TEST_ASSERT( WriteFile( path, content ) );
     GatewayConfig loaded;
     TEST_ASSERT( GatewayConfig::Load( path, loaded, error ) );
     TEST_ASSERT( loaded.m_Workers.GetSize() == 4 );
@@ -3386,45 +3266,6 @@ namespace
         Semaphore m_StallSemaphore;
     };
 
-    // Answers the handshake with an ack this version cannot use
-    class OddAckWorker : public EchoWorker
-    {
-    public:
-        enum Reply
-        {
-            ACK_OF_ANOTHER_MAJOR,
-            ACK_TOO_SHORT,  // The version fields and a little more
-        };
-        explicit OddAckWorker( Reply reply ) : EchoWorker( 4 ), m_Reply( reply ) {}
-        virtual ~OddAckWorker() override = default;
-        explicit OddAckWorker( const OddAckWorker & other ) = delete;
-        OddAckWorker & operator=( const OddAckWorker & other ) = delete;
-
-    private:
-        virtual void Handshake( const ConnectionInfo * connection ) override
-        {
-            const Protocol::MsgConnectionAck ack( 4 );
-            uint8_t bytes[ sizeof( ack ) ];
-            memcpy( bytes, &ack, sizeof( ack ) );
-            size_t size = sizeof( bytes );
-            if ( m_Reply == ACK_OF_ANOTHER_MAJOR )
-            {
-                bytes[ sizeof( Protocol::IMessage ) + sizeof( uint16_t ) ] = (uint8_t)( Protocol::kVersionMajor + 1 ); // After the worker version
-            }
-            else
-            {
-                size = Protocol::kHandshakePrefixSize + 2;
-            }
-            Send( connection, bytes, size );
-
-            // The inventories follow, as they would from a worker of this version
-            SendInventory( connection, Protocol::MsgPchInventory( 0 ), Array<uint64_t>() );
-            SendInventory( connection, Protocol::MsgToolchainInventory( 0 ), Array<uint64_t>() );
-        }
-
-        const Reply m_Reply;
-    };
-
     // Plays the gateway: the PCHs and toolchains it stores, and what the connection tells it
     class RecordingOwner : public DownstreamConnection::Owner, public PchLease::Owner
     {
@@ -3447,11 +3288,10 @@ namespace
                 AString & path = toolchain.m_Paths.EmplaceBack();
                 VERIFY( FBuild::GetTempDir( path ) );
                 path.AppendFormat( "downstream_tool_%u_%u.bin", (uint32_t)toolId, fileId );
-                char bytes[ 100 ];
-                memset( bytes, (int)i, sizeof( bytes ) );
-                FileStream f;
-                VERIFY( f.Open( path.Get(), FileStream::WRITE_ONLY ) );
-                VERIFY( f.Write( bytes, sizeof( bytes ) ) == sizeof( bytes ) );
+                Array<char> bytes;
+                bytes.SetSize( 100 );
+                memset( bytes.Begin(), (int)i, bytes.GetSize() );
+                VERIFY( FBuildTest::WriteFile( path, bytes ) );
                 toolchain.m_FileIds.Append( fileId );
             }
         }
@@ -3584,16 +3424,8 @@ namespace
         VERIFY( FBuild::GetTempDir( pch.m_File ) );
         pch.m_File.AppendFormat( "downstream_pch_%u.bin", (uint32_t)pchId );
         Array<char> bytes;
-        bytes.SetSize( size );
-        uint32_t x = (uint32_t)pchId;
-        for ( char & c : bytes )
-        {
-            x = ( x * 1664525u ) + 1013904223u;
-            c = (char)( x >> 24 );
-        }
-        FileStream f;
-        VERIFY( f.Open( pch.m_File.Get(), FileStream::WRITE_ONLY ) );
-        VERIFY( f.Write( bytes.Begin(), size ) == size );
+        FBuildTest::MakeRandomBytes( size, pchId, bytes );
+        VERIFY( FBuildTest::WriteFile( pch.m_File, bytes ) );
         return pch;
     }
 
@@ -3631,7 +3463,7 @@ void TestGateway::DownstreamBecomesReadyWithTheWorkerInventories() const
         TEST_ASSERT( ( connection.GetAllowance() == 0 ) && ( connection.GetPoolSlots() == 0 ) );
 
         connection.Start();
-        TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
         // Both inventories were in by then
         TEST_ASSERT( owner.GetAffinityWhenReady() == GatewayScheduler::AFFINITY_HOLDS );
@@ -3667,7 +3499,7 @@ void TestGateway::DownstreamSendsToolchainPchThenJob() const
 
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
     TEST_ASSERT( connection.GetAffinity( pch.m_Id, kDownstreamTool ) == GatewayScheduler::AFFINITY_NONE );
 
     worker.StallReading( true );
@@ -3676,11 +3508,11 @@ void TestGateway::DownstreamSendsToolchainPchThenJob() const
     TEST_ASSERT( owner.GetNumLeases() == 1 ); // Held while the chunks are queued
     worker.StallReading( false );
 
-    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
     TEST_ASSERT( connection.GetAffinity( pch.m_Id, kDownstreamTool ) == GatewayScheduler::AFFINITY_HOLDS );
     TEST_ASSERT( owner.GetNumLeases() == 0 );
     TEST_ASSERT( worker.GetPchBytes() == pchSize );
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 1 ); } ) );
 
     Array<uint8_t> types;
     worker.GetMessageTypes( types );
@@ -3697,7 +3529,7 @@ void TestGateway::DownstreamSendsToolchainPchThenJob() const
     SendDownstreamJob( connection, owner, 6, "m6", &pch );
     TEST_ASSERT( connection.GetAffinity( pch.m_Id, kDownstreamTool ) == GatewayScheduler::AFFINITY_HOLDS );
     TEST_ASSERT( owner.GetNumLeases() == 0 );
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 2 ); } ) );
     Thread::Sleep( 100 ); // Anything sent after the job would have arrived by now
     worker.GetMessageTypes( types );
     TEST_ASSERT( types.GetSize() == ( 4 + numChunks ) );
@@ -3729,14 +3561,14 @@ void TestGateway::DownstreamSendsAJobOnlyBehindItsPch() const
     owner.AddPch( large );
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     // Two jobs for each, the second sent while the PCH is on its way
     SendDownstreamJob( connection, owner, 5, "m5", &small );
     SendDownstreamJob( connection, owner, 6, "m6", &small );
     SendDownstreamJob( connection, owner, 7, "m7", &large );
     SendDownstreamJob( connection, owner, 8, "m8", &large );
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 4 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 4 ); } ) );
     Thread::Sleep( 100 ); // A copy sent again would have arrived by now
 
     TEST_ASSERT( worker.GetNumPchAsks() == 0 );
@@ -3757,15 +3589,15 @@ void TestGateway::DownstreamResultIsHandedOver() const
     RecordingOwner owner;
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     SendDownstreamJob( connection, owner, 9, "m9", nullptr );
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 1 ); } ) );
 
     // A failure the worker reports is the owner's to judge
     worker.SetAnswer( EchoWorker::ANSWER_SYSTEM_ERROR );
     SendDownstreamJob( connection, owner, 10, "m10", nullptr );
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 2 ); } ) );
 
     Array<DistributedTest::ReceivedResult> results;
     owner.GetResults( results );
@@ -3798,14 +3630,14 @@ void TestGateway::DownstreamAskingForAPchGetsItAgain() const
     owner.AddPch( pch );
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     SendDownstreamJob( connection, owner, 5, "m5", &pch );
-    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
 
     TEST_ASSERT( worker.AskForPch( pch.m_Id ) );
-    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 2 ); } ) );
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLeases() == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumLeases() == 0 ); } ) );
     TEST_ASSERT( owner.GetNumPchLookups() == 1 );
     TEST_ASSERT( worker.GetPchBytes() == ( 2 * 5000 ) );
     TEST_ASSERT( connection.GetAffinity( pch.m_Id, kDownstreamTool ) == GatewayScheduler::AFFINITY_HOLDS );
@@ -3826,21 +3658,21 @@ void TestGateway::DownstreamAskingTooOftenIsClosed() const
     owner.AddPch( pch );
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     SendDownstreamJob( connection, owner, 5, "m5", &pch );
-    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
 
     // Each copy is asked for once it has arrived, so none is still on its way
     for ( uint32_t i = 1; i <= PchSendState::kMaxResends; ++i )
     {
         TEST_ASSERT( worker.AskForPch( pch.m_Id ) );
-        TEST_ASSERT( WaitUntil( [ &worker, i ]() { return ( worker.GetNumPchCopies() == ( i + 1 ) ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &worker, i ]() { return ( worker.GetNumPchCopies() == ( i + 1 ) ); } ) );
     }
     TEST_ASSERT( connection.HasEnded() == false );
 
     TEST_ASSERT( worker.AskForPch( pch.m_Id ) );
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
     TEST_ASSERT( connection.HasEnded() );
     TEST_ASSERT( strcmp( connection.GetCloseReason(), "pch" ) == 0 );
     TEST_ASSERT( worker.GetNumPchCopies() == ( PchSendState::kMaxResends + 1 ) );
@@ -3860,17 +3692,17 @@ void TestGateway::DownstreamCompletingJobsMayAskForAPchAgain() const
     owner.AddPch( pch );
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     SendDownstreamJob( connection, owner, 5, "m5", &pch );
-    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumPchCopies() == 1 ); } ) );
 
     // A healthy worker that evicts a hot PCH again and again, with jobs for it completing in between
     const uint32_t numAsks = ( 2 * PchSendState::kMaxResends ) + 1;
     for ( uint32_t i = 1; i <= numAsks; ++i )
     {
         TEST_ASSERT( worker.AskForPch( pch.m_Id ) );
-        TEST_ASSERT( WaitUntil( [ &worker, i ]() { return ( worker.GetNumPchCopies() == ( i + 1 ) ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &worker, i ]() { return ( worker.GetNumPchCopies() == ( i + 1 ) ); } ) );
         connection.OnJobCompleted( pch.m_Id );
     }
     TEST_ASSERT( connection.HasEnded() == false );
@@ -3887,10 +3719,10 @@ void TestGateway::DownstreamAskingForAnUnknownPchIsClosed() const
     RecordingOwner owner;
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     TEST_ASSERT( worker.AskForPch( 0xDEAD0002 ) );
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
     TEST_ASSERT( connection.HasEnded() );
     TEST_ASSERT( strcmp( connection.GetCloseReason(), "pch" ) == 0 );
     TEST_ASSERT( owner.GetNumPchLookups() == 1 );
@@ -3907,12 +3739,12 @@ void TestGateway::DownstreamIgnoresARequestForAnUnknownToolchain() const
     owner.AddToolchain( kDownstreamTool, 1 );
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     // As when the toolchain was evicted after the jobs that used it ended: nothing is sent, and the connection stays
     TEST_ASSERT( worker.RequestToolchainFile( 0x7999, 0 ) );
     SendDownstreamJob( connection, owner, 5, "m5", nullptr );
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 1 ); } ) );
     TEST_ASSERT( connection.HasEnded() == false );
     TEST_ASSERT( owner.GetNumLost() == 0 );
     Array<uint8_t> types;
@@ -3934,11 +3766,11 @@ void TestGateway::DownstreamThatCannotReadWhatItSendsIsClosed() const
     owner.AddPch( missing );
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     // The send thread stops, and the connection ends saying why
     SendDownstreamJob( connection, owner, 5, "m5", &missing );
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
     const char * reason = connection.GetCloseReason();
     TEST_ASSERT( reason && ( strcmp( reason, "send" ) == 0 ) );
 }
@@ -3963,7 +3795,7 @@ void TestGateway::DownstreamTakesABoundedInventory() const
     RecordingOwner owner;
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     // The first ones are held, those beyond the bound are not known
     const uint64_t lastTaken = ( DownstreamConnection::kMaxInventoryEntries - 1 );
@@ -3983,12 +3815,12 @@ void TestGateway::DownstreamAllowanceIsWithinThePool() const
     RecordingOwner owner;
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     // A worker that gives more than its pool gives its pool
     worker.SendCapacity( 10, 6 );
     Array<uint32_t> updates;
-    TEST_ASSERT( WaitUntil( [ &owner, &updates ]() { owner.GetCapacityUpdates( updates ); return ( updates.GetSize() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner, &updates ]() { owner.GetCapacityUpdates( updates ); return ( updates.GetSize() == 2 ); } ) );
     TEST_ASSERT( ( updates[ 0 ] == 6 ) && ( updates[ 1 ] == 6 ) );
     TEST_ASSERT( ( connection.GetAllowance() == 6 ) && ( connection.GetPoolSlots() == 6 ) );
 }
@@ -3997,15 +3829,15 @@ void TestGateway::DownstreamAllowanceIsWithinThePool() const
 //------------------------------------------------------------------------------
 void TestGateway::DownstreamOfAnotherMajorIsLost() const
 {
-    const OddAckWorker::Reply replies[] = { OddAckWorker::ACK_OF_ANOTHER_MAJOR, OddAckWorker::ACK_TOO_SHORT };
-    for ( const OddAckWorker::Reply reply : replies )
+    const DistributedTest::OddHandshakeWorker::Reply replies[] = { DistributedTest::OddHandshakeWorker::ACK_OF_OLDER_MAJOR, DistributedTest::OddHandshakeWorker::ACK_TOO_SHORT };
+    for ( const DistributedTest::OddHandshakeWorker::Reply reply : replies )
     {
-        OddAckWorker worker( reply );
+        DistributedTest::OddHandshakeWorker worker( reply, true );
         TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
         RecordingOwner owner;
         DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
         connection.Start();
-        TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
         TEST_ASSERT( connection.HasEnded() );
         TEST_ASSERT( strcmp( connection.GetCloseReason(), "handshake" ) == 0 );
         TEST_ASSERT( owner.GetNumReady() == 0 );
@@ -4021,7 +3853,7 @@ void TestGateway::UnreachableDownstreamIsLost() const
     {
         DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 ); // Nothing listens there
         connection.Start();
-        TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
         TEST_ASSERT( connection.HasEnded() );
         TEST_ASSERT( connection.GetCloseReason() == nullptr );
         TEST_ASSERT( owner.GetNumReady() == 0 );
@@ -4085,18 +3917,6 @@ namespace
         probe.GetToolchainRequests( requests );
         return requests.GetSize();
     }
-
-    bool ReadWholeFile( const AString & path, AString & outContent )
-    {
-        FileStream f;
-        if ( f.Open( path.Get(), FileStream::READ_ONLY ) == false )
-        {
-            return false;
-        }
-        const uint32_t size = (uint32_t)f.GetFileSize();
-        outContent.SetLength( size );
-        return ( f.Read( outContent.Get(), size ) == size );
-    }
 }
 
 // MakeGatewayConfig
@@ -4125,7 +3945,7 @@ namespace
 //------------------------------------------------------------------------------
 /*static*/ bool TestGateway::WaitForReadyWorkers( const Gateway & gateway, uint32_t numWorkers )
 {
-    return WaitUntil( [ &gateway, numWorkers ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == numWorkers ); } );
+    return DistributedTest::WaitUntil( [ &gateway, numWorkers ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == numWorkers ); } );
 }
 
 // GatewayAdvertisesTheSumOfItsWorkers
@@ -4174,7 +3994,7 @@ void TestGateway::GatewayForwardsAJobAndItsResult() const
 
     // The client's id comes back, and the thread is on worker 1's lane
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( results[ 0 ].m_JobId == 5 );
     TEST_ASSERT( results[ 0 ].m_Name == "m5" );
     TEST_ASSERT( results[ 0 ].m_Ok );
@@ -4190,7 +4010,7 @@ void TestGateway::GatewayForwardsAJobAndItsResult() const
     TEST_ASSERT( ( types[ 0 ] == Protocol::MSG_MANIFEST ) && ( types[ 1 ] == Protocol::MSG_FILE ) && ( types[ 2 ] == Protocol::MSG_JOB ) );
 
     // Nothing is held once the result has gone back
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
     const Gateway::Stats stats = GetGatewayStats( gateway );
     TEST_ASSERT( ( stats.m_Forwarded == 1 ) && ( stats.m_Running == 0 ) && ( stats.m_Waiting == 0 ) && ( stats.m_Parked == 0 ) );
     probe.ShutdownAllConnections();
@@ -4217,12 +4037,12 @@ void TestGateway::JobsWaitForTheirToolchainAtTheGateway() const
     TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 0 ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
     Thread::Sleep( 100 );
     TEST_ASSERT( worker.GetNumJobs() == 0 );
 
     TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 1 ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
     Array<uint8_t> types;
     worker.GetMessageTypes( types );
     TEST_ASSERT( types.GetSize() == 4 );
@@ -4258,18 +4078,18 @@ void TestGateway::JobForAMissingToolchainRequestsIt() const
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
     Array<DistributedTest::HandshakeProbe::ToolchainRequest> requests;
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 1 ); } ) );
     probe.GetToolchainRequests( requests );
     TEST_ASSERT( requests[ 0 ].m_IsManifest && ( requests[ 0 ].m_ToolId == kGatewayTool ) );
 
     TEST_ASSERT( SendToolchainManifest( probe, ci, kGatewayTool, 1 ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 2 ); } ) );
     probe.GetToolchainRequests( requests );
     TEST_ASSERT( ( requests[ 1 ].m_IsManifest == false ) && ( requests[ 1 ].m_ToolId == kGatewayTool ) && ( requests[ 1 ].m_FileId == 0 ) );
     TEST_ASSERT( worker.GetNumJobs() == 0 );
 
     TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 0 ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
     Array<uint8_t> types;
     worker.GetMessageTypes( types );
     TEST_ASSERT( types.GetSize() == 3 );
@@ -4317,18 +4137,18 @@ void TestGateway::AdvertisedToolchainIsPinnedForTheConnection() const
         {
             TEST_ASSERT( SendToolchain( b, ciB, toolId ) );
         }
-        TEST_ASSERT( WaitUntil( [ &gateway, lastTool ]() { return gateway.m_Stash.IsComplete( lastTool ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway, lastTool ]() { return gateway.m_Stash.IsComplete( lastTool ); } ) );
         TEST_ASSERT( gateway.m_Stash.IsComplete( firstTool ) == false );
         TEST_ASSERT( gateway.m_Stash.IsComplete( kGatewayTool ) );
         b.ShutdownAllConnections();
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 1 ); } ) );
     }
     TEST_ASSERT( gateway.m_Stash.IsComplete( kGatewayTool ) );
 
     // A's job is forwarded with the toolchain, and nothing is asked of A
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( a, ciA, encoder, 5, "m5" ) );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( GetNumResults( a ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( GetNumResults( a ) == 1 ); } ) );
     TEST_ASSERT( GetNumToolchainRequests( a ) == 0 );
     Array<uint8_t> types;
     worker.GetMessageTypes( types );
@@ -4337,12 +4157,12 @@ void TestGateway::AdvertisedToolchainIsPinnedForTheConnection() const
 
     // Once A has gone, the toolchain can be evicted
     a.ShutdownAllConnections();
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 0 ); } ) );
     for ( uint64_t toolId = 0x9001; toolId < ( 0x9001 + ToolchainStash::kMaxToolchains ); ++toolId )
     {
         AddCompleteToStash( gateway.m_Stash, toolId );
     }
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( gateway.m_Stash.IsComplete( kGatewayTool ) == false ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( gateway.m_Stash.IsComplete( kGatewayTool ) == false ); } ) );
 }
 
 // GatewayAsksTheClientForAMissingPch
@@ -4366,14 +4186,14 @@ void TestGateway::GatewayAsksTheClientForAMissingPch() const
     DistributedTest::MakeCompressedPch( 64 * 1024, 3, pch );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() == 1 ); } ) );
     TEST_ASSERT( probe.GetPchNeededId( 0 ) == pch.m_Id );
     TEST_ASSERT( GetGatewayStats( gateway ).m_Parked == 1 );
     TEST_ASSERT( worker.GetNumJobs() == 0 );
 
     TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( worker.GetNumPchCopies() == 1 );
     TEST_ASSERT( worker.GetPchBytes() == pch.m_CompressedSize );
@@ -4407,12 +4227,12 @@ void TestGateway::PchCrossesTheUplinkOnceForTwoWorkers() const
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6", pch.m_Id ) );
-    TEST_ASSERT( WaitUntil( [ &w1, &w2 ]() { return ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &w1, &w2 ]() { return ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 1 ); } ) );
     TEST_ASSERT( ( w1.GetNumPchCopies() == 1 ) && ( w1.GetPchBytes() == pch.m_CompressedSize ) );
     TEST_ASSERT( ( w2.GetNumPchCopies() == 1 ) && ( w2.GetPchBytes() == pch.m_CompressedSize ) );
     w1.AnswerHeldJobs();
     w2.AnswerHeldJobs();
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
 
     // The client sent it once, and was never asked for it
     TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
@@ -4445,7 +4265,7 @@ void TestGateway::ResultsGoBackToTheClientThatSentTheJob() const
     JobStreamEncoder encoderB;
     TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 5, "a" ) );
     TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, 5, "b" ) );
-    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( GetNumResults( a ) == 1 ) && ( GetNumResults( b ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a, &b ]() { return ( GetNumResults( a ) == 1 ) && ( GetNumResults( b ) == 1 ); } ) );
     Thread::Sleep( 100 ); // A result sent to the wrong client would have arrived by now
 
     Array<DistributedTest::ReceivedResult> results;
@@ -4479,11 +4299,11 @@ void TestGateway::ThreadLanesOfTwoWorkersDoNotCollide() const
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
-    TEST_ASSERT( WaitUntil( [ &w1, &w2 ]() { return ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &w1, &w2 ]() { return ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 1 ); } ) );
     w1.AnswerHeldJobs();
     w2.AnswerHeldJobs();
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
 
     // Worker 1's lanes start at 1257, worker 2's at 1513
     Array<EchoWorker::ReceivedJob> jobsOf1;
@@ -4511,7 +4331,7 @@ void TestGateway::ClientsAreServedInTurn() const
 
     // The worker's pool has a slot for each client, and it gives the gateway one of them
     worker.SendCapacity( 1, 2 );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_PoolSlots == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_PoolSlots == 2 ); } ) );
 
     DistributedTest::HandshakeProbe a;
     DistributedTest::HandshakeProbe b;
@@ -4525,21 +4345,21 @@ void TestGateway::ClientsAreServedInTurn() const
     JobStreamEncoder encoderA;
     JobStreamEncoder encoderB;
     TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 1, "a1" ) );
-    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumJobs() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumJobs() == 1 ); } ) );
     TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 2, "a2" ) );
     TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 3, "a3" ) );
     TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 4, "a4" ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 3 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 3 ); } ) );
     TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, 1, "b1" ) );
     TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, 2, "b2" ) );
     TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, 3, "b3" ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 6 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 6 ); } ) );
 
     // Each result frees the slot for the next turn
     for ( size_t i = 1; i < 7; ++i )
     {
         worker.AnswerHeldJobs();
-        TEST_ASSERT( WaitUntil( [ &worker, i ]() { return ( worker.GetNumJobs() == ( i + 1 ) ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &worker, i ]() { return ( worker.GetNumJobs() == ( i + 1 ) ); } ) );
     }
     worker.AnswerHeldJobs();
 
@@ -4551,7 +4371,7 @@ void TestGateway::ClientsAreServedInTurn() const
     {
         TEST_ASSERT( jobs[ i ].m_Name == expected[ i ] );
     }
-    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( GetNumResults( a ) == 4 ) && ( GetNumResults( b ) == 3 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a, &b ]() { return ( GetNumResults( a ) == 4 ) && ( GetNumResults( b ) == 3 ); } ) );
     a.ShutdownAllConnections();
     b.ShutdownAllConnections();
 }
@@ -4582,14 +4402,14 @@ void TestGateway::GatewayLogsForwarding() const
         TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
         JobStreamEncoder encoder;
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
-        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
         probe.ShutdownAllConnections();
     }
 
     // The gateway's own log, with the stats line it wrote as it shut down
     TEST_ASSERT( logPath.BeginsWith( config.m_CacheDir ) );
     AString log;
-    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    LoadFileContentsAsString( logPath.Get(), log );
     AStackString<> expected;
     expected.Format( "gateway worker-ready worker=127.0.0.1:%u slots=4", (uint32_t)kGatewayTestDownstreamPort );
     TEST_ASSERT( log.Find( expected.Get() ) );
@@ -4612,14 +4432,10 @@ namespace
     AString WriteStoredPch( const AString & cacheDir, uint64_t pchId, const void * storedData, size_t storedSize )
     {
         AStackString<> storedFile( cacheDir );
-        storedFile.AppendFormat( "pch.%016" PRIx64, pchId );
-        if ( FileIO::EnsurePathExists( storedFile ) == false )
-        {
-            return AString();
-        }
-        storedFile.AppendFormat( "%c%s", (char)NATIVE_SLASH, PchBlob::kStoredFileName );
-        FileStream f;
-        if ( ( f.Open( storedFile.Get(), FileStream::WRITE_ONLY ) == false ) || ( f.Write( storedData, storedSize ) != storedSize ) )
+        storedFile.AppendFormat( "pch.%016" PRIx64 "%c%s", pchId, (char)NATIVE_SLASH, PchBlob::kStoredFileName );
+        Array<char> content;
+        content.Append( static_cast<const char *>( storedData ), static_cast<const char *>( storedData ) + storedSize );
+        if ( FBuildTest::WriteFile( storedFile, content ) == false )
         {
             return AString();
         }
@@ -4673,7 +4489,7 @@ namespace
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
 
     // It goes from the store once it has been measured, so it is not advertised
-    TEST_ASSERT( WaitUntil( [ &gateway, &pch ]() { AStackString<> path; return ( gateway.GetServer().FindCachedPch( pch.m_Id, path ) == false ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway, &pch ]() { AStackString<> path; return ( gateway.GetServer().FindCachedPch( pch.m_Id, path ) == false ); } ) );
     TEST_ASSERT( FileIO::FileExists( storedFile.Get() ) == false );
     DistributedTest::HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
@@ -4686,11 +4502,11 @@ namespace
     TEST_ASSERT( SendToolchain( probe, ci ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() == 1 ); } ) );
     TEST_ASSERT( probe.GetPchNeededId( 0 ) == pch.m_Id );
     TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( worker.GetPchBytes() == pch.m_CompressedSize );
     probe.ShutdownAllConnections();
@@ -4709,24 +4525,24 @@ void TestGateway::DroppedPchIsUnpackedAgainOnceStoredAgain() const
     DistributedTest::MakeCompressedPch( 64 * 1024, 9, pch );
     AStackString<> stored;
     TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.FindCachedPch( pch.m_Id, stored ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.FindCachedPch( pch.m_Id, stored ); } ) );
 
     // A job has the working copy made
     Job first( static_cast<Node *>( nullptr ) );
     first.SetPchId( pch.m_Id );
     first.SetPchLease( s.AcquirePchLease( pch.m_Id ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( first ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.TryResolvePch( first ); } ) );
     TEST_ASSERT( FileIO::FileExists( first.GetPchCachePath().Get() ) );
 
     // Dropped with its working copy while that job holds it, then stored again: the next job has a working copy made again
     s.DropStoredPch( pch.m_Id );
     TEST_ASSERT( FileIO::FileExists( first.GetPchCachePath().Get() ) == false );
     TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.FindCachedPch( pch.m_Id, stored ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.FindCachedPch( pch.m_Id, stored ); } ) );
     Job second( static_cast<Node *>( nullptr ) );
     second.SetPchId( pch.m_Id );
     second.SetPchLease( s.AcquirePchLease( pch.m_Id ) );
-    TEST_ASSERT( WaitUntil( [ & ]() { return s.TryResolvePch( second ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ & ]() { return s.TryResolvePch( second ); } ) );
     TEST_ASSERT( FileIO::FileExists( second.GetPchCachePath().Get() ) );
     TEST_ASSERT( s.m_NumPchsUnpacked.Load() == 2 );
 
@@ -4768,7 +4584,7 @@ void TestGateway::PchStoreOfAGatewayCacheDirLeavesTheWorkerCacheAlone() const
         DistributedTest::CompressedPch pch;
         DistributedTest::MakeCompressedPch( 64 * 1024, 10, pch );
         TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
-        TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumStoredPchs() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumStoredPchs() == 1 ); } ) );
         probe.ShutdownAllConnections();
     }
     const bool madeWorkerCache = FileIO::DirectoryExists( workerCache );
@@ -4806,12 +4622,12 @@ void TestGateway::PchEvictedFromTheStoreLeavesTheGateway() const
     DistributedTest::MakeCompressedPch( 64 * 1024, 11, first );
     DistributedTest::MakeCompressedPch( 64 * 1024, 12, second );
     TEST_ASSERT( SendPchFromProbe( probe, ci, first ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_KnownPchs == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_KnownPchs == 1 ); } ) );
     TEST_ASSERT( SendPchFromProbe( probe, ci, second ) );
-    TEST_ASSERT( WaitUntil( [ &gateway, &first ]() { AStackString<> path; return ( gateway.GetServer().FindCachedPch( first.m_Id, path ) == false ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway, &first ]() { AStackString<> path; return ( gateway.GetServer().FindCachedPch( first.m_Id, path ) == false ); } ) );
 
     // The gateway knows only what the store holds
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_KnownPchs == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_KnownPchs == 1 ); } ) );
     MutexHolder mh( gateway.m_Mutex );
     TEST_ASSERT( gateway.FindKnownPch( first.m_Id ) == nullptr );
     TEST_ASSERT( gateway.IsPchStored( first.m_Id ) == false );
@@ -4865,16 +4681,16 @@ void TestGateway::HousekeepingRunsWhileStoredPchsAreMeasured() const
         Gateway gateway( config );
         TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         logPath = gateway.GetServer().GetLogPath();
-        TEST_ASSERT( WaitUntil( []() { return ( s_HeldMeasurements.Load() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( []() { return ( s_HeldMeasurements.Load() == 1 ); } ) );
 
         // The reconnect: once the first connection has failed, the worker is connected when it listens (the delay
         // is 0.2 s, plus a refused connect's retries)
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { MutexHolder mh( gateway.m_Mutex ); return gateway.m_Workers[ 0 ].m_Lost; } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { MutexHolder mh( gateway.m_Mutex ); return gateway.m_Workers[ 0 ].m_Lost; } ) );
         TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); }, 10.0f ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); }, 10.0f ) );
 
         // The stats line
-        TEST_ASSERT( WaitUntil( [ &logPath ]() { AString log; return ReadWholeFile( logPath, log ) && ( log.Find( "gateway stats clients=" ) != nullptr ); }, 5.0f ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &logPath ]() { uint32_t n = 0; return DistributedTest::CountInStatsLogSince( logPath, 0, "gateway stats clients=", n ) && ( n >= 1 ); }, 5.0f ) );
 
         // The watchdog
         DistributedTest::HandshakeProbe probe;
@@ -4883,21 +4699,21 @@ void TestGateway::HousekeepingRunsWhileStoredPchsAreMeasured() const
         TEST_ASSERT( SendToolchain( probe, ci ) );
         JobStreamEncoder encoder;
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Timeouts >= 1 ); }, 5.0f ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Timeouts >= 1 ); }, 5.0f ) );
         worker.SetAnswer( EchoWorker::ANSWER_OK );
         worker.AnswerHeldJobs();
-        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
 
         // A job for the PCH waits for its measurement, and its client is not asked for the PCH
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6", pch.m_Id ) );
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
         Thread::Sleep( 100 );
         TEST_ASSERT( ( GetGatewayStats( gateway ).m_Parked == 1 ) && ( GetNumResults( probe ) == 1 ) );
 
         // Once measured, it is sent from the store
         s_MeasurementsReleased.Store( true );
         Array<DistributedTest::ReceivedResult> results;
-        TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
         TEST_ASSERT( ( results[ 1 ].m_JobId == 6 ) && results[ 1 ].m_Ok );
         TEST_ASSERT( worker.GetPchBytes() == pch.m_CompressedSize );
         TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
@@ -4905,7 +4721,7 @@ void TestGateway::HousekeepingRunsWhileStoredPchsAreMeasured() const
     }
 
     AString log;
-    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    LoadFileContentsAsString( logPath.Get(), log );
     TEST_ASSERT( log.Find( "gateway pch-measured n=1 failed=0 ms=" ) );
 }
 
@@ -4937,7 +4753,7 @@ void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
         TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
         TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
         logPath = gateway.GetServer().GetLogPath();
-        TEST_ASSERT( WaitUntil( []() { return ( s_HeldMeasurements.Load() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( []() { return ( s_HeldMeasurements.Load() == 1 ); } ) );
         {
             MutexHolder mh( gateway.m_Mutex );
             for ( const Gateway::KnownPch & known : gateway.m_Pchs )
@@ -4957,28 +4773,28 @@ void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
         TEST_ASSERT( SendToolchain( probe, ci ) );
         JobStreamEncoder encoder;
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", lastPchId ) );
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
         s_AllowedMeasurements.Store( 1 );
 
         // Another job parks while the next measurement is under way
-        TEST_ASSERT( WaitUntil( []() { return ( s_HeldMeasurements.Load() == 2 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( []() { return ( s_HeldMeasurements.Load() == 2 ); } ) );
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6", otherPchId ) );
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 2 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 2 ); } ) );
         TEST_ASSERT( s_HeldMeasurements.Load() == 2 );
 
         // The first job is released once that measurement ends, while the one after it is held
         s_AllowedMeasurements.Store( 2 );
         Array<DistributedTest::ReceivedResult> results;
-        TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.IsEmpty() == false ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.IsEmpty() == false ); } ) );
         TEST_ASSERT( ( results.GetSize() == 1 ) && ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
         TEST_ASSERT( s_MeasureOrder[ 1 ] == lastPchId );
         s_AllowedMeasurements.Store( kOrderedStoredPchs );
-        TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
         TEST_ASSERT( ( results[ 1 ].m_JobId == 6 ) && results[ 1 ].m_Ok );
         TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
 
         // The awaited ones first, in the order they were awaited, then the rest in store order
-        TEST_ASSERT( WaitUntil( [ &logPath ]() { AString log; return ReadWholeFile( logPath, log ) && ( log.Find( "gateway pch-measured n=" ) != nullptr ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &logPath ]() { uint32_t n = 0; return DistributedTest::CountInStatsLogSince( logPath, 0, "gateway pch-measured n=", n ) && ( n >= 1 ); } ) );
         TEST_ASSERT( s_HeldMeasurements.Load() == kOrderedStoredPchs );
         TEST_ASSERT( s_MeasureOrder[ 1 ] == lastPchId );
         TEST_ASSERT( s_MeasureOrder[ 2 ] == otherPchId );
@@ -4990,7 +4806,7 @@ void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
     }
 
     AString log;
-    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    LoadFileContentsAsString( logPath.Get(), log );
     AStackString<> expected;
     expected.Format( "gateway pch-measured n=%u failed=0 ms=", kOrderedStoredPchs );
     TEST_ASSERT( log.Find( expected.Get() ) );
@@ -5009,15 +4825,12 @@ namespace
     // A job whose data does not compress, so that a worker that does not read holds up its sends
     bool SendLargeGatewayJob( DistributedTest::HandshakeProbe & probe, const ConnectionInfo * ci, JobStreamEncoder & encoder, uint32_t jobId, const char * marker, uint32_t size )
     {
+        Array<char> data;
+        FBuildTest::MakeRandomBytes( size, jobId, data );
         MemoryStream job;
         job.Write( jobId );
         job.Write( AStackString<>( marker ) );
-        uint32_t x = jobId;
-        for ( uint32_t i = 0; i < ( size / sizeof( uint32_t ) ); ++i )
-        {
-            x = ( x * 1664525u ) + 1013904223u;
-            job.Write( x );
-        }
+        job.WriteBuffer( data.Begin(), data.GetSize() );
         job.Write( (uint64_t)0 ); // No PCH
         return probe.SendJob( ci, encoder, kGatewayTool, 0, job );
     }
@@ -5069,7 +4882,7 @@ void TestGateway::GiveUpDoesNotDenyListTheGateway() const
 
     // The gateway was still given jobs after it gave one up
     AString log;
-    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    LoadFileContentsAsString( logPath.Get(), log );
     const char * giveUp = log.Find( "gateway job-giveup client=" );
     TEST_ASSERT( giveUp );
     TEST_ASSERT( strstr( giveUp, "gateway job-forward client=" ) );
@@ -5098,11 +4911,11 @@ void TestGateway::JobOfALostWorkerIsRetriedElsewhere() const
 
     // Worker 1 takes it first (the lower id) and goes; worker 2 builds it
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok && ( results[ 0 ].m_SystemError == false ) );
     TEST_ASSERT( results[ 0 ].m_ThreadIndex == GatewayWire::MakeLane( 2, 1001 ) );
     TEST_ASSERT( ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 1 ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
     const Gateway::Stats stats = GetGatewayStats( gateway );
     TEST_ASSERT( ( stats.m_Retries == 1 ) && ( stats.m_GiveUps == 0 ) && ( stats.m_Running == 0 ) );
     Thread::Sleep( 100 );
@@ -5133,7 +4946,7 @@ void TestGateway::SystemErrorIsRetriedAndNotPassedOn() const
 
     // Only the result of the retry reaches the client
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     Thread::Sleep( 100 );
     probe.GetResults( results );
     TEST_ASSERT( results.GetSize() == 1 );
@@ -5176,7 +4989,7 @@ void TestGateway::JobIsTriedOnAtMostThreeWorkers() const
 
     // One result, the last worker's failure, flagged as given up by the gateway
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     Thread::Sleep( 200 );
     probe.GetResults( results );
     TEST_ASSERT( results.GetSize() == 1 );
@@ -5222,7 +5035,7 @@ void TestGateway::CompileFailureIsPassedOnUnretried() const
 
     // The code is at fault, not the worker: the failure goes up as it is
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && ( results[ 0 ].m_Ok == false ) && ( results[ 0 ].m_SystemError == false ) );
     Array<uint8_t> flags;
     probe.GetResultFlags( flags );
@@ -5256,7 +5069,7 @@ void TestGateway::HungJobIsRetriedAfterTheWatchdog() const
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
 
     // Worker 1 holds it, and after the watchdog worker 2 builds it
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
     TEST_ASSERT( timer.GetElapsed() >= config.m_JobTimeoutSeconds );
     TEST_ASSERT( ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 1 ) );
     Array<DistributedTest::ReceivedResult> results;
@@ -5267,15 +5080,15 @@ void TestGateway::HungJobIsRetriedAfterTheWatchdog() const
 
     // Worker 1's slot stays taken by the hung attempt, so the next job goes to worker 2
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
     TEST_ASSERT( ( w1.GetNumJobs() == 1 ) && ( w2.GetNumJobs() == 2 ) );
 
     // Its late result is dropped, and frees the slot
     w1.SetAnswer( EchoWorker::ANSWER_OK );
     w1.AnswerHeldJobs();
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Running == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Running == 0 ); } ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 7, "m7" ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 3 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 3 ); } ) );
     Thread::Sleep( 100 );
     TEST_ASSERT( GetNumResults( probe ) == 3 );
     TEST_ASSERT( ( w1.GetNumJobs() == 2 ) && ( w2.GetNumJobs() == 2 ) );
@@ -5307,12 +5120,12 @@ void TestGateway::WorkerAskingForAnUnknownPchDoesNotReachTheClient() const
     TEST_ASSERT( SendToolchain( probe, ci ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-    TEST_ASSERT( WaitUntil( [ &w1 ]() { return ( w1.GetNumJobs() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &w1 ]() { return ( w1.GetNumJobs() == 1 ); } ) );
 
     // The gateway ends that connection, and builds the job elsewhere
     TEST_ASSERT( w1.AskForPch( 0xDEAD0003 ) );
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( w2.GetNumJobs() == 1 );
     TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
@@ -5335,8 +5148,8 @@ void TestGateway::LostWorkerIsConnectedAgain() const
 
     // It goes out of the pool, and comes back on a new connection
     worker.DisconnectConnections();
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_PoolSlots == 0 ); } ) );
-    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumConnections() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_PoolSlots == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumConnections() == 2 ); } ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
     TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 4 );
     Array<float> times;
@@ -5351,7 +5164,7 @@ void TestGateway::LostWorkerIsConnectedAgain() const
     TEST_ASSERT( SendToolchain( probe, ci ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
     probe.ShutdownAllConnections();
 }
 
@@ -5375,16 +5188,16 @@ void TestGateway::DroppedClientJobsFinishAndAreDiscarded() const
         TEST_ASSERT( SendToolchain( probe, ci ) );
         JobStreamEncoder encoder;
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-        TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumJobs() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumJobs() == 1 ); } ) );
         probe.ShutdownAllConnections();
     }
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 0 ); } ) );
 
     // The job carries on, and its result goes nowhere
     Gateway::Stats stats = GetGatewayStats( gateway );
     TEST_ASSERT( ( stats.m_Running == 1 ) && ( stats.m_HeldJobBytes > 0 ) );
     worker.AnswerHeldJobs();
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
     stats = GetGatewayStats( gateway );
     TEST_ASSERT( ( stats.m_Running == 0 ) && ( stats.m_GiveUps == 0 ) && ( stats.m_Retries == 0 ) );
 }
@@ -5411,14 +5224,14 @@ void TestGateway::RunningJobsOfADroppedClientAreFreedWithTheirWorker() const
         TEST_ASSERT( SendToolchain( probe, ci ) );
         JobStreamEncoder encoder;
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-        TEST_ASSERT( WaitUntil( [ &w1 ]() { return ( w1.GetNumJobs() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &w1 ]() { return ( w1.GetNumJobs() == 1 ); } ) );
         probe.ShutdownAllConnections();
     }
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 0 ); } ) );
 
     // Its worker goes: the job is not tried again for nobody, and nothing of it is held
     w1.DisconnectConnections();
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
     Thread::Sleep( 100 );
     TEST_ASSERT( w2.GetNumJobs() == 0 );
     const Gateway::Stats stats = GetGatewayStats( gateway );
@@ -5446,23 +5259,23 @@ void TestGateway::WaitingJobsOfADroppedClientAreFreed() const
         TEST_ASSERT( SendToolchain( probe, ci ) );
         JobStreamEncoder encoder;
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-        TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumJobs() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumJobs() == 1 ); } ) );
         heldWhileRunning = GetGatewayStats( gateway ).m_HeldJobBytes;
 
         // A job for a toolchain it never sends, which is parked
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 7, "m7", 0, 0x7777 ) );
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Waiting == 1 ) && ( s.m_Parked == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Waiting == 1 ) && ( s.m_Parked == 1 ); } ) );
         probe.ShutdownAllConnections();
     }
 
     // The waiting and parked jobs go with their client, and the running one stays until it ends
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Clients == 0 ); } ) );
     Gateway::Stats stats = GetGatewayStats( gateway );
     TEST_ASSERT( ( stats.m_Waiting == 0 ) && ( stats.m_Parked == 0 ) && ( stats.m_Running == 1 ) );
     TEST_ASSERT( stats.m_HeldJobBytes == heldWhileRunning );
     worker.AnswerHeldJobs();
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
     Thread::Sleep( 100 );
     TEST_ASSERT( worker.GetNumJobs() == 1 );
 }
@@ -5495,16 +5308,16 @@ void TestGateway::ClientHoldingTooManyJobsIsDisconnected() const
         marker.Format( "m%u", i );
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, i + 1, marker.Get() ) );
     }
-    TEST_ASSERT( WaitUntil( [ &gateway, maxJobs ]() { return ( GetGatewayStats( gateway ).m_Waiting == ( maxJobs - 1 ) ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway, maxJobs ]() { return ( GetGatewayStats( gateway ).m_Waiting == ( maxJobs - 1 ) ); } ) );
     Thread::Sleep( 100 );
     TEST_ASSERT( probe.IsDisconnected() == false );
 
     // One more, and the client goes with what it held
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, maxJobs + 1, "over" ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Clients == 0 ) && ( s.m_Waiting == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Clients == 0 ) && ( s.m_Waiting == 0 ); } ) );
     worker.AnswerHeldJobs();
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
     TEST_ASSERT( worker.GetNumJobs() == 1 );
 }
 
@@ -5532,11 +5345,11 @@ void TestGateway::StalledWorkerDoesNotStallTheGateway() const
     JobStreamEncoder encoder;
     TEST_ASSERT( SendLargeGatewayJob( probe, ci, encoder, 1, "big1", 16 * MEGABYTE ) );
     TEST_ASSERT( SendLargeGatewayJob( probe, ci, encoder, 2, "big2", 16 * MEGABYTE ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Running == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Running == 2 ); } ) );
 
     // The other worker and another client are served meanwhile
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 3, "m3" ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
     TEST_ASSERT( w2.GetNumJobs() == 1 );
     DistributedTest::HandshakeProbe other;
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), other ) != 0 );
@@ -5545,7 +5358,7 @@ void TestGateway::StalledWorkerDoesNotStallTheGateway() const
     TEST_ASSERT( CountJobs( w1, w2 ) == 1 );
 
     w1.StallReading( false );
-    TEST_ASSERT( WaitUntil( [ &w1 ]() { return ( w1.GetNumJobs() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &w1 ]() { return ( w1.GetNumJobs() == 2 ); } ) );
     other.ShutdownAllConnections();
     probe.ShutdownAllConnections();
 }
@@ -5572,26 +5385,26 @@ void TestGateway::ToolchainOfADroppedClientIsAskedOfAnother() const
     // A sends half of the toolchain; B's job for it waits, and B is not asked while A sends it
     TEST_ASSERT( SendToolchainManifest( a, ciA, kGatewayTool, 2 ) );
     TEST_ASSERT( SendToolchainFile( a, ciA, kGatewayTool, 0 ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return gateway.m_Stash.HasManifest( kGatewayTool ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return gateway.m_Stash.HasManifest( kGatewayTool ); } ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( b, ciB, encoder, 5, "m5" ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
     Thread::Sleep( 100 );
     TEST_ASSERT( GetNumToolchainRequests( b ) == 0 );
 
     // A goes with what it sent, and B is asked for the whole toolchain
     a.ShutdownAllConnections();
-    TEST_ASSERT( WaitUntil( [ &b ]() { return ( GetNumToolchainRequests( b ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &b ]() { return ( GetNumToolchainRequests( b ) == 1 ); } ) );
     Array<DistributedTest::HandshakeProbe::ToolchainRequest> requests;
     b.GetToolchainRequests( requests );
     TEST_ASSERT( requests[ 0 ].m_IsManifest && ( requests[ 0 ].m_ToolId == kGatewayTool ) );
     TEST_ASSERT( gateway.m_Stash.HasManifest( kGatewayTool ) == false );
 
     TEST_ASSERT( SendToolchainManifest( b, ciB, kGatewayTool, 2 ) );
-    TEST_ASSERT( WaitUntil( [ &b ]() { return ( GetNumToolchainRequests( b ) == 3 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &b ]() { return ( GetNumToolchainRequests( b ) == 3 ); } ) );
     TEST_ASSERT( SendToolchainFile( b, ciB, kGatewayTool, 0 ) );
     TEST_ASSERT( SendToolchainFile( b, ciB, kGatewayTool, 1 ) );
-    TEST_ASSERT( WaitUntil( [ &b ]() { return ( GetNumResults( b ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &b ]() { return ( GetNumResults( b ) == 1 ); } ) );
     b.ShutdownAllConnections();
 }
 
@@ -5607,11 +5420,9 @@ void TestGateway::GatewayWithNoWorkersRefusesClients() const
     Thread::Sleep( 500 ); // Some attempts to connect to it
 
     DistributedTest::HandshakeProbe probe;
-    const ConnectionInfo * ci = probe.Connect( AStackString( "127.0.0.1" ), Protocol::kTestPort, 2000 );
-    TEST_ASSERT( ci );
-    const Protocol::MsgConnection msg;
-    TEST_ASSERT( probe.Send( ci, &msg, sizeof( msg ) ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
+    const ConnectionInfo * ci = probe.ConnectTo( Protocol::kTestPort );
+    TEST_ASSERT( ci && probe.SendHandshake( ci ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
     TEST_ASSERT( probe.GetNumMessages() == 0 );
     TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 0 );
 }
@@ -5678,7 +5489,7 @@ void TestGateway::JobsWaitingWithNoWorkersAreReturned() const
         JobStreamEncoder encoder;
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Running == 1 ) && ( s.m_Waiting == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Running == 1 ) && ( s.m_Waiting == 1 ); } ) );
 
         // The only worker goes and does not come back. Until the gateway is told it is lost, which retries the job
         // it held, the job waiting for it does not count as having no worker.
@@ -5688,18 +5499,18 @@ void TestGateway::JobsWaitingWithNoWorkersAreReturned() const
             MutexHolder mh( gateway.m_Mutex ); // Holds back the loss
             DownstreamConnection * connection = gateway.m_Workers[ 0 ].m_Connection;
             worker.ShutdownAllConnections();
-            TEST_ASSERT( WaitUntil( [ connection ]() { return connection->HasEnded(); } ) );
+            TEST_ASSERT( DistributedTest::WaitUntil( [ connection ]() { return connection->HasEnded(); } ) );
             Gateway::Actions actions;
             gateway.GiveUpJobsNoWorkerCanTake( actions );
             const Gateway::GatewayJob * waiting = gateway.FindJob( 2 ); // Client job 6
             countedWithoutWorker = waiting && ( waiting->m_NoWorkerSince != 0 );
         }
         TEST_ASSERT( countedWithoutWorker == false );
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 2 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 2 ); } ) );
 
         // Once the bound has passed, each goes back to the client flagged, so it requeues it and keeps the gateway
         Array<uint32_t> jobIds;
-        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
         TEST_ASSERT( timer.GetElapsed() >= ( config.m_NoWorkerGiveUpSeconds * 0.9f ) );
         TEST_ASSERT( AreAllGivenUp( probe, jobIds ) );
         TEST_ASSERT( jobIds.Find( 5u ) && jobIds.Find( 6u ) );
@@ -5712,7 +5523,7 @@ void TestGateway::JobsWaitingWithNoWorkersAreReturned() const
     }
 
     AString log;
-    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    LoadFileContentsAsString( logPath.Get(), log );
     uint32_t numGiveUps = 0;
     for ( const char * line = log.Find( "gateway job-giveup client=" ); line; line = strstr( line + 1, "gateway job-giveup client=" ) )
     {
@@ -5744,7 +5555,7 @@ void TestGateway::ToolchainIsKeptForAClientSendingItWhenAnotherLeaves() const
     // A's job waits for the toolchain, which A is asked for
     JobStreamEncoder encoderA;
     TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 5, "a5" ) );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( GetNumToolchainRequests( a ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( GetNumToolchainRequests( a ) == 1 ); } ) );
 
     // B sends the same toolchain and a job of its own. While the gateway takes B's manifest, A leaves.
     JobStreamEncoder encoderB;
@@ -5752,13 +5563,13 @@ void TestGateway::ToolchainIsKeptForAClientSendingItWhenAnotherLeaves() const
         MutexHolder mh( gateway.m_Mutex );
         TEST_ASSERT( SendToolchain( b, ciB ) );
         TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, 6, "b6" ) );
-        WaitUntil( [ &gateway ]() { return gateway.m_Stash.HasManifest( kGatewayTool ); }, 1.0f ); // Unless B counts as sending it first
+        DistributedTest::WaitUntil( [ &gateway ]() { return gateway.m_Stash.HasManifest( kGatewayTool ); }, 1.0f ); // Unless B counts as sending it first
         gateway.OnClientGone( idA );
     }
 
     // What B sent is kept, and B's job is built
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &b, &results ]() { b.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &b, &results ]() { b.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 6 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( b.IsDisconnected() == false );
     a.ShutdownAllConnections();
@@ -5784,23 +5595,23 @@ void TestGateway::ToolchainDroppedUnderItsSenderIsAskedForAgain() const
     JobStreamEncoder encoder;
     TEST_ASSERT( SendToolchainManifest( probe, ci, kGatewayTool, 1 ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
 
     // The stash lets the toolchain go before its file arrives: the client is asked for it again, from the manifest on
     gateway.m_Stash.DropIncomplete( kGatewayTool );
     TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 0 ) );
     Array<DistributedTest::HandshakeProbe::ToolchainRequest> requests;
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 1 ); } ) );
     probe.GetToolchainRequests( requests );
     TEST_ASSERT( requests[ 0 ].m_IsManifest && ( requests[ 0 ].m_ToolId == kGatewayTool ) );
     TEST_ASSERT( SendToolchainManifest( probe, ci, kGatewayTool, 1 ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 2 ); } ) );
     probe.GetToolchainRequests( requests );
     TEST_ASSERT( ( requests[ 1 ].m_IsManifest == false ) && ( requests[ 1 ].m_FileId == 0 ) );
     TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 0 ) );
 
     Array<DistributedTest::ReceivedResult> results;
-    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 6 ) && results[ 0 ].m_Ok );
     TEST_ASSERT( probe.IsDisconnected() == false );
     probe.ShutdownAllConnections();
@@ -5826,25 +5637,22 @@ void TestGateway::ToolchainTheStashCannotWriteReturnsItsJobs() const
     GetStashToolchainDir( gateway.m_Stash.m_Directory, kGatewayTool, blocker );
     TEST_ASSERT( FileIO::EnsurePathExists( gateway.m_Stash.m_Directory ) );
     FileIO::DirectoryDelete( blocker ); // Left empty by an earlier test
-    {
-        FileStream f;
-        TEST_ASSERT( f.Open( blocker.Get(), FileStream::WRITE_ONLY ) );
-    }
+    TEST_ASSERT( WriteFile( blocker, Array<char>() ) );
 
     // A job waits for the toolchain, which its client is asked for and sends
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 1 ); } ) );
     TEST_ASSERT( SendToolchain( probe, ci ) );
 
     // The job goes back flagged, the client stays, and the log says why
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
     Array<uint32_t> jobIds;
     TEST_ASSERT( AreAllGivenUp( probe, jobIds ) );
     TEST_ASSERT( jobIds[ 0 ] == 5 );
     TEST_ASSERT( probe.IsDisconnected() == false );
     AString log;
-    TEST_ASSERT( ReadWholeFile( gateway.GetServer().GetLogPath(), log ) );
+    LoadFileContentsAsString( gateway.GetServer().GetLogPath().Get(), log );
     TEST_ASSERT( log.Find( "error The gateway cannot write toolchain" ) );
     probe.ShutdownAllConnections();
 }
@@ -5870,11 +5678,11 @@ void TestGateway::JobWaitingForAHungWorkerIsReturned() const
     TEST_ASSERT( SendToolchain( probe, ci ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Timeouts == 1 ) && ( s.m_Waiting == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Timeouts == 1 ) && ( s.m_Waiting == 1 ); } ) );
     const Timer timer;
 
     Array<uint32_t> jobIds;
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
     TEST_ASSERT( timer.GetElapsed() >= ( config.m_NoWorkerGiveUpSeconds * 0.8f ) );
     TEST_ASSERT( AreAllGivenUp( probe, jobIds ) && ( jobIds[ 0 ] == 5 ) );
     TEST_ASSERT( worker.GetNumJobs() == 1 );
@@ -5905,7 +5713,7 @@ void TestGateway::JobsQueuedBehindABusyWorkerAreKept() const
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 7, "m7" ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 2 ); } ) );
 
     // The worker builds one job at a time, each for longer than the bound: the others wait their turn
     for ( uint32_t i = 1; i <= 3; ++i )
@@ -5914,8 +5722,8 @@ void TestGateway::JobsQueuedBehindABusyWorkerAreKept() const
         TEST_ASSERT( GetNumResults( probe ) == ( i - 1 ) );
         TEST_ASSERT( GetGatewayStats( gateway ).m_GiveUps == 0 );
         worker.AnswerHeldJobs();
-        TEST_ASSERT( WaitUntil( [ &probe, i ]() { return ( GetNumResults( probe ) == i ); } ) );
-        TEST_ASSERT( WaitUntil( [ &worker, i ]() { return ( worker.GetNumJobs() == ( ( i < 3 ) ? ( i + 1 ) : 3 ) ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, i ]() { return ( GetNumResults( probe ) == i ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &worker, i ]() { return ( worker.GetNumJobs() == ( ( i < 3 ) ? ( i + 1 ) : 3 ) ); } ) );
     }
     Array<DistributedTest::ReceivedResult> results;
     probe.GetResults( results );
@@ -5948,18 +5756,18 @@ void TestGateway::NoWorkerBoundStartsAgainWhenAWorkerReturns() const
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
-    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumHeldJobs() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumHeldJobs() == 1 ); } ) );
 
     // The worker goes, for less than the bound, and comes back to build the retried job
     worker.DisconnectConnections();
-    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumHeldJobs() == 1 ) && ( worker.GetNumConnections() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumHeldJobs() == 1 ) && ( worker.GetNumConnections() == 2 ); } ) );
     TEST_ASSERT( GetNumResults( probe ) == 0 );
     Thread::Sleep( 500 ); // Busy, with a job waiting behind it
 
     // It goes for good: the bound is counted from here, not from when it first went
     const Timer timer;
     worker.ShutdownAllConnections();
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
     TEST_ASSERT( timer.GetElapsed() >= ( config.m_NoWorkerGiveUpSeconds * 0.9f ) );
     Array<uint32_t> jobIds;
     TEST_ASSERT( AreAllGivenUp( probe, jobIds ) );
@@ -5992,19 +5800,19 @@ void TestGateway::GatewayLogsFailures() const
         TEST_ASSERT( SendToolchain( probe, ci ) );
         JobStreamEncoder encoder;
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-        TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
 
         // A job is held by the worker as it goes
         worker.SetAnswer( EchoWorker::ANSWER_NEVER );
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
-        TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumHeldJobs() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumHeldJobs() == 1 ); } ) );
         worker.DisconnectConnections();
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Retries == 3 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Retries == 3 ); } ) );
         probe.ShutdownAllConnections();
     }
 
     AString log;
-    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    LoadFileContentsAsString( logPath.Get(), log );
     AStackString<> expected;
     expected.Format( "gateway job-retry client=%u job=5 reason=system-error attempt=1", clientId );
     TEST_ASSERT( log.Find( expected.Get() ) );
@@ -6065,14 +5873,9 @@ namespace
 
     // The toolchain messages a client sent over each of its connections, and the toolchains it did not
     // send because the worker had them
-    void GetToolchainStats( const AString & logPath, Array<uint32_t> & outMessages, uint32_t & outNumSkipped )
+    void GetToolchainStats( const AString & log, Array<uint32_t> & outMessages, uint32_t & outNumSkipped )
     {
         outNumSkipped = 0;
-        AString log;
-        if ( ReadWholeFile( logPath, log ) == false )
-        {
-            return;
-        }
         const char * const kPrefix = "  toolchain: ";
         for ( const char * line = log.Find( kPrefix ); line; line = strstr( line + 1, kPrefix ) )
         {
@@ -6179,7 +5982,7 @@ void TestGateway::BuildThroughAPureForwardingGateway() const
     const Gateway::Stats stats = GetGatewayStats( gateway );
     TEST_ASSERT( stats.m_Forwarded == 3 );
     TEST_ASSERT( ( stats.m_Retries == 0 ) && ( stats.m_GiveUps == 0 ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
 }
 
 #if defined( __WINDOWS__ )
@@ -6241,7 +6044,7 @@ void TestGateway::PchBuildThroughTheGatewaySendsEachPchOnce() const
 
     // The gateway sent it on to both workers
     AString log;
-    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    LoadFileContentsAsString( logPath.Get(), log );
     for ( uint32_t i = 0; i < 2; ++i )
     {
         AStackString<> expected;
@@ -6307,7 +6110,9 @@ void TestGateway::GatewayRestartMidBuildCompletesTheBuild() const
     DistributedTest::GetStatsLogPath( statsLogPath );
     Array<uint32_t> toolchainMessages;
     uint32_t numSkippedToolchains = 0;
-    GetToolchainStats( statsLogPath, toolchainMessages, numSkippedToolchains );
+    AString statsLog;
+    LoadFileContentsAsString( statsLogPath.Get(), statsLog );
+    GetToolchainStats( statsLog, toolchainMessages, numSkippedToolchains );
     TEST_ASSERT( toolchainMessages.GetSize() >= 2 );
     TEST_ASSERT( toolchainMessages[ 0 ] >= 2 ); // The manifest and its files
     for ( size_t i = 1; i < toolchainMessages.GetSize(); ++i )
@@ -7062,10 +6867,10 @@ void TestGateway::DownstreamReportsDemandAndTakesItsAllowance() const
     // Nothing is reported before the inventories, and the ramp starts small
     connection.UpdateDemand( 2, 0 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
     connection.UpdateDemand( 100, 0 );
     Array<uint32_t> demands;
-    TEST_ASSERT( WaitUntil( [ &worker, &demands ]() { worker.GetDemands( demands ); return ( demands.IsEmpty() == false ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker, &demands ]() { worker.GetDemands( demands ); return ( demands.IsEmpty() == false ); } ) );
     TEST_ASSERT( demands[ 0 ] == DemandRamp::kStartSlots );
 
     // The same demand is not sent again
@@ -7078,13 +6883,13 @@ void TestGateway::DownstreamReportsDemandAndTakesItsAllowance() const
     TEST_ASSERT( ( connection.GetAllowance() == 4 ) && ( connection.GetPoolSlots() == 4 ) );
     worker.SendCapacity( 3, 12 );
     Array<uint32_t> updates;
-    TEST_ASSERT( WaitUntil( [ &owner, &updates ]() { owner.GetCapacityUpdates( updates ); return ( updates.GetSize() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner, &updates ]() { owner.GetCapacityUpdates( updates ); return ( updates.GetSize() == 2 ); } ) );
     TEST_ASSERT( ( updates[ 0 ] == 3 ) && ( updates[ 1 ] == 12 ) );
     TEST_ASSERT( ( connection.GetAllowance() == 3 ) && ( connection.GetPoolSlots() == 12 ) );
 
     // Nothing left to do is sent at once
     connection.UpdateDemand( 0, 0 );
-    TEST_ASSERT( WaitUntil( [ &worker, &demands ]() { worker.GetDemands( demands ); return ( demands.GetSize() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker, &demands ]() { worker.GetDemands( demands ); return ( demands.GetSize() == 2 ); } ) );
     TEST_ASSERT( demands[ 1 ] == 0 );
     TEST_ASSERT( connection.HasEnded() == false );
 }
@@ -7120,7 +6925,7 @@ void TestGateway::DownstreamKeepsACapacityThatComesBeforeItIsReady() const
     RecordingOwner owner;
     DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
     connection.Start();
-    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
 
     // The owner reads it when the connection is ready, and is not told of it before
     TEST_ASSERT( owner.GetCapacityWhenReady() == 2 );
@@ -7148,14 +6953,14 @@ void TestGateway::GatewayPoolIsTheSumOfItsWorkerPools() const
     // Their pools, not the shares they give the gateway, which are its slots on them
     w1.SendCapacity( 1, 8 );
     w2.SendCapacity( 3, 16 );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_PoolSlots == 24 ) && ( GetSchedulerSlots( gateway ) == 4 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_PoolSlots == 24 ) && ( GetSchedulerSlots( gateway ) == 4 ); } ) );
 
     DistributedTest::HandshakeProbe probe;
     const ConnectionInfo * ci = nullptr;
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
     TEST_ASSERT( probe.GetAckCapacity() == FairShareAllocator::kInitialDemand );
     TEST_ASSERT( probe.SendDemand( ci, 100 ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 24, 24 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 24, 24 ); } ) );
     probe.ShutdownAllConnections();
 }
 
@@ -7173,14 +6978,14 @@ void TestGateway::WorkerWithoutSlotsLeavesTheScheduler() const
 
     // A worker that offers nothing leaves the pool
     worker.SendCapacity( 0, 0 );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_ReadyWorkers == 0 ) && ( s.m_PoolSlots == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_ReadyWorkers == 0 ) && ( s.m_PoolSlots == 0 ); } ) );
 
     // With a pool and no share for the gateway, it is back, without slots until the gateway is given some
     worker.SendCapacity( 0, 6 );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_ReadyWorkers == 1 ) && ( s.m_PoolSlots == 6 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_ReadyWorkers == 1 ) && ( s.m_PoolSlots == 6 ); } ) );
     TEST_ASSERT( GetSchedulerSlots( gateway ) == 0 );
     worker.SendCapacity( 2, 6 );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetSchedulerSlots( gateway ) == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetSchedulerSlots( gateway ) == 2 ); } ) );
     TEST_ASSERT( GetGatewayStats( gateway ).m_PoolSlots == 6 );
 }
 
@@ -7201,20 +7006,20 @@ void TestGateway::SharesMoveWithDemandThroughTheGateway() const
     const ConnectionInfo * ciA = nullptr;
     TEST_ASSERT( ConnectProbe( server, a, &ciA ) != 0 );
     TEST_ASSERT( a.SendDemand( ciA, 100 ) );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 20 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 20 ); } ) );
 
     // Only the final shares are known: A may pass through what is left once B's first share is taken
     DistributedTest::HandshakeProbe b;
     const ConnectionInfo * ciB = nullptr;
     TEST_ASSERT( ConnectProbe( server, b, &ciB ) != 0 );
     TEST_ASSERT( b.SendDemand( ciB, 100 ) );
-    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 10 ) && ( b.GetLastAllowance() == 10 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 10 ) && ( b.GetLastAllowance() == 10 ); } ) );
 
     TEST_ASSERT( b.SendDemand( ciB, 0 ) );
-    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 20 ) && ( b.GetLastAllowance() == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 20 ) && ( b.GetLastAllowance() == 0 ); } ) );
 
     b.ShutdownAllConnections();
-    TEST_ASSERT( WaitUntil( [ &server ]() { MutexHolder mh( server.m_ClientListMutex ); return ( server.m_ClientList.GetSize() == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &server ]() { MutexHolder mh( server.m_ClientListMutex ); return ( server.m_ClientList.GetSize() == 1 ); } ) );
     Thread::Sleep( 200 ); // An update would have come by now
     TEST_ASSERT( a.GetLastAllowance() == 20 );
 
@@ -7245,10 +7050,10 @@ void TestGateway::ReducedAllowanceKeepsTheJobsAClientHolds() const
     const ConnectionInfo * ciB = nullptr;
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), a, &ciA ) != 0 );
     TEST_ASSERT( a.SendDemand( ciA, 8 ) );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 8 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 8 ); } ) );
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), b, &ciB ) != 0 );
     TEST_ASSERT( b.SendDemand( ciB, 8 ) );
-    TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 4 ) && ( b.GetLastAllowance() == 4 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 4 ) && ( b.GetLastAllowance() == 4 ); } ) );
 
     // What it could have sent under the larger allowance is more than the smaller one bounds, and is kept
     TEST_ASSERT( SendToolchain( a, ciA ) );
@@ -7260,13 +7065,13 @@ void TestGateway::ReducedAllowanceKeepsTheJobsAClientHolds() const
         marker.Format( "m%u", i );
         TEST_ASSERT( SendGatewayJob( a, ciA, encoder, i + 1, marker.Get() ) );
     }
-    TEST_ASSERT( WaitUntil( [ &gateway, maxJobs ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Waiting + s.m_Running ) == maxJobs; } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway, maxJobs ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_Waiting + s.m_Running ) == maxJobs; } ) );
     Thread::Sleep( 100 );
     TEST_ASSERT( a.IsDisconnected() == false );
 
     // Past the largest allowance it was given, it goes
     TEST_ASSERT( SendGatewayJob( a, ciA, encoder, maxJobs + 1, "over" ) );
-    TEST_ASSERT( WaitUntil( [ &a ]() { return a.IsDisconnected(); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return a.IsDisconnected(); } ) );
     TEST_ASSERT( b.IsDisconnected() == false );
     worker.AnswerHeldJobs();
     b.ShutdownAllConnections();
@@ -7323,18 +7128,15 @@ void TestGateway::GatewayDemandSharesADownstreamWorker() const
 
     // Another client of the worker wants all of it
     DistributedTest::HandshakeProbe other;
-    const ConnectionInfo * ci = other.Connect( AStackString( "127.0.0.1" ), kGatewayTestDownstreamPort, 2000 );
+    const ConnectionInfo * ci = other.ConnectAndHandshake( kGatewayTestDownstreamPort );
     TEST_ASSERT( ci );
-    const Protocol::MsgConnection msg;
-    TEST_ASSERT( other.Send( ci, &msg, sizeof( msg ) ) );
-    TEST_ASSERT( WaitUntil( [ &other ]() { return ( other.GetNumMessages() >= 3 ); } ) );
     uint32_t otherId = 0;
     {
         MutexHolder mh( worker.m_ClientListMutex );
         otherId = worker.m_ClientList[ 0 ]->m_Id;
     }
     TEST_ASSERT( other.SendDemand( ci, 100 ) );
-    TEST_ASSERT( WaitUntil( [ &other ]() { return ( other.GetLastAllowance() == 8 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &other ]() { return ( other.GetLastAllowance() == 8 ); } ) );
 
     // An idle gateway asks for nothing, so the other client keeps the worker
     GatewayConfig config;
@@ -7342,8 +7144,8 @@ void TestGateway::GatewayDemandSharesADownstreamWorker() const
     Gateway gateway( config );
     TEST_ASSERT( gateway.GetServer().Listen( Protocol::kTestPort ) );
     TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
-    TEST_ASSERT( WaitUntil( [ &worker ]() { MutexHolder mh( worker.m_ClientListMutex ); return ( worker.m_ClientList.GetSize() == 2 ) && worker.m_ClientList[ 1 ]->m_HandshakeDone.Load() && ( worker.m_ClientList[ 1 ]->m_AllocatedCapacity == 0 ); } ) );
-    TEST_ASSERT( WaitUntil( [ &other ]() { return ( other.GetLastAllowance() == 8 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { MutexHolder mh( worker.m_ClientListMutex ); return ( worker.m_ClientList.GetSize() == 2 ) && worker.m_ClientList[ 1 ]->m_HandshakeDone.Load() && ( worker.m_ClientList[ 1 ]->m_AllocatedCapacity == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &other ]() { return ( other.GetLastAllowance() == 8 ); } ) );
 
     // While the gateway has jobs, the worker shares itself evenly between the two
     ShareWatch watch;
@@ -7366,7 +7168,7 @@ void TestGateway::GatewayDemandSharesADownstreamWorker() const
     TEST_ASSERT( watch.m_MinOtherAllowance.Load() == 4 );
 
     // Once the gateway has nothing left to do, the other client has the worker again
-    TEST_ASSERT( WaitUntil( [ &other ]() { return ( other.GetLastAllowance() == 8 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &other ]() { return ( other.GetLastAllowance() == 8 ); } ) );
     other.ShutdownAllConnections();
 }
 
@@ -7382,12 +7184,12 @@ void TestGateway::ClientWithoutAllowanceLearnsANewPool() const
     const ConnectionInfo * ci = nullptr;
     TEST_ASSERT( ConnectProbe( s, probe, &ci ) != 0 );
     TEST_ASSERT( probe.SendDemand( ci, 0 ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 4 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 4 ); } ) );
 
     WorkerThreadRemote::SetNumCPUsToUse( 0 );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 0 ); } ) );
     WorkerThreadRemote::SetNumCPUsToUse( 6 );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 6 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return LastCapacityIs( probe, 0, 6 ); } ) );
     probe.ShutdownAllConnections();
 }
 
@@ -7413,11 +7215,11 @@ void TestGateway::WorkerWithoutSlotsKeepsTheJobsItRuns() const
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 1, "m1" ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 2, "m2" ) );
-    TEST_ASSERT( WaitUntil( [ &w1 ]() { return ( w1.GetNumHeldJobs() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &w1 ]() { return ( w1.GetNumHeldJobs() == 2 ); } ) );
 
     // A worker that offers no slots finishes what it runs, as a worker in idle mode does
     w1.SendCapacity( 0, 0 );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); } ) );
     Thread::Sleep( 200 );
     TEST_ASSERT( w2.GetNumJobs() == 0 );
     const Gateway::Stats stats = GetGatewayStats( gateway );
@@ -7425,8 +7227,8 @@ void TestGateway::WorkerWithoutSlotsKeepsTheJobsItRuns() const
 
     // Its results go to the client, once each
     w1.AnswerHeldJobs();
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
     Thread::Sleep( 100 );
     TEST_ASSERT( GetNumResults( probe ) == 2 );
     TEST_ASSERT( ( GetGatewayStats( gateway ).m_Retries == 0 ) && ( w2.GetNumJobs() == 0 ) );
@@ -7454,21 +7256,21 @@ void TestGateway::WorkerBackWithSlotsCountsTheJobsItRuns() const
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 1, "m1" ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 2, "m2" ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 3, "m3" ) );
-    TEST_ASSERT( WaitUntil( [ &worker, &gateway ]() { return ( worker.GetNumHeldJobs() == 2 ) && ( GetGatewayStats( gateway ).m_Waiting == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker, &gateway ]() { return ( worker.GetNumHeldJobs() == 2 ) && ( GetGatewayStats( gateway ).m_Waiting == 1 ); } ) );
 
     // Back with its slots, which its running jobs still fill
     worker.SendCapacity( 0, 0 );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 0 ); } ) );
     worker.SendCapacity( 2, 2 );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ) && ( GetSchedulerSlots( gateway ) == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ) && ( GetSchedulerSlots( gateway ) == 2 ); } ) );
     Thread::Sleep( 200 );
     TEST_ASSERT( worker.GetNumJobs() == 2 );
 
     // A result frees a slot for the waiting job
     worker.AnswerHeldJobs();
-    TEST_ASSERT( WaitUntil( [ &worker ]() { return ( worker.GetNumJobs() == 3 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &worker ]() { return ( worker.GetNumJobs() == 3 ); } ) );
     worker.AnswerHeldJobs();
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 3 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 3 ); } ) );
     TEST_ASSERT( GetGatewayStats( gateway ).m_Retries == 0 );
     probe.ShutdownAllConnections();
 }
@@ -7494,17 +7296,17 @@ void TestGateway::LostWorkerWithoutSlotsHasItsJobsRetried() const
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 1, "m1" ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 2, "m2" ) );
-    TEST_ASSERT( WaitUntil( [ &w1 ]() { return ( w1.GetNumHeldJobs() == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &w1 ]() { return ( w1.GetNumHeldJobs() == 2 ); } ) );
 
     // Kept while the worker has no slots
     w1.SendCapacity( 0, 0 );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); } ) );
     Thread::Sleep( 200 );
     TEST_ASSERT( w2.GetNumJobs() == 0 );
 
     // Retried elsewhere once its connection is lost
     w1.DisconnectConnections();
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
     TEST_ASSERT( w2.GetNumJobs() == 2 );
     TEST_ASSERT( GetGatewayStats( gateway ).m_Retries == 2 );
     probe.ShutdownAllConnections();
@@ -7642,7 +7444,7 @@ void TestGateway::GatewayWithItsOwnCacheDirHasNoLocalPool() const
     }
     TEST_ASSERT( logPath.BeginsWith( cacheDir ) );
     AString log;
-    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    LoadFileContentsAsString( logPath.Get(), log );
     TEST_ASSERT( log.Find( "has no local pool" ) );
 
     // So the gateway is a pure forwarder
@@ -7661,7 +7463,7 @@ void TestGateway::LocalJobThatCannotRunEndsWithoutAResult() const
 {
     // A real job, for a toolchain no Server of this test has
     DistributedTest::CapturedJob captured;
-    TEST_ASSERT( DistributedTest::CapturePchJob( captured, kWaitTimeoutSeconds ) );
+    TEST_ASSERT( DistributedTest::CapturePchJob( captured, DistributedTest::kWaitTimeoutSeconds ) );
     uint32_t jobId = 0;
     uint64_t pchId = 0;
     TEST_ASSERT( GatewayWire::PeekJob( captured.m_Data.Begin(), captured.m_Data.GetSize(), jobId, pchId ) );
@@ -7675,7 +7477,7 @@ void TestGateway::LocalJobThatCannotRunEndsWithoutAResult() const
         Server s( forwarder, ( localThreads > 0 ) ? AString::GetEmpty() : pureCacheDir, localThreads, 0 );
         TEST_ASSERT( JobQueueRemote::IsValid() == ( localThreads > 0 ) );
         s.RunLocalJob( Protocol::MsgJob( captured.m_ToolId, 0 ), captured.m_Data.Begin(), captured.m_Data.GetSize() );
-        TEST_ASSERT( WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumLocalJobsEnded() == 1 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &forwarder ]() { return ( forwarder.GetNumLocalJobsEnded() == 1 ); } ) );
         Array<StubForwarder::LocalJobEnded> ended;
         forwarder.GetLocalJobsEnded( ended );
         TEST_ASSERT( ( ended[ 0 ].m_JobId == jobId ) && ( ended[ 0 ].m_HasResult == false ) );
@@ -7700,13 +7502,13 @@ void TestGateway::JobsTheLocalPoolCannotTakeAreReturned() const
     const ConnectionInfo * ci = nullptr;
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
     TEST_ASSERT( SendToolchain( probe, ci ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return gateway.m_Stash.IsComplete( kGatewayTool ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return gateway.m_Stash.IsComplete( kGatewayTool ); } ) );
     TEST_ASSERT( gateway.GetServer().IsToolchainSynchronized( kGatewayTool ) == false ); // Its files are not what a worker can use
 
     const Timer timer;
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
     TEST_ASSERT( timer.GetElapsed() >= ( config.m_NoWorkerGiveUpSeconds * 0.9f ) );
     Array<uint32_t> jobIds;
     TEST_ASSERT( AreAllGivenUp( probe, jobIds ) );
@@ -7728,7 +7530,7 @@ void TestGateway::LocalToolchainWorkDoesNotHoldBackTheGateway() const
     const ConnectionInfo * ci = nullptr;
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
     TEST_ASSERT( SendToolchain( probe, ci ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return gateway.m_Stash.IsComplete( kGatewayTool ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return gateway.m_Stash.IsComplete( kGatewayTool ); } ) );
 
     // Reads the gateway's stats until a job waits there
     struct StatsReader
@@ -7763,7 +7565,7 @@ void TestGateway::LocalToolchainWorkDoesNotHoldBackTheGateway() const
         JobStreamEncoder encoder;
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
         thread.Start( StatsReader::ThreadFunc, "StatsReader", &reader );
-        readStats = WaitUntil( [ &reader ]() { return reader.m_Done.Load(); } );
+        readStats = DistributedTest::WaitUntil( [ &reader ]() { return reader.m_Done.Load(); } );
     }
     thread.Join();
     TEST_ASSERT( readStats );
@@ -7800,14 +7602,14 @@ void TestGateway::JobTheLocalPoolCannotTakeIsReturnedWhileOthersWaitForIt() cons
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), a, &ciA ) != 0 );
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), b, &ciB ) != 0 );
     TEST_ASSERT( SendToolchain( a, ciA ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return gateway.m_Stash.IsComplete( kGatewayTool ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return gateway.m_Stash.IsComplete( kGatewayTool ); } ) );
     TEST_ASSERT( gateway.GetServer().IsToolchainSynchronized( kGatewayTool ) == false );
 
     // B's first jobs wait while the local pool has no slots, then fill its 3 slots: 2 of them hung (expired
     // by the watchdog, still running), 1 running. Only B's jobs are runnable there (they are never run: these
     // are not real jobs), and they wait behind the local pool's slots.
     WorkerThreadRemote::SetNumCPUsToUse( 0 );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_LocalSlots == 0 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_LocalSlots == 0 ); } ) );
     JobStreamEncoder encoderA;
     JobStreamEncoder encoderB;
     uint32_t nextJobB = 100;
@@ -7815,7 +7617,7 @@ void TestGateway::JobTheLocalPoolCannotTakeIsReturnedWhileOthersWaitForIt() cons
     {
         TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, nextJobB++, "b", 0, localTool ) );
     }
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 5 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 5 ); } ) );
     {
         MutexHolder mh( gateway.m_Mutex );
         WorkerThreadRemote::SetNumCPUsToUse( 3 );
@@ -7891,7 +7693,7 @@ void TestGateway::RetryOfALocalJobWaitsForADroppedPch() const
     TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
     JobStreamEncoder encoder;
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
-    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 1 ); } ) );
 
     // As if the local pool had been given the job, and its unpack had found the PCH damaged: the PCH is dropped
     // from the store, and the job ends without a result
@@ -7917,7 +7719,7 @@ void TestGateway::RetryOfALocalJobWaitsForADroppedPch() const
     gateway.OnLocalJobEnded( attemptId, false, false, none );
 
     // The job is retried once its PCH is here again, which its client is asked for
-    TEST_ASSERT( WaitUntil( [ &probe, numAsksBefore ]() { return ( probe.GetNumPchNeeded() > numAsksBefore ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, numAsksBefore ]() { return ( probe.GetNumPchNeeded() > numAsksBefore ); } ) );
     TEST_ASSERT( probe.GetPchNeededId( probe.GetNumPchNeeded() - 1 ) == pch.m_Id );
     Gateway::Stats stats = GetGatewayStats( gateway );
     TEST_ASSERT( ( stats.m_Retries == 1 ) && ( stats.m_Parked == 1 ) && ( stats.m_Waiting == 0 ) && ( stats.m_Running == 0 ) );
@@ -7931,7 +7733,7 @@ void TestGateway::RetryOfALocalJobWaitsForADroppedPch() const
     TEST_ASSERT( echo.GetNumJobs() == 0 );
 
     TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
-    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
     Array<DistributedTest::ReceivedResult> results;
     probe.GetResults( results );
     TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
@@ -7979,7 +7781,7 @@ void TestGateway::LocalPoolIsOneMoreWorker() const
         TEST_ASSERT( stats.m_GiveUps == 0 );
     }
     AString log;
-    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    LoadFileContentsAsString( logPath.Get(), log );
     uint32_t numRetries = 0;
     TEST_ASSERT( AreRetriesBuiltLocally( log, numRetries ) );
     TEST_ASSERT( numRetries == echo.GetNumJobs() );
@@ -8039,11 +7841,11 @@ void TestGateway::BuildOnTheGatewayAlone() const
 
         const Gateway::Stats stats = GetGatewayStats( gateway );
         TEST_ASSERT( ( stats.m_Forwarded == 3 ) && ( stats.m_Retries == 0 ) && ( stats.m_GiveUps == 0 ) && ( stats.m_LocalSlots == 4 ) );
-        TEST_ASSERT( WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_HeldJobBytes == 0 ) && ( s.m_RunningLocally == 0 ); } ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { const Gateway::Stats s = GetGatewayStats( gateway ); return ( s.m_HeldJobBytes == 0 ) && ( s.m_RunningLocally == 0 ); } ) );
     }
 
     AString log;
-    TEST_ASSERT( ReadWholeFile( logPath, log ) );
+    LoadFileContentsAsString( logPath.Get(), log );
     uint32_t numLocal = 0;
     for ( const char * line = log.Find( "gateway job-forward client=" ); line; line = strstr( line + 1, "gateway job-forward client=" ) )
     {
@@ -8152,7 +7954,9 @@ void TestGateway::GatewayRestartMidBuildWithALocalPool() const
     DistributedTest::GetStatsLogPath( statsLogPath );
     Array<uint32_t> toolchainMessages;
     uint32_t numSkippedToolchains = 0;
-    GetToolchainStats( statsLogPath, toolchainMessages, numSkippedToolchains );
+    AString statsLog;
+    LoadFileContentsAsString( statsLogPath.Get(), statsLog );
+    GetToolchainStats( statsLog, toolchainMessages, numSkippedToolchains );
     TEST_ASSERT( toolchainMessages.GetSize() >= 2 );
     TEST_ASSERT( toolchainMessages[ 0 ] >= 2 ); // The manifest and its files
     for ( size_t i = 1; i < toolchainMessages.GetSize(); ++i )

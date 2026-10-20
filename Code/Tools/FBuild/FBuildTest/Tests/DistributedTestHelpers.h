@@ -23,6 +23,7 @@
 #include "Core/FileIO/FileIO.h"
 #include "Core/FileIO/FileStream.h"
 #include "Core/FileIO/MemoryStream.h"
+#include "Core/Math/Conversions.h"
 #include "Core/Mem/Mem.h"
 #include "Core/Network/TCPConnectionPool.h"
 #include "Core/Process/Atomic.h"
@@ -39,6 +40,52 @@
 //------------------------------------------------------------------------------
 namespace DistributedTest
 {
+    // Waits for something that happens on another thread
+    constexpr float kWaitTimeoutSeconds = 30.0f;
+    template <class CONDITION>
+    bool WaitUntil( const CONDITION & condition, float timeoutSeconds = kWaitTimeoutSeconds )
+    {
+        const Timer timer;
+        while ( condition() == false )
+        {
+            if ( timer.GetElapsed() > timeoutSeconds )
+            {
+                return false;
+            }
+            Thread::Sleep( 1 );
+        }
+        return true;
+    }
+
+    // The layout of the handshake messages that every major keeps, as numbers: what peers of another
+    // major find by (see Protocol.h). A change to the protocol that moves one of them has to change these too.
+    constexpr uint32_t kGoldenConnectionSize = 76;
+    constexpr uint32_t kGolden23ConnectionSize = 76;       // The handshake of major 23, which this version reads
+    constexpr uint32_t kGoldenAckSize = 12;
+    constexpr uint32_t kGoldenPrefixSize = 8;               // Header and version fields
+    constexpr uint32_t kGoldenConnectionMajorOffset = 4;    // uint32_t
+    constexpr uint32_t kGoldenHostNameOffset = 12;          // char[ 64 ]
+    constexpr uint32_t kGoldenAckMajorOffset = 6;           // uint8_t, also in MsgRefused
+
+    // The handshake of a client of this version, as bytes a test can change
+    struct HandshakeBytes
+    {
+        HandshakeBytes()
+        {
+            const Protocol::MsgConnection msg;
+            static_assert( sizeof( bytes ) == sizeof( msg ), "Size of the handshake" );
+            memcpy( bytes, &msg, sizeof( msg ) );
+        }
+        void SetMajor( uint32_t major ) { memcpy( bytes + kGoldenConnectionMajorOffset, &major, sizeof( major ) ); }
+        void SetHostName( const char * name ) // Zero terminated if it is shorter than the 64 bytes there are
+        {
+            memset( bytes + kGoldenHostNameOffset, 0, 64 );
+            memcpy( bytes + kGoldenHostNameOffset, name, Math::Min<size_t>( strlen( name ), 64 ) );
+        }
+        void FillHostName( char c ) { memset( bytes + kGoldenHostNameOffset, c, 64 ); }
+        uint8_t bytes[ kGoldenConnectionSize ];
+    };
+
     // A result as a test client reads it, with the job's name
     struct ReceivedResult : public Protocol::JobResultHeader
     {
@@ -273,7 +320,8 @@ namespace DistributedTest
         }
     }
 
-    // A worker that completes the handshake and leaves the rest to the test
+    // A worker that completes the handshake and leaves the rest to the test. A subclass whose callbacks use
+    // members of its own stops the connections in its own destructor: what arrives after that is dropped here.
     class FakeWorker : public TCPConnectionPool
     {
     public:
@@ -284,6 +332,11 @@ namespace DistributedTest
             , m_ToolchainInventory( toolchainInventory )
             , m_PchInventory( pchInventory )
         {
+        }
+        virtual ~FakeWorker() override
+        {
+            m_Stopping.Store( true );
+            ShutdownAllConnections();
         }
         explicit FakeWorker( const FakeWorker & other ) = delete;
         FakeWorker & operator=( const FakeWorker & other ) = delete;
@@ -405,7 +458,11 @@ namespace DistributedTest
                 state->m_Message = nullptr;
             }
 
-            if ( message->GetType() == Protocol::MSG_CONNECTION )
+            if ( m_Stopping.Load() )
+            {
+                // The subclass has gone
+            }
+            else if ( message->GetType() == Protocol::MSG_CONNECTION )
             {
                 {
                     MutexHolder mh( m_ConnectionTimesMutex );
@@ -444,12 +501,131 @@ namespace DistributedTest
         Array<float> m_ConnectionTimes;
         mutable Mutex m_DemandsMutex;
         Array<uint32_t> m_Demands;
+        Atomic<bool> m_Stopping{ false };
     };
 
-    // Connects to a worker and records the messages it sends back, in order
+    // A worker that answers the handshake in a way that is not valid for this version
+    class OddHandshakeWorker : public FakeWorker
+    {
+    public:
+        enum Reply
+        {
+            REFUSE_AS_NEWER_MAJOR,  // MSG_REFUSED from a worker of the next major
+            ACK_OF_OLDER_MAJOR,     // An ack of the previous major
+            ACK_TOO_SHORT,          // An ack of this major that stops after the version fields
+            ACK_WITH_PAYLOAD,       // An ack whose header says a payload follows, which an ack never has
+        };
+        // With the inventories after the reply, as a worker of this version sends them after its ack
+        explicit OddHandshakeWorker( Reply reply, bool sendInventories = false )
+            : FakeWorker( 4 )
+            , m_Reply( reply )
+            , m_SendInventories( sendInventories )
+        {
+        }
+        explicit OddHandshakeWorker( const OddHandshakeWorker & other ) = delete;
+        OddHandshakeWorker & operator=( const OddHandshakeWorker & other ) = delete;
+
+    private:
+        virtual void Handshake( const ConnectionInfo * connection ) override
+        {
+            uint8_t bytes[ sizeof( Protocol::MsgConnectionAck ) ];
+            size_t size = sizeof( bytes );
+            switch ( m_Reply )
+            {
+                case REFUSE_AS_NEWER_MAJOR:
+                {
+                    const Protocol::MsgRefused refused;
+                    size = sizeof( refused );
+                    memcpy( bytes, &refused, size );
+                    bytes[ kGoldenAckMajorOffset ] = (uint8_t)( Protocol::kVersionMajor + 1 );
+                    break;
+                }
+                case ACK_OF_OLDER_MAJOR:
+                {
+                    const Protocol::MsgConnectionAck ack( 4 );
+                    memcpy( bytes, &ack, size );
+                    bytes[ kGoldenAckMajorOffset ] = (uint8_t)( Protocol::kVersionMajor - 1 );
+                    break;
+                }
+                case ACK_TOO_SHORT:
+                {
+                    const Protocol::MsgConnectionAck ack( 4 );
+                    memcpy( bytes, &ack, size );
+                    size = ( kGoldenPrefixSize + 2 ); // The version fields and a little more
+                    break;
+                }
+                case ACK_WITH_PAYLOAD:
+                {
+                    const Protocol::MsgConnectionAck ack( 4 );
+                    memcpy( bytes, &ack, size );
+
+                    // The header alone, announcing a payload. The ack in full follows as that payload.
+                    uint8_t header[ kGoldenPrefixSize ];
+                    memcpy( header, bytes, sizeof( header ) );
+                    header[ 2 ] = 1;
+                    Send( connection, header, sizeof( header ) );
+                    break;
+                }
+            }
+            Send( connection, bytes, (uint32_t)size );
+            if ( m_SendInventories )
+            {
+                SendInventory( connection, Protocol::MsgPchInventory( 0 ), Array<uint64_t>() );
+                SendInventory( connection, Protocol::MsgToolchainInventory( 0 ), Array<uint64_t>() );
+            }
+        }
+        virtual void OnMessage( const ConnectionInfo *, const Protocol::IMessage &, void *, uint32_t ) override {}
+
+        const Reply m_Reply;
+        const bool m_SendInventories;
+    };
+
+    // Connects to a worker and records the messages it sends back, in order. It can also listen, as a worker
+    // that records what a client sends.
     class HandshakeProbe : public TCPConnectionPool
     {
     public:
+        HandshakeProbe() = default;
+        virtual ~HandshakeProbe() override
+        {
+            StallReading( false );
+            ShutdownAllConnections();
+        }
+        explicit HandshakeProbe( const HandshakeProbe & other ) = delete;
+        HandshakeProbe & operator=( const HandshakeProbe & other ) = delete;
+
+        // A connection to a worker on this machine
+        const ConnectionInfo * ConnectTo( uint16_t port ) { return Connect( AStackString( "127.0.0.1" ), port, 2000 ); }
+        bool SendHandshake( const ConnectionInfo * connection )
+        {
+            const HandshakeBytes handshake;
+            return Send( connection, handshake.bytes, sizeof( handshake.bytes ) );
+        }
+        // Sends the handshake of a client of this version, and waits for the ack and the inventories that answer
+        // it. Sent after other messages it also says they have been dealt with, as a connection is served in order:
+        // whatever they made the worker send came before the ack.
+        bool Handshake( const ConnectionInfo * connection )
+        {
+            const size_t numBefore = GetNumMessages();
+            return SendHandshake( connection ) &&
+                   WaitUntil( [ this, numBefore ]() { return ( GetNumMessages() >= ( numBefore + 3 ) ); } );
+        }
+        // ConnectTo and Handshake. The connection, or null.
+        const ConnectionInfo * ConnectAndHandshake( uint16_t port )
+        {
+            const ConnectionInfo * connection = ConnectTo( port );
+            return ( connection && Handshake( connection ) ) ? connection : nullptr;
+        }
+
+        // From here on, the payload of each message is kept too
+        void KeepPayloads() { m_KeepPayloads.Store( true ); }
+        // Empty for a message without one, or one that came before KeepPayloads
+        void GetPayload( size_t index, Array<char> & outPayload ) const
+        {
+            MutexHolder mh( m_Mutex );
+            outPayload = m_Payloads[ index ];
+        }
+
         size_t GetNumMessages() const
         {
             MutexHolder mh( m_Mutex );
@@ -584,6 +760,11 @@ namespace DistributedTest
             {
                 MutexHolder mh( m_Mutex );
                 m_MessageTypes.Append( (uint8_t)m_CurrentMessage->GetType() );
+                Array<char> & kept = m_Payloads.EmplaceBack();
+                if ( payload && m_KeepPayloads.Load() )
+                {
+                    kept.Append( static_cast<const char *>( payload ), static_cast<const char *>( payload ) + size );
+                }
                 if ( m_CurrentMessage->GetType() == Protocol::MSG_REFUSED )
                 {
                     const Protocol::MsgRefused * refused = static_cast<const Protocol::MsgRefused *>( m_CurrentMessage );
@@ -663,6 +844,8 @@ namespace DistributedTest
 
         mutable Mutex m_Mutex;
         Array<uint8_t> m_MessageTypes;
+        Array<Array<char>> m_Payloads;  // One for each message
+        Atomic<bool> m_KeepPayloads{ false };
         Array<uint64_t> m_ToolchainIds;
         Array<uint64_t> m_PchInventoryIds;
         Array<uint64_t> m_PchNeededIds;

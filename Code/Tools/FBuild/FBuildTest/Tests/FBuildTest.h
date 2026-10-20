@@ -52,6 +52,17 @@ public:
 //------------------------------------------------------------------------------
 class FBuildTest : public TestGroup
 {
+public:
+    // The files in a directory and below
+    static uint32_t CountFilesIn( const AString & dir );
+
+    // Data that does not compress, the same for the same seed
+    static void MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes );
+
+    // Files as they are written and read by tests: the whole of the content, in a directory that is made if it is not there
+    static bool WriteFile( const AString & path, const Array<char> & content );
+    static bool ReadFile( const AString & path, Array<char> & outContent );
+
 protected:
     FBuildTest();
 
@@ -90,12 +101,6 @@ protected:
     // other helpers
     static void GetCodeDir( AString & codeDir );
 
-    // The files in a directory and below
-    static uint32_t CountFilesIn( const AString & dir );
-
-    // Data that does not compress, the same for the same seed
-    static void MakeRandomBytes( uint32_t size, uint64_t seed, Array<char> & outBytes );
-
     // Data like the heap image of an MSVC PCH, the same for the same seed: 8 byte words, most of them pointers
     // into the image (words whose high half is the base kPchLikeBase), that repeat or are near each other, and
     // the rest numbers. It compresses, and better after PchTransform.
@@ -110,10 +115,6 @@ protected:
     // whether it was: it is not if the transform does not make the PCH smaller.
     static constexpr uint32_t kNoTransform = 0xFFFFFFFFu;
     static bool MakePchBlob( const Array<char> & pch, uint32_t transformBase, Array<char> & outBlob, bool * outTransformed = nullptr );
-
-    // Files as they are written and read by tests: the whole of the content, in a directory that is made if it is not there
-    static bool WriteFile( const AString & path, const Array<char> & content );
-    static bool ReadFile( const AString & path, Array<char> & outContent );
 
     // Ids of processes: one that no process has, and one that is running that is not this process
     static uint32_t GetIdOfNoProcess();
