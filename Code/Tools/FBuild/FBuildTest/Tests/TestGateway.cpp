@@ -893,7 +893,7 @@ void TestGateway::SlowClientDoesNotHoldBackAnother() const
     TEST_ASSERT( s.QueueResult( idB, false, Move( small ) ) );
 
     // B's result arrives while A's outbox still holds results it cannot send
-    TEST_ASSERT( WaitUntil( [ &b ]() { return ( CountMessages( b, Protocol::MSG_JOB_RESULT ) == 1 ); }, 2.0f ) );
+    TEST_ASSERT( WaitUntil( [ &b ]() { return ( CountMessages( b, Protocol::MSG_JOB_RESULT ) == 1 ); } ) );
     TEST_ASSERT( CountMessages( a, Protocol::MSG_JOB_RESULT ) == 0 );
     TEST_ASSERT( GetNumJobsActive( s, idA ) > 0 );
 
@@ -941,7 +941,7 @@ void TestGateway::SlowClientDoesNotHoldBackCapacityUpdates() const
 
     // B wants nothing, so A's allowance changes too: B's update arrives while A's waits behind its results
     TEST_ASSERT( b.SendDemand( ciB, 0 ) );
-    TEST_ASSERT( WaitUntil( [ &b ]() { return ( b.GetLastAllowance() == 0 ); }, 2.0f ) );
+    TEST_ASSERT( WaitUntil( [ &b ]() { return ( b.GetLastAllowance() == 0 ); } ) );
     TEST_ASSERT( CountMessages( a, Protocol::MSG_JOB_RESULT ) == 0 );
     TEST_ASSERT( CountMessages( a, Protocol::MSG_CAPACITY ) == numCapacityMessagesA );
 
@@ -1690,8 +1690,8 @@ void TestGateway::AskingASlowClientForAPchDoesNotHoldBackAnother() const
     asker.m_OtherPchId = 0x5678;
     Thread thread;
     thread.Start( PchAsker::ThreadFunc, "PchAsker", &asker );
-    const bool returned = WaitUntil( [ &asker ]() { return asker.m_Done.Load(); }, 2.0f );
-    const bool otherAsked = WaitUntil( [ &b ]() { return ( b.GetNumPchNeeded() == 1 ); }, 2.0f );
+    const bool returned = WaitUntil( [ &asker ]() { return asker.m_Done.Load(); } );
+    const bool otherAsked = WaitUntil( [ &b ]() { return ( b.GetNumPchNeeded() == 1 ); } );
     a.StallReading( false );
     thread.Join();
     TEST_ASSERT( returned );
@@ -4637,11 +4637,11 @@ namespace
         }
     }
 
-    // The first measurement waits until the test releases it, and each one after lasts kMeasureDelayMs. Records the order.
+    // Each measurement waits until the test has allowed more measurements than came before it. Records the order.
     constexpr uint32_t kOrderedStoredPchs = 8;
-    constexpr uint32_t kMeasureDelayMs = 400;
     uint64_t s_MeasureOrder[ kOrderedStoredPchs ];
-    void DelayStoredPchMeasurement( uint64_t pchId, const Atomic<bool> & quit )
+    Atomic<uint32_t> s_AllowedMeasurements;
+    void GateStoredPchMeasurement( uint64_t pchId, const Atomic<bool> & quit )
     {
         const uint32_t index = s_HeldMeasurements.Load();
         if ( index < kOrderedStoredPchs )
@@ -4649,9 +4649,7 @@ namespace
             s_MeasureOrder[ index ] = pchId;
         }
         s_HeldMeasurements.Increment();
-        const Timer timer;
-        while ( ( ( index == 0 ) ? ( s_MeasurementsReleased.Load() == false ) : ( timer.GetElapsedMS() < (float)kMeasureDelayMs ) ) &&
-                ( quit.Load() == false ) )
+        while ( ( index >= s_AllowedMeasurements.Load() ) && ( quit.Load() == false ) )
         {
             Thread::Sleep( 1 );
         }
@@ -4923,8 +4921,8 @@ void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
         TEST_ASSERT( WriteStoredPch( config.m_CacheDir, pch.m_Id, pch.m_Compressed.GetResult(), pch.m_CompressedSize ).IsEmpty() == false );
     }
     s_HeldMeasurements.Store( 0 );
-    s_MeasurementsReleased.Store( false );
-    Gateway::s_MeasureTestHook = DelayStoredPchMeasurement;
+    s_AllowedMeasurements.Store( 0 );
+    Gateway::s_MeasureTestHook = GateStoredPchMeasurement;
     const AtScopeEnd clearHook( []() { Gateway::s_MeasureTestHook = nullptr; } );
 
     EchoWorker worker( 4 );
@@ -4959,8 +4957,7 @@ void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
         JobStreamEncoder encoder;
         TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", lastPchId ) );
         TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
-        const Timer sinceRelease;
-        s_MeasurementsReleased.Store( true );
+        s_AllowedMeasurements.Store( 1 );
 
         // Another job parks while the next measurement is under way
         TEST_ASSERT( WaitUntil( []() { return ( s_HeldMeasurements.Load() == 2 ); } ) );
@@ -4968,12 +4965,13 @@ void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
         TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 2 ); } ) );
         TEST_ASSERT( s_HeldMeasurements.Load() == 2 );
 
-        // The first job is released after one measurement, not the store's
+        // The first job is released once that measurement ends, while the one after it is held
+        s_AllowedMeasurements.Store( 2 );
         Array<GatewayWire::ResultHeader> results;
         TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.IsEmpty() == false ); } ) );
-        const float releasedMs = sinceRelease.GetElapsedMS();
-        TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
-        TEST_ASSERT( releasedMs < (float)( kMeasureDelayMs + 750 ) );
+        TEST_ASSERT( ( results.GetSize() == 1 ) && ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
+        TEST_ASSERT( s_MeasureOrder[ 1 ] == lastPchId );
+        s_AllowedMeasurements.Store( kOrderedStoredPchs );
         TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 2 ); } ) );
         TEST_ASSERT( ( results[ 1 ].m_JobId == 6 ) && results[ 1 ].m_Ok );
         TEST_ASSERT( probe.GetNumPchNeeded() == 0 );
@@ -5274,7 +5272,7 @@ void TestGateway::HungJobIsRetriedAfterTheWatchdog() const
     // Its late result is dropped, and frees the slot
     w1.SetAnswer( EchoWorker::ANSWER_OK );
     w1.AnswerHeldJobs();
-    Thread::Sleep( 200 ); // For the late result to arrive
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Running == 0 ); } ) );
     TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 7, "m7" ) );
     TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 3 ); } ) );
     Thread::Sleep( 100 );
