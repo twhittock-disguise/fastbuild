@@ -53,7 +53,7 @@ namespace
 //
 // The local pool holds what a job needs once the job's toolchain is synchronized there, as its PCH is stored
 // before the job is scheduled. Which toolchains are synchronized is asked of the Server once per toolchain in
-// a pass, so a scheduler pass that looks at every waiting job takes the Server's toolchain lock a few times only.
+// a pass, from a list it keeps under a lock of its own, so no toolchain being received there holds a pass up.
 class Gateway::WorkerAffinity
 {
 public:

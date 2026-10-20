@@ -42,8 +42,9 @@
 // job and keeps the gateway. A lost worker is connected again after GatewayConfig::m_ReconnectSeconds.
 //
 // Locking: m_Mutex guards everything below it. Under it the gateway only pushes to queues, calls
-// the scheduler, reads connection state and takes the Server's PCH cache lock. Sends to clients,
-// disk access (the stash's, the log's) and the Server's client list come after it is released.
+// the scheduler, reads connection state and the stash's index, and takes the Server's PCH cache lock and
+// its lock of synchronized toolchains. Sends to clients, disk access (the stash's, the log's) and the
+// Server's client list come after it is released.
 //------------------------------------------------------------------------------
 class Gateway : private Server::Forwarder, private DownstreamConnection::Owner
 {

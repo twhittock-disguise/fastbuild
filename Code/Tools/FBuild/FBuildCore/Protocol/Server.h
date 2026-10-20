@@ -78,7 +78,7 @@ public:
 
     // The local pool of a gateway
     uint32_t GetLocalSlots() const; // 0 if pure or if the worker gives no CPUs; else CPUs + prefetch
-    bool IsToolchainSynchronized( uint64_t toolId ) const; // Takes only m_ToolManifestsMutex
+    bool IsToolchainSynchronized( uint64_t toolId ) const; // Takes only m_SynchronizedToolsMutex, a leaf lock
     // Builds a decoded job (as Forwarder::OnClientJob has it) once its toolchain and PCH are here. Forwarder::
     // OnLocalJobEnded follows, from the Server's thread. Takes m_PchCacheMutex (the lease) and m_ToolManifestsMutex,
     // each alone, then m_LocalJobsMutex and, under it, m_PchCacheMutex and the job queue's locks.
@@ -270,6 +270,12 @@ private:
 
     mutable Mutex m_ToolManifestsMutex;
     Array<ToolManifest *> m_Tools;
+
+    // The ids of the synchronized ones in m_Tools, under a lock of their own, as m_ToolManifestsMutex is held while
+    // a toolchain is hashed or written. Taken last.
+    void SetToolchainSynchronized( uint64_t toolId, bool synchronized );
+    mutable Mutex m_SynchronizedToolsMutex;
+    Array<uint64_t> m_SynchronizedToolIds;
 
     // Toolchain cache: synchronized toolchains stay on disk (with a persisted manifest) across
     // connections and worker restarts, and are advertised to clients

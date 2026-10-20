@@ -523,6 +523,7 @@ private:
     void LocalJobThatCannotRunEndsWithoutAResult() const;
 #endif
     void JobsTheLocalPoolCannotTakeAreReturned() const;
+    void LocalToolchainWorkDoesNotHoldBackTheGateway() const;
     void JobTheLocalPoolCannotTakeIsReturnedWhileOthersWaitForIt() const;
     void RetryOfALocalJobWaitsForADroppedPch() const;
     void LocalPoolIsOneMoreWorker() const;
@@ -714,6 +715,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( LocalJobThatCannotRunEndsWithoutAResult )
 #endif
     REGISTER_TEST( JobsTheLocalPoolCannotTakeAreReturned )
+    REGISTER_TEST( LocalToolchainWorkDoesNotHoldBackTheGateway )
     REGISTER_TEST( JobTheLocalPoolCannotTakeIsReturnedWhileOthersWaitForIt )
     REGISTER_TEST( RetryOfALocalJobWaitsForADroppedPch )
     REGISTER_TEST( LocalPoolIsOneMoreWorker )
@@ -7400,6 +7402,60 @@ void TestGateway::JobsTheLocalPoolCannotTakeAreReturned() const
     TEST_ASSERT( jobIds[ 0 ] == 5 );
     const Gateway::Stats stats = GetGatewayStats( gateway );
     TEST_ASSERT( ( stats.m_Forwarded == 0 ) && ( stats.m_GiveUps == 1 ) && ( stats.m_LocalSlots == 1 ) );
+    probe.ShutdownAllConnections();
+}
+
+// LocalToolchainWorkDoesNotHoldBackTheGateway
+//------------------------------------------------------------------------------
+void TestGateway::LocalToolchainWorkDoesNotHoldBackTheGateway() const
+{
+    const DistributedTest::RemoteCpusForTest oneCpu( 1 );
+    GatewayConfig config;
+    Gateway gateway( config, 1, 0 );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return gateway.m_Stash.IsComplete( kGatewayTool ); } ) );
+
+    // Reads the gateway's stats until a job waits there
+    struct StatsReader
+    {
+        static uint32_t ThreadFunc( void * param )
+        {
+            StatsReader * self = static_cast<StatsReader *>( param );
+            for ( ;; )
+            {
+                Gateway::Stats stats;
+                self->m_Gateway->GetStats( stats );
+                if ( stats.m_Waiting == 1 )
+                {
+                    break;
+                }
+                Thread::Sleep( 1 );
+            }
+            self->m_Done.Store( true );
+            return 0;
+        }
+        const Gateway * m_Gateway = nullptr;
+        Atomic<bool> m_Done{ false };
+    };
+
+    // A job is scheduled while the Server's toolchain lock is held, as it is while the local pool synchronizes a toolchain
+    StatsReader reader;
+    reader.m_Gateway = &gateway;
+    Thread thread;
+    bool readStats = false;
+    {
+        MutexHolder mh( gateway.GetServer().m_ToolManifestsMutex );
+        JobStreamEncoder encoder;
+        TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+        thread.Start( StatsReader::ThreadFunc, "StatsReader", &reader );
+        readStats = WaitUntil( [ &reader ]() { return reader.m_Done.Load(); } );
+    }
+    thread.Join();
+    TEST_ASSERT( readStats );
     probe.ShutdownAllConnections();
 }
 

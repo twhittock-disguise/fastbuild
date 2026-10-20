@@ -1412,9 +1412,24 @@ uint32_t Server::GetLocalSlots() const
 //------------------------------------------------------------------------------
 bool Server::IsToolchainSynchronized( uint64_t toolId ) const
 {
-    MutexHolder manifestMH( m_ToolManifestsMutex );
-    ToolManifest * const * found = m_Tools.FindDeref( toolId );
-    return found && ( *found )->IsSynchronized();
+    MutexHolder mh( m_SynchronizedToolsMutex );
+    return ( m_SynchronizedToolIds.Find( toolId ) != nullptr );
+}
+
+// SetToolchainSynchronized
+//------------------------------------------------------------------------------
+void Server::SetToolchainSynchronized( uint64_t toolId, bool synchronized )
+{
+    MutexHolder mh( m_SynchronizedToolsMutex );
+    const bool found = ( m_SynchronizedToolIds.Find( toolId ) != nullptr );
+    if ( synchronized && ( found == false ) )
+    {
+        m_SynchronizedToolIds.Append( toolId );
+    }
+    else if ( ( synchronized == false ) && found )
+    {
+        m_SynchronizedToolIds.FindAndErase( toolId );
+    }
 }
 
 // RunLocalJob
@@ -2004,6 +2019,7 @@ void Server::ScanToolchainCache()
             continue;
         }
         m_Tools.Append( manifest );
+        SetToolchainSynchronized( manifest->GetToolId(), true );
         ++numLoaded;
     }
 
@@ -2062,6 +2078,7 @@ void Server::OnToolchainSynchronized( ToolManifest * manifest )
         MutexHolder manifestMH( m_ToolManifestsMutex );
         manifest->MarkUsed(); // Just arrived, so the most recent
     }
+    SetToolchainSynchronized( manifest->GetToolId(), true );
 
     // The connection that sent the toolchain holds a use of it, so it stays while it is written
     if ( manifest->SaveToDisk() == false )
@@ -2101,6 +2118,7 @@ void Server::EvictToolchains( const ToolManifest * keep )
         for ( const size_t idx : evictions )
         {
             m_Tools.FindAndErase( candidates[ idx ] );
+            SetToolchainSynchronized( candidates[ idx ]->GetToolId(), false );
             evicted.Append( candidates[ idx ] );
         }
     }
