@@ -26,7 +26,14 @@ public:
     explicit ToolchainStash( const ToolchainStash & other ) = delete;
     ToolchainStash & operator=( const ToolchainStash & other ) = delete;
 
-    enum Result { STASH_INCOMPLETE, STASH_COMPLETE, STASH_INVALID };
+    enum Result
+    {
+        STASH_INCOMPLETE,
+        STASH_COMPLETE,
+        STASH_INVALID,  // Not what a client sends
+        STASH_UNKNOWN,  // A file of a toolchain the stash does not hold: it was dropped, or its manifest never came
+        STASH_FAILED,   // It could not be written here
+    };
     Result AddManifest( uint64_t toolId, const void * payload, size_t payloadSize ); // A second manifest for a held toolchain is accepted and ignored
     Result AddFile( uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize ); // A second copy of a held file is accepted and ignored
 
@@ -41,6 +48,10 @@ public:
     void AddUse( uint64_t toolId );      // Pinned: an advertised toolchain per client connection, or a held job's
     void ReleaseUse( uint64_t toolId );
     void DropIncomplete( uint64_t toolId );
+    // From the index only, so a caller can decide and drop under its own lock: the directories of the toolchains
+    // added to outRemoved are deleted by DeleteRemoved, with no lock held
+    void DropIncomplete( uint64_t toolId, Array<uint64_t> & outRemoved );
+    void DeleteRemoved( const Array<uint64_t> & toolIds );
 
 private:
     friend class TestGateway;
@@ -84,6 +95,8 @@ private:
     Array<uint32_t>     m_PinCounts;
     Array<uint64_t>     m_Deleting;     // Removed toolchains whose directory is not yet deleted
     mutable uint64_t    m_Clock = 0;
+
+    uint32_t            m_MaxDeleteWaitMs;  // How long a manifest waits for the directory of the same toolchain to finish being deleted
 
     // Called, with no lock held, before the directories of removed toolchains are deleted (tests stall it)
     void ( *m_BeforeDelete )( void * ) = nullptr;

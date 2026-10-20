@@ -16,6 +16,7 @@
 #include "Core/FileIO/FileStream.h"
 #include "Core/FileIO/PathUtils.h"
 #include "Core/Strings/AStackString.h"
+#include "Core/Time/Timer.h"
 
 #include <inttypes.h>
 
@@ -135,6 +136,7 @@ namespace
 //------------------------------------------------------------------------------
 ToolchainStash::ToolchainStash( const AString & directory )
     : m_Directory( directory )
+    , m_MaxDeleteWaitMs( kMaxDeleteWaitMs )
 {
     PathUtils::EnsureTrailingSlash( m_Directory );
     Scan();
@@ -205,9 +207,13 @@ ToolchainStash::Result ToolchainStash::Claim( uint64_t toolId, uint32_t slot, ui
             return STASH_INVALID;
         }
     }
-    else if ( ( entry == nullptr ) || ( slot >= entry->m_NumFiles ) )
+    else if ( entry == nullptr )
     {
-        return STASH_INVALID; // A file with no manifest to say it belongs
+        return STASH_UNKNOWN; // A file with no manifest to say it belongs
+    }
+    else if ( slot >= entry->m_NumFiles )
+    {
+        return STASH_INVALID;
     }
     entry->m_LastUse = ++m_Clock;
 
@@ -234,7 +240,8 @@ ToolchainStash::Result ToolchainStash::Write( uint64_t toolId, uint32_t slot, ui
     }
 
     Array<uint64_t> toDelete;
-    for ( uint32_t attempt = 0;; ++attempt )
+    const Timer waitTimer;
+    for ( ;; )
     {
         bool claimed = false;
         bool mustWait = false;
@@ -244,9 +251,9 @@ ToolchainStash::Result ToolchainStash::Write( uint64_t toolId, uint32_t slot, ui
         if ( mustWait )
         {
             // The toolchain was just evicted and its directory is still being deleted
-            if ( attempt >= kMaxDeleteWaitMs )
+            if ( waitTimer.GetElapsedMS() >= (float)m_MaxDeleteWaitMs )
             {
-                return STASH_INVALID;
+                return STASH_FAILED;
             }
             Thread::Sleep( 1 );
             continue;
@@ -265,7 +272,7 @@ ToolchainStash::Result ToolchainStash::Write( uint64_t toolId, uint32_t slot, ui
     const bool written = FileIO::EnsurePathExists( directory ) &&
                          WriteThroughTemporaryFile( path, payload, payloadSize );
 
-    Result result = STASH_INVALID;
+    Result result = STASH_FAILED;
     {
         MutexHolder mh( m_Mutex );
         Entry * entry = Find( toolId );
@@ -295,7 +302,7 @@ ToolchainStash::Result ToolchainStash::Write( uint64_t toolId, uint32_t slot, ui
         if ( entry->m_DropWhenIdle && ( entry->m_NumWrites == 0 ) && ( entry->IsComplete() == false ) )
         {
             Remove( entry, toDelete );
-            result = written ? STASH_INCOMPLETE : STASH_INVALID;
+            result = written ? STASH_INCOMPLETE : STASH_FAILED;
         }
         else if ( result == STASH_COMPLETE )
         {
@@ -456,23 +463,35 @@ void ToolchainStash::ReleaseUse( uint64_t toolId )
 void ToolchainStash::DropIncomplete( uint64_t toolId )
 {
     Array<uint64_t> toDelete;
+    DropIncomplete( toolId, toDelete );
+    DeleteRemoved( toDelete );
+}
+
+// DropIncomplete
+//------------------------------------------------------------------------------
+void ToolchainStash::DropIncomplete( uint64_t toolId, Array<uint64_t> & outRemoved )
+{
+    MutexHolder mh( m_Mutex );
+    Entry * entry = Find( toolId );
+    if ( ( entry == nullptr ) || entry->IsComplete() )
     {
-        MutexHolder mh( m_Mutex );
-        Entry * entry = Find( toolId );
-        if ( ( entry == nullptr ) || entry->IsComplete() )
-        {
-            return;
-        }
-        if ( entry->m_NumWrites > 0 )
-        {
-            entry->m_DropWhenIdle = true; // The last write removes it
-        }
-        else
-        {
-            Remove( entry, toDelete );
-        }
+        return;
     }
-    DeleteToolchains( toDelete );
+    if ( entry->m_NumWrites > 0 )
+    {
+        entry->m_DropWhenIdle = true; // The last write removes it
+    }
+    else
+    {
+        Remove( entry, outRemoved );
+    }
+}
+
+// DeleteRemoved
+//------------------------------------------------------------------------------
+void ToolchainStash::DeleteRemoved( const Array<uint64_t> & toolIds )
+{
+    DeleteToolchains( toolIds );
 }
 
 // Find

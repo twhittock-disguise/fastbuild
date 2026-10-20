@@ -421,6 +421,7 @@ private:
     void ReleaseWithoutUseKeepsLaterPins() const;
     void DroppingAnIncompleteToolchainKeepsItsPins() const;
     void ReUploadDuringAPendingDeleteEndsIntact() const;
+    void ManifestWaitsForAPendingDeleteForABoundedTime() const;
     void SchedulerTakesClientsInTurn() const;
     void SchedulerPrefersAWorkerHoldingThePch() const;
     void SchedulerTakesAJobItsWorkerHoldsFirst() const;
@@ -479,6 +480,9 @@ private:
     void ClientHoldingTooManyJobsIsDisconnected() const;
     void StalledWorkerDoesNotStallTheGateway() const;
     void ToolchainOfADroppedClientIsAskedOfAnother() const;
+    void ToolchainIsKeptForAClientSendingItWhenAnotherLeaves() const;
+    void ToolchainDroppedUnderItsSenderIsAskedForAgain() const;
+    void ToolchainTheStashCannotWriteReturnsItsJobs() const;
     void GatewayWithNoWorkersRefusesClients() const;
 #if defined( __WINDOWS__ )
     void ClientBuildsLocallyWhenTheGatewayHasNoWorkers() const;
@@ -614,6 +618,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( ReleaseWithoutUseKeepsLaterPins )
     REGISTER_TEST( DroppingAnIncompleteToolchainKeepsItsPins )
     REGISTER_TEST( ReUploadDuringAPendingDeleteEndsIntact )
+    REGISTER_TEST( ManifestWaitsForAPendingDeleteForABoundedTime )
     REGISTER_TEST( SchedulerTakesClientsInTurn )
     REGISTER_TEST( SchedulerPrefersAWorkerHoldingThePch )
     REGISTER_TEST( SchedulerTakesAJobItsWorkerHoldsFirst )
@@ -672,6 +677,9 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( ClientHoldingTooManyJobsIsDisconnected )
     REGISTER_TEST( StalledWorkerDoesNotStallTheGateway )
     REGISTER_TEST( ToolchainOfADroppedClientIsAskedOfAnother )
+    REGISTER_TEST( ToolchainIsKeptForAClientSendingItWhenAnotherLeaves )
+    REGISTER_TEST( ToolchainDroppedUnderItsSenderIsAskedForAgain )
+    REGISTER_TEST( ToolchainTheStashCannotWriteReturnsItsJobs )
     REGISTER_TEST( GatewayWithNoWorkersRefusesClients )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( ClientBuildsLocallyWhenTheGatewayHasNoWorkers )
@@ -2090,8 +2098,8 @@ void TestGateway::StashRejectsWhatDoesNotMatch() const
         TEST_ASSERT( stash.AddManifest( 0x11, manifest.GetData(), cut ) == ToolchainStash::STASH_INVALID );
     }
 
-    // A file before its manifest, from a client that never sent one
-    TEST_ASSERT( stash.AddFile( 0x11, 0, "bytes", 5 ) == ToolchainStash::STASH_INVALID );
+    // A file before its manifest, from a client that never sent one: the client can be asked for it
+    TEST_ASSERT( stash.AddFile( 0x11, 0, "bytes", 5 ) == ToolchainStash::STASH_UNKNOWN );
     TEST_ASSERT( stash.HasManifest( 0x11 ) == false );
     TEST_ASSERT( stash.GetNumFiles( 0x11 ) == 0 );
     stash.DropIncomplete( 0x11 ); // Nothing to drop
@@ -2595,6 +2603,41 @@ void TestGateway::ReUploadDuringAPendingDeleteEndsIntact() const
     uint32_t size = 0;
     TEST_ASSERT( stash.GetManifestFile( 1, path, size ) );
     TEST_ASSERT( StoredFileEquals( path, manifest.GetData(), manifest.GetSize() ) );
+}
+
+// ManifestWaitsForAPendingDeleteForABoundedTime
+//------------------------------------------------------------------------------
+void TestGateway::ManifestWaitsForAPendingDeleteForABoundedTime() const
+{
+    AStackString<> dir;
+    GetStashDir( dir );
+    ToolchainStash stash( dir );
+    for ( uint64_t id = 1; id <= ToolchainStash::kMaxToolchains; ++id )
+    {
+        AddCompleteToStash( stash, id, 2 );
+    }
+    stash.m_MaxDeleteWaitMs = 300;
+
+    // Toolchain 1 is evicted, and its directory delete stalls
+    StalledDelete stall;
+    stash.m_BeforeDelete = StalledDelete::Hook;
+    stash.m_BeforeDeleteUserData = &stall;
+    const AtScopeEnd clearHook( [ &stash ]() { stash.m_BeforeDelete = nullptr; stash.m_BeforeDeleteUserData = nullptr; } );
+    StashUploader uploader;
+    uploader.m_Stash = &stash;
+    Thread evictor;
+    evictor.Start( StashUploader::EvictorFunc, "StashEvictor", &uploader );
+    TEST_ASSERT( WaitUntil( [ &stall ]() { return stall.m_Entered.Load(); } ) );
+
+    // Its manifest, sent again meanwhile, waits for the delete as long as the bound, in time
+    const Timer timer;
+    const ToolchainStash::Result result = AddStashManifest( stash, 1, 2 );
+    const float waited = timer.GetElapsed();
+    stall.m_Release.Store( true );
+    evictor.Join();
+    TEST_ASSERT( result == ToolchainStash::STASH_FAILED );
+    TEST_ASSERT( waited >= 0.25f );
+    TEST_ASSERT( waited < 1.5f );
 }
 
 // Scheduler helpers
@@ -5593,6 +5636,132 @@ void TestGateway::JobsWaitingWithNoWorkersAreReturned() const
     AString log;
     TEST_ASSERT( ReadWholeFile( logPath, log ) );
     TEST_ASSERT( log.Find( "gateway jobs-giveup reason=no-worker n=2" ) );
+}
+
+// ToolchainIsKeptForAClientSendingItWhenAnotherLeaves
+//------------------------------------------------------------------------------
+void TestGateway::ToolchainIsKeptForAClientSendingItWhenAnotherLeaves() const
+{
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+    DistributedTest::HandshakeProbe a;
+    DistributedTest::HandshakeProbe b;
+    const ConnectionInfo * ciA = nullptr;
+    const ConnectionInfo * ciB = nullptr;
+    const uint32_t idA = ConnectProbe( gateway.GetServer(), a, &ciA );
+    TEST_ASSERT( ( idA != 0 ) && ( ConnectProbe( gateway.GetServer(), b, &ciB ) != 0 ) );
+
+    // A's job waits for the toolchain, which A is asked for
+    JobStreamEncoder encoderA;
+    TEST_ASSERT( SendGatewayJob( a, ciA, encoderA, 5, "a5" ) );
+    TEST_ASSERT( WaitUntil( [ &a ]() { return ( GetNumToolchainRequests( a ) == 1 ); } ) );
+
+    // B sends the same toolchain and a job of its own. While the gateway takes B's manifest, A leaves.
+    JobStreamEncoder encoderB;
+    {
+        MutexHolder mh( gateway.m_Mutex );
+        TEST_ASSERT( SendToolchain( b, ciB ) );
+        TEST_ASSERT( SendGatewayJob( b, ciB, encoderB, 6, "b6" ) );
+        WaitUntil( [ &gateway ]() { return gateway.m_Stash.HasManifest( kGatewayTool ); }, 1.0f ); // Unless B counts as sending it first
+        gateway.OnClientGone( idA );
+    }
+
+    // What B sent is kept, and B's job is built
+    Array<GatewayWire::ResultHeader> results;
+    TEST_ASSERT( WaitUntil( [ &b, &results ]() { b.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( ( results[ 0 ].m_JobId == 6 ) && results[ 0 ].m_Ok );
+    TEST_ASSERT( b.IsDisconnected() == false );
+    a.ShutdownAllConnections();
+    b.ShutdownAllConnections();
+}
+
+// ToolchainDroppedUnderItsSenderIsAskedForAgain
+//------------------------------------------------------------------------------
+void TestGateway::ToolchainDroppedUnderItsSenderIsAskedForAgain() const
+{
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+
+    // The client's job waits for the toolchain the client is sending
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendToolchainManifest( probe, ci, kGatewayTool, 1 ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 6, "m6" ) );
+    TEST_ASSERT( WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
+
+    // The stash lets the toolchain go before its file arrives: the client is asked for it again, from the manifest on
+    gateway.m_Stash.DropIncomplete( kGatewayTool );
+    TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 0 ) );
+    Array<DistributedTest::HandshakeProbe::ToolchainRequest> requests;
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 1 ); } ) );
+    probe.GetToolchainRequests( requests );
+    TEST_ASSERT( requests[ 0 ].m_IsManifest && ( requests[ 0 ].m_ToolId == kGatewayTool ) );
+    TEST_ASSERT( SendToolchainManifest( probe, ci, kGatewayTool, 1 ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 2 ); } ) );
+    probe.GetToolchainRequests( requests );
+    TEST_ASSERT( ( requests[ 1 ].m_IsManifest == false ) && ( requests[ 1 ].m_FileId == 0 ) );
+    TEST_ASSERT( SendToolchainFile( probe, ci, kGatewayTool, 0 ) );
+
+    Array<GatewayWire::ResultHeader> results;
+    TEST_ASSERT( WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+    TEST_ASSERT( ( results[ 0 ].m_JobId == 6 ) && results[ 0 ].m_Ok );
+    TEST_ASSERT( probe.IsDisconnected() == false );
+    probe.ShutdownAllConnections();
+}
+
+// ToolchainTheStashCannotWriteReturnsItsJobs
+//------------------------------------------------------------------------------
+void TestGateway::ToolchainTheStashCannotWriteReturnsItsJobs() const
+{
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    Gateway gateway( config );
+    TEST_ASSERT( gateway.Listen( Protocol::kTestPort ) );
+    TEST_ASSERT( WaitForReadyWorkers( gateway, 1 ) );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+
+    // A file is where the toolchain's directory goes, so nothing of it can be written
+    AStackString<> blocker;
+    GetStashToolchainDir( gateway.m_Stash.m_Directory, kGatewayTool, blocker );
+    TEST_ASSERT( FileIO::EnsurePathExists( gateway.m_Stash.m_Directory ) );
+    FileIO::DirectoryDelete( blocker ); // Left empty by an earlier test
+    {
+        FileStream f;
+        TEST_ASSERT( f.Open( blocker.Get(), FileStream::WRITE_ONLY ) );
+    }
+
+    // A job waits for the toolchain, which its client is asked for and sends
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumToolchainRequests( probe ) == 1 ); } ) );
+    TEST_ASSERT( SendToolchain( probe, ci ) );
+
+    // The job goes back flagged, the client stays, and the log says why
+    TEST_ASSERT( WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    Array<uint32_t> jobIds;
+    TEST_ASSERT( AreAllGivenUp( probe, jobIds ) );
+    TEST_ASSERT( jobIds[ 0 ] == 5 );
+    TEST_ASSERT( probe.IsDisconnected() == false );
+    AString log;
+    TEST_ASSERT( ReadWholeFile( gateway.GetServer().GetLogPath(), log ) );
+    TEST_ASSERT( log.Find( "error The gateway cannot write toolchain" ) );
+    probe.ShutdownAllConnections();
 }
 
 // JobWaitingForAHungWorkerIsReturned

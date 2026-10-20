@@ -90,6 +90,11 @@ public:
     void GetStats( Stats & outStats ) const;
 
 private:
+    // A client's toolchain message: it counts as sending the toolchain before the stash is written, so another
+    // client that leaves meanwhile does not drop what it sends
+    void BeginUpload( uint32_t clientId, uint64_t toolId );
+    void OnStashed( uint32_t clientId, uint64_t toolId, ToolchainStash::Result result );
+
     // Server::Forwarder
     virtual uint32_t GetPoolSlots() const override;
     virtual void GetToolchainInventory( uint32_t clientId, Array<uint64_t> & outToolIds ) override;
@@ -190,7 +195,8 @@ private:
         explicit Actions( const Actions & other ) = delete;
         Actions & operator=( const Actions & other ) = delete;
 
-        Array<uint64_t>         m_DropIncomplete;
+        Array<uint64_t>         m_DroppedToolchains;    // From the stash's index, under m_Mutex
+        Array<uint64_t>         m_DeleteToolchains;     // Their directories (ToolchainStash::DeleteRemoved)
         Array<uint64_t>         m_ReleaseUses;
         Array<GatewayJob *>     m_FreeJobs;
         Array<LocalJob>         m_LocalJobs;
@@ -217,12 +223,15 @@ private:
     void RequestToolchain( uint32_t clientId, uint64_t toolId, bool askForManifest, Actions & actions ); // Else its missing files
     void RequestMissingFiles( Upload & upload, Actions & actions );
     void OnToolchainPayload( uint32_t clientId, uint64_t toolId, Actions & actions );
+    void OnUnknownToolchain( uint32_t clientId, uint64_t toolId, Actions & actions ); // The stash holds none of it: asked for again
+    void OnToolchainNotStored( uint64_t toolId, Actions & actions ); // The stash cannot write it: its jobs are given up
     bool IsUploaded( uint64_t toolId ) const; // Some live client is sending it
+    Upload * FindUpload( uint32_t clientId, uint64_t toolId );
     void RemoveJob( GatewayJob * job, Actions & actions );
     // An attempt ended without a usable result. Retries the job, or gives it up: true if the client is then
     // to get the job's failed result (it is still connected), and the job is removed either way.
     bool FailAttempt( GatewayJob & job, uint32_t workerIndex, const char * reason, Actions & actions );
-    void GiveUpWithoutResult( GatewayJob & job, Actions & actions ); // After FailAttempt: a lost-job result goes up
+    void GiveUpWithoutResult( GatewayJob & job, Actions & actions, const char * why = nullptr ); // After FailAttempt: a lost-job result goes up
     // A result for the worker's attempt: retried if the worker failed it, else passed on (PassOnResult). One for
     // an attempt the gateway no longer waits for only frees its slot.
     struct ResultRoute

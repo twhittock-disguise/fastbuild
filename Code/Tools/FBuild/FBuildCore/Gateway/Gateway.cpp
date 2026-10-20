@@ -355,24 +355,36 @@ void Gateway::GetStats( Stats & outStats ) const
 //------------------------------------------------------------------------------
 /*virtual*/ void Gateway::OnClientManifest( uint32_t clientId, uint64_t toolId, const void * payload, size_t payloadSize )
 {
-    if ( m_Stash.AddManifest( toolId, payload, payloadSize ) == ToolchainStash::STASH_INVALID )
-    {
-        m_Server->DisconnectClient( clientId );
-        return;
-    }
-    Actions actions;
-    {
-        MutexHolder mh( m_Mutex );
-        OnToolchainPayload( clientId, toolId, actions );
-    }
-    Run( actions );
+    BeginUpload( clientId, toolId );
+    OnStashed( clientId, toolId, m_Stash.AddManifest( toolId, payload, payloadSize ) );
 }
 
 // OnClientFile
 //------------------------------------------------------------------------------
 /*virtual*/ void Gateway::OnClientFile( uint32_t clientId, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize )
 {
-    if ( m_Stash.AddFile( toolId, fileId, payload, payloadSize ) == ToolchainStash::STASH_INVALID )
+    BeginUpload( clientId, toolId );
+    OnStashed( clientId, toolId, m_Stash.AddFile( toolId, fileId, payload, payloadSize ) );
+}
+
+// BeginUpload
+//------------------------------------------------------------------------------
+void Gateway::BeginUpload( uint32_t clientId, uint64_t toolId )
+{
+    MutexHolder mh( m_Mutex );
+    if ( ( m_ShuttingDown == false ) && ( FindUpload( clientId, toolId ) == nullptr ) )
+    {
+        Upload & upload = m_Uploads.EmplaceBack(); // Sent unasked, as a client sends a toolchain ahead of its jobs
+        upload.m_ToolId = toolId;
+        upload.m_ClientId = clientId;
+    }
+}
+
+// OnStashed
+//------------------------------------------------------------------------------
+void Gateway::OnStashed( uint32_t clientId, uint64_t toolId, ToolchainStash::Result result )
+{
+    if ( result == ToolchainStash::STASH_INVALID )
     {
         m_Server->DisconnectClient( clientId );
         return;
@@ -380,7 +392,22 @@ void Gateway::GetStats( Stats & outStats ) const
     Actions actions;
     {
         MutexHolder mh( m_Mutex );
-        OnToolchainPayload( clientId, toolId, actions );
+        if ( result == ToolchainStash::STASH_UNKNOWN )
+        {
+            OnUnknownToolchain( clientId, toolId, actions );
+        }
+        else if ( result == ToolchainStash::STASH_FAILED )
+        {
+            OnToolchainNotStored( toolId, actions );
+        }
+        else
+        {
+            OnToolchainPayload( clientId, toolId, actions );
+        }
+    }
+    if ( result == ToolchainStash::STASH_FAILED )
+    {
+        m_Server->LogWarning( "The gateway cannot write toolchain 0x%016" PRIx64 " from client %u to its stash: the jobs waiting for it go back to their clients\n", toolId, clientId );
     }
     Run( actions );
 }
@@ -475,9 +502,11 @@ void Gateway::GetStats( Stats & outStats ) const
             const uint64_t toolId = upload.m_ToolId;
             m_Uploads.EraseIndex( i - 1 );
             if ( ( IsUploaded( toolId ) == false ) && ( m_Stash.IsComplete( toolId ) == false ) &&
-                 ( actions.m_DropIncomplete.Find( toolId ) == nullptr ) )
+                 ( actions.m_DroppedToolchains.Find( toolId ) == nullptr ) )
             {
-                actions.m_DropIncomplete.Append( toolId );
+                // Under m_Mutex, as a client counts as sending it before it writes any of it
+                m_Stash.DropIncomplete( toolId, actions.m_DeleteToolchains );
+                actions.m_DroppedToolchains.Append( toolId );
             }
         }
 
@@ -504,7 +533,7 @@ void Gateway::GetStats( Stats & outStats ) const
                         actions.m_PchAsks.Append( Actions::PchAsk{ job->m_ClientId, job->m_PchId } );
                     }
                 }
-                if ( actions.m_DropIncomplete.Find( job->m_ToolId ) && ( IsUploaded( job->m_ToolId ) == false ) )
+                if ( actions.m_DroppedToolchains.Find( job->m_ToolId ) && ( IsUploaded( job->m_ToolId ) == false ) )
                 {
                     RequestToolchain( job->m_ClientId, job->m_ToolId, true, actions );
                 }
@@ -881,10 +910,7 @@ Gateway::Actions::~Actions()
 //------------------------------------------------------------------------------
 void Gateway::Run( Actions & actions )
 {
-    for ( const uint64_t toolId : actions.m_DropIncomplete )
-    {
-        m_Stash.DropIncomplete( toolId );
-    }
+    m_Stash.DeleteRemoved( actions.m_DeleteToolchains );
     for ( const uint64_t toolId : actions.m_ReleaseUses )
     {
         m_Stash.ReleaseUse( toolId );
@@ -1167,22 +1193,102 @@ void Gateway::OnToolchainPayload( uint32_t clientId, uint64_t toolId, Actions & 
         return;
     }
 
+    // The manifest the gateway asked for: the files are asked for next
+    Upload * upload = FindUpload( clientId, toolId );
+    if ( upload && upload->m_Requested && ( upload->m_FilesRequested == false ) && m_Stash.HasManifest( toolId ) )
+    {
+        RequestMissingFiles( *upload, actions );
+    }
+}
+
+// OnUnknownToolchain
+//------------------------------------------------------------------------------
+void Gateway::OnUnknownToolchain( uint32_t clientId, uint64_t toolId, Actions & actions )
+{
+    if ( m_ShuttingDown )
+    {
+        return;
+    }
+    Upload * upload = FindUpload( clientId, toolId );
+    if ( upload && upload->m_Requested && ( upload->m_FilesRequested == false ) )
+    {
+        return; // Its manifest was asked for: what it pushed before is asked for again after it
+    }
+    if ( upload )
+    {
+        m_Uploads.Erase( upload );
+    }
+    if ( IsUploaded( toolId ) )
+    {
+        return; // Another client sends it
+    }
+
+    // A client with a job waiting for it is asked for it, this one first
+    const GatewayJob * waiting = nullptr;
+    for ( const GatewayJob * job : m_Jobs )
+    {
+        if ( job->m_Parked && ( job->m_ToolId == toolId ) && ( ( waiting == nullptr ) || ( job->m_ClientId == clientId ) ) )
+        {
+            waiting = job;
+        }
+    }
+    if ( waiting )
+    {
+        RequestToolchain( waiting->m_ClientId, toolId, ( m_Stash.HasManifest( toolId ) == false ), actions );
+    }
+}
+
+// OnToolchainNotStored
+//------------------------------------------------------------------------------
+void Gateway::OnToolchainNotStored( uint64_t toolId, Actions & actions )
+{
+    if ( m_ShuttingDown )
+    {
+        return;
+    }
+    for ( size_t i = m_Uploads.GetSize(); i > 0; --i )
+    {
+        if ( m_Uploads[ i - 1 ].m_ToolId == toolId )
+        {
+            m_Uploads.EraseIndex( i - 1 );
+        }
+    }
+
+    // Each goes back to its client flagged, so the client requeues it and keeps the gateway
+    Array<GatewayJob *> givenUp;
+    for ( GatewayJob * job : m_Jobs )
+    {
+        if ( job->m_Parked && ( job->m_ToolId == toolId ) )
+        {
+            givenUp.Append( job );
+        }
+    }
+    for ( GatewayJob * job : givenUp )
+    {
+        ++m_GiveUps;
+        GiveUpWithoutResult( *job, actions, "its toolchain cannot be stored at the gateway" );
+        RemoveJob( job, actions );
+    }
+    if ( givenUp.IsEmpty() == false )
+    {
+        AStackString<> line;
+        line.Format( "gateway jobs-giveup reason=toolchain n=%u", (uint32_t)givenUp.GetSize() );
+        actions.m_LogLines.EmplaceBack( line.Get() );
+    }
+}
+
+// FindUpload
+//------------------------------------------------------------------------------
+Gateway::Upload * Gateway::FindUpload( uint32_t clientId, uint64_t toolId )
+{
     for ( Upload & upload : m_Uploads )
     {
         if ( ( upload.m_ToolId == toolId ) && ( upload.m_ClientId == clientId ) )
         {
-            // The manifest the gateway asked for: the files are asked for next
-            if ( upload.m_Requested && ( upload.m_FilesRequested == false ) && m_Stash.HasManifest( toolId ) )
-            {
-                RequestMissingFiles( upload, actions );
-            }
-            return;
+            return &upload;
         }
     }
-    Upload upload; // Sent unasked, as a client sends a toolchain ahead of its jobs
-    upload.m_ToolId = toolId;
-    upload.m_ClientId = clientId;
-    m_Uploads.Append( upload );
+    return nullptr;
 }
 
 // IsUploaded
@@ -1247,10 +1353,17 @@ bool Gateway::FailAttempt( GatewayJob & job, uint32_t workerIndex, const char * 
 
 // GiveUpWithoutResult
 //------------------------------------------------------------------------------
-void Gateway::GiveUpWithoutResult( GatewayJob & job, Actions & actions )
+void Gateway::GiveUpWithoutResult( GatewayJob & job, Actions & actions, const char * why )
 {
     AStackString<> message;
-    message.Format( "no result after %u attempts", job.m_NumAttempts );
+    if ( why )
+    {
+        message = why;
+    }
+    else
+    {
+        message.Format( "no result after %u attempts", job.m_NumAttempts );
+    }
     MemoryStream result;
     GatewayWire::WriteLostResult( result, job.m_ClientJobId, message.Get() );
     actions.m_GivenUp.Append( Actions::GivenUp{ job.m_ClientId, false, FNEW( MemoryStream( Move( result ) ) ) } );

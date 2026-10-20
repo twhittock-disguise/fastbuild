@@ -110,6 +110,8 @@ public:
     // within it. 0 if it has gone.
     uint32_t GetMaxAllowance( uint32_t clientId ) const;
     WorkerLog & GetLog() { return m_Log; }
+    // Warns on the console, and in the log as "error <text>"
+    void LogWarning( MSVC_SAL_PRINTF const char * fmtString, ... ) FORMAT_STRING( 2, 3 );
 
 private:
     // TCPConnection interface
@@ -127,9 +129,6 @@ private:
 
     static uint32_t ThreadFuncStatic( void * param );
     void ThreadFunc();
-
-    // Warns on the console, and in the log as "error <text>"
-    void LogWarning( MSVC_SAL_PRINTF const char * fmtString, ... ) FORMAT_STRING( 2, 3 );
 
     void FinalizeCompletedJobs();
     void TouchToolchains();
