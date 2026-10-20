@@ -202,7 +202,7 @@ void FBuildWorkerOptions::ShowUsageError()
                 "        Default: ceil(cpus/2). Use 0 to disable.\n"
                 " -gateway=<file>\n"
                 "        Run as a gateway for the workers listed in <file>, one host[:port]\n"
-                "        per line, instead of running jobs here.\n"
+                "        per line. Its own CPUs build jobs too, as -cpus and -mode set.\n"
                 " -nobrokerage\n"
                 "        Don't register in the worker brokerage (for workers behind a gateway).\n"
                 " -nosubprocess\n"

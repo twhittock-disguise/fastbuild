@@ -424,7 +424,7 @@ void Worker::UpdateUI()
     {
         Gateway::Stats stats;
         m_Gateway->GetStats( stats );
-        status.AppendFormat( "\nGateway: %u of %u workers, %u slots (%u local, %u running), %u clients",
+        status.AppendFormat( " | Gateway: %u of %u workers, %u slots (%u local, %u running), %u clients",
                              stats.m_ReadyWorkers, stats.m_Workers, stats.m_PoolSlots, stats.m_LocalSlots, stats.m_RunningLocally, stats.m_Clients );
     }
     if ( m_RestartNeeded )

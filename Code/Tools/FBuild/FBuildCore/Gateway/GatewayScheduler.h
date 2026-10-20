@@ -15,12 +15,7 @@
 // A job is waiting (in its client's queue) or running (on one worker). Slots are
 // counted apart from jobs: Next takes a slot and only ReleaseSlot gives it back, so a
 // job retried after a timeout keeps the slot of its first attempt taken.
-//
-// Every registered worker counts as connected when a failed job decides whether to
-// avoid the workers that failed it, even one with 0 slots for now (a Phase B worker
-// with no allowance gets one from the demand GetNumWaitingFor reports). So the gateway
-// registers a worker only while its capacity is above 0, and calls RemoveWorker when
-// that drops to 0; otherwise a failed job could wait for it forever.
+// Register a worker only while it has slots: avoidance counts every registered worker.
 //------------------------------------------------------------------------------
 class GatewayScheduler
 {

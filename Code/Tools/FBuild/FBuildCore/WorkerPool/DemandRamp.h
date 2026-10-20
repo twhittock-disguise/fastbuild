@@ -21,7 +21,7 @@ inline bool IsChangeAtLeast( uint32_t delta, uint32_t base, uint32_t minDelta, u
     return ( delta >= minDelta ) && ( ( (uint64_t)delta * 100 ) >= ( (uint64_t)base * percent ) );
 }
 
-class DemandRamp   // Not thread safe: one thread only (the client thread)
+class DemandRamp   // Not thread safe: one thread only (a client's, or the gateway's housekeeping thread)
 {
 public:
     static constexpr uint32_t kStartSlots = 4;

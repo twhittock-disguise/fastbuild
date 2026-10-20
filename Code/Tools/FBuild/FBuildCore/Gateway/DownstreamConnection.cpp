@@ -165,7 +165,7 @@ GatewayScheduler::Affinity DownstreamConnection::GetAffinity( uint64_t pchId, ui
     }
 
     // A toolchain is held once it is queued: it goes out ahead of the jobs queued after it. The jobs
-    // queued while a PCH is on its way wait on the worker for it.
+    // sent while a PCH is on its way wait in the connection until its last chunk is handed to the socket.
     MutexHolder mh( m_Mutex );
     const GatewayScheduler::Affinity tool = ( ( toolId == 0 ) || m_Toolchains.Find( toolId ) ) ? GatewayScheduler::AFFINITY_HOLDS
                                                                                                 : GatewayScheduler::AFFINITY_NONE;

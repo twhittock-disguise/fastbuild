@@ -1054,7 +1054,7 @@ void Gateway::Park( GatewayJob & job, Actions & actions )
     {
         actions.m_PchAsks.Append( Actions::PchAsk{ job.m_ClientId, job.m_PchId } );
 
-        // Stored but not yet measured: it is measured next
+        // Stored but not yet measured: marked for measurement ahead of the PCHs no job waits for
         KnownPch * known = FindKnownPch( job.m_PchId );
         if ( known && ( known->m_AwaitedSince == 0 ) )
         {
@@ -1270,14 +1270,9 @@ void Gateway::OnToolchainNotStored( uint64_t toolId, Actions & actions )
     for ( GatewayJob * job : givenUp )
     {
         ++m_GiveUps;
+        LogGiveUp( *job, "toolchain", actions );
         GiveUpWithoutResult( *job, actions, "its toolchain cannot be stored at the gateway" );
         RemoveJob( job, actions );
-    }
-    if ( givenUp.IsEmpty() == false )
-    {
-        AStackString<> line;
-        line.Format( "gateway jobs-giveup reason=toolchain n=%u", (uint32_t)givenUp.GetSize() );
-        actions.m_LogLines.EmplaceBack( line.Get() );
     }
 }
 
@@ -1350,9 +1345,17 @@ bool Gateway::FailAttempt( GatewayJob & job, uint32_t workerIndex, const char * 
         return false;
     }
     ++m_GiveUps;
-    line.Format( "gateway job-giveup client=%u job=%u", job.m_ClientId, job.m_ClientJobId );
-    actions.m_LogLines.EmplaceBack( line.Get() );
+    LogGiveUp( job, reason, actions );
     return true;
+}
+
+// LogGiveUp
+//------------------------------------------------------------------------------
+/*static*/ void Gateway::LogGiveUp( const GatewayJob & job, const char * reason, Actions & actions )
+{
+    AStackString<> line;
+    line.Format( "gateway job-giveup client=%u job=%u reason=%s", job.m_ClientId, job.m_ClientJobId, reason );
+    actions.m_LogLines.EmplaceBack( line.Get() );
 }
 
 // GiveUpWithoutResult
@@ -1464,22 +1467,16 @@ void Gateway::GiveUpJobsNoWorkerCanTake( Actions & actions )
             givenUp.Append( job );
         }
     }
-    if ( givenUp.IsEmpty() )
-    {
-        return;
-    }
 
     // Each goes back to its client flagged, so the client requeues it and keeps the gateway
     for ( GatewayJob * job : givenUp )
     {
         VERIFY( m_Scheduler.RemoveWaitingJob( job->m_Id ) );
         ++m_GiveUps;
+        LogGiveUp( *job, "no-worker", actions );
         GiveUpWithoutResult( *job, actions );
         RemoveJob( job, actions );
     }
-    AStackString<> line;
-    line.Format( "gateway jobs-giveup reason=no-worker n=%u", (uint32_t)givenUp.GetSize() );
-    actions.m_LogLines.EmplaceBack( line.Get() );
 }
 
 // CountExpiredAttempts
@@ -1683,7 +1680,7 @@ void Gateway::FormatStats( AString & outLine ) const
 {
     Stats stats;
     GetStatsLocked( stats );
-    outLine.Format( "gateway stats clients=%u workers=%u/%u pool=%u waiting=%u parked=%u running=%u heldMiB=%u forwarded=%u retries=%u giveups=%u timeouts=%u pchMiB=%u local=%u local-running=%u",
+    outLine.Format( "gateway stats clients=%u workers=%u/%u pool=%u waiting=%u parked=%u running=%u held-mib=%u forwarded=%u retries=%u giveups=%u timeouts=%u pch-mib=%u local=%u local-running=%u",
                     stats.m_Clients,
                     stats.m_ReadyWorkers,
                     stats.m_Workers,
@@ -1884,7 +1881,7 @@ void Gateway::MeasureStoredPchs()
                     {
                         const float waitedMs = (float)( Timer::GetNow() - known->m_AwaitedSince ) * Timer::GetFrequencyInvFloatMS();
                         AStackString<> line;
-                        line.Format( "gateway pch-awaited pch=0x%016" PRIx64 " waited-ms=%u", pchId, (uint32_t)waitedMs );
+                        line.Format( "gateway pch-awaited pch=0x%016" PRIx64 " ms=%u", pchId, (uint32_t)waitedMs );
                         actions.m_LogLines.EmplaceBack( line.Get() );
                     }
                     ReleaseParked();

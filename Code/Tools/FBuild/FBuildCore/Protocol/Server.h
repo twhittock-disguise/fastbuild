@@ -68,7 +68,7 @@ public:
     // - localThreads == 0, a pure forwarder: no JobQueueRemote, no toolchain extraction, no unpacking.
     // - localThreads > 0, with a local pool: jobs given to RunLocalJob are built here, as a worker builds them.
     //   cacheDir must then be the worker cache dir, where ToolManifest keeps toolchains; with another, the
-    //   Server logs an error and has no local pool.
+    //   Server warns (LogWarning) and has no local pool.
     Server( Forwarder & forwarder, const AString & cacheDir, uint32_t localThreads = 0, uint32_t prefetchBuffer = 0 );
     virtual ~Server() override;
 
@@ -85,7 +85,7 @@ public:
     bool IsToolchainSynchronized( uint64_t toolId ) const; // Takes only m_SynchronizedToolsMutex, a leaf lock
     // Builds a decoded job (as Forwarder::OnClientJob has it) once its toolchain and PCH are here. Forwarder::
     // OnLocalJobEnded follows, from the Server's thread. Takes m_PchCacheMutex (the lease) and m_ToolManifestsMutex,
-    // each alone, then m_LocalJobsMutex and, under it, m_PchCacheMutex and the job queue's locks.
+    // each alone, then m_LocalJobsMutex and, under it, m_PchCacheMutex and the job queue's locks, then the log's.
     void RunLocalJob( const Protocol::MsgJob & msg, const void * job, size_t jobSize );
 
     bool IsSynchingTool( AString & statusStr ) const;
@@ -141,7 +141,7 @@ private:
     // a gateway keeps the client and its local pool goes without the toolchain.
     void ReceiveManifest( const ConnectionInfo * connection, uint64_t toolId, const void * payload, size_t payloadSize );
     void ReceiveFile( const ConnectionInfo * connection, uint64_t toolId, uint32_t fileId, const void * payload, size_t payloadSize );
-    void OnUnusableToolchainData( const ConnectionInfo * connection, const char * what );
+    void OnUnusableToolchainData( const ConnectionInfo * connection, uint64_t toolId, const char * what );
 
     // Local jobs (tagged s_LocalJobTag). Lock order: m_LocalJobsMutex, then m_PchCacheMutex and JobQueueRemote's.
     enum LocalJobState : uint8_t { LOCAL_JOB_READY, LOCAL_JOB_WAITING, LOCAL_JOB_CANNOT_RUN };
@@ -179,7 +179,7 @@ private:
 
         const Protocol::IMessage * m_CurrentMessage = nullptr;
         const ConnectionInfo * m_Connection = nullptr;
-        Atomic<uint32_t> m_NumJobsActive;
+        Atomic<uint32_t> m_NumJobsActive; // Received and not yet answered, for the disconnect log line
         uint32_t m_AllocatedCapacity = 0; // The allowance. Under m_ClientListMutex.
         uint32_t m_MaxAllocatedCapacity = 0; // The largest allowance so far. Under m_ClientListMutex.
         Atomic<bool> m_CapacityChanged{ false }; // The outbox is to send the allowance
@@ -210,7 +210,7 @@ private:
         ClientOutbox( Server & server, ClientState & cs );
         ~ClientOutbox(); // Stops and joins; what is queued is dropped
 
-        // Caller holds m_ClientListMutex. A result counts in cs.m_NumJobsActive until it is sent.
+        // Caller holds m_ClientListMutex
         void PushResult( bool compressed, MemoryStream && payload, uint8_t flags );
         void PushMessage( const Protocol::IMessage & msg ); // Without a payload. Sent after what is queued before it.
         void Wake();

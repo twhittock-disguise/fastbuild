@@ -4601,7 +4601,7 @@ void TestGateway::GatewayLogsForwarding() const
     TEST_ASSERT( log.Find( expected.Get() ) );
     const char * stats = log.Find( "gateway stats clients=" );
     TEST_ASSERT( stats );
-    TEST_ASSERT( strstr( stats, " workers=1/1 pool=4 waiting=0 parked=0 running=0 heldMiB=0 forwarded=1 retries=0 giveups=0 timeouts=0 pchMiB=0" ) );
+    TEST_ASSERT( strstr( stats, " workers=1/1 pool=4 waiting=0 parked=0 running=0 held-mib=0 forwarded=1 retries=0 giveups=0 timeouts=0 pch-mib=0" ) );
 }
 
 // PCHs found in the gateway's store at start
@@ -4994,9 +4994,9 @@ void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
     AStackString<> expected;
     expected.Format( "gateway pch-measured n=%u failed=0 ms=", kOrderedStoredPchs );
     TEST_ASSERT( log.Find( expected.Get() ) );
-    expected.Format( "gateway pch-awaited pch=0x%016" PRIx64 " waited-ms=", lastPchId );
+    expected.Format( "gateway pch-awaited pch=0x%016" PRIx64 " ms=", lastPchId );
     TEST_ASSERT( log.Find( expected.Get() ) );
-    expected.Format( "gateway pch-awaited pch=0x%016" PRIx64 " waited-ms=", otherPchId );
+    expected.Format( "gateway pch-awaited pch=0x%016" PRIx64 " ms=", otherPchId );
     TEST_ASSERT( log.Find( expected.Get() ) );
 }
 
@@ -5713,7 +5713,14 @@ void TestGateway::JobsWaitingWithNoWorkersAreReturned() const
 
     AString log;
     TEST_ASSERT( ReadWholeFile( logPath, log ) );
-    TEST_ASSERT( log.Find( "gateway jobs-giveup reason=no-worker n=2" ) );
+    uint32_t numGiveUps = 0;
+    for ( const char * line = log.Find( "gateway job-giveup client=" ); line; line = strstr( line + 1, "gateway job-giveup client=" ) )
+    {
+        const char * end = strchr( line, '\n' );
+        const AStackString<> text( line, end ? end : ( line + strlen( line ) ) );
+        numGiveUps += text.Find( " reason=no-worker" ) ? 1 : 0;
+    }
+    TEST_ASSERT( numGiveUps == 2 );
 }
 
 // ToolchainIsKeptForAClientSendingItWhenAnotherLeaves
@@ -7213,7 +7220,7 @@ void TestGateway::SharesMoveWithDemandThroughTheGateway() const
 
     // Each demand is logged with the allowance it led to
     uint32_t numLines = 0;
-    TEST_ASSERT( DistributedTest::CountInStatsLogSince( server.GetLogPath(), 0, "gateway allowance client=", numLines ) );
+    TEST_ASSERT( DistributedTest::CountInStatsLogSince( server.GetLogPath(), 0, "demand client=", numLines ) );
     TEST_ASSERT( numLines == 3 );
     a.ShutdownAllConnections();
 }

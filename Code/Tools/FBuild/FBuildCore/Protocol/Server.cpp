@@ -341,16 +341,17 @@ void Server::LogWarning( const char * fmtString, ... )
     ClientState * cs = FNEW( ClientState( connection ) );
     connection->SetUserData( cs );
 
+    ClientOutbox * outbox = FNEW( ClientOutbox( *this, *cs ) );
+    {
+        MutexHolder mh( m_ClientListMutex );
+        cs->m_Id = m_NextClientId++;
+        cs->m_Outbox = outbox;
+        m_ClientList.Append( cs );
+    }
+
     AStackString<> remoteAddr;
     TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-    m_Log.Write( "connect addr=%s", remoteAddr.Get() );
-
-    ClientOutbox * outbox = FNEW( ClientOutbox( *this, *cs ) );
-
-    MutexHolder mh( m_ClientListMutex );
-    cs->m_Id = m_NextClientId++;
-    cs->m_Outbox = outbox;
-    m_ClientList.Append( cs );
+    m_Log.Write( "connect client=%u addr=%s", cs->m_Id, remoteAddr.Get() );
 }
 
 //------------------------------------------------------------------------------
@@ -362,7 +363,7 @@ void Server::LogWarning( const char * fmtString, ... )
 
     AStackString<> remoteAddr;
     TCPConnectionPool::GetAddressAsString( connection->GetRemoteAddress(), remoteAddr );
-    m_Log.Write( "disconnect addr=%s host=%s jobs=%u", remoteAddr.Get(), cs->m_HostName.Get(), cs->m_NumJobsActive.Load() );
+    m_Log.Write( "disconnect client=%u addr=%s host=%s jobs=%u", cs->m_Id, remoteAddr.Get(), cs->m_HostName.Get(), cs->m_NumJobsActive.Load() );
 
     // No result is queued for this client from here on. The connection is marked as closing first,
     // so a send that waits for the client to read gives up, and the outbox thread can be joined.
@@ -771,7 +772,6 @@ void Server::ClientOutbox::Send( const QueuedResult & result )
         return;
     }
 
-    // Before the send mutex is taken, so the result is no longer counted while it waits to be sent
     ASSERT( cs.m_NumJobsActive.Load() > 0 );
     cs.m_NumJobsActive.Decrement();
 
@@ -887,7 +887,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgConn
         return;
     }
 
-    m_Log.Write( "handshake addr=%s host=%s", remoteAddr.Get(), hostName.Get() );
+    m_Log.Write( "handshake client=%u addr=%s host=%s", cs->m_Id, remoteAddr.Get(), hostName.Get() );
 
     // The new client's share of the demand it is assumed to have. The ack carries it, so it is not sent again.
     uint32_t capacity = 0;
@@ -948,14 +948,7 @@ void Server::Process( const ConnectionInfo * connection, const Protocol::MsgDema
         MarkCapacityChanged( *cs ); // Whether or not its allowance changed, so that it learns the pool
         allowance = cs->m_AllocatedCapacity;
     }
-    if ( m_Forwarder )
-    {
-        m_Log.Write( "gateway allowance client=%u demand=%u allowance=%u", cs->m_Id, msg->GetDemand(), allowance );
-    }
-    else
-    {
-        m_Log.Write( "demand host=%s demand=%u allowance=%u pool=%u", cs->m_HostName.Get(), msg->GetDemand(), allowance, poolSlots );
-    }
+    m_Log.Write( "demand client=%u host=%s demand=%u allowance=%u pool=%u", cs->m_Id, cs->m_HostName.Get(), msg->GetDemand(), allowance, poolSlots );
 }
 
 // Process( MsgJob )
@@ -1115,7 +1108,7 @@ void Server::ReceiveManifest( const ConnectionInfo * connection, uint64_t toolId
         }
         if ( manifest->DeserializeFromRemote( ms ) == false )
         {
-            OnUnusableToolchainData( connection, "corrupt MsgManifest" );
+            OnUnusableToolchainData( connection, toolId, "corrupt MsgManifest" );
             return;
         }
 
@@ -1187,7 +1180,7 @@ void Server::ReceiveFile( const ConnectionInfo * connection, uint64_t toolId, ui
         {
             if ( corruptData )
             {
-                OnUnusableToolchainData( connection, "corrupt MsgFile" );
+                OnUnusableToolchainData( connection, toolId, "corrupt MsgFile" );
             }
             else
             {
@@ -1223,7 +1216,7 @@ void Server::ReceiveFile( const ConnectionInfo * connection, uint64_t toolId, ui
 
 // OnUnusableToolchainData
 //------------------------------------------------------------------------------
-void Server::OnUnusableToolchainData( const ConnectionInfo * connection, const char * what )
+void Server::OnUnusableToolchainData( const ConnectionInfo * connection, uint64_t toolId, const char * what )
 {
     const ClientState * cs = (const ClientState *)connection->GetUserData();
     AStackString remoteAddr;
@@ -1231,7 +1224,7 @@ void Server::OnUnusableToolchainData( const ConnectionInfo * connection, const c
     if ( m_Forwarder )
     {
         // The forwarder has the same data, and decides for itself whether the client stays
-        LogWarning( "The gateway's local pool cannot use the toolchain '%s' (%s) sent: %s\n", remoteAddr.Get(), cs->m_HostName.Get(), what );
+        LogWarning( "The gateway's local pool cannot use toolchain 0x%016" PRIx64 " from '%s' (%s): %s\n", toolId, remoteAddr.Get(), cs->m_HostName.Get(), what );
         return;
     }
 

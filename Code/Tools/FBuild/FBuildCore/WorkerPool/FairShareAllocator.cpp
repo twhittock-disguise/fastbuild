@@ -65,7 +65,7 @@ void FairShareAllocator::Recompute( Array<uint32_t> & outChanged )
         anyWantMore |= ( client.m_Demand > level );
     }
 
-    // When some want more, the slots left are fewer than they are: one each, in order
+    // When some want more, the slots left are fewer than they are: one each, least recently served first
     const uint32_t remainder = anyWantMore ? (uint32_t)( m_PoolSlots - used ) : 0;
     for ( uint32_t i = 0; i < remainder; ++i )
     {

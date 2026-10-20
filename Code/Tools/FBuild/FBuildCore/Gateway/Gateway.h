@@ -41,10 +41,10 @@
 // does the client get a failed result, flagged Protocol::kResultReturnedByGateway, so it requeues the
 // job and keeps the gateway. A lost worker is connected again after GatewayConfig::m_ReconnectSeconds.
 //
-// Locking: m_Mutex guards everything below it. Under it the gateway only pushes to queues, calls
-// the scheduler, reads connection state and the stash's index, and takes the Server's PCH cache lock and
-// its lock of synchronized toolchains. Sends to clients, disk access (the stash's, the log's) and the
-// Server's client list come after it is released.
+// Locking: m_Mutex guards everything below it. Under it the gateway calls the scheduler and takes only leaf
+// locks: the connections' and their send queues', the stash's index, and the Server's m_PchCacheMutex and
+// m_SynchronizedToolsMutex. Sends to clients, disk access (the stash's, the log's) and the Server's client
+// list come after it is released.
 //------------------------------------------------------------------------------
 class Gateway : private Server::Forwarder, private DownstreamConnection::Owner
 {
@@ -230,6 +230,7 @@ private:
     // to get the job's failed result (it is still connected), and the job is removed either way.
     bool FailAttempt( GatewayJob & job, uint32_t workerIndex, const char * reason, Actions & actions );
     void GiveUpWithoutResult( GatewayJob & job, Actions & actions, const char * why = nullptr ); // After FailAttempt: a lost-job result goes up
+    static void LogGiveUp( const GatewayJob & job, const char * reason, Actions & actions ); // gateway job-giveup client= job= reason=
     // A result for the worker's attempt: retried if the worker failed it, else passed on (PassOnResult). One for
     // an attempt the gateway no longer waits for only frees its slot.
     struct ResultRoute

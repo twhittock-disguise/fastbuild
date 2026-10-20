@@ -175,8 +175,8 @@ namespace PchDispatch
     // this long is not counted as a holder, so the jobs waiting on its PCH can reach another worker
     static constexpr float kHolderStallSeconds = 60.0f;
 
-    // Whether a connection's PCHs count as held: not one that still awaits its inventories or that
-    // can never take a job, as the jobs waiting on its PCH could not run there
+    // Whether a connection's PCHs count as held: not one that still awaits its inventories or whose
+    // allowance is 0 for now, as the jobs waiting on its PCH could not run there
     inline bool CountsAsHolder( bool awaitingInventory, uint32_t capacity, uint32_t freeSlots, float secondsSinceProgress )
     {
         return ( awaitingInventory == false ) && ( capacity > 0 ) && ( ( freeSlots > 0 ) || ( secondsSinceProgress < kHolderStallSeconds ) );

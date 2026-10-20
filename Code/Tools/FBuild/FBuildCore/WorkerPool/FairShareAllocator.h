@@ -19,7 +19,8 @@
 // - above it, to those that already hold one, so that one spare slot does not move on every Recompute.
 // A smaller allowance replaces the old one only past the hysteresis threshold; a larger one, one equal to the
 // client's full demand (0 included), or the loss of the single slot of a level of 0, always does. An allowance
-// held back is still never more than the client's demand or the pool.
+// held back is still never more than the client's demand or the pool, but the allowances can sum above the
+// pool: each by less than max( kHysteresisSlots, kHysteresisPercent of it ).
 // Allowances below what a client has in flight only stop new admissions. Not thread safe.
 //------------------------------------------------------------------------------
 class FairShareAllocator
