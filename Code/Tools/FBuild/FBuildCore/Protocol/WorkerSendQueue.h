@@ -129,6 +129,7 @@ public:
     void Push( SendQueueItem && item ); // Any thread; never blocks on the socket
     void Quit();
     bool IsQuitting() const { return m_Quit.Load(); }
+    bool HasFailed() const { return m_Failed.Load(); } // It stopped as what it was to send could not be read or compressed
     const Atomic<bool> & GetQuitFlag() const { return m_Quit; } // For Client::RunTestHook
 
     // Send thread: sends until told to quit, or until a send fails
@@ -146,6 +147,7 @@ private:
 
     Semaphore m_WakeSemaphore;
     Atomic<bool> m_Quit{ false };
+    Atomic<bool> m_Failed{ false };
     Atomic<uint32_t> m_UnsentJobs{ 0 }; // Queued for the send thread, not yet sent
     Atomic<uint32_t> m_NumTransformedPchs{ 0 }; // PCHs delivered in the form that a transform makes (see PchTransform)
     JobStreamEncoder m_JobEncoder; // Send thread only. A new connection starts a new stream.

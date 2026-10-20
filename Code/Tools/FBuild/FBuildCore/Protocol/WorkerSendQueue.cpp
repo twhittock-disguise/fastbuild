@@ -112,6 +112,7 @@ bool WorkerSendQueue::SendItem( TCPConnectionPool & pool, const ConnectionInfo *
         {
             FLOG_WARN( "Failed to read '%s' to send it to %s. Closing the connection.\n",
                        item.m_PayloadFile.Get(), m_PeerName.Get() );
+            m_Failed.Store( true );
             m_Quit.Store( true );
             return false;
         }
@@ -126,6 +127,7 @@ bool WorkerSendQueue::SendItem( TCPConnectionPool & pool, const ConnectionInfo *
         if ( m_JobEncoder.Encode( payload, payloadSize ) == false )
         {
             FLOG_WARN( "Failed to compress a job for %s. Closing the connection.\n", m_PeerName.Get() );
+            m_Failed.Store( true );
             m_Quit.Store( true );
             return false;
         }

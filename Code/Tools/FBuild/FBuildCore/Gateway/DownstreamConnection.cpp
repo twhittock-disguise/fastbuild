@@ -605,6 +605,10 @@ void DownstreamConnection::SendThreadFunc()
         if ( ( m_SendQueue.IsQuitting() == false ) && msg.Send( ci ) )
         {
             m_SendQueue.Run( *this, ci );
+            if ( m_SendQueue.HasFailed() )
+            {
+                Close( "send" );
+            }
         }
     }
     m_SendThreadDone.Store( true );

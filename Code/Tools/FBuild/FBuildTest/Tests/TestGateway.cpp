@@ -444,6 +444,7 @@ private:
     void DownstreamCompletingJobsMayAskForAPchAgain() const;
     void DownstreamAskingForAnUnknownPchIsClosed() const;
     void DownstreamIgnoresARequestForAnUnknownToolchain() const;
+    void DownstreamThatCannotReadWhatItSendsIsClosed() const;
     void DownstreamOfAnotherMajorIsLost() const;
     void UnreachableDownstreamIsLost() const;
     void GatewayAdvertisesTheSumOfItsWorkers() const;
@@ -641,6 +642,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( DownstreamCompletingJobsMayAskForAPchAgain )
     REGISTER_TEST( DownstreamAskingForAnUnknownPchIsClosed )
     REGISTER_TEST( DownstreamIgnoresARequestForAnUnknownToolchain )
+    REGISTER_TEST( DownstreamThatCannotReadWhatItSendsIsClosed )
     REGISTER_TEST( DownstreamOfAnotherMajorIsLost )
     REGISTER_TEST( UnreachableDownstreamIsLost )
     REGISTER_TEST( GatewayAdvertisesTheSumOfItsWorkers )
@@ -3911,6 +3913,29 @@ void TestGateway::DownstreamIgnoresARequestForAnUnknownToolchain() const
     Array<uint8_t> types;
     worker.GetMessageTypes( types );
     TEST_ASSERT( ( types.GetSize() == 3 ) && ( types[ 2 ] == Protocol::MSG_JOB ) );
+}
+
+// DownstreamThatCannotReadWhatItSendsIsClosed
+//------------------------------------------------------------------------------
+void TestGateway::DownstreamThatCannotReadWhatItSendsIsClosed() const
+{
+    Array<uint64_t> tools;
+    tools.Append( kDownstreamTool );
+    EchoWorker worker( 4, EchoWorker::ANSWER_OK, Array<uint64_t>(), tools );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    RecordingOwner owner;
+    StoredPch missing = WriteDownstreamPch( 0xB601, 5000 );
+    TEST_ASSERT( FileIO::FileDelete( missing.m_File.Get() ) ); // Gone before its chunks are read
+    owner.AddPch( missing );
+    DownstreamConnection connection( owner, GetEchoWorkerAddress(), 1 );
+    connection.Start();
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumReady() == 1 ); } ) );
+
+    // The send thread stops, and the connection ends saying why
+    SendDownstreamJob( connection, owner, 5, "m5", &missing );
+    TEST_ASSERT( WaitUntil( [ &owner ]() { return ( owner.GetNumLost() == 1 ); } ) );
+    const char * reason = connection.GetCloseReason();
+    TEST_ASSERT( reason && ( strcmp( reason, "send" ) == 0 ) );
 }
 
 // DownstreamOfAnotherMajorIsLost
