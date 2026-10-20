@@ -162,6 +162,7 @@ private:
     void CorruptResultIsRejected() const;
     void ClientRequeuesAGatewayReturnedResultWithoutDenyListing() const;
     void ClientStillDenyListsAPlainSystemError() const;
+    void DenyListedWorkerIsAskedForNothing() const;
     void SendMutexHoldsBackResults() const;
     void ToolchainIsSentBeforeAnyJob() const;
     void PchIsNotSentToAWorkerWithoutAFreeSlot() const;
@@ -440,6 +441,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( CorruptResultIsRejected )
     REGISTER_TEST( ClientRequeuesAGatewayReturnedResultWithoutDenyListing )
     REGISTER_TEST( ClientStillDenyListsAPlainSystemError )
+    REGISTER_TEST( DenyListedWorkerIsAskedForNothing )
     REGISTER_TEST( SendMutexHoldsBackResults )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( ToolchainIsSentBeforeAnyJob )
@@ -2980,6 +2982,41 @@ void TestDistributed::ClientStillDenyListsAPlainSystemError() const
     }
     TEST_ASSERT( worker.GetNumJobs() == 1 );
     TEST_ASSERT( poller.GetMax() == 1 );
+}
+
+// DenyListedWorkerIsAskedForNothing
+//------------------------------------------------------------------------------
+void TestDistributed::DenyListedWorkerIsAskedForNothing() const
+{
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true;
+    options.m_ForceCleanBuild = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    GiveUpWorker worker( 0 );
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    // Jobs still wait once the worker is deny-listed, and its demand goes to 0, so it keeps no share of its slots
+    DenyListPoller poller( fBuild );
+    auto askedForNothing = [ &poller, &worker ]()
+    {
+        Array<uint32_t> demands;
+        worker.GetDemands( demands );
+        return ( poller.GetMax() == 1 ) && ( demands.IsEmpty() == false ) && ( demands.Top() == 0 );
+    };
+    bool reached = false;
+    {
+        BuildAborter aborter( askedForNothing, kWaitTimeoutSeconds );
+        const bool built = fBuild.Build( "../tmp/Test/Distributed/dist.lib" );
+        worker.ShutdownAllConnections();
+        reached = aborter.HasReached();
+        TEST_ASSERT( built == false );
+    }
+    TEST_ASSERT( reached );
 }
 
 // CorruptResultIsRejected

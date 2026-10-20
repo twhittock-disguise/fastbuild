@@ -1121,8 +1121,9 @@ void ClientToWorkerConnection::UpdateDemand( uint32_t waiting )
         return;
     }
 
+    // A deny-listed worker is given no more jobs, so it is asked only for the slots of those it still runs
     const float now = m_ConnectionTimer.GetElapsed();
-    const uint32_t demand = m_DemandRamp.Update( waiting, m_JobsInFlight.Load(), now );
+    const uint32_t demand = m_DemandRamp.Update( m_Worker->m_DenyListed.Load() ? 0 : waiting, m_JobsInFlight.Load(), now );
     if ( m_DemandRamp.ShouldSend( demand, now ) )
     {
         EnqueueSend( Protocol::MsgDemand( demand ) );
