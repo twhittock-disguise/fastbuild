@@ -22,6 +22,7 @@
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/FLog.h"
 #include "Tools/FBuild/FBuildCore/Graph/FileNode.h"
+#include "Tools/FBuild/FBuildCore/Helpers/CacheLayout.h"
 #include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 
 // system
@@ -824,13 +825,7 @@ void ToolManifest::GetRemoteFilePath( uint32_t fileId, AString & remotePath ) co
 void ToolManifest::GetRemotePath( AString & path ) const
 {
     VERIFY( FBuild::GetWorkerCacheDir( path ) );
-    AStackString subDir;
-#if defined( __WINDOWS__ )
-    subDir.Format( "toolchain.%016" PRIx64 "\\", m_ToolId );
-#else
-    subDir.Format( "toolchain.%016" PRIx64 "/", m_ToolId );
-#endif
-    path += subDir;
+    path.AppendFormat( "%s%016" PRIx64 "%c", CacheLayout::kToolchainDirPrefix, m_ToolId, (char)NATIVE_SLASH );
 }
 
 // GetPersistedPath
@@ -950,36 +945,17 @@ void ToolManifest::DeleteFromDisk()
     root.Trim( 0, 1 ); // trailing slash
 
     // Files are held open to prevent their deletion
-    Array<AString> directories;
-    directories.Append( root );
+    Array<AString> files;
+    files.SetCapacity( m_Files.GetSize() + 1 );
     for ( size_t i = 0; i < m_Files.GetSize(); ++i )
     {
         m_Files[ i ].ReleaseFileLock();
-
-        AStackString path;
-        GetRemoteFilePath( (uint32_t)i, path );
-        FileIO::FileDelete( path.Get() );
-
-        // Directories between the file and the root
-        AStackString directory( path.Get(), path.FindLast( NATIVE_SLASH ) );
-        while ( ( directory.GetLength() > root.GetLength() ) && ( directories.Find( directory ) == nullptr ) )
-        {
-            directories.Append( directory );
-            directory.SetLength( (uint32_t)( directory.FindLast( NATIVE_SLASH ) - directory.Get() ) );
-        }
+        GetRemoteFilePath( (uint32_t)i, files.EmplaceBack() );
     }
-
-    AStackString persistedPath;
-    GetPersistedPath( persistedPath );
-    FileIO::FileDelete( persistedPath.Get() );
+    GetPersistedPath( files.EmplaceBack() );
     m_Persisted = false;
 
-    // Deepest first, so a directory is empty by the time it is removed
-    directories.Sort( []( const AString & a, const AString & b ) { return a.GetLength() > b.GetLength(); } );
-    for ( const AString & directory : directories )
-    {
-        FileIO::DirectoryDelete( directory );
-    }
+    CacheLayout::DeleteFilesAndDirectories( root, files );
 }
 
 // LoadFile (ToolManifestFile)

@@ -7,6 +7,8 @@
 #include "Protocol.h"
 
 #include "Tools/FBuild/FBuildCore/FLog.h"
+#include "Tools/FBuild/FBuildCore/Helpers/CacheLayout.h"
+#include "Tools/FBuild/FBuildCore/Helpers/LruSelect.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
@@ -66,89 +68,6 @@ namespace
 
     constexpr uint64_t kNoLimit = ~(uint64_t)0;
 
-    // Where the PCH store and the worker log are kept: cacheDir, or else the worker cache.
-    // Empty (so no store and no log) if there is no such place.
-    AString GetCacheRoot( const AString & cacheDir )
-    {
-        AStackString<> directory( cacheDir );
-        if ( directory.IsEmpty() )
-        {
-            if ( FBuild::GetWorkerCacheDir( directory ) == false )
-            {
-                directory.Clear();
-            }
-        }
-        else
-        {
-            PathUtils::EnsureTrailingSlash( directory );
-        }
-        return AString( directory );
-    }
-
-    struct LruLimits
-    {
-        size_t      m_MaxEntries;
-        size_t      m_MinEntries;   // Not evicted for the sake of m_MaxBytes
-        uint64_t    m_MaxBytes;
-    };
-
-    // Picks entries to evict, least recently used first, until at most m_MaxEntries remain and they
-    // come to at most m_MaxBytes (which never takes the count below m_MinEntries).
-    // Protected entries are never picked, so more may remain.
-    template <class AGE, class SIZE, class PROTECTED>
-    void SelectLeastRecentlyUsed( size_t numEntries,
-                                  const LruLimits & limits,
-                                  const AGE & ageOf,
-                                  const SIZE & sizeOf,
-                                  const PROTECTED & isProtected,
-                                  Array<size_t> & outIndicesToEvict )
-    {
-        outIndicesToEvict.Clear();
-
-        uint64_t remainingBytes = 0;
-        for ( size_t i = 0; i < numEntries; ++i )
-        {
-            remainingBytes += sizeOf( i );
-        }
-        const auto isOverLimits = [ &limits ]( size_t remaining, uint64_t bytes )
-        {
-            return ( remaining > limits.m_MaxEntries ) ||
-                   ( ( bytes > limits.m_MaxBytes ) && ( remaining > limits.m_MinEntries ) );
-        };
-        if ( isOverLimits( numEntries, remainingBytes ) == false )
-        {
-            return;
-        }
-
-        // Visit indices oldest (lowest age value) first
-        Array<size_t> indicesOldestFirst;
-        indicesOldestFirst.SetCapacity( numEntries );
-        for ( size_t i = 0; i < numEntries; ++i )
-        {
-            indicesOldestFirst.Append( i );
-        }
-        indicesOldestFirst.Sort( [ &ageOf ]( size_t a, size_t b ) -> bool
-        {
-            return ( ageOf( a ) < ageOf( b ) );
-        } );
-
-        size_t remaining = numEntries;
-        for ( const size_t idx : indicesOldestFirst )
-        {
-            if ( isOverLimits( remaining, remainingBytes ) == false )
-            {
-                break;
-            }
-            if ( isProtected( idx ) )
-            {
-                continue;
-            }
-            outIndicesToEvict.Append( idx );
-            --remaining;
-            remainingBytes -= sizeOf( idx );
-        }
-    }
-
     // Persistent on-disk cache layout. Toolchains are under FBuild::GetWorkerCacheDir, PCHs under the
     // Server's cache root (the same directory unless a gateway is given another):
     //   toolchain.<toolId hex>/...
@@ -197,17 +116,7 @@ namespace
             return 0;
         }
         uint64_t pchId = 0;
-        for ( const char * p = ( dirStart + 4 ); p < dirEnd; ++p )
-        {
-            const char c = *p;
-            uint8_t nibble;
-            if ( ( c >= '0' ) && ( c <= '9' ) )      { nibble = (uint8_t)( c - '0' ); }
-            else if ( ( c >= 'a' ) && ( c <= 'f' ) ) { nibble = (uint8_t)( c - 'a' + 10 ); }
-            else if ( ( c >= 'A' ) && ( c <= 'F' ) ) { nibble = (uint8_t)( c - 'A' + 10 ); }
-            else { return 0; }
-            pchId = ( ( pchId << 4 ) | nibble );
-        }
-        return pchId;
+        return CacheLayout::ParseHex64( dirStart + 4, dirEnd, pchId ) ? pchId : 0;
     }
 
     // Removes the toolchain directory that holds the manifest file, and everything in it
@@ -221,33 +130,11 @@ namespace
         AStackString<> root( manifestPath.Get(), lastSlash );
         const char * name = root.FindLast( NATIVE_SLASH );
         name = ( name ? ( name + 1 ) : root.Get() );
-        if ( AString::StrNCmp( name, "toolchain.", 10 ) != 0 )
+        if ( AString::StrNCmp( name, CacheLayout::kToolchainDirPrefix, CacheLayout::kToolchainDirPrefixLength ) != 0 )
         {
             return;
         }
-
-        Array<AString> files;
-        FileIO::GetFiles( root, AStackString<>( "*" ), true, &files );
-        Array<AString> directories;
-        directories.Append( root );
-        for ( const AString & file : files )
-        {
-            FileIO::FileDelete( file.Get() );
-
-            AStackString<> directory( file.Get(), file.FindLast( NATIVE_SLASH ) );
-            while ( ( directory.GetLength() > root.GetLength() ) && ( directories.Find( directory ) == nullptr ) )
-            {
-                directories.Append( directory );
-                directory.SetLength( (uint32_t)( directory.FindLast( NATIVE_SLASH ) - directory.Get() ) );
-            }
-        }
-
-        // Deepest first, so a directory is empty by the time it is removed
-        directories.Sort( []( const AString & a, const AString & b ) { return a.GetLength() > b.GetLength(); } );
-        for ( const AString & directory : directories )
-        {
-            FileIO::DirectoryDelete( directory );
-        }
+        CacheLayout::DeleteDirectoryTree( root );
     }
 
     // The payload of a MSG_JOB_RESULT(_COMPRESSED) for a job built here
@@ -270,6 +157,25 @@ namespace
 // Static Data
 //------------------------------------------------------------------------------
 /*static*/ uint8_t Server::s_LocalJobTag = 0;
+
+// GetCacheRoot
+//------------------------------------------------------------------------------
+/*static*/ AString Server::GetCacheRoot( const AString & cacheDir )
+{
+    AStackString<> directory( cacheDir );
+    if ( directory.IsEmpty() )
+    {
+        if ( FBuild::GetWorkerCacheDir( directory ) == false )
+        {
+            directory.Clear();
+        }
+    }
+    else
+    {
+        PathUtils::EnsureTrailingSlash( directory );
+    }
+    return AString( directory );
+}
 
 // CONSTRUCTOR
 //------------------------------------------------------------------------------

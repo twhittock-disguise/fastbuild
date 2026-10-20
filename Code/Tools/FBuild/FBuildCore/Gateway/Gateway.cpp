@@ -33,15 +33,7 @@ namespace
     // <cache root>gateway<slash>toolchains<slash>, the cache root being the Server's
     AString GetStashDirectory( const AString & cacheDir )
     {
-        AStackString<> directory( cacheDir );
-        if ( directory.IsEmpty() && ( FBuild::GetWorkerCacheDir( directory ) == false ) )
-        {
-            directory.Clear();
-        }
-        if ( directory.IsEmpty() == false )
-        {
-            PathUtils::EnsureTrailingSlash( directory );
-        }
+        AStackString<> directory( Server::GetCacheRoot( cacheDir ) );
         directory.AppendFormat( "gateway%ctoolchains%c", (char)NATIVE_SLASH, (char)NATIVE_SLASH );
         return AString( directory );
     }

@@ -76,6 +76,9 @@ public:
     Server & operator=( const Server & other ) = delete;
 
     static void GetHostForJob( const Job * job, AString & hostName );
+    // Where the PCH store and the log are kept: cacheDir, or else the worker cache dir; with a trailing slash.
+    // Empty if there is no such place.
+    static AString GetCacheRoot( const AString & cacheDir );
 
     // The local pool of a gateway
     uint32_t GetLocalSlots() const; // 0 if pure or if the worker gives no CPUs; else CPUs + prefetch

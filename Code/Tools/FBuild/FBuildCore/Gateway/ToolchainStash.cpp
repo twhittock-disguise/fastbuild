@@ -6,6 +6,8 @@
 #include "ToolchainStash.h"
 
 // FBuildCore
+#include "Tools/FBuild/FBuildCore/Helpers/CacheLayout.h"
+#include "Tools/FBuild/FBuildCore/Helpers/LruSelect.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 
 // Core
@@ -24,8 +26,6 @@
 //------------------------------------------------------------------------------
 namespace
 {
-    const char * const kToolchainDirPrefix = "toolchain.";
-    const size_t kToolchainDirPrefixLength = 10;
     const char * const kManifestFileName = "manifest.bin";
     const char * const kTempExtension = ".tmp";
 
@@ -70,27 +70,6 @@ namespace
             FileIO::FileDelete( temp.Get() );
             return false;
         }
-        return true;
-    }
-
-    bool ParseHex( const char * begin, const char * end, uint64_t & outValue )
-    {
-        if ( ( end - begin ) != 16 )
-        {
-            return false;
-        }
-        uint64_t value = 0;
-        for ( const char * p = begin; p < end; ++p )
-        {
-            const char c = *p;
-            uint8_t nibble;
-            if ( ( c >= '0' ) && ( c <= '9' ) )      { nibble = (uint8_t)( c - '0' ); }
-            else if ( ( c >= 'a' ) && ( c <= 'f' ) ) { nibble = (uint8_t)( c - 'a' + 10 ); }
-            else if ( ( c >= 'A' ) && ( c <= 'F' ) ) { nibble = (uint8_t)( c - 'A' + 10 ); }
-            else { return false; }
-            value = ( ( value << 4 ) | nibble );
-        }
-        outValue = value;
         return true;
     }
 
@@ -535,22 +514,24 @@ void ToolchainStash::Remove( Entry * entry, Array<uint64_t> & outToolIds )
 //------------------------------------------------------------------------------
 void ToolchainStash::Trim( Array<uint64_t> & outToolIds )
 {
-    while ( m_Entries.GetSize() > kMaxToolchains )
+    // One being received is kept: its client is still sending it
+    const LruLimits limits = { kMaxToolchains, 0, ~(uint64_t)0 };
+    Array<size_t> indices;
+    SelectLeastRecentlyUsed( m_Entries.GetSize(),
+                             limits,
+                             [ this ]( size_t i ) { return m_Entries[ i ].m_LastUse; },
+                             []( size_t ) { return (uint64_t)0; },
+                             [ this ]( size_t i ) { return ( m_Entries[ i ].IsComplete() == false ) || ( GetNumPins( m_Entries[ i ].m_ToolId ) > 0 ); },
+                             indices );
+    Array<uint64_t> toolIds;
+    toolIds.SetCapacity( indices.GetSize() );
+    for ( const size_t i : indices )
     {
-        Entry * oldest = nullptr;
-        for ( Entry & entry : m_Entries )
-        {
-            // One being received is kept: its client is still sending it
-            if ( entry.IsComplete() && ( GetNumPins( entry.m_ToolId ) == 0 ) && ( ( oldest == nullptr ) || ( entry.m_LastUse < oldest->m_LastUse ) ) )
-            {
-                oldest = &entry;
-            }
-        }
-        if ( oldest == nullptr )
-        {
-            return;
-        }
-        Remove( oldest, outToolIds );
+        toolIds.Append( m_Entries[ i ].m_ToolId );
+    }
+    for ( const uint64_t toolId : toolIds )
+    {
+        Remove( Find( toolId ), outToolIds );
     }
 }
 
@@ -559,7 +540,7 @@ void ToolchainStash::Trim( Array<uint64_t> & outToolIds )
 void ToolchainStash::GetToolchainDirectory( uint64_t toolId, AString & outDirectory ) const
 {
     outDirectory = m_Directory;
-    outDirectory.AppendFormat( "%s%016" PRIx64 "%c", kToolchainDirPrefix, toolId, (char)NATIVE_SLASH );
+    outDirectory.AppendFormat( "%s%016" PRIx64 "%c", CacheLayout::kToolchainDirPrefix, toolId, (char)NATIVE_SLASH );
 }
 
 // GetSlotPath
@@ -589,14 +570,8 @@ void ToolchainStash::DeleteToolchains( const Array<uint64_t> & toolIds )
     {
         AStackString<> directory;
         GetToolchainDirectory( toolId, directory );
-        Array<AString> files;
-        FileIO::GetFiles( directory, AStackString<>( "*" ), false, &files );
-        for ( const AString & file : files )
-        {
-            FileIO::FileDelete( file.Get() );
-        }
         directory.Trim( 0, 1 ); // The slash
-        FileIO::DirectoryDelete( directory );
+        CacheLayout::DeleteDirectoryTree( directory );
 
         MutexHolder mh( m_Mutex );
         m_Deleting.FindAndErase( toolId );
@@ -632,8 +607,8 @@ void ToolchainStash::Scan()
         }
         uint64_t toolId;
         if ( ( *dirEnd == '\0' ) ||
-             ( AString::StrNCmp( dirBegin, kToolchainDirPrefix, kToolchainDirPrefixLength ) != 0 ) ||
-             ( ParseHex( dirBegin + kToolchainDirPrefixLength, dirEnd, toolId ) == false ) )
+             ( AString::StrNCmp( dirBegin, CacheLayout::kToolchainDirPrefix, CacheLayout::kToolchainDirPrefixLength ) != 0 ) ||
+             ( CacheLayout::ParseHex64( dirBegin + CacheLayout::kToolchainDirPrefixLength, dirEnd, toolId ) == false ) )
         {
             continue;
         }
