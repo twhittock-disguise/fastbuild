@@ -820,7 +820,7 @@ void Gateway::UpdateWorker( Worker & worker, DownstreamConnection & connection, 
     {
         worker.m_Ready = true;
         AStackString<> line;
-        line.Format( "gateway worker-ready worker=%s slots=%u pool=%u", connection.GetAddress().Get(), allowance, poolSlots );
+        line.Format( "gateway worker-ready worker=%s", connection.GetAddress().Get() ); // Its pool is the ack's until a MSG_CAPACITY
         actions.m_LogLines.EmplaceBack( line.Get() );
     }
     UpdatePool();

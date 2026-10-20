@@ -4363,7 +4363,7 @@ void TestGateway::GatewayLogsForwarding() const
     AString log;
     LoadFileContentsAsString( logPath.Get(), log );
     AStackString<> expected;
-    expected.Format( "gateway worker-ready worker=127.0.0.1:%u slots=4", (uint32_t)kGatewayTestDownstreamPort );
+    expected.Format( "gateway worker-ready worker=127.0.0.1:%u", (uint32_t)kGatewayTestDownstreamPort );
     TEST_ASSERT( log.Find( expected.Get() ) );
     expected.Format( "gateway job-forward client=%u job=5 attempt=", clientId );
     TEST_ASSERT( log.Find( expected.Get() ) );
