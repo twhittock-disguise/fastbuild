@@ -3062,16 +3062,6 @@ namespace
         }
         size_t GetNumHeldJobs() const { MutexHolder mh( m_Mutex ); return m_Held.GetSize(); }
 
-        // While set, what arrives is not read, so what the gateway sends backs up
-        void StallReading( bool stall )
-        {
-            m_StallReading.Store( stall );
-            if ( stall == false )
-            {
-                m_StallSemaphore.Signal();
-            }
-        }
-
         // As a worker that has lost a PCH a job waits for. False if there is no connection.
         bool AskForPch( uint64_t pchId )
         {
@@ -3123,11 +3113,6 @@ namespace
 
         virtual void OnMessage( const ConnectionInfo * connection, const Protocol::IMessage & message, void * payload, uint32_t payloadSize ) override
         {
-            while ( m_StallReading.Load() )
-            {
-                m_StallSemaphore.Wait( 10 );
-            }
-
             {
                 MutexHolder mh( m_Mutex );
                 m_Types.Append( (uint8_t)message.GetType() );
@@ -3230,8 +3215,6 @@ namespace
         uint32_t m_NumPchCopies = 0;
         Array<uint64_t> m_HeldPchs;         // Advertised, or a copy arrived
         uint32_t m_NumJobsAheadOfTheirPch = 0;
-        Atomic<bool> m_StallReading{ false };
-        Semaphore m_StallSemaphore;
     };
 
     // Plays the gateway: the PCHs and toolchains it stores, and what the connection tells it
@@ -5374,7 +5357,8 @@ void TestGateway::ClientHoldingTooManyJobsIsDisconnected() const
 //------------------------------------------------------------------------------
 void TestGateway::StalledWorkerDoesNotStallTheGateway() const
 {
-    // Worker 1 has the more slots, so it is given the first two jobs, and stops reading
+    // Worker 1 has the more slots, so it is given the first two jobs, and stops reading: they are more than the
+    // socket buffers hold, so its sends are held up
     EchoWorker w1( 2, EchoWorker::ANSWER_NEVER );
     EchoWorker w2( 1 );
     TEST_ASSERT( w1.Listen( kGatewayTestDownstreamPort ) );
@@ -5391,8 +5375,8 @@ void TestGateway::StalledWorkerDoesNotStallTheGateway() const
     TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
     TEST_ASSERT( SendToolchain( probe, ci ) );
     JobStreamEncoder encoder;
-    TEST_ASSERT( SendLargeGatewayJob( probe, ci, encoder, 1, "big1", 16 * MEGABYTE ) );
-    TEST_ASSERT( SendLargeGatewayJob( probe, ci, encoder, 2, "big2", 16 * MEGABYTE ) );
+    TEST_ASSERT( SendLargeGatewayJob( probe, ci, encoder, 1, "big1", 24 * MEGABYTE ) );
+    TEST_ASSERT( SendLargeGatewayJob( probe, ci, encoder, 2, "big2", 24 * MEGABYTE ) );
     TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Running == 2 ); } ) );
 
     // The other worker and another client are served meanwhile

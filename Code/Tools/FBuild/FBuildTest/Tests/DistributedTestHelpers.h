@@ -337,6 +337,7 @@ namespace DistributedTest
         virtual ~FakeWorker() override
         {
             m_Stopping.Store( true );
+            StallReading( false );
             ShutdownAllConnections();
             for ( const ConnectionState & state : m_Connections )
             {
@@ -347,6 +348,16 @@ namespace DistributedTest
         FakeWorker & operator=( const FakeWorker & other ) = delete;
 
         uint32_t GetNumConnections() const { return m_NumConnections.Load(); }
+
+        // While set, what arrives is not read, so what is sent to the worker backs up
+        void StallReading( bool stall )
+        {
+            m_StallReading.Store( stall );
+            if ( stall == false )
+            {
+                m_StallSemaphore.Signal();
+            }
+        }
 
         // Ends the connections it has, as when a worker goes away, and listens for the next
         void DisconnectConnections()
@@ -442,6 +453,11 @@ namespace DistributedTest
         {
             keepMemory = true; // freed below
 
+            while ( m_StallReading.Load() )
+            {
+                m_StallSemaphore.Wait( 10 );
+            }
+
             // A message is in two parts if it has a payload, and the connections are read on their own threads
             const Protocol::IMessage * message = nullptr;
             void * payload = nullptr;
@@ -535,6 +551,8 @@ namespace DistributedTest
         mutable Mutex m_DemandsMutex;
         Array<uint32_t> m_Demands;
         Atomic<bool> m_Stopping{ false };
+        Atomic<bool> m_StallReading{ false };
+        Semaphore m_StallSemaphore;
     };
 
     // A worker that answers the handshake in a way that is not valid for this version
