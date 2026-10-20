@@ -142,6 +142,7 @@ private:
     void ClientRequeuesAGatewayReturnedResultWithoutDenyListing() const;
     void ClientStillDenyListsAPlainSystemError() const;
     void DenyListedWorkerIsAskedForNothing() const;
+    void ResultThatCannotBeReadEndsTheConnection() const;
     void SendMutexHoldsBackResults() const;
     void ToolchainIsSentBeforeAnyJob() const;
     void PchIsNotSentToAWorkerWithoutAFreeSlot() const;
@@ -401,6 +402,7 @@ REGISTER_TESTS_BEGIN( TestDistributed )
     REGISTER_TEST( ClientRequeuesAGatewayReturnedResultWithoutDenyListing )
     REGISTER_TEST( ClientStillDenyListsAPlainSystemError )
     REGISTER_TEST( DenyListedWorkerIsAskedForNothing )
+    REGISTER_TEST( ResultThatCannotBeReadEndsTheConnection )
     REGISTER_TEST( SendMutexHoldsBackResults )
 #if defined( __WINDOWS__ )
     REGISTER_TEST( ToolchainIsSentBeforeAnyJob )
@@ -2960,6 +2962,69 @@ void TestDistributed::DenyListedWorkerIsAskedForNothing() const
         TEST_ASSERT( built == false );
     }
     TEST_ASSERT( reached );
+}
+
+// ResultThatCannotBeReadEndsTheConnection
+//------------------------------------------------------------------------------
+namespace
+{
+    // Answers every job with a result shorter than the fields of a result
+    class ShortResultWorker : public DistributedTest::FakeWorker
+    {
+    public:
+        ShortResultWorker() : DistributedTest::FakeWorker( 1 ) {}
+        virtual ~ShortResultWorker() override { ShutdownAllConnections(); }
+        explicit ShortResultWorker( const ShortResultWorker & other ) = delete;
+        ShortResultWorker & operator=( const ShortResultWorker & other ) = delete;
+
+        uint32_t GetNumJobs() const { return m_NumJobs.Load(); }
+        uint32_t GetNumDisconnects() const { return m_NumDisconnects.Load(); }
+
+    private:
+        virtual void OnMessage( const ConnectionInfo * connection, const Protocol::IMessage & message, void *, uint32_t ) override
+        {
+            if ( message.GetType() == Protocol::MSG_JOB )
+            {
+                m_NumJobs.Increment();
+                MemoryStream ms;
+                ms.Write( (uint32_t)1 ); // A job id, and nothing after it
+                Protocol::MsgJobResult( 0 ).Send( connection, ms );
+            }
+        }
+        virtual void OnDisconnected( const ConnectionInfo * ) override { m_NumDisconnects.Increment(); }
+
+        Atomic<uint32_t> m_NumJobs{ 0 };
+        Atomic<uint32_t> m_NumDisconnects{ 0 };
+    };
+}
+
+void TestDistributed::ResultThatCannotBeReadEndsTheConnection() const
+{
+    FBuildTestOptions options;
+    options.m_ConfigFile = "Tools/FBuild/FBuildTest/Data/TestDistributed/fbuild.bff";
+    options.m_AllowDistributed = true;
+    options.m_NumWorkerThreads = 1;
+    options.m_NoLocalConsumptionOfRemoteJobs = true; // Only the worker takes the job
+    options.m_ForceCleanBuild = true;
+    options.m_DistVerbose = true;
+    FBuildForTest fBuild( options );
+    TEST_ASSERT( fBuild.Initialize() );
+
+    ShortResultWorker worker;
+    TEST_ASSERT( worker.Listen( Protocol::kTestPort ) );
+
+    // The client ends the connection, and does not read past the end of the result
+    auto disconnected = [ &worker ]() { return ( worker.GetNumDisconnects() >= 1 ); };
+    bool built = true;
+    {
+        DistributedTest::BuildAborter aborter( disconnected, DistributedTest::kWaitTimeoutSeconds );
+        built = fBuild.Build( "../tmp/Test/Distributed/dist.lib" );
+        worker.ShutdownAllConnections();
+        TEST_ASSERT( aborter.HasReached() );
+    }
+    TEST_ASSERT( built == false ); // Aborted
+    TEST_ASSERT( worker.GetNumJobs() >= 1 );
+    TEST_ASSERT( GetRecordedOutput().Find( "sent a result that cannot be read (4 bytes)" ) );
 }
 
 // CorruptResultIsRejected

@@ -14,6 +14,7 @@
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayScheduler.h"
 #include "Tools/FBuild/FBuildCore/Gateway/GatewayWire.h"
 #include "Tools/FBuild/FBuildCore/Gateway/ToolchainStash.h"
+#include "Tools/FBuild/FBuildCore/Helpers/Compressor.h"
 #include "Tools/FBuild/FBuildCore/Helpers/JobStream.h"
 #include "Tools/FBuild/FBuildCore/Helpers/ToolManifest.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
@@ -374,6 +375,7 @@ private:
     void DownstreamWithAnAckItCannotUseIsLost() const;
     void UnreachableDownstreamIsLost() const;
     void GatewayForwardsAJobAndItsResult() const;
+    void CompressedResultIsPassedOnAsItIs() const;
     void JobsWaitForTheirToolchainAtTheGateway() const;
     void JobForAMissingToolchainRequestsIt() const;
     void AdvertisedToolchainIsPinnedForTheConnection() const;
@@ -389,6 +391,7 @@ private:
     void StoredPchThatFailsMeasurementIsDropped() const;
     void StoredPchOfAnotherIdIsDropped() const;
     void HousekeepingRunsWhileStoredPchsAreMeasured() const;
+    void AwaitedStoredPchThatFailsMeasurementIsAskedFor() const;
     void StoredPchsThatJobsWaitForAreMeasuredFirst() const;
     void StashRejectsAManifestAWorkerWouldRefuse() const;
     void StashRejectsAManifestOfLengthsItCannotHold() const;
@@ -398,6 +401,8 @@ private:
     void JobIsTriedOnAtMostThreeWorkers() const;
     void CompileFailureIsPassedOnUnretried() const;
     void HungJobIsRetriedAfterTheWatchdog() const;
+    void HungJobsOfAWorkerWithoutSlotsAreForgotten() const;
+    void ExpiredJobsGoWithAWorkerThatHasNoSlots() const;
     void WorkerAskingForAnUnknownPchDoesNotReachTheClient() const;
     void LostWorkerIsConnectedAgain() const;
     void DroppedClientJobsFinishAndAreDiscarded() const;
@@ -456,6 +461,7 @@ private:
     void JobsTheLocalPoolCannotTakeAreReturned() const;
     void LocalToolchainWorkDoesNotHoldBackTheGateway() const;
     void JobTheLocalPoolCannotTakeIsReturnedWhileOthersWaitForIt() const;
+    void LocalPoolWithoutSlotsKeepsCountOfTheJobsItRuns() const;
 #if defined( __WINDOWS__ )
     void RetryOfALocalJobWaitsForADroppedPch() const;
 #endif
@@ -566,6 +572,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( DownstreamWithAnAckItCannotUseIsLost )
     REGISTER_TEST( UnreachableDownstreamIsLost )
     REGISTER_TEST( GatewayForwardsAJobAndItsResult )
+    REGISTER_TEST( CompressedResultIsPassedOnAsItIs )
     REGISTER_TEST( JobsWaitForTheirToolchainAtTheGateway )
     REGISTER_TEST( JobForAMissingToolchainRequestsIt )
     REGISTER_TEST( AdvertisedToolchainIsPinnedForTheConnection )
@@ -581,6 +588,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( StoredPchThatFailsMeasurementIsDropped )
     REGISTER_TEST( StoredPchOfAnotherIdIsDropped )
     REGISTER_TEST( HousekeepingRunsWhileStoredPchsAreMeasured )
+    REGISTER_TEST( AwaitedStoredPchThatFailsMeasurementIsAskedFor )
     REGISTER_TEST( StoredPchsThatJobsWaitForAreMeasuredFirst )
     REGISTER_TEST( StashRejectsAManifestAWorkerWouldRefuse )
     REGISTER_TEST( StashRejectsAManifestOfLengthsItCannotHold )
@@ -590,6 +598,8 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( JobIsTriedOnAtMostThreeWorkers )
     REGISTER_TEST( CompileFailureIsPassedOnUnretried )
     REGISTER_TEST( HungJobIsRetriedAfterTheWatchdog )
+    REGISTER_TEST( HungJobsOfAWorkerWithoutSlotsAreForgotten )
+    REGISTER_TEST( ExpiredJobsGoWithAWorkerThatHasNoSlots )
     REGISTER_TEST( WorkerAskingForAnUnknownPchDoesNotReachTheClient )
     REGISTER_TEST( LostWorkerIsConnectedAgain )
     REGISTER_TEST( DroppedClientJobsFinishAndAreDiscarded )
@@ -648,6 +658,7 @@ REGISTER_TESTS_BEGIN( TestGateway )
     REGISTER_TEST( JobsTheLocalPoolCannotTakeAreReturned )
     REGISTER_TEST( LocalToolchainWorkDoesNotHoldBackTheGateway )
     REGISTER_TEST( JobTheLocalPoolCannotTakeIsReturnedWhileOthersWaitForIt )
+    REGISTER_TEST( LocalPoolWithoutSlotsKeepsCountOfTheJobsItRuns )
 #if defined( __WINDOWS__ ) // PCH distribution is for MSVC
     REGISTER_TEST( RetryOfALocalJobWaitsForADroppedPch )
 #endif
@@ -2999,6 +3010,7 @@ namespace
             ANSWER_SYSTEM_ERROR,
             ANSWER_NEVER,       // Held until AnswerHeldJobs
             ANSWER_DISCONNECT,  // The connection is closed when a job arrives
+            ANSWER_OK_COMPRESSED, // Built, with its data compressed as a worker compresses it
         };
         struct ReceivedJob
         {
@@ -3187,13 +3199,21 @@ namespace
 
         void SendResult( const ConnectionInfo * connection, uint32_t jobId, const AString & name, Answer answer )
         {
-            const bool ok = ( answer == ANSWER_OK );
+            const bool ok = ( answer == ANSWER_OK ) || ( answer == ANSWER_OK_COMPRESSED );
             Array<AString> messages;
             if ( ok == false )
             {
                 messages.EmplaceBack( "echo worker failure" );
             }
             MemoryStream ms; // The data: the name again
+            if ( answer == ANSWER_OK_COMPRESSED )
+            {
+                Compressor compressed;
+                VERIFY( compressed.Compress( name.Get(), name.GetLength() ) );
+                Protocol::WriteJobResult( ms, jobId, name, ok, false, messages, 1, m_ThreadIndex, compressed.GetResult(), (uint32_t)compressed.GetResultSize() );
+                Protocol::MsgJobResultCompressed( 0 ).Send( connection, ms );
+                return;
+            }
             Protocol::WriteJobResult( ms, jobId, name, ok, ( answer == ANSWER_SYSTEM_ERROR ), messages, 1, m_ThreadIndex, name.Get(), name.GetLength() );
             const Protocol::MsgJobResult result( 0 );
             result.Send( connection, ms );
@@ -3558,14 +3578,21 @@ void TestGateway::DownstreamResultIsHandedOver() const
     TEST_ASSERT( results[ 0 ].m_ThreadIndex == 1007 );
     TEST_ASSERT( ( results[ 1 ].m_JobId == 10 ) && ( results[ 1 ].m_Name == "m10" ) );
     TEST_ASSERT( ( results[ 1 ].m_Ok == false ) && results[ 1 ].m_SystemError );
+    TEST_ASSERT( owner.WasAnyResultCompressed() == false );
+
+    // And whether it is compressed
+    worker.SetAnswer( EchoWorker::ANSWER_OK_COMPRESSED );
+    SendDownstreamJob( connection, owner, 11, "m11", nullptr );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &owner ]() { return ( owner.GetNumResults() == 3 ); } ) );
+    TEST_ASSERT( owner.WasAnyResultCompressed() );
     TEST_ASSERT( connection.HasEnded() == false );
     TEST_ASSERT( owner.GetNumLost() == 0 );
 
     // The worker had the toolchain, so only the jobs were sent
     Array<uint8_t> types;
     worker.GetMessageTypes( types );
-    TEST_ASSERT( types.GetSize() == 2 );
-    TEST_ASSERT( ( types[ 0 ] == Protocol::MSG_JOB ) && ( types[ 1 ] == Protocol::MSG_JOB ) );
+    TEST_ASSERT( types.GetSize() == 3 );
+    TEST_ASSERT( ( types[ 0 ] == Protocol::MSG_JOB ) && ( types[ 1 ] == Protocol::MSG_JOB ) && ( types[ 2 ] == Protocol::MSG_JOB ) );
 }
 
 // DownstreamAskingForAPchGetsItAgain
@@ -3950,6 +3977,38 @@ void TestGateway::GatewayForwardsAJobAndItsResult() const
     TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_HeldJobBytes == 0 ); } ) );
     const Gateway::Stats stats = GetGatewayStats( gateway );
     TEST_ASSERT( ( stats.m_Forwarded == 1 ) && ( stats.m_Running == 0 ) && ( stats.m_Waiting == 0 ) && ( stats.m_Parked == 0 ) );
+}
+
+// CompressedResultIsPassedOnAsItIs
+//------------------------------------------------------------------------------
+void TestGateway::CompressedResultIsPassedOnAsItIs() const
+{
+    EchoWorker worker( 4, EchoWorker::ANSWER_OK_COMPRESSED );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    Gateway gateway( config );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( StartGateway( gateway, 1, probe, ci ) );
+    probe.KeepPayloads();
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5" ) );
+
+    // The client is told it is compressed, and its data is what the worker compressed
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 1 ); } ) );
+    const size_t index = ( probe.GetNumMessages() - 1 );
+    TEST_ASSERT( probe.GetMessageType( index ) == Protocol::MSG_JOB_RESULT_COMPRESSED );
+    Array<char> payload;
+    probe.GetPayload( index, payload );
+    DistributedTest::ReceivedResult result;
+    TEST_ASSERT( DistributedTest::ReadReceivedResult( payload.Begin(), payload.GetSize(), result ) );
+    TEST_ASSERT( ( result.m_JobId == 5 ) && result.m_Ok && ( result.m_ThreadIndex == GatewayWire::MakeLane( 1, 1001 ) ) );
+    const char * data = ( payload.Begin() + result.m_DataOffset );
+    TEST_ASSERT( Compressor::IsValidData( data, result.m_DataSize ) );
+    Compressor decompressed;
+    TEST_ASSERT( decompressed.Decompress( data ) );
+    TEST_ASSERT( ( decompressed.GetResultSize() == 2 ) && ( memcmp( decompressed.GetResult(), "m5", 2 ) == 0 ) );
 }
 
 // JobsWaitForTheirToolchainAtTheGateway
@@ -4625,6 +4684,54 @@ void TestGateway::HousekeepingRunsWhileStoredPchsAreMeasured() const
     TEST_ASSERT( log.Find( "gateway pch-measured n=1 failed=0 ms=" ) );
 }
 
+// AwaitedStoredPchThatFailsMeasurementIsAskedFor
+//------------------------------------------------------------------------------
+void TestGateway::AwaitedStoredPchThatFailsMeasurementIsAskedFor() const
+{
+    // A damaged PCH left in the store, whose measurement lasts until the test releases it
+    DistributedTest::CompressedPch pch;
+    DistributedTest::MakeCompressedPch( 64 * 1024, 13, pch );
+    GatewayConfig config;
+    MakeGatewayConfig( 1, config );
+    const char corrupt[] = "not a compressed PCH";
+    TEST_ASSERT( WriteStoredPch( config.m_CacheDir, pch.m_Id, corrupt, sizeof( corrupt ) ).IsEmpty() == false );
+    s_HeldMeasurements.Store( 0 );
+    s_MeasurementsReleased.Store( false );
+    Gateway::s_MeasureTestHook = HoldStoredPchMeasurement;
+    const AtScopeEnd clearHook( []() { Gateway::s_MeasureTestHook = nullptr; } );
+
+    EchoWorker worker( 4 );
+    TEST_ASSERT( worker.Listen( kGatewayTestDownstreamPort ) );
+    AStackString<> logPath;
+    {
+        Gateway gateway( config );
+        DistributedTest::HandshakeProbe probe;
+        const ConnectionInfo * ci = nullptr;
+        TEST_ASSERT( StartGateway( gateway, 1, probe, ci ) );
+        logPath = gateway.GetServer().GetLogPath();
+        TEST_ASSERT( DistributedTest::WaitUntil( []() { return ( s_HeldMeasurements.Load() == 1 ); } ) );
+
+        // A job for it waits for its measurement
+        JobStreamEncoder encoder;
+        TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 5, "m5", pch.m_Id ) );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Parked == 1 ); } ) );
+
+        // It fails it: it goes from the store, and the client is asked for it
+        s_MeasurementsReleased.Store( true );
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetNumPchNeeded() == 1 ); } ) );
+        TEST_ASSERT( probe.GetPchNeededId( 0 ) == pch.m_Id );
+        TEST_ASSERT( SendPchFromProbe( probe, ci, pch ) );
+        Array<DistributedTest::ReceivedResult> results;
+        TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 1 ); } ) );
+        TEST_ASSERT( ( results[ 0 ].m_JobId == 5 ) && results[ 0 ].m_Ok );
+        TEST_ASSERT( worker.GetPchBytes() == pch.m_CompressedSize );
+    }
+
+    uint32_t numLines = 0;
+    TEST_ASSERT( DistributedTest::CountInStatsLogSince( logPath, 0, "gateway pch-measured n=0 failed=1 ms=", numLines ) );
+    TEST_ASSERT( numLines == 1 );
+}
+
 // StoredPchsThatJobsWaitForAreMeasuredFirst
 //------------------------------------------------------------------------------
 void TestGateway::StoredPchsThatJobsWaitForAreMeasuredFirst() const
@@ -4960,6 +5067,99 @@ void TestGateway::HungJobIsRetriedAfterTheWatchdog() const
     TEST_ASSERT( ( results[ 1 ].m_JobId == 6 ) && ( results[ 2 ].m_JobId == 7 ) );
     stats = GetGatewayStats( gateway );
     TEST_ASSERT( ( stats.m_Timeouts == 1 ) && ( stats.m_Running == 0 ) );
+}
+
+// HungJobsOfAWorkerWithoutSlotsAreForgotten
+//------------------------------------------------------------------------------
+namespace
+{
+    // The demand the gateway last reported to the worker is 0
+    bool LastDemandIsNone( const EchoWorker & worker )
+    {
+        Array<uint32_t> demands;
+        worker.GetDemands( demands );
+        return ( demands.IsEmpty() == false ) && ( demands.Top() == 0 );
+    }
+}
+
+void TestGateway::HungJobsOfAWorkerWithoutSlotsAreForgotten() const
+{
+    // Worker 1 has the more slots, so it is given both jobs, and holds them
+    EchoWorker w1( 2, EchoWorker::ANSWER_NEVER );
+    EchoWorker w2( 1 );
+    TEST_ASSERT( w1.Listen( kGatewayTestDownstreamPort ) );
+    TEST_ASSERT( w2.Listen( kGatewayTestDownstreamPort + 1 ) );
+    GatewayConfig config;
+    MakeFailureConfig( 2, config );
+    Gateway gateway( config );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( StartGateway( gateway, 2, probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 1, "m1" ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 2, "m2" ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &w1 ]() { return ( w1.GetNumHeldJobs() == 2 ); } ) );
+
+    // It offers no slots before the watchdog: the jobs it runs expire, and having no slots of it to hold, they are
+    // forgotten. They are built on worker 2.
+    w1.SendCapacity( 0, 0 );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    Gateway::Stats stats = GetGatewayStats( gateway );
+    TEST_ASSERT( ( stats.m_Timeouts == 2 ) && ( stats.m_Retries == 2 ) && ( stats.m_Running == 0 ) );
+    TEST_ASSERT( w2.GetNumJobs() == 2 );
+
+    // Back with its slots, nothing of it is counted as running there, and its late answers are dropped
+    w1.SendCapacity( 2, 2 );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &w1 ]() { return LastDemandIsNone( w1 ); } ) );
+    w1.AnswerHeldJobs( EchoWorker::ANSWER_OK );
+    w1.SetAnswer( EchoWorker::ANSWER_OK );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 3, "m3" ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 3 ); } ) );
+    Thread::Sleep( 100 ); // A late answer passed on would have arrived by now
+    TEST_ASSERT( GetNumResults( probe ) == 3 );
+    TEST_ASSERT( w1.GetNumJobs() == 3 );
+}
+
+// ExpiredJobsGoWithAWorkerThatHasNoSlots
+//------------------------------------------------------------------------------
+void TestGateway::ExpiredJobsGoWithAWorkerThatHasNoSlots() const
+{
+    // Worker 1 has the more slots, so it is given both jobs, and holds them
+    EchoWorker w1( 2, EchoWorker::ANSWER_NEVER );
+    EchoWorker w2( 1 );
+    TEST_ASSERT( w1.Listen( kGatewayTestDownstreamPort ) );
+    TEST_ASSERT( w2.Listen( kGatewayTestDownstreamPort + 1 ) );
+    GatewayConfig config;
+    MakeFailureConfig( 2, config );
+    Gateway gateway( config );
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( StartGateway( gateway, 2, probe, ci ) );
+    JobStreamEncoder encoder;
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 1, "m1" ) );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 2, "m2" ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &w1 ]() { return ( w1.GetNumHeldJobs() == 2 ); } ) );
+
+    // The watchdog expires them, and they are built on worker 2, while worker 1's slots stay taken
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    TEST_ASSERT( GetGatewayStats( gateway ).m_Timeouts == 2 );
+    TEST_ASSERT( w2.GetNumJobs() == 2 );
+
+    // It then offers no slots, which ends what the expired jobs held; back with its slots, it holds none
+    w1.SendCapacity( 0, 0 );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 1 ); } ) );
+    w1.SendCapacity( 2, 2 );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_ReadyWorkers == 2 ); } ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &w1 ]() { return LastDemandIsNone( w1 ); } ) );
+    w1.AnswerHeldJobs( EchoWorker::ANSWER_OK );
+    w1.SetAnswer( EchoWorker::ANSWER_OK );
+    TEST_ASSERT( SendGatewayJob( probe, ci, encoder, 3, "m3" ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 3 ); } ) );
+    Thread::Sleep( 100 ); // A late answer passed on would have arrived by now
+    TEST_ASSERT( GetNumResults( probe ) == 3 );
+    TEST_ASSERT( w1.GetNumJobs() == 3 );
 }
 
 // WorkerAskingForAnUnknownPchDoesNotReachTheClient
@@ -7587,6 +7787,56 @@ void TestGateway::JobTheLocalPoolCannotTakeIsReturnedWhileOthersWaitForIt() cons
     TEST_ASSERT( GetNumResults( b ) == 2 );
     TEST_ASSERT( b.IsDisconnected() == false );
     TEST_ASSERT( ( stats.m_GiveUps == ( before.m_GiveUps + 1 ) ) && ( stats.m_Waiting == ( nextJobB - 103 ) ) );
+}
+
+// LocalPoolWithoutSlotsKeepsCountOfTheJobsItRuns
+//------------------------------------------------------------------------------
+void TestGateway::LocalPoolWithoutSlotsKeepsCountOfTheJobsItRuns() const
+{
+    // The local pool is the gateway's only worker. A build synchronizes the compiler's toolchain there, and its
+    // jobs are kept to be sent again.
+    const DistributedTest::RemoteCpusForTest cpus( 2 );
+    LocalJobHold hold;
+    Gateway::s_LocalJobTestHook = LocalJobHold::Hook;
+    const AtScopeEnd clearHook( []() { Gateway::s_LocalJobTestHook = nullptr; } );
+    GatewayConfig config;
+    Gateway gateway( config, 2, 0 );
+    LocalJobHold::LocalJob built;
+    TEST_ASSERT( BuildOnTheLocalPool( gateway, hold, built ) );
+
+    // Two jobs run there
+    DistributedTest::HandshakeProbe probe;
+    const ConnectionInfo * ci = nullptr;
+    TEST_ASSERT( ConnectProbe( gateway.GetServer(), probe, &ci ) != 0 );
+    JobStreamEncoder encoder;
+    hold.HoldNext( 2 );
+    TEST_ASSERT( SendLocalJob( probe, ci, encoder, built, 1 ) && SendLocalJob( probe, ci, encoder, built, 2 ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &hold ]() { return ( hold.GetNumHeld() == 2 ); } ) );
+
+    // The worker settings give no CPUs: the local pool leaves the scheduler, and finishes what it runs
+    WorkerThreadRemote::SetNumCPUsToUse( 0 );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_LocalSlots == 0 ); } ) );
+    TEST_ASSERT( SendLocalJob( probe, ci, encoder, built, 3 ) );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_Waiting == 1 ); } ) );
+    Gateway::Stats stats = GetGatewayStats( gateway );
+    TEST_ASSERT( ( stats.m_RunningLocally == 2 ) && ( stats.m_Retries == 0 ) );
+
+    // Back with its slots, which the jobs it runs still fill: the third job waits (the slots and what is dispatched
+    // to them are updated together)
+    WorkerThreadRemote::SetNumCPUsToUse( 2 );
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &gateway ]() { return ( GetGatewayStats( gateway ).m_LocalSlots == 2 ); } ) );
+    stats = GetGatewayStats( gateway );
+    TEST_ASSERT( ( stats.m_RunningLocally == 2 ) && ( stats.m_Waiting == 1 ) );
+
+    // Each job that ends frees a slot
+    hold.ReleaseOne();
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( GetNumResults( probe ) == 2 ); } ) );
+    hold.ReleaseOne();
+    Array<DistributedTest::ReceivedResult> results;
+    TEST_ASSERT( DistributedTest::WaitUntil( [ &probe, &results ]() { probe.GetResults( results ); return ( results.GetSize() == 3 ); } ) );
+    TEST_ASSERT( results[ 0 ].m_Ok && results[ 1 ].m_Ok && results[ 2 ].m_Ok );
+    stats = GetGatewayStats( gateway );
+    TEST_ASSERT( ( stats.m_Retries == 0 ) && ( stats.m_Timeouts == 0 ) && ( stats.m_GiveUps == 0 ) );
 }
 
 #if defined( __WINDOWS__ ) // PCH distribution is for MSVC
