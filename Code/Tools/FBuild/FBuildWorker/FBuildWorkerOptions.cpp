@@ -118,6 +118,7 @@ bool FBuildWorkerOptions::ProcessCommandLine( const AString & commandLine )
         else if ( token.BeginsWith( "-gateway=" ) )
         {
             m_GatewayConfigFile.Assign( token.Get() + 9, token.GetEnd() );
+            m_GatewayConfigFile.RemoveQuotes(); // A path with spaces is quoted
             if ( !m_GatewayConfigFile.IsEmpty() )
             {
                 continue;
