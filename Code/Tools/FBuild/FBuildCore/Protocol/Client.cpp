@@ -1573,7 +1573,16 @@ void ClientToWorkerConnection::ProcessJobResultCommon( bool isCompressed,
             {
                 failureOutput += '\n';
             }
-            failureOutput.AppendFormat( "FBuild: Error: Task failed on %u different workers\n", (uint32_t)SYSTEM_ERROR_ATTEMPT_COUNT );
+            if ( ( flags & Protocol::kResultReturnedByGateway ) != 0 )
+            {
+                failureOutput.AppendFormat( "FBuild: Error: Task failed %u times, the last returned by the gateway %s after its own retries\n",
+                                            (uint32_t)SYSTEM_ERROR_ATTEMPT_COUNT,
+                                            m_Worker->m_Address.Get() );
+            }
+            else
+            {
+                failureOutput.AppendFormat( "FBuild: Error: Task failed on %u different workers\n", (uint32_t)SYSTEM_ERROR_ATTEMPT_COUNT );
+            }
         }
 
         Node::DumpOutput( nullptr, failureOutput, nullptr );

@@ -2934,10 +2934,12 @@ void TestDistributed::ClientRequeuesAGatewayReturnedResultWithoutDenyListing() c
         TEST_ASSERT( poller.GetMax() == 0 );
     }
 
-    // The job came back to the same connection each time, and failed as a job that fails everywhere does
+    // The job came back to the same connection each time, and failed as a job that fails everywhere does,
+    // saying it was the gateway that returned it
     TEST_ASSERT( built == false );
     TEST_ASSERT( worker.GetMostReceivesOfOneJob() == 3 ); // The client's SYSTEM_ERROR_ATTEMPT_COUNT
-    TEST_ASSERT( GetRecordedOutput().Find( "Task failed on 3 different workers" ) );
+    TEST_ASSERT( GetRecordedOutput().Find( "Task failed 3 times, the last returned by the gateway " ) );
+    TEST_ASSERT( GetRecordedOutput().Find( "different workers" ) == nullptr );
 }
 
 // ClientStillDenyListsAPlainSystemError
