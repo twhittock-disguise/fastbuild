@@ -13,6 +13,7 @@
 #include "Tools/FBuild/FBuildCore/Helpers/PchBlob.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchId.h"
 #include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
+#include "Tools/FBuild/FBuildCore/Protocol/Server.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/Job.h"
 #include "Tools/FBuild/FBuildCore/WorkerPool/WorkerThreadRemote.h"
 
@@ -874,6 +875,39 @@ namespace DistributedTest
     private:
         const uint32_t m_Original;
     };
+
+    // Two clients of a server on the test port whose pool has 20 slots: the slots go where the demand is
+    inline void CheckSharesMoveWithDemand( Server & server )
+    {
+        const AStackString<> logPath( server.GetLogPath() );
+        const uint64_t logSizeBefore = GetStatsLogSize( logPath );
+        HandshakeProbe a;
+        const ConnectionInfo * ciA = a.ConnectAndHandshake( Protocol::kTestPort );
+        TEST_ASSERT( ciA );
+        TEST_ASSERT( a.SendDemand( ciA, 100 ) );
+        TEST_ASSERT( WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 20 ); } ) );
+
+        // Only the final shares are known: A may pass through what is left once B's first share is taken
+        HandshakeProbe b;
+        const ConnectionInfo * ciB = b.ConnectAndHandshake( Protocol::kTestPort );
+        TEST_ASSERT( ciB );
+        TEST_ASSERT( b.SendDemand( ciB, 100 ) );
+        TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 10 ) && ( b.GetLastAllowance() == 10 ); } ) );
+
+        TEST_ASSERT( b.SendDemand( ciB, 0 ) );
+        TEST_ASSERT( WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 20 ) && ( b.GetLastAllowance() == 0 ); } ) );
+
+        // B leaves, which changes nothing for A
+        b.ShutdownAllConnections();
+        TEST_ASSERT( WaitUntil( [ &logPath, logSizeBefore ]() { uint32_t n = 0; return CountInStatsLogSince( logPath, logSizeBefore, "disconnect client=", n ) && ( n == 1 ); } ) );
+        Thread::Sleep( 200 ); // An update would have come by now
+        TEST_ASSERT( a.GetLastAllowance() == 20 );
+
+        // Each demand is logged with the allowance it led to
+        uint32_t numLines = 0;
+        TEST_ASSERT( CountInStatsLogSince( logPath, logSizeBefore, "demand client=", numLines ) );
+        TEST_ASSERT( numLines == 3 );
+    }
 
     // Aborts the build once a condition holds, or after a timeout, so that a test fails instead of hanging.
     // Does nothing if the build ends first.

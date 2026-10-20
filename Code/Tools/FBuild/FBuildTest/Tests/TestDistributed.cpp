@@ -3386,8 +3386,6 @@ void TestDistributed::ToolchainInventoryFollowsAck() const
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
     TEST_ASSERT( probe.GetMessageType( 1 ) == Protocol::MSG_PCH_INVENTORY );
     TEST_ASSERT( probe.GetMessageType( 2 ) == Protocol::MSG_TOOLCHAIN_INVENTORY );
-
-    probe.ShutdownAllConnections();
 }
 
 // ToolchainInventoryIsBounded
@@ -3510,8 +3508,6 @@ void TestDistributed::MismatchedProtocolVersionIsRefused() const
     {
         TEST_ASSERT( numRefusals == 1 );
     }
-
-    probe.ShutdownAllConnections();
 }
 
 // FramesOfAnotherMajorAreRefused
@@ -3540,7 +3536,6 @@ void TestDistributed::FramesOfAnotherMajorAreRefused() const
         TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
         TEST_ASSERT( probe.GetNumMessages() == 1 );
         TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_REFUSED );
-        probe.ShutdownAllConnections();
     }
 }
 
@@ -3625,7 +3620,6 @@ void TestDistributed::AckCarriesACapacityAbove255() const
     Array<DistributedTest::HandshakeProbe::CapacityUpdate> updates;
     probe.GetCapacityUpdates( updates );
     TEST_ASSERT( updates.Top().m_PoolSlots == WorkerThreadRemote::GetNumCPUsToUse() );
-    probe.ShutdownAllConnections();
 }
 
 // SharesMoveWithDemandBetweenTwoClients
@@ -3635,28 +3629,7 @@ void TestDistributed::SharesMoveWithDemandBetweenTwoClients() const
     const DistributedTest::RemoteCpusForTest cpus( 20 );
     Server s( 1 );
     TEST_ASSERT( s.Listen( Protocol::kTestPort ) );
-
-    DistributedTest::HandshakeProbe a;
-    const ConnectionInfo * ciA = a.ConnectAndHandshake( Protocol::kTestPort );
-    TEST_ASSERT( ciA );
-    TEST_ASSERT( a.SendDemand( ciA, 100 ) );
-    TEST_ASSERT( DistributedTest::WaitUntil( [ &a ]() { return ( a.GetLastAllowance() == 20 ); } ) );
-
-    // Only the final shares are known: A may pass through what is left once B's first share is taken
-    DistributedTest::HandshakeProbe b;
-    const ConnectionInfo * ciB = b.ConnectAndHandshake( Protocol::kTestPort );
-    TEST_ASSERT( ciB );
-    TEST_ASSERT( b.SendDemand( ciB, 100 ) );
-    TEST_ASSERT( DistributedTest::WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 10 ) && ( b.GetLastAllowance() == 10 ); } ) );
-
-    TEST_ASSERT( b.SendDemand( ciB, 0 ) );
-    TEST_ASSERT( DistributedTest::WaitUntil( [ &a, &b ]() { return ( a.GetLastAllowance() == 20 ) && ( b.GetLastAllowance() == 0 ); } ) );
-
-    b.ShutdownAllConnections();
-    TEST_ASSERT( DistributedTest::WaitUntil( [ &s ]() { MutexHolder mh( s.m_ClientListMutex ); return ( s.m_ClientList.GetSize() == 1 ); } ) );
-    Thread::Sleep( 200 ); // An update would have come by now
-    TEST_ASSERT( a.GetLastAllowance() == 20 );
-    a.ShutdownAllConnections();
+    DistributedTest::CheckSharesMoveWithDemand( s );
 }
 
 // ScarceSlotsRotateOnTheirOwn
@@ -3694,9 +3667,6 @@ void TestDistributed::ScarceSlotsRotateOnTheirOwn() const
         return ( newA >= ( numUpdatesA + 2 ) ) && ( newB >= ( numUpdatesB + 2 ) );
     };
     TEST_ASSERT( DistributedTest::WaitUntil( rotated, 5.0f * Server::kRotateSeconds ) );
-
-    a.ShutdownAllConnections();
-    b.ShutdownAllConnections();
 }
 
 // ClientRampsUpItsDemand
@@ -3933,7 +3903,6 @@ void TestDistributed::ShortMessagesAreRejected() const
         TEST_ASSERT( probe.Send( ci, frame.data, frame.size ) );
         TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
         TEST_ASSERT( probe.GetNumMessages() == 0 );
-        probe.ShutdownAllConnections();
     }
 }
 
@@ -3974,7 +3943,6 @@ void TestDistributed::HeadersWithTheWrongPayloadAreRejected() const
         }
         TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return probe.IsDisconnected(); } ) );
         TEST_ASSERT( probe.GetNumMessages() == 0 ); // No ack
-        probe.ShutdownAllConnections();
     }
 }
 
@@ -3999,7 +3967,6 @@ void TestDistributed::LongerMessagesAreAccepted() const
     TEST_ASSERT( DistributedTest::WaitUntil( [ &probe ]() { return ( probe.GetNumMessages() >= 3 ); } ) );
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
     TEST_ASSERT( probe.IsDisconnected() == false );
-    probe.ShutdownAllConnections();
 }
 
 // HostNameStaysBounded
@@ -4027,7 +3994,6 @@ void TestDistributed::HostNameStaysBounded() const
         hostNameLength = (uint32_t)s.m_ClientList[ 0 ]->m_HostName.GetLength();
     }
     TEST_ASSERT( hostNameLength == 64 );
-    probe.ShutdownAllConnections();
 }
 
 // HostNameIsBoundedByTheFrame
@@ -4085,7 +4051,6 @@ void TestDistributed::ServerSendsBothInventoriesAfterTheAck() const
     TEST_ASSERT( probe.GetMessageType( 0 ) == Protocol::MSG_CONNECTION_ACK );
     TEST_ASSERT( probe.GetMessageType( 1 ) == Protocol::MSG_PCH_INVENTORY );
     TEST_ASSERT( probe.GetMessageType( 2 ) == Protocol::MSG_TOOLCHAIN_INVENTORY );
-    probe.ShutdownAllConnections();
 }
 
 // ClientRefusesAWorkerThatRefusesIt, ClientRefusesAnAckOfAnotherMajor, ClientRejectsAShortAck, ClientRejectsAnAckWithAPayload
@@ -4522,7 +4487,6 @@ void TestDistributed::WorkerAsksForAMissingPch() const
     {
         TEST_ASSERT( numLogged == 1 );
     }
-    probe.ShutdownAllConnections();
 }
 
 // WorkerDoesNotAskForAPchBeingReceived
@@ -4576,7 +4540,6 @@ void TestDistributed::WorkerDoesNotAskForAPchBeingReceived() const
     Thread::Sleep( 100 ); // The disconnect is dealt with on another thread than the connection's, so nothing sent on it says it is done
     TEST_ASSERT( waiting.GetNumPchNeeded() == 1 );
     TEST_ASSERT( waiting.GetPchNeededId( 0 ) == job.m_PchId );
-    waiting.ShutdownAllConnections();
 }
 
 // WorkerAsksAgainWhenAPchItHadIsNeededAgain
@@ -4627,7 +4590,6 @@ void TestDistributed::WorkerAsksAgainWhenAPchItHadIsNeededAgain() const
     TEST_ASSERT( client.Handshake( ci ) ); // Answered after the job
     TEST_ASSERT( client.GetNumPchNeeded() == 2 );
     TEST_ASSERT( client.GetPchNeededId( 1 ) == pchs[ 0 ].m_Id );
-    client.ShutdownAllConnections();
 }
 
 // Fake workers that lose PCHs
@@ -5564,7 +5526,6 @@ void TestDistributed::CorruptPchIsAskedForAgain() const
     // and the client is not asked again: whatever the worker sent before it answers this was sent by then
     TEST_ASSERT( probe.Handshake( ci ) );
     TEST_ASSERT( probe.GetNumPchNeeded() == 1 );
-    probe.ShutdownAllConnections();
 }
 
 // PchUnpackIsSingleFlight
