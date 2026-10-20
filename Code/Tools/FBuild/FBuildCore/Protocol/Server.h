@@ -199,7 +199,8 @@ private:
     };
 
     // A thread per client that sends what is queued for it, so a client that reads slowly holds back only itself.
-    // Lock order: m_ClientListMutex, then the outbox's own mutex; the thread sends holding only cs.m_SendMutex.
+    // Pushed to under m_ClientListMutex, and under any lock taken after it: the outbox's own mutex is taken last.
+    // The thread sends holding only cs.m_SendMutex.
     // An allowance marked as changed goes ahead of the results queued when the thread wakes for it.
     class ClientOutbox
     {
