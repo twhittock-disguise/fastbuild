@@ -8,6 +8,7 @@
 // FBuildCore
 #include "Tools/FBuild/FBuildCore/FBuild.h"
 #include "Tools/FBuild/FBuildCore/Helpers/PchTransform.h"
+#include "Tools/FBuild/FBuildCore/Protocol/Protocol.h"
 
 // Core
 #include "Core/FileIO/FileIO.h"
@@ -36,14 +37,14 @@ namespace
         }
     }
 
-    // "<label> <n> msgs, <raw> raw, <sent> sent, send time <t>s[, encode time <t>s][, max wait <t>s], done at <t>s"
+    // "<label> <n> msgs, <raw> raw, <sent> sent, handoff time <t>s[, encode time <t>s][, max wait <t>s], last sent at <t>s"
     void AppendBulkLine( AString & text, const char * label, const DistributionSendStats & s )
     {
         text.AppendFormat( "  %-10s %u msgs, ", label, s.m_Messages );
         AppendSize( text, s.m_RawBytes );
         text += " raw, ";
         AppendSize( text, s.m_SentBytes );
-        text.AppendFormat( " sent, send time %.1fs", s.m_SendTime );
+        text.AppendFormat( " sent, handoff time %.1fs", s.m_SendTime );
         if ( s.m_EncodeTime > 0.0 )
         {
             text.AppendFormat( ", encode time %.1fs", s.m_EncodeTime );
@@ -52,7 +53,7 @@ namespace
         {
             text.AppendFormat( ", max wait %.1fs", s.m_MaxQueueDelay );
         }
-        text.AppendFormat( ", done at %.1fs\n", s.m_LastSentAt );
+        text.AppendFormat( ", last sent at %.1fs\n", s.m_LastSentAt );
     }
 }
 
@@ -84,8 +85,17 @@ namespace
     outText += " raw, ";
     AppendSize( outText, stats.m_ResultBytesReceived );
     outText += " received\n";
-    outText.AppendFormat( "  upload:    %.1f MB in %.1fs of send time = %.2f MB/s (%.1f Mbit/s)\n\n",
-                          ToMB( totalSent ), totalSendTime, mbPerSecond, mbPerSecond * 8.0 );
+    if ( totalSent > Protocol::kClientSendBufferSize )
+    {
+        outText.AppendFormat( "  upload:    %.1f MB in %.1fs of handoff time = %.2f MB/s (%.1f Mbit/s)\n\n",
+                              ToMB( totalSent ), totalSendTime, mbPerSecond, mbPerSecond * 8.0 );
+    }
+    else
+    {
+        // The socket buffer took it all, so the handoff time says nothing about the link
+        outText.AppendFormat( "  upload:    %.1f MB in %.1fs of handoff time, too small to measure the link\n\n",
+                              ToMB( totalSent ), totalSendTime );
+    }
 }
 
 // AppendToLog

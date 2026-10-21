@@ -1683,21 +1683,22 @@ void TestDistributed::DistributionStatsLog() const
         DistributionStats::Format( stats, "2026-01-02 03:04:05", text );
         TEST_ASSERT( text.Find( "[2026-01-02 03:04:05] worker 10.0.0.7, connected 12.5s" ) );
         TEST_ASSERT( text.Find( "toolchain: 18 msgs, 40.0 MB raw, 2.0 MB sent" ) );
-        TEST_ASSERT( text.Find( "jobs:      3 msgs, 24.0 MB raw, 3.0 MB sent, send time 0.5s, encode time 0.4s, max wait 0.2s, done at" ) );
-        TEST_ASSERT( text.Find( "pch:       1 msgs, 0.0 KB raw, 1.0 MB sent, send time 0.5s, done at" ) );
+        TEST_ASSERT( text.Find( "jobs:      3 msgs, 24.0 MB raw, 3.0 MB sent, handoff time 0.5s, encode time 0.4s, max wait 0.2s, last sent at" ) );
+        TEST_ASSERT( text.Find( "pch:       1 msgs, 0.0 KB raw, 1.0 MB sent, handoff time 0.5s, last sent at" ) );
         TEST_ASSERT( text.Find( "toolchain: 2 cached on the worker, not sent" ) );
         TEST_ASSERT( text.Find( "results:   3 received, 4.0 MB raw, 1.0 MB received" ) );
-        TEST_ASSERT( text.Find( "upload:    6.0 MB in 2.0s of send time = 3.00 MB/s (24.0 Mbit/s)" ) );
+        TEST_ASSERT( text.Find( "upload:    6.0 MB in 2.0s of handoff time = 3.00 MB/s (24.0 Mbit/s)" ) );
     }
 
-    // No send time: no rate rather than a division by zero
+    // Fits in the socket buffer: no rate, as the handoff time says nothing about the link
     {
         DistributionConnectionStats stats;
         stats.m_WorkerAddress = "10.0.0.7";
         stats.m_Jobs.m_SentBytes = 1000;
         AStackString<> text;
         DistributionStats::Format( stats, "t", text );
-        TEST_ASSERT( text.Find( "= 0.00 MB/s (0.0 Mbit/s)" ) );
+        TEST_ASSERT( text.Find( "of handoff time, too small to measure the link" ) );
+        TEST_ASSERT( text.Find( "MB/s" ) == nullptr );
 
         // Small amounts show in KB, not as 0.0 MB
         TEST_ASSERT( text.Find( "0.0 KB raw, 1.0 KB sent" ) );
