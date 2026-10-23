@@ -36,6 +36,7 @@ void WorkerSendQueue::Push( SendQueueItem && item )
     if ( item.m_Kind == SendKind::Job )
     {
         m_UnsentJobs.Increment();
+        m_UnsentJobBytes.Add( item.m_RawBytes );
     }
     {
         MutexHolder lock( m_SendQueueMutex );
@@ -156,6 +157,12 @@ bool WorkerSendQueue::SendItem( TCPConnectionPool & pool, const ConnectionInfo *
     if ( item.m_Kind == SendKind::Job )
     {
         m_UnsentJobs.Decrement();
+        m_UnsentJobBytes.Sub( item.m_RawBytes );
+        if ( m_ClientWake && m_WakeWhenJobsSent.Load() )
+        {
+            m_WakeWhenJobsSent.Store( false );
+            m_ClientWake->Signal();
+        }
     }
 
     // If the send fails, we should be disconnected

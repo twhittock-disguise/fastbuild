@@ -43,7 +43,7 @@
 // Defines
 //------------------------------------------------------------------------------
 #define SYSTEM_ERROR_ATTEMPT_COUNT ( 3u )
-#define MAX_UNSENT_JOBS ( 4u ) // Per connection. Bounds the uncompressed job data waiting for the send thread.
+#define MAX_UNSENT_JOB_BYTES ( 32u * 1024u * 1024u ) // Per connection. Bounds the uncompressed job data waiting for the send thread.
 #define DIST_INFO( ... ) do { if ( m_DetailedLogging ) { FLOG_OUTPUT( __VA_ARGS__ ); } } while ( false )
 
 //------------------------------------------------------------------------------
@@ -328,7 +328,8 @@ void Client::ThreadFunc()
             break;
         }
 
-        Thread::Sleep( 1 );
+        // A sleep rounds up to the timer tick, about 16ms. A send thread that has sent the jobs the pass left behind ends the wait.
+        m_WakeSemaphore.Wait( 1 );
         if ( m_ShouldExit.Load() )
         {
             break;
@@ -1024,8 +1025,9 @@ void ClientToWorkerConnection::PushJobsToWorker()
     {
         // Jobs are compressed as they are sent. Take no more than the send thread can use,
         // as the rest are better left for other workers than held as uncompressed copies.
-        if ( m_SendQueue.GetNumUnsentJobs() >= MAX_UNSENT_JOBS )
+        if ( m_SendQueue.GetUnsentJobBytes() >= MAX_UNSENT_JOB_BYTES )
         {
+            m_SendQueue.WakeWhenJobsSent(); // Not a sleep's length until the next pass
             break;
         }
 
@@ -1694,6 +1696,7 @@ ClientToWorkerConnection::ClientToWorkerConnection( Client * client,
     , m_Worker( worker )
     , m_SendQueue( *this, worker->m_Address )
 {
+    m_SendQueue.SetWakeSemaphore( &client->GetWakeSemaphore() );
     SetConnectSendBufferSize( Protocol::kClientSendBufferSize );
     m_SendThread.Start( SendQueueThreadFuncStatic, "ClientSend", this );
 }

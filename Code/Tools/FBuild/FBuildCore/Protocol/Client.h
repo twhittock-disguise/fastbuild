@@ -12,6 +12,7 @@
 #include "Core/Containers/UniquePtr.h"
 #include "Core/Process/Atomic.h"
 #include "Core/Process/Mutex.h"
+#include "Core/Process/Semaphore.h"
 #include "Core/Process/Thread.h"
 #include "Core/Strings/AString.h"
 #include "Core/Time/Timer.h"
@@ -58,6 +59,9 @@ public:
     void GetToolchains( Array<const ToolManifest *> & outManifests ) const;
     uint32_t GetToolchainsGeneration() const { return m_ToolchainsGeneration.Load(); } // Changes when one is added
 
+    // Wakes the client thread early from its wait between passes
+    Semaphore & GetWakeSemaphore() { return m_WakeSemaphore; }
+
     // Test seam: points of a connection where the order of two of its threads matters, so that a test can hold the
     // thread that reaches one until the other has come as far as it needs. The hook runs on the thread that reached
     // the point, and is given whether the connection has ended.
@@ -98,6 +102,7 @@ private:
 
     // Primary "Client" thread
     Atomic<bool> m_ShouldExit{ false }; // signal from main thread
+    Semaphore m_WakeSemaphore; // Signalled when a connection's send thread has room for the jobs the thread had to leave
     Thread m_Thread; // the thread to find and manage workers
 
     // state

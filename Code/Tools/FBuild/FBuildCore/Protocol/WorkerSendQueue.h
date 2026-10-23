@@ -136,6 +136,12 @@ public:
     void Run( TCPConnectionPool & pool, const ConnectionInfo * connection );
 
     uint32_t GetNumUnsentJobs() const { return m_UnsentJobs.Load(); }
+    uint64_t GetUnsentJobBytes() const { return m_UnsentJobBytes.Load(); } // Before compression
+
+    // The thread that pushes jobs has stopped for want of room: the semaphore is signalled when the send thread next
+    // sends a job
+    void SetWakeSemaphore( Semaphore * semaphore ) { m_ClientWake = semaphore; } // Before the first Push
+    void WakeWhenJobsSent() { m_WakeWhenJobsSent.Store( true ); }
     uint32_t GetNumTransformedPchs() const { return m_NumTransformedPchs.Load(); }
     const DistributionSendStats & GetStats( SendKind kind ) const { return m_SendStats[ (size_t)kind ]; } // Send thread, or once it has ended
 
@@ -149,6 +155,9 @@ private:
     Atomic<bool> m_Quit{ false };
     Atomic<bool> m_Failed{ false };
     Atomic<uint32_t> m_UnsentJobs{ 0 }; // Queued for the send thread, not yet sent
+    Atomic<uint64_t> m_UnsentJobBytes{ 0 }; // The raw size of those
+    Semaphore * m_ClientWake = nullptr; // The client thread's
+    Atomic<bool> m_WakeWhenJobsSent{ false };
     Atomic<uint32_t> m_NumTransformedPchs{ 0 }; // PCHs delivered in the form that a transform makes (see PchTransform)
     JobStreamEncoder m_JobEncoder; // Send thread only. A new connection starts a new stream.
 
